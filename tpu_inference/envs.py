@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     DECODE_SLICES: str = ""
     SKIP_JAX_PRECOMPILE: bool = False
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
-    MODEL_IMPL_TYPE: str = "flax_nnx"
+    MODEL_IMPL_TYPE: str = "vllm"
     NEW_MODEL_DESIGN: bool = False
     PHASED_PROFILING_DIR: str = ""
     PYTHON_TRACER_LEVEL: int = 1

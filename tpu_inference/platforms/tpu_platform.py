@@ -2,7 +2,6 @@
 
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Union, cast
 
-import jax.numpy as jnp
 import torch
 import vllm.envs as vllm_envs
 from tpu_info import device
@@ -12,7 +11,6 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from tpu_inference import envs
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
-from tpu_inference.utils import to_jax_dtype, to_torch_dtype
 
 if TYPE_CHECKING:
     from vllm.attention.backends.registry import AttentionBackendEnum
@@ -52,7 +50,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
-                             head_size: int, dtype: jnp.dtype,
+                             head_size: int, dtype,
                              kv_cache_dtype: Optional[str], block_size: int,
                              use_v1: bool, use_mla: bool, has_sink: bool,
                              use_sparse: bool, attn_type: Any) -> str:
@@ -101,8 +99,8 @@ class TpuPlatform(Platform):
         return "tpu_inference.lora.torch_punica_tpu.PunicaWrapperTPU"
 
     @classmethod
-    def get_infinity_values(cls, dtype: jnp.dtype) -> Tuple[float, float]:
-        return jnp.finfo(dtype).min, jnp.finfo(dtype).max
+    def get_infinity_values(cls, dtype) -> Tuple[float, float]:
+        return torch.finfo(dtype).min, torch.finfo(dtype).max
 
     @classmethod
     def can_update_inplace(cls):
@@ -152,22 +150,17 @@ class TpuPlatform(Platform):
         # If we use vLLM's model implementation in PyTorch, we should set it with torch version of the dtype.
         impl = envs.MODEL_IMPL_TYPE
 
-        # NOTE(xiang): convert dtype to jnp.dtype
-        # NOTE(wenlong): skip this logic for mm model preprocessing
-        # For mm model preprocessors, it may need the output dtype to be torch.
-        # In order to avoid a PR to vLLM, we postpone the dtype checking during
-        # tpu_worker initialization
-        if not vllm_config.scheduler_config.is_multimodal_model or impl == "vllm":
-            model_dtype = vllm_config.model_config.dtype
-            try:
-                dtype = to_jax_dtype(model_dtype)
-            except ValueError:
-                logger.warning(f"{model_dtype=} is not supported. "
-                               "Falling back to jnp.bfloat16")
-                dtype = jnp.bfloat16
-            if impl == "vllm":
-                dtype = to_torch_dtype(dtype)
-            vllm_config.model_config.dtype = dtype
+        model_config = vllm_config.model_config
+        if model_config is not None and model_config.dtype in (
+            torch.float16,
+            torch.float32,
+        ):
+            logger.warning(
+                "The TPU backend currently does not support %s. "
+                "Using bfloat16 instead.",
+                model_config.dtype,
+            )
+            model_config.dtype = torch.bfloat16
 
         # TODO(cuiq): remove this dependency.
         from vllm.v1.attention.backends.pallas import PallasAttentionBackend
@@ -220,11 +213,6 @@ class TpuPlatform(Platform):
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             assert kv_transfer_config.kv_connector == "TPUConnector"
-        # Late initialization to avoid circular import
-        from tpu_inference.models.jax.utils.quantization.quantization_utils import \
-            update_vllm_config_for_qwix_quantization
-
-        update_vllm_config_for_qwix_quantization(vllm_config)
 
         from tpu_inference.core.sched.dp_scheduler import \
             update_vllm_config_for_dp_scheduler
@@ -272,8 +260,10 @@ class TpuPlatform(Platform):
         """
         Returns if the current platform needs to sync weight loader.
         """
-        return True
+        # TODO: Fix this
+        return False
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
-        return True
+        # TODO: Fix this
+        return False

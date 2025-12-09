@@ -15,7 +15,6 @@ from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 from jax._src.numpy.scalar_types import _ScalarMeta
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from torchax.ops.mappings import j2t_dtype, t2j_dtype
 from vllm import envs as vllm_envs
 from vllm import utils
 
@@ -25,36 +24,6 @@ from tpu_inference.logger import init_logger
 GBYTES = 1024 * 1024 * 1024
 TPU_HEAD_SIZE_ALIGNMENT = 128
 TPU_SECOND_LAST_MINOR = 8
-
-# Map vllm dtype string that doesn't exactly match jax dtype string name.
-_VLLM_DTYPE_STR_TO_JAX_DTYPE = {
-    "fp8": jnp.float8_e4m3fn,
-    "fp8_e4m3": jnp.float8_e4m3fn,
-    "fp8_e5m2": jnp.float8_e5m2,
-}
-
-
-def to_jax_dtype(dtype: str | jnp.dtype | torch.dtype) -> jnp.dtype:
-    if isinstance(dtype, str):
-        if dict_dtype := _VLLM_DTYPE_STR_TO_JAX_DTYPE.get(dtype, None):
-            return dict_dtype
-        return jnp.dtype(dtype)
-    elif isinstance(dtype, torch.dtype):
-        return t2j_dtype(dtype)
-    elif isinstance(dtype, jnp.dtype):
-        return dtype
-    elif isinstance(dtype, _ScalarMeta):
-        return dtype.dtype
-    else:
-        raise ValueError(f"Argument is unsupported data type {type(dtype)}")
-
-
-def to_torch_dtype(dtype: str | jnp.dtype | torch.dtype) -> torch.dtype:
-    # Use jax dtype as an intermediate dtype which we'll be used to convert it
-    # into torch dtype.
-    dtype = to_jax_dtype(dtype)
-    return j2t_dtype(dtype)
-
 
 _megacore = False
 logger = init_logger(__name__)
@@ -194,85 +163,6 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-def make_optimized_mesh(axis_shapes: Sequence[int],
-                        axis_names: Sequence[str],
-                        *,
-                        devices: Sequence[xc.Device] | None = None):
-    if devices is None:
-        devices = xb.devices()
-    # Sort the devices in case it's passed in an arbitary order
-    devices = sorted(devices, key=lambda x: x.coords)
-
-    def _is_1D(axis_shapes):
-        return sum(x > 1 for x in axis_shapes) == 1
-
-    if _is_1D(axis_shapes):
-        dev_kind = devices[0].device_kind
-        device_num = len(devices)
-        if dev_kind == "TPU v6 lite":
-            ordered_devices = None
-            # NOTE(chengjiyao):
-            # The coords of v6e-8 are
-            # (0,0,0)
-            # (1,0,0)
-            # (0,1,0)
-            # (1,1,0)
-            # (0,2,0)
-            # (1,2,0)
-            # (0,3,0)
-            # (1,3,0)
-            if device_num == 8:
-                ordered_devices = np.array([
-                    devices[0],
-                    devices[1],
-                    devices[2],
-                    devices[3],
-                    devices[7],
-                    devices[6],
-                    devices[5],
-                    devices[4],
-                ])
-            # NOTE(chengjiyao):
-            # The coords of v6e-4 are
-            # (0,0,0)
-            # (1,0,0)
-            # (0,1,0)
-            # (1,1,0)
-            elif device_num == 4:
-                ordered_devices = np.array([
-                    devices[0],
-                    devices[1],
-                    devices[3],
-                    devices[2],
-                ])
-            if ordered_devices is not None:
-                ordered_devices = np.array(ordered_devices)
-                ordered_devices = ordered_devices.reshape(axis_shapes)
-                mesh = mesh_lib.Mesh(ordered_devices, axis_names)
-                logger.info("Use customized mesh: %s", mesh)
-                return mesh
-
-    return jax.make_mesh(axis_shapes, axis_names, devices=devices)
-
-
-def device_array(mesh: Mesh, *args, sharding=None, **kwargs) -> jax.Array:
-    """
-    Create a device array with the specified mesh and sharding.
-
-    Args:
-        mesh: The JAX mesh to use for device placement
-        *args: Positional arguments to pass to jax.device_put
-        sharding: Optional sharding specification. If None, uses PartitionSpec(None)
-        **kwargs: Keyword arguments to pass to jax.device_put
-
-    Returns:
-        A JAX array placed on the specified devices
-    """
-    if sharding is None:
-        sharding = NamedSharding(mesh, PartitionSpec(None))
-    return jax.device_put(*args, device=sharding, **kwargs)
-
-
 def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
     """
     A wrapper function of vllm.utils.hashing.get_hash_fn_by_name to support builtin
@@ -280,49 +170,6 @@ def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
     if hash_fn_name == "builtin":
         return hash
     return utils.hashing.get_hash_fn_by_name(hash_fn_name)
-
-
-def quantize_kv(key: jax.Array, value: jax.Array,
-                kv_cache_quantized_dtype: jnp.dtype, k_scale: float,
-                v_scale: float) -> Tuple[jax.Array, jax.Array]:
-    """
-        Quantize the key and value tensors.
-
-        Args:
-            key: The key tensor to quantize.
-            value: The value tensor to quantize.
-            kv_cache_quantized_dtype: The dtype to quantize the key and value tensors to.
-            q_scale: The scale to quantize the key and value tensors by.
-            k_scale: The scale to quantize the key tensor by.
-            v_scale: The scale to quantize the value tensor by.
-
-        Returns:
-            Tuple[jax.Array, jax.Array]: The quantized key and value tensors.
-        """
-    dtype_info = jnp.finfo(kv_cache_quantized_dtype)
-    minval, maxval = float(dtype_info.min), float(dtype_info.max)
-    key = key.astype(jnp.float32) / k_scale
-    key = jnp.clip(key, minval, maxval)
-    key = key.astype(kv_cache_quantized_dtype)
-    value = value.astype(jnp.float32) / v_scale
-    value = jnp.clip(value, minval, maxval)
-    value = value.astype(kv_cache_quantized_dtype)
-
-    return key, value
-
-
-def get_jax_dtype_from_str_dtype(str_dtype: str) -> jnp.dtype:
-    """
-    Get the JAX dtype from a string dtype.
-
-    Args:
-        str_dtype: The string dtype to get the JAX dtype from.
-
-    Returns:
-        jnp.dtype: The JAX dtype.
-    """
-    # TODO(kyuyeunk): Replace all reference of this function into TpuDtype.
-    return to_jax_dtype(str_dtype)
 
 
 def time_function(func):
