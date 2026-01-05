@@ -5,17 +5,38 @@
   <img src="docs/assets/tpu_inference_light_mode_short.png#gh-light-mode-only" alt="vLLM TPU" style="width: 86%;">
 </p>
 
-<p align="center">
-| <a href="https://docs.vllm.ai/projects/tpu/en/latest/"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/google-tpu-support/27"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a>  (#sig-tpu) |
-</p>
-
 ---
 
 This repo contains TorchTPU + vLLM
 
+The codebase references both vLLM main and tpu-inference, with majority of the server code from vLLM, and custom kernels from tpu-inference
+
+---
+
+---
+To run Qwen3 model on single device
+
+Start a server:
+```
+MODEL_IMPL_TYPE="vllm" vllm serve "Qwen/Qwen3-0.6B"     --download_dir /tmp     --disable-log-requests     --tensor_parallel_size=1     --max-model-len=2048 --enforce-eager
+```
+
+Send a request:
+```
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Qwen/Qwen3-0.6B",
+        "prompt": "Hello, my name is",
+        "max_tokens": 20,
+        "temperature": 0.7
+    }'
+```
 ---
 
 ## Get started
+
+(The following are from tpu-inference, mostly apply)
 
 Get started with vLLM on TPUs by following the [quickstart guide](https://docs.vllm.ai/projects/tpu/en/latest/getting_started/quickstart/).
 
