@@ -11,7 +11,6 @@ This repo contains TorchTPU + vLLM
 
 The codebase references both vLLM main and tpu-inference, with majority of the server code from vLLM, and custom kernels from tpu-inference
 
----
 
 ---
 To run Qwen3 model on single device
