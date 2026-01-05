@@ -416,7 +416,7 @@ class TPUWorker:
         pass
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
-        return (int(node_id), ip, int(port))
+        pass
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
