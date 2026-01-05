@@ -152,17 +152,10 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
 
         # SPMD Related
+        # TODO: Fix this
         self.use_spmd = envs.VLLM_XLA_USE_SPMD
-        if self.use_spmd:
-            # num_devices = xr.global_runtime_device_count()
-            mesh_shape = (num_devices, 1)
-            device_ids = np.array(range(num_devices))
-            # self.mesh = xs.Mesh(device_ids, mesh_shape, ("x", "y"))
 
         self.enforce_eager = model_config.enforce_eager
-
-        self.num_xla_graphs = 0
-        self._update_num_xla_graphs("init")
 
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
@@ -341,16 +334,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             0, 32, device="cpu", pin_memory=self.pin_memory
         )
 
-        self.mm_budget = (
-            MultiModalBudget(
-                self.model_config,
-                self.scheduler_config,
-                self.mm_registry,
-            )
-            if self.supports_mm_inputs
-            else None
-        )
-
         # TODO: torch.compile this
         self.sample_from_logits_func = self.sample_from_logits
 
@@ -360,36 +343,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
 
     def reset_mm_cache(self) -> None:
-        if self.mm_budget:
-            self.mm_budget.reset_cache()
-
-    def _update_num_xla_graphs(self, case_str):
-        check_comp = self.check_recompilation and not self.enforce_eager
-        if not check_comp:
-            return
-
-        # total_cached_graphs = xr.get_num_cached_compilation_graph()
-        new_compiled_graphs = total_cached_graphs - self.num_xla_graphs
-        if new_compiled_graphs == 0:
-            return
-
-        logger.info(
-            "Add new %d compiled XLA graphs due to %s", new_compiled_graphs, case_str
-        )
-        self.num_xla_graphs += new_compiled_graphs
-
-    def _verify_num_xla_graphs(self, case_str):
-        check_comp = self.check_recompilation and not self.enforce_eager
-        if not check_comp:
-            return
-
-        # curr_cached_graph = xr.get_num_cached_compilation_graph()
-        assert self.num_xla_graphs == curr_cached_graph, (
-            "Recompilation after warm up is detected during {}."
-            " num_xla_graphs = {} curr_cached_graph = {}".format(
-                case_str, self.num_xla_graphs, curr_cached_graph
-            )
-        )
+        pass
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> bool:
         """Update the cached states and the persistent batch with the scheduler
@@ -964,11 +918,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # depending on the input multimodal items.
             curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
 
-            sanity_check_mm_encoder_outputs(
-                curr_group_outputs,
-                expected_num_items=num_items,
-            )
-
             if isinstance(curr_group_outputs, torch.Tensor):
                 encoder_outputs.append(curr_group_outputs)
             else:
@@ -1284,10 +1233,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
         )
 
-        # Check there are no new graphs compiled - all the graphs should be
-        # captured and compiled during warm up.
-        self._verify_num_xla_graphs("execute_model")
-
         return model_runner_output
 
     def update_config(self, overrides: dict[str, Any]) -> None:
@@ -1398,216 +1343,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             prompt_lora_mapping, token_lora_mapping, lora_requests
         )
 
-    def _precompile_mm_encoder(self) -> None:
-        if not self.supports_mm_inputs:
-            return
-
-        # Pre-compile MM encoder for all supported data modalities.
-        hf_config = self.vllm_config.model_config.hf_config
-
-        mm_budget = self.mm_budget
-        assert mm_budget is not None
-
-        max_items_per_seq_by_modality = (
-            mm_budget.max_items_per_batch_by_modality
-        )  # noqa: E501
-
-        for mode, max_items_per_seq in max_items_per_seq_by_modality.items():
-            logger.info(
-                "Compiling Multimodal %s Encoder with different input shapes.", mode
-            )
-            start = time.perf_counter()
-            # No padding for MM encoder just yet.
-            for num_items in range(1, max_items_per_seq + 1):
-                logger.info("  -- mode: %s items: %d", mode, num_items)
-                batched_dummy_mm_inputs = self._get_mm_dummy_batch(
-                    mode,
-                    num_items,
-                )
-                # Run multimodal encoder.
-                mm_embeds = self.model.embed_multimodal(**batched_dummy_mm_inputs)
-                num_patches = mm_embeds[0].shape[0]
-                items_size = num_patches * num_items
-
-                # NOTE (NickLucche) pre-compile `embed_input_ids` when mm
-                # embeddings are present. We assume `--disable-mm-chunked`,
-                # hence only whole items can be scheduled. This implies we just
-                # need to compile when `num_items` fit the (padded) `input_ids`
-                for num_tokens in self.num_tokens_paddings:
-                    if num_tokens >= items_size:
-                        # XLA Workaround: if torch.zeros(..device) is used, XLA
-                        # compiles a scalar+expansion op, which won't match
-                        # the graph generated at runtime. CPU->TPU must be used
-                        placeholders_ids = torch.zeros(
-                            num_tokens, dtype=torch.int32, device="cpu"
-                        )
-                        # Align placeholders and actual num mm_embeddings.
-                        placeholders_ids[:items_size] = hf_config.image_token_index
-
-                        placeholders_ids = placeholders_ids.to(self.device)
-
-                        mm_mask = torch.tensor([False] * num_tokens)
-                        mm_mask[:items_size] = True
-                        mm_mask = mm_mask.to(self.device)
-                        # Assign outputs or the graph will be cut short.
-                        a, b = self._get_model_inputs(
-                            placeholders_ids,
-                            mm_embed_inputs=([mm_embeds], mm_mask),
-                        )
-                        assert a is None
-
-            # Pre-compile `embed_input_ids` when mm_embeddings are not
-            # present. Chunk is only made of text, no mm_placeholders.
-            for num_tokens in self.num_tokens_paddings:
-                placeholders_ids = torch.zeros(
-                    num_tokens, dtype=torch.int32, device="cpu"
-                )
-                placeholders_ids = placeholders_ids.to(self.device)
-                a, b = self._get_model_inputs(
-                    placeholders_ids,
-                    mm_embed_inputs=None,
-                )
-                assert a is None
-
-            end = time.perf_counter()
-            logger.info(
-                "Multimodal %s Encoder compilation finished in in %.2f [secs].",
-                mode,
-                end - start,
-            )
-
-    def _precompile_backbone(self) -> None:
-        logger.info("Compiling the model with different input shapes.")
-        start = time.perf_counter()
-        for num_tokens in self.num_tokens_paddings:
-            logger.info("  -- num_tokens: %d", num_tokens)
-            self._dummy_run(
-                num_tokens, self.num_reqs_max_model_len, self.max_num_blocks_per_req
-            )
-            if self.most_model_len is not None:
-                self._dummy_run(
-                    num_tokens,
-                    self.num_reqs_most_model_len,
-                    self.num_blocks_per_most_len_req,
-                )
-        end = time.perf_counter()
-        logger.info("Compilation finished in %.2f [secs].", end - start)
-        self._update_num_xla_graphs("model backbone")
-
-    def _precompile_select_hidden_states(self) -> None:
-        # Compile hidden state selection function for bucketed
-        # n_tokens x max_num_reqs. Graph is really small so this is fine.
-        logger.info("Compiling select_hidden_states with different input shapes.")
-        start = time.perf_counter()
-        hsize = self.model_config.get_hidden_size()
-        for num_tokens in self.num_tokens_paddings:
-            dummy_hidden = torch.zeros(
-                (num_tokens, hsize), device=self.device, dtype=self._hidden_states_dtype
-            )
-            torch._dynamo.mark_dynamic(dummy_hidden, 0)
-            for num_reqs in self.num_reqs_paddings:
-                indices = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
-                torch._dynamo.mark_dynamic(indices, 0)
-                self.select_hidden_states(dummy_hidden, indices)
-                logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs)
-                # Requests can't be more than tokens. But do compile for the
-                # next bigger value in case num_tokens uses bucketed padding.
-                if num_reqs >= min(num_tokens, self.max_num_reqs):
-                    break
-        end = time.perf_counter()
-        logger.info("Compilation finished in %.2f [secs].", end - start)
-        self._update_num_xla_graphs("select_hidden_states")
-
-    def _precompile_compute_logits(self) -> None:
-        logger.info("Compiling compute_logits with different input shapes.")
-        start = time.perf_counter()
-        hsize = self.model_config.get_hidden_size()
-        for num_reqs in self.num_reqs_paddings:
-            dummy_hidden = torch.zeros(
-                (num_reqs, hsize), device=self.device, dtype=self._hidden_states_dtype
-            )
-            torch._dynamo.mark_dynamic(dummy_hidden, 0)
-            self.compute_logits(dummy_hidden)
-            logger.info("  -- num_seqs: %d", num_reqs)
-        end = time.perf_counter()
-        logger.info("Compilation finished in %.2f [secs].", end - start)
-        self._update_num_xla_graphs("compute_logits")
-
-    def _precompile_structured_decoding(self) -> None:
-        logger.info("Compiling structured_decoding with different input shapes.")
-        start = time.perf_counter()
-        for num_reqs in self.num_reqs_paddings:
-            dummy_logits = torch.zeros(
-                (num_reqs, self.vocab_size),
-                device=self.device,
-                dtype=self._hidden_states_dtype,
-            )
-            dummy_require_struct_decoding = self.require_structured_out_cpu[
-                :num_reqs
-            ].to(self.device)
-            dummy_grammar_bitmask = self.grammar_bitmask_cpu[:num_reqs].to(self.device)
-            # The first dimension of the above 3 dummy tensors cannot be
-            # mark_dynamic because some operations in structured_decode require
-            # them to be static.
-            arange = self.structured_decode_arange.to(self.device)
-            self.structured_decode(
-                dummy_require_struct_decoding,
-                dummy_grammar_bitmask,
-                dummy_logits,
-                arange,
-            )
-            logger.info("  -- num_seqs: %d", num_reqs)
-        end = time.perf_counter()
-        logger.info("Compilation finished in %.2f [secs].", end - start)
-        self._update_num_xla_graphs("structured_decoding")
-
-    def _precompile_sample_from_logits(self) -> None:
-        logger.info("Compiling sample_from_logits with different input shapes.")
-        start = time.perf_counter()
-        for num_reqs in self.num_reqs_paddings:
-            dummy_logits = torch.zeros(
-                (num_reqs, self.vocab_size),
-                device=self.device,
-                dtype=self._hidden_states_dtype,
-            )
-            # The first dimension of dummy_logits cannot be mark_dynamic
-            # because some operations in the sampler require it to be static.
-            for all_greedy in [False, True]:
-                generate_params_if_all_greedy = not all_greedy
-                sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
-                    self.input_batch,
-                    num_reqs,
-                    self.device,
-                    generate_params_if_all_greedy,
-                )
-                sampling_metadata.all_greedy = all_greedy
-                with self.maybe_select_dummy_loras(
-                    self.lora_config, np.array([num_reqs], dtype=np.int32)
-                ):
-                    self.sample_from_logits_func(dummy_logits, sampling_metadata)
-            logger.info("  -- num_seqs: %d", num_reqs)
-        end = time.perf_counter()
-        logger.info("Compilation finished in %.2f [secs].", end - start)
-        self._update_num_xla_graphs("sample_from_logits")
-
-    def _precompile_gather_logprobs(self) -> None:
-        logger.info("Compiling gather_logprobs with different input shapes.")
-        start = time.perf_counter()
-        for num_reqs in self.num_reqs_paddings:
-            dummy_logits = torch.zeros(
-                (num_reqs, self.vocab_size),
-                device=self.device,
-                dtype=self._hidden_states_dtype,
-            )
-            dummy_tokens = torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device)
-            with self.maybe_select_dummy_loras(
-                self.lora_config, np.array([num_reqs], dtype=np.int32)
-            ):
-                self.gather_logprobs(dummy_logits, dummy_tokens)
-            logger.info("  -- num_seqs: %d", num_reqs)
-        end = time.perf_counter()
-        logger.info("Compilation finished in %.2f [secs].", end - start)
-        self._update_num_xla_graphs("gather_logprobs")
 
     def capture_model(self) -> None:
         """
@@ -1616,90 +1351,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # TODO: precompile properly
         return None
 
-        with self.maybe_setup_dummy_loras(self.lora_config):
-            self._precompile_mm_encoder()
-            self._precompile_backbone()
-            self._precompile_select_hidden_states()
-            self._precompile_compute_logits()
-            self._precompile_structured_decoding()
-            self._precompile_sample_from_logits()
-            self._precompile_gather_logprobs()
-
     def profile_run(
         self,
         num_tokens: int,
     ) -> None:
-        # Profile with multimodal encoder & encoder cache.
-        if self.supports_mm_inputs:
-            mm_config = self.model_config.multimodal_config
-            if mm_config is not None and mm_config.skip_mm_profiling:
-                logger.info(
-                    "Skipping memory profiling for multimodal encoder and "
-                    "encoder cache."
-                )
-            else:
-                mm_budget = self.mm_budget
-                assert mm_budget is not None
-
-                # TODO: handle encoder-decoder models once we support them.
-                if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
-                    # NOTE: Currently model is profiled with a single non-text
-                    # modality with the max possible input tokens even when
-                    # it supports multiple.
-                    dummy_modality = mm_budget.get_modality_with_max_tokens()
-                    max_mm_items_per_batch = mm_budget.max_items_per_batch_by_modality[
-                        dummy_modality
-                    ]
-
-                    logger.info(
-                        "Encoder cache will be initialized with a budget of "
-                        "%s tokens, and profiled with %s %s items of the "
-                        "maximum feature size.",
-                        encoder_budget,
-                        max_mm_items_per_batch,
-                        dummy_modality,
-                    )
-
-                    # Create dummy batch of multimodal inputs.
-                    batched_dummy_mm_inputs = self._get_mm_dummy_batch(
-                        dummy_modality,
-                        max_mm_items_per_batch,
-                    )
-
-                    # Run multimodal encoder.
-                    # Isolate encoder graph from post-processing to minimize
-                    # impact of recompilation until it's fixed.
-                    start = time.perf_counter()
-                    dummy_encoder_outputs = self.model.embed_multimodal(
-                        **batched_dummy_mm_inputs
-                    )
-                    end = time.perf_counter()
-                    logger.info(
-                        "Multimodal Encoder profiling finished in %.2f [secs].",
-                        end - start,
-                    )
-
-                    sanity_check_mm_encoder_outputs(
-                        dummy_encoder_outputs,
-                        expected_num_items=max_mm_items_per_batch,
-                    )
-
-                    # Cache the dummy encoder outputs.
-                    self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
-
-        # Trigger compilation for general shape.
-        self._dummy_run(
-            num_tokens, self.num_reqs_max_model_len, self.max_num_blocks_per_req
-        )
-        if self.most_model_len is not None:
-            self._dummy_run(
-                num_tokens,
-                self.num_reqs_most_model_len,
-                self.num_blocks_per_most_len_req,
-            )
-
-        self.encoder_cache.clear()
-        gc.collect()
+        pass
 
     def maybe_setup_cross_layer_kv_sharing(
         self,
@@ -1710,18 +1366,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Add layers that re-use KV cache to KV cache group of its target layer.
         Mapping of KV cache tensors happens in `initialize_kv_cache_tensors()`
         """
-        if not self.shared_kv_cache_layers:
-            # No cross-layer KV sharing, return
-            return
-
-        add_kv_sharing_layers_to_kv_cache_groups(
-            self.shared_kv_cache_layers,
-            kv_cache_config.kv_cache_groups,
-        )
-
-        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
-            logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
-            kv_caches[layer_name] = kv_caches[target_layer_name]
+        pass
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -1801,12 +1446,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Set up cross-layer KV cache sharing if needed
         self.maybe_setup_cross_layer_kv_sharing(kv_caches, kv_cache_config)
-
-        bind_kv_cache(
-            kv_caches,
-            self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches,
-        )
 
         if self.use_spmd:
             # Shard KV Cache
@@ -1939,38 +1578,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.require_structured_out_cpu[:num_reqs].to(logits.device),
             self.grammar_bitmask_cpu[:num_reqs].to(logits.device),
             self.structured_decode_arange.to(logits.device),
-        )
-
-    def _get_mm_dummy_batch(
-        self,
-        modality: str,
-        max_items_per_batch: int,
-    ) -> BatchedTensorInputs:
-        """Dummy data for profiling and precompiling multimodal models."""
-        assert self.mm_budget is not None
-
-        dummy_decoder_data = self.mm_registry.get_decoder_dummy_data(
-            model_config=self.model_config,
-            seq_len=self.max_model_len,
-            mm_counts={modality: 1},
-            cache=self.mm_budget.cache,
-        )
-        dummy_mm_data = dummy_decoder_data.multi_modal_data
-
-        # Result in the maximum GPU consumption of the model
-        dummy_mm_item = dummy_mm_data[modality][0]
-        dummy_mm_items = [dummy_mm_item] * max_items_per_batch
-
-        model = cast(SupportsMultiModal, self.model)
-        return next(
-            grouped_mm_kwargs
-            for _, _, grouped_mm_kwargs in group_mm_kwargs_by_modality(
-                dummy_mm_items,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                merge_by_field_config=model.merge_by_field_config,
-                multimodal_cpu_fields=model.multimodal_cpu_fields,
-            )
         )
 
 

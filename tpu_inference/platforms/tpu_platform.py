@@ -147,9 +147,6 @@ class TpuPlatform(Platform):
         if compilation_config.backend == "":
             compilation_config.backend = "openxla"
 
-        # If we use vLLM's model implementation in PyTorch, we should set it with torch version of the dtype.
-        impl = envs.MODEL_IMPL_TYPE
-
         model_config = vllm_config.model_config
         if model_config is not None and model_config.dtype in (
             torch.float16,
