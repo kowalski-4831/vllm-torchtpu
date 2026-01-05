@@ -3,56 +3,32 @@
 import os
 import tempfile
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-from vllm.config import (
-    ParallelConfig,
-    VllmConfig,
-    get_layers_from_vllm_config,
-    update_config,
-)
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheSpec,
-    MLAAttentionSpec,
-    SlidingWindowSpec,
-)
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+import vllm.envs as vllm_envs
+from torch_tpu import api
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention, MLAAttention
 from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
-import vllm.envs as vllm_envs
-from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed import get_pp_group
-from vllm.distributed.kv_transfer import (
-    ensure_kv_transfer_initialized,
-    has_kv_transfer_group,
-)
-from vllm.distributed.parallel_state import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-)
+from vllm.config import (VllmConfig, get_layers_from_vllm_config,
+                         set_current_vllm_config)
+from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
+                                             init_distributed_environment)
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.tasks import SupportedTask
 from vllm.v1 import utils as vllm_utils
-from vllm.v1.core.kv_cache_utils import get_num_blocks, get_uniform_page_size
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                        KVCacheSpec, MLAAttentionSpec,
+                                        SlidingWindowSpec)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 from tpu_inference import envs, utils
 from tpu_inference.distributed import jax_parallel_state
-from tpu_inference.distributed.utils import (
-    get_host_ip,
-    get_kv_transfer_port,
-    get_node_id,
-)
+from tpu_inference.distributed.utils import get_node_id
 from tpu_inference.logger import init_logger
 from tpu_inference.runner.tpu_runner import TPUModelRunner
-
-from torch_tpu import api
 
 logger = init_logger(__name__)
 
@@ -110,9 +86,8 @@ class TPUWorker:
         self.is_driver_worker = is_driver_worker
         self.devices = devices if devices is not None else []
         self.device_ranks = set(device.id for device in self.devices)
-        self.pp_config = PPConfig(
-            rank, ip, prev_worker_ip, self.parallel_config.pipeline_parallel_size
-        )
+        self.pp_config = PPConfig(rank, ip, prev_worker_ip,
+                                  self.parallel_config.pipeline_parallel_size)
 
         self.kv_cache_dtype = self.model_config.dtype
 
@@ -127,18 +102,14 @@ class TPUWorker:
         # TPU Worker is initialized. The profiler server needs to start after
         # MP runtime is initialized.
         self.profile_dir = None
-        if (
-            vllm_envs.VLLM_TORCH_PROFILER_DIR
-            and self.rank < 1
-            and self.pp_config.pp_world_size == 1
-        ):
+        if (vllm_envs.VLLM_TORCH_PROFILER_DIR and self.rank < 1
+                and self.pp_config.pp_world_size == 1):
             if not self.devices or 0 in self.device_ranks:
                 # For TPU, we can only have 1 active profiler session for 1 profiler
                 # server. So we only profile on rank0.
                 self.profile_dir = vllm_envs.VLLM_TORCH_PROFILER_DIR
-                logger.info(
-                    "Profiling enabled. Traces will be saved to: %s", self.profile_dir
-                )
+                logger.info("Profiling enabled. Traces will be saved to: %s",
+                            self.profile_dir)
 
         # For PP, we use MPMD so we want to profile every worker.
         if self.pp_config.pp_world_size > 1 and vllm_envs.VLLM_TORCH_PROFILER_DIR:
@@ -151,7 +122,8 @@ class TPUWorker:
         # step_counter is used to calculate uuid to transfer intermediate tensors.
         self.step_counter = 0
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
+    def initialize_cache(self, num_gpu_blocks: int,
+                         num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
@@ -163,17 +135,14 @@ class TPUWorker:
     ):
         # set tpu visible devices for Jax runtime in single host PP.
         multihost_backend = os.environ.get("TPU_MULTIHOST_BACKEND", "").lower()
-        if (
-            multihost_backend != "ray"
-            and self.parallel_config.pipeline_parallel_size > 1
-        ):
+        if (multihost_backend != "ray"
+                and self.parallel_config.pipeline_parallel_size > 1):
             tpu_ports = [
                 jax_parallel_state.BASE_JAX_PORT + i
                 for i in range(self.pp_config.pp_world_size)
             ]
             os.environ["TPU_PROCESS_ADDRESSES"] = ",".join(
-                [f"localhost:{port}" for port in tpu_ports]
-            )
+                [f"localhost:{port}" for port in tpu_ports])
             os.environ["TPU_PROCESS_PORT"] = f"{tpu_ports[self.rank]}"
             os.environ["CLOUD_TPU_TASK_ID"] = f"{self.rank}"
 
@@ -187,20 +156,14 @@ class TPUWorker:
             # 2) 1 chip for each subslice, with at most 8 subslices,
             #    we can do TP=1, PP=1/2/3/4/5/6/7/8
             os.environ["TPU_PROCESS_BOUNDS"] = (
-                tpu_process_bounds
-                if tpu_process_bounds
-                else self.pp_config.default_tpu_process_bounds
-            )
+                tpu_process_bounds if tpu_process_bounds else
+                self.pp_config.default_tpu_process_bounds)
             os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] = (
-                tpu_chips_per_process_bounds
-                if tpu_chips_per_process_bounds
-                else self.pp_config.default_tpu_chips_per_process_bounds
-            )
+                tpu_chips_per_process_bounds if tpu_chips_per_process_bounds
+                else self.pp_config.default_tpu_chips_per_process_bounds)
             os.environ["TPU_VISIBLE_CHIPS"] = (
-                tpu_visible_chips
-                if tpu_visible_chips
-                else self.pp_config.default_tpu_visible_chips
-            )
+                tpu_visible_chips if tpu_visible_chips else
+                self.pp_config.default_tpu_visible_chips)
 
         if not self.devices:
             self.devices = []
@@ -239,27 +202,27 @@ class TPUWorker:
 
         # TODO: Fix device assignment
         self.model_runner = TPUModelRunner(self.vllm_config, self.devices[0])
-        logger.info(
-            f"Init worker | "
-            f"rank={self.rank} | "
-            f"is_first_rank={is_first_rank} | "
-            f"is_last_rank={is_last_rank} | "
-            f"node_id={get_node_id()} | "
-            f"is_driver_worker={self.is_driver_worker} | "
-        )
+        logger.info(f"Init worker | "
+                    f"rank={self.rank} | "
+                    f"is_first_rank={is_first_rank} | "
+                    f"is_last_rank={is_last_rank} | "
+                    f"node_id={get_node_id()} | "
+                    f"is_driver_worker={self.is_driver_worker} | ")
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
 
     def initialize_pp_transfer_connect(self):
         if self.rank == 0:
             return
-        jax_parallel_state.connect(self.pp_config.prev_worker_ip, self.rank - 1)
+        jax_parallel_state.connect(self.pp_config.prev_worker_ip,
+                                   self.rank - 1)
 
     def determine_available_memory(self) -> int:
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
 
         # TODO: Fix device memory when corresponding APIs become available
-        hbm_usage = []  # 15 * 1024 *1024 *1024#utils.hbm_usage_bytes(self.devices)
+        hbm_usage = [
+        ]  # 15 * 1024 *1024 *1024#utils.hbm_usage_bytes(self.devices)
         total_hbm_limit = total_hbm_used = 0
         for used, limit in hbm_usage:
             total_hbm_used += used
@@ -276,22 +239,18 @@ class TPUWorker:
         total_hbm_used_gb = round(total_hbm_used / utils.GBYTES, 2)
         total_hbm_avail_gb = round(total_hbm_avail / utils.GBYTES, 2)
 
-        logger.info(
-            f"Memory statistics | "
-            f"{total_hbm_limit_gb=}GiB | "
-            f"{total_hbm_limit_cap_gb=}GiB | "
-            f"{total_hbm_used_gb=}GiB | "
-            f"{total_hbm_avail_gb=}GiB"
-        )
+        logger.info(f"Memory statistics | "
+                    f"{total_hbm_limit_gb=}GiB | "
+                    f"{total_hbm_limit_cap_gb=}GiB | "
+                    f"{total_hbm_used_gb=}GiB | "
+                    f"{total_hbm_avail_gb=}GiB")
 
         if total_hbm_avail <= 0:
-            raise ValueError(
-                f"{total_hbm_used_gb=}GiB exceeds "
-                f"{total_hbm_limit_cap_gb=}GiB by "
-                f"{-total_hbm_avail_gb}GiB. Please consider "
-                f"increasing --gpu-memory-utilization from "
-                f"{gpu_memory_utilization} to a larger value."
-            )
+            raise ValueError(f"{total_hbm_used_gb=}GiB exceeds "
+                             f"{total_hbm_limit_cap_gb=}GiB by "
+                             f"{-total_hbm_avail_gb}GiB. Please consider "
+                             f"increasing --gpu-memory-utilization from "
+                             f"{gpu_memory_utilization} to a larger value.")
         return total_hbm_avail
 
     def execute_model(
@@ -300,7 +259,8 @@ class TPUWorker:
     ) -> Optional[ModelRunnerOutput]:
         return self.model_runner.execute_model(scheduler_output)
 
-    def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput:
+    def sample_tokens(self,
+                      grammar_output: GrammarOutput) -> ModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
@@ -346,9 +306,8 @@ class TPUWorker:
         for layer_name, attn_module in layers.items():
             # Classic Attention path
             if isinstance(attn_module, Attention):
-                if (
-                    kv_tgt_layer := attn_module.kv_sharing_target_layer_name
-                ) is not None:
+                if (kv_tgt_layer :=
+                        attn_module.kv_sharing_target_layer_name) is not None:
                     # The layer doesn't need its own KV cache and will use that of
                     # the target layer. We skip creating a KVCacheSpec for it, so
                     # that KV cache management logic will act as this layer does
@@ -381,15 +340,16 @@ class TPUWorker:
                             dtype=self.kv_cache_dtype,
                         )
                 elif attn_module.attn_type in (
-                    AttentionType.ENCODER,
-                    AttentionType.ENCODER_ONLY,
+                        AttentionType.ENCODER,
+                        AttentionType.ENCODER_ONLY,
                 ):
                     # encoder-only attention does not need KV cache.
                     continue
                 elif attn_module.attn_type == AttentionType.ENCODER_DECODER:
                     raise NotImplementedError
                 else:
-                    raise ValueError(f"Unknown attention type: {attn_module.attn_type}")
+                    raise ValueError(
+                        f"Unknown attention type: {attn_module.attn_type}")
             # MLAAttention path
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:

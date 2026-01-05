@@ -11,16 +11,17 @@ This repo contains TorchTPU + vLLM
 
 The codebase references both vLLM main and tpu-inference, with majority of the server code from vLLM, and custom kernels from tpu-inference
 
-
 ---
 To run Qwen3 model on single device
 
 Start a server:
+
 ```
 MODEL_IMPL_TYPE="vllm" vllm serve "Qwen/Qwen3-0.6B"     --download_dir /tmp     --disable-log-requests     --tensor_parallel_size=1     --max-model-len=2048 --enforce-eager
 ```
 
 Send a request:
+
 ```
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
@@ -31,6 +32,7 @@ curl http://localhost:8000/v1/completions \
         "temperature": 0.7
     }'
 ```
+
 ---
 
 ## Get started

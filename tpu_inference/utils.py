@@ -1,20 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
 from collections import defaultdict
-from collections.abc import Sequence
 from functools import wraps
 from typing import Any, Callable, List, Tuple
 
 import jax
-import jax.numpy as jnp
-import numpy as np
-import torch
 from jax._src import dtypes
-from jax._src import mesh as mesh_lib
-from jax._src import xla_bridge as xb
-from jax._src.lib import xla_client as xc
-from jax._src.numpy.scalar_types import _ScalarMeta
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from vllm import envs as vllm_envs
 from vllm import utils
 

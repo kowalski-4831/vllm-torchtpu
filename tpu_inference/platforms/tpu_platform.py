@@ -149,8 +149,8 @@ class TpuPlatform(Platform):
 
         model_config = vllm_config.model_config
         if model_config is not None and model_config.dtype in (
-            torch.float16,
-            torch.float32,
+                torch.float16,
+                torch.float32,
         ):
             logger.warning(
                 "The TPU backend currently does not support %s. "
