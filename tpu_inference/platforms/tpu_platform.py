@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Optional, Tuple, Union, cast
 
 import torch
 import vllm.envs as vllm_envs
@@ -14,6 +14,7 @@ from tpu_inference.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.attention.backends.registry import AttentionBackendEnum
+    from vllm.attention.selector import AttentionSelectorConfig
     from vllm.config import BlockSize, ModelConfig, VllmConfig
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams, SamplingType
