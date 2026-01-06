@@ -18,7 +18,10 @@ Install torch_tpu python wheel
 
 Follow https://docs.vllm.ai/projects/tpu/en/latest/getting_started/installation/#install-from-source to install from source. Currently vllm==v0.13.0 is supported.
 
-Start a server:
+---
+### Online Serving
+
+To run Qwen3 model on single device, start a server:
 
 ```
 MODEL_IMPL_TYPE="vllm" vllm serve "Qwen/Qwen3-0.6B"     --download_dir /tmp     --disable-log-requests     --tensor_parallel_size=1     --max-model-len=2048 --enforce-eager
@@ -38,6 +41,17 @@ curl http://localhost:8000/v1/completions \
 ```
 
 ---
+
+### Running Offline Inference
+
+You can also run a simple offline inference script to verify the setup without starting a server.
+
+```bash
+MODEL_IMPL_TYPE="vllm" python examples/offline_inference.py --model Qwen/Qwen3-0.6B --max-model-len 2048 --enforce-eager
+```
+
+---
+
 
 ## Get started
 
