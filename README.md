@@ -14,13 +14,17 @@ The codebase references both vLLM main and tpu-inference, with majority of the s
 ---
 To run Qwen3 model on single device
 
-Start a server:
+1. Install torch_tpu python wheel
+
+2. Follow https://docs.vllm.ai/projects/tpu/en/latest/getting_started/installation/#install-from-source to install from source. Currently vllm==v0.13.0 is supported.
+
+3. Start a server:
 
 ```
 MODEL_IMPL_TYPE="vllm" vllm serve "Qwen/Qwen3-0.6B"     --download_dir /tmp     --disable-log-requests     --tensor_parallel_size=1     --max-model-len=2048 --enforce-eager
 ```
 
-Send a request:
+4. Send a request:
 
 ```
 curl http://localhost:8000/v1/completions \
