@@ -17,12 +17,10 @@ Base configuration classes for TPU quantization.
 These classes provide the foundation for all TPU-specific quantization configs.
 """
 
-from typing import Optional
 
-import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 
 from tpu_inference.logger import init_logger

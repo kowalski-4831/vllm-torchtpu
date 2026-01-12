@@ -29,9 +29,8 @@ import copy
 from typing import Dict, Optional, Type
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-)
+from vllm.model_executor.layers.quantization.base_config import \
+    QuantizationConfig
 
 from tpu_inference.layers.common import quant_methods
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
@@ -42,8 +41,7 @@ logger = init_logger(__name__)
 
 
 def get_tpu_quantization_config(
-    vllm_config: VllmConfig,
-) -> QuantizationConfig:
+    vllm_config: VllmConfig, ) -> QuantizationConfig:
     """
     Get TPU-specific quantization configuration.
 
@@ -64,7 +62,8 @@ def get_tpu_quantization_config(
     # Map from quant method name to TPU config class
     method_to_config: Dict[Optional[str], Type[VllmQuantConfig]] = {
         # None: VllmUnquantizedConfig,  # TODO: Implement unquantized config
-        quant_methods.MXFP4: VllmMxfp4Config,
+        quant_methods.MXFP4:
+        VllmMxfp4Config,
         # TODO: Add more quantization methods as needed
         # quant_methods.AWQ: VllmAWQConfig,
         # quant_methods.FP8: VllmFp8Config,
@@ -74,8 +73,7 @@ def get_tpu_quantization_config(
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
             f"{model_config.quantization} quantization method not supported on TPU. "
-            f"Supported methods are: {list(method_to_config.keys())}"
-        )
+            f"Supported methods are: {list(method_to_config.keys())}")
 
     quant_config_cls = method_to_config[model_config.quantization]
     assert issubclass(quant_config_cls, VllmQuantConfig)
@@ -85,8 +83,6 @@ def get_tpu_quantization_config(
 
     # Register the TPU quant method name so vLLM uses our custom config
     model_config.quantization = quant_methods.get_tpu_quant_method(
-        quant_config_cls.get_name()
-    )
-    return VllmConfig.get_quantization_config(
-        model_config, vllm_config.load_config
-    )
+        quant_config_cls.get_name())
+    return VllmConfig.get_quantization_config(model_config,
+                                              vllm_config.load_config)

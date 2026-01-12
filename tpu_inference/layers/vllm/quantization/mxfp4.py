@@ -48,28 +48,25 @@ scaling.
 from typing import Optional
 
 import torch
-
 from vllm.attention.layer import Attention
 from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEQuantConfig,
-    mxfp4_w4a16_moe_quant_config,
-)
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE,
-    FusedMoEMethodBase,
-)
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.layers.quantization.mxfp4 import (
-    Mxfp4Backend,
-    Mxfp4Config,
-    Mxfp4MoEMethod,
-)
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+    FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
+from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
+                                                        FusedMoEMethodBase)
+from vllm.model_executor.layers.linear import (LinearBase,
+                                               UnquantizedLinearMethod)
+from vllm.model_executor.layers.quantization import \
+    register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import \
+    QuantizeMethodBase
+from vllm.model_executor.layers.quantization.mxfp4 import (Mxfp4Backend,
+                                                           Mxfp4Config,
+                                                           Mxfp4MoEMethod)
+from vllm.model_executor.layers.quantization.utils.quant_utils import \
+    is_layer_skipped
 
-from tpu_inference.layers.common.quant_methods import MXFP4, get_tpu_quant_method
+from tpu_inference.layers.common.quant_methods import (MXFP4,
+                                                       get_tpu_quant_method)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -113,16 +110,15 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
             # MXFP4 only quantizes MoE layers, not linear layers.
             # For linear layers (attention projections, etc.), use unquantized method.
             if self.ignored_layers and is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
+                    prefix=prefix,
+                    ignored_layers=self.ignored_layers,
+                    fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
             # MXFP4 linear layer is not implemented - use unquantized
             logger.warning_once(
                 "MXFP4 linear layer is not implemented on TPU - "
-                "using unquantized linear method."
-            )
+                "using unquantized linear method.")
             return UnquantizedLinearMethod()
 
         elif isinstance(layer, FusedMoE):
@@ -133,8 +129,7 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
         elif isinstance(layer, Attention):
             logger.warning_once(
                 "MXFP4 attention layer is not implemented on TPU. "
-                "Skipping quantization for this layer."
-            )
+                "Skipping quantization for this layer.")
 
         return None
 
@@ -216,24 +211,23 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
         # Update layer weights with dequantized values
         # Store as bfloat16 for TPU inference
-        layer.w13_weight = torch.nn.Parameter(
-            w13_dequant.to(torch.bfloat16), requires_grad=False
-        )
-        layer.w2_weight = torch.nn.Parameter(
-            w2_dequant.to(torch.bfloat16), requires_grad=False
-        )
+        layer.w13_weight = torch.nn.Parameter(w13_dequant.to(torch.bfloat16),
+                                              requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2_dequant.to(torch.bfloat16),
+                                             requires_grad=False)
 
         # Scales are no longer needed after dequantization, but we keep them
         # for compatibility with get_fused_moe_quant_config
         # Convert to float32 for any downstream use
-        layer.w13_weight_scale = torch.nn.Parameter(
-            self._e8m0_to_fp32(layer.w13_weight_scale.data), requires_grad=False
-        )
-        layer.w2_weight_scale = torch.nn.Parameter(
-            self._e8m0_to_fp32(layer.w2_weight_scale.data), requires_grad=False
-        )
+        layer.w13_weight_scale = torch.nn.Parameter(self._e8m0_to_fp32(
+            layer.w13_weight_scale.data),
+                                                    requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(self._e8m0_to_fp32(
+            layer.w2_weight_scale.data),
+                                                   requires_grad=False)
 
-        logger.info_once("MXFP4 weights dequantized to bfloat16 for TPU inference.")
+        logger.info_once(
+            "MXFP4 weights dequantized to bfloat16 for TPU inference.")
 
     def _dequantize_mxfp4_packed(
         self,
@@ -272,9 +266,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         # [E, out_dim, num_blocks] -> [E, out_dim, num_blocks, 1]
         scale_expanded = scale_fp32.unsqueeze(-1)
         # [E, out_dim, num_blocks, 1] -> [E, out_dim, num_blocks, block_size]
-        scale_expanded = scale_expanded.expand(
-            *scale_fp32.shape, block_size
-        )
+        scale_expanded = scale_expanded.expand(*scale_fp32.shape, block_size)
         # [E, out_dim, num_blocks, block_size] -> [E, out_dim, in_dim]
         scale_expanded = scale_expanded.reshape(weight_unpacked.shape)
 
@@ -297,7 +289,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             Unpacked float32 tensor [..., N]
         """
         # Extract low and high nibbles
-        low_nibble = (packed & 0x0F).to(torch.int8)   # bits 0-3
+        low_nibble = (packed & 0x0F).to(torch.int8)  # bits 0-3
         high_nibble = ((packed >> 4) & 0x0F).to(torch.int8)  # bits 4-7
 
         # Convert fp4 nibbles to float32
@@ -324,8 +316,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         """
         # Use lookup table for conversion (most efficient)
         fp4_lut = torch.tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            [
+                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
+                -2.0, -3.0, -4.0, -6.0
+            ],
             dtype=torch.float32,
             device=fp4.device,
         )
@@ -348,10 +342,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         E8M0_BIAS = 127
         exponents = u8.to(torch.int32) - E8M0_BIAS
         # 2^exponent = ldexp(1.0, exponent)
-        return torch.ldexp(
-            torch.ones_like(u8, dtype=torch.float32),
-            exponents
-        )
+        return torch.ldexp(torch.ones_like(u8, dtype=torch.float32), exponents)
 
     def get_fused_moe_quant_config(
         self,
@@ -406,7 +397,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         num_tokens, hidden_size = x.shape
         num_experts = layer.moe_config.num_experts
         top_k = layer.moe_config.experts_per_token
-        intermediate_size = layer.w13_weight.shape[1] // 2  # w13 is [E, 2*inter, hidden]
+        intermediate_size = layer.w13_weight.shape[
+            1] // 2  # w13 is [E, 2*inter, hidden]
 
         # Step 1: Compute top-k routing
         # router_logits: [num_tokens, num_experts]
@@ -415,7 +407,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
         # Renormalize top-k weights
         if layer.renormalize:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1,
+                                                           keepdim=True)
 
         # Step 2: Prepare output tensor
         output = torch.zeros_like(x)
@@ -443,7 +436,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
                 # Gather tokens for this expert using index_select (TPU-compatible)
                 expert_input = torch.index_select(x, 0, token_indices)
-                expert_routing_weight = torch.index_select(expert_weights, 0, token_indices)
+                expert_routing_weight = torch.index_select(
+                    expert_weights, 0, token_indices)
 
                 # Get expert weights
                 w13 = layer.w13_weight[expert_id]  # [2*intermediate, hidden]
@@ -453,7 +447,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
                 # Gate-Up projection: x @ w13.T + bias
                 # Output: [num_expert_tokens, 2*intermediate]
-                gate_up = torch.nn.functional.linear(expert_input, w13, w13_bias)
+                gate_up = torch.nn.functional.linear(expert_input, w13,
+                                                     w13_bias)
 
                 # Split gate and up projections
                 gate, up = gate_up.chunk(2, dim=-1)
@@ -463,10 +458,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
                 # Down projection: hidden @ w2.T + bias
                 # Output: [num_expert_tokens, hidden]
-                expert_output = torch.nn.functional.linear(hidden_states, w2, w2_bias)
+                expert_output = torch.nn.functional.linear(
+                    hidden_states, w2, w2_bias)
 
                 # Apply routing weight
-                expert_output = expert_output * expert_routing_weight.unsqueeze(-1)
+                expert_output = expert_output * expert_routing_weight.unsqueeze(
+                    -1)
 
                 # Scatter back to output using index_add (TPU-compatible)
                 output.index_add_(0, token_indices, expert_output)

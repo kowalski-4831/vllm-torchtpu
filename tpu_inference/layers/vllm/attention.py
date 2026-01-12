@@ -231,7 +231,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if self.sinks.shape[0] != num_heads:
                 raise ValueError(
                     f"Sinks must have the same number of heads as num_heads. "
-                    f"Got sinks.shape[0]={self.sinks.shape[0]}, num_heads={num_heads}")
+                    f"Got sinks.shape[0]={self.sinks.shape[0]}, num_heads={num_heads}"
+                )
             if head_size != 64:
                 raise NotImplementedError(
                     "Attention sink support is only available when head_dim==64. "
@@ -241,8 +242,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""
         if self.sinks is not None:
             # RPA v3 kernel requires sinks to be float32
-            self.sinks = torch.nn.Parameter(
-                self.sinks.to(torch.float32), requires_grad=False)
+            self.sinks = torch.nn.Parameter(self.sinks.to(torch.float32),
+                                            requires_grad=False)
 
     def forward(
         self,
@@ -504,9 +505,9 @@ def ragged_paged_attention_with_sinks(
         Output tensor with shape = [num_tokens, num_heads, head_size]
     """
     from torch_tpu._internal import pallas
-    from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import (
-        ragged_paged_attention_hd64,
-    )
+
+    from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
+        ragged_paged_attention_hd64
 
     # Use functools.partial to freeze all non-tensor args (trace-time constants)
     wrapped_kernel = functools.partial(
