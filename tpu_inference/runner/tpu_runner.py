@@ -47,6 +47,8 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.tpu_input_batch import CachedRequestState, InputBatch
 
+from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
@@ -1206,6 +1208,16 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.device_config.device = api.tpu_device()
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
+
+        # Set TPU-specific quantization config before model loading.
+        # This ensures that TPU-compatible quantization methods are used
+        # instead of the default GPU-based ones (e.g., MXFP4 for MoE models).
+        if self.model_config.quantization is not None:
+            logger.info("Setting TPU quantization config for: %s",
+                        self.model_config.quantization)
+            self.vllm_config.quant_config = get_tpu_quantization_config(
+                self.vllm_config)
+
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         model = model_loader.load_model(vllm_config=self.vllm_config,
