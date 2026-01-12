@@ -397,8 +397,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         num_tokens, hidden_size = x.shape
         num_experts = layer.moe_config.num_experts
         top_k = layer.moe_config.experts_per_token
-        intermediate_size = layer.w13_weight.shape[
-            1] // 2  # w13 is [E, 2*inter, hidden]
 
         # Step 1: Compute top-k routing
         # router_logits: [num_tokens, num_experts]
