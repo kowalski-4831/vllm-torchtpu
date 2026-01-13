@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -199,6 +200,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         logits_soft_cap: float | None = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: int | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -222,6 +224,26 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if kv_cache_dtype != "auto":
             self.kv_cache_quantized_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(
                 kv_cache_dtype.lower().strip())
+
+        # Store sinks for attention sink optimization
+        self.sinks = sinks
+        if self.sinks is not None:
+            if self.sinks.shape[0] != num_heads:
+                raise ValueError(
+                    f"Sinks must have the same number of heads as num_heads. "
+                    f"Got sinks.shape[0]={self.sinks.shape[0]}, num_heads={num_heads}"
+                )
+            if head_size != 64:
+                raise NotImplementedError(
+                    "Attention sink support is only available when head_dim==64. "
+                    f"Got head_size={head_size}")
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        """Process sinks after model loading - convert to float32 as required by RPA kernel."""
+        if self.sinks is not None:
+            # RPA v3 kernel requires sinks to be float32
+            self.sinks = torch.nn.Parameter(self.sinks.to(torch.float32),
+                                            requires_grad=False)
 
     def forward(
         self,
@@ -292,26 +314,45 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 layer._k_scale_float == 0.0 or layer._v_scale_float == 0.0):
             raise ValueError(
                 "k_scale_float and v_scale_float must be non-zero")
-        output = torch.ops.xla.ragged_paged_attention(
-            query,
-            kv_cache,
-            attn_metadata.context_lens,
-            attn_metadata.block_tables,
-            attn_metadata.query_start_loc,
-            attn_metadata.num_seqs,
-            # By default, the system utilizes optimized block size and
-            # vmem_limit_bytes parameters from the kernel repository. However,
-            # these can be manually adjusted for debugging if necessary.
-            num_kv_pages_per_block=None,
-            num_queries_per_block=None,
-            vmem_limit_bytes=None,
-            use_kernel=True,
-            sm_scale=self.scale,
-            sliding_window=self.sliding_window,
-            soft_cap=self.logits_soft_cap,
-            k_scale=layer._k_scale_float,
-            v_scale=layer._v_scale_float,
-        )
+
+        # Use custom kernel with sink support when sinks is available
+        if self.sinks is not None:
+            output = ragged_paged_attention_with_sinks(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata.context_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.num_seqs,
+                self.sinks,
+                sm_scale=self.scale,
+                sliding_window=self.sliding_window,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+            )
+        else:
+            output = torch.ops.xla.ragged_paged_attention(
+                query,
+                kv_cache,
+                attn_metadata.context_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.num_seqs,
+                # By default, the system utilizes optimized block size and
+                # vmem_limit_bytes parameters from the kernel repository. However,
+                # these can be manually adjusted for debugging if necessary.
+                num_kv_pages_per_block=None,
+                num_queries_per_block=None,
+                vmem_limit_bytes=None,
+                use_kernel=True,
+                sm_scale=self.scale,
+                sliding_window=self.sliding_window,
+                soft_cap=self.logits_soft_cap,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+            )
 
         if self.head_size % TPU_HEAD_SIZE_ALIGNMENT != 0:
             output = output[:, :, :self.head_size]
@@ -421,3 +462,81 @@ def get_page_size_bytes(block_size: int, num_kv_heads: int, head_size: int,
     kv_cache_dtype_bits = dtype_bits(kv_cache_dtype)
     return (block_size * num_combined_kv_heads * padded_head_size *
             kv_cache_dtype_bits // 8)
+
+
+def ragged_paged_attention_with_sinks(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_seqs: torch.Tensor,
+    sinks: torch.Tensor,
+    *,
+    sm_scale: float,
+    sliding_window: int | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """Ragged paged attention with attention sink support.
+
+    This function wraps the JAX ragged_paged_attention_hd64 kernel which
+    supports attention sinks. It uses pallas.custom_jax_kernel to convert
+    the JAX function to a PyTorch operation.
+
+    Args:
+        query: shape = [num_tokens, num_heads, head_size]
+        key: shape = [num_tokens, num_kv_heads, head_size]
+        value: shape = [num_tokens, num_kv_heads, head_size]
+        kv_cache: shape = [num_blocks, block_size, num_kv_heads // kv_packing, kv_packing, head_size * 2]
+        context_lens: KV lengths for each sequence
+        block_tables: Page indices for KV cache
+        query_start_loc: Cumulative query lengths
+        num_seqs: Distribution array [decode_end, prefill_end, mixed_end]
+        sinks: Attention sink values, shape = [num_heads]
+        sm_scale: Softmax scale
+        sliding_window: Optional sliding window size
+        k_scale: Key scale for quantization
+        v_scale: Value scale for quantization
+
+    Returns:
+        Output tensor with shape = [num_tokens, num_heads, head_size]
+    """
+    from torch_tpu._internal import pallas
+
+    from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
+        ragged_paged_attention_hd64
+
+    # Use functools.partial to freeze all non-tensor args (trace-time constants)
+    wrapped_kernel = functools.partial(
+        ragged_paged_attention_hd64,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        strict_sliding_window=True,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    # Convert to Torch Op using pallas.custom_jax_kernel
+    torch_fn = pallas.custom_jax_kernel(wrapped_kernel)
+
+    # Call the kernel with tensor arguments
+    # The kernel returns (output, updated_kv_cache)
+    output, updated_kv_cache = torch_fn(
+        query,
+        key,
+        value,
+        kv_cache,
+        context_lens,
+        block_tables,
+        query_start_loc,
+        num_seqs,
+        sinks,
+    )
+
+    # Copy updated kv_cache back (in-place update pattern)
+    kv_cache.copy_(updated_kv_cache)
+
+    return output
