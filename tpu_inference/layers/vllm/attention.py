@@ -11,7 +11,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
-
 logger = init_logger(__name__)
 
 # TPU requires the head size to be a multiple of 128.
