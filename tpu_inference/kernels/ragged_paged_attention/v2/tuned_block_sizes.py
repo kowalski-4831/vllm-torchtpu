@@ -13,6 +13,8 @@
 # limitations under the License.
 """Auto-tuned block sizes for ragged paged attention."""
 
+import re
+
 import jax
 import jax.numpy as jnp
 
@@ -1426,8 +1428,17 @@ def get_tpu_version() -> int:
         return -1
     if kind.endswith(' lite'):
         kind = kind[:-len(' lite')]
-    assert kind[:-1] == 'TPU v', kind
-    return int(kind[-1])
+
+    # Handle new format like "TPU7x" or "TPU8x"
+    match = re.match(r'TPU(\d+)', kind)
+    if match:
+        return int(match.group(1))
+
+    # Handle old format like "TPU v5"
+    if kind[:-1] == 'TPU v':
+        return int(kind[-1])
+
+    return -1
 
 
 def get_device_name(num_devices: int | None = None):

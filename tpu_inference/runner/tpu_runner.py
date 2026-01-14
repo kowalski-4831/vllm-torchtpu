@@ -46,6 +46,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin, KVConnectorOutput)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.tpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.utils import bind_kv_cache
 
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
 
@@ -1406,6 +1407,17 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Set up cross-layer KV cache sharing if needed
         self.maybe_setup_cross_layer_kv_sharing(kv_caches, kv_cache_config)
+
+        # Reset kv_caches list (bind_kv_cache expects empty list)
+        self.kv_caches = []
+
+        # Use bind_kv_cache to bind KV caches to attention layers using layer names
+        # This is the native vLLM pattern and avoids the 'layer_id' attribute error
+        bind_kv_cache(
+            kv_caches,
+            self.vllm_config.compilation_config.static_forward_context,
+            self.kv_caches,
+        )
 
         if self.use_spmd:
             # Shard KV Cache

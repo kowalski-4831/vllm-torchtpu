@@ -5,11 +5,19 @@ import functools
 from dataclasses import dataclass
 
 import torch
+from torch_tpu._internal import pallas
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, next_power_of_2
+
+from tpu_inference.kernels.ragged_paged_attention.v2.kernel import \
+    ragged_paged_attention as jax_ragged_paged_attention
+from tpu_inference.kernels.ragged_paged_attention.v2.ragged_kv_cache_update import \
+    kv_cache_update as jax_kv_cache_update
+from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
+    ragged_paged_attention_hd64
 
 logger = init_logger(__name__)
 
@@ -29,72 +37,255 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "uint8": torch.uint8,
 }
 
-try:
-    import tpu_inference  # noqa: F401
-except ImportError:
-    # Lazy import torch_xla
-    import torch_xla.core.xla_builder as xb
-    import torch_xla.experimental.custom_kernel  # noqa: F401
-    from torch.library import impl
-    from torch_xla._internal.jax_workarounds import requires_jax
-    from torch_xla.experimental.custom_kernel import XLA_LIB
+# =========================================================================================
+# Pallas Kernel Wrappers
+# =========================================================================================
 
-    @requires_jax
-    def kv_cache_update_op_impl(
-        kv: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        kv_cache: torch.Tensor,
-        num_kv_update_slices: torch.Tensor,
-        page_size: int,
-        num_slices_per_block: int,
-    ):
-        from vllm.attention.ops.pallas_kv_cache_update import kv_cache_update
 
-        new_kv_cache = xb.call_jax(
-            kv_cache_update,
-            (kv, slot_mapping, kv_cache, num_kv_update_slices),
-            {
-                "page_size": page_size,
-                "num_slices_per_block": num_slices_per_block
-            },
-        )
-        return new_kv_cache
+def pallas_kv_cache_update(
+    kv: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    num_kv_update_slices: torch.Tensor,
+    page_size: int,
+    num_slices_per_block: int,
+) -> torch.Tensor:
+    """TorchTPU-compatible wrapper for kv_cache_update using pallas.custom_jax_kernel."""
+    # Use functools.partial to freeze all non-tensor args (trace-time constants)
+    wrapped_fn = functools.partial(
+        jax_kv_cache_update,
+        page_size=page_size,
+        num_slices_per_block=num_slices_per_block,
+    )
 
-    XLA_LIB.define(
-        "kv_cache_update_op(Tensor kv, Tensor slot_mapping,"
-        "Tensor kv_cache, Tensor num_kv_update_slices, int page_size,"
-        "int num_slices_per_block)"
-        "-> Tensor", )
+    # Convert to Torch Op using pallas.custom_jax_kernel
+    torch_fn = pallas.custom_jax_kernel(wrapped_fn)
 
-    @impl(XLA_LIB, "kv_cache_update_op", "XLA")
-    def kv_cache_update_op_xla(
-        kv: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        kv_cache: torch.Tensor,
-        num_kv_update_slices: torch.Tensor,
-        page_size: int,
-        num_slices_per_block: int,
-    ) -> torch.Tensor:
-        new_kv_cache = kv_cache_update_op_impl(
-            kv,
-            slot_mapping,
-            kv_cache,
-            num_kv_update_slices,
-            page_size,
-            num_slices_per_block,
-        )
-        return new_kv_cache
+    # Call the kernel - the JAX function expects positional tensor args
+    return torch_fn(kv, slot_mapping, kv_cache, num_kv_update_slices)
 
-    @impl(XLA_LIB, "kv_cache_update_op", "CompositeExplicitAutograd")
-    def kv_cache_update_op_non_xla(
-        kv: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        kv_cache: torch.Tensor,
-        num_kv_update_slices: torch.Tensor,
-        page_size: int,
-        num_slices_per_block: int,
-    ) -> torch.Tensor:
-        return kv_cache
+
+def pallas_ragged_paged_attention(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_seqs: torch.Tensor,
+    *,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """TorchTPU-compatible wrapper for ragged_paged_attention using pallas.custom_jax_kernel."""
+
+    # Use functools.partial to freeze all non-tensor args (trace-time constants)
+    wrapped_fn = functools.partial(
+        jax_ragged_paged_attention,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        k_scale=k_scale if k_scale != 1.0 else None,
+        v_scale=v_scale if v_scale != 1.0 else None,
+    )
+
+    # Convert to Torch Op using pallas.custom_jax_kernel
+    torch_fn = pallas.custom_jax_kernel(wrapped_fn)
+
+    # Call the kernel - the JAX function expects positional tensor args
+    # Note: The JAX function signature is:
+    # ragged_paged_attention(q, kv_pages, kv_lens, page_indices, cu_q_lens, num_seqs, ...)
+    return torch_fn(query, kv_cache, context_lens, block_tables,
+                    query_start_loc, num_seqs)
+
+
+def pallas_ragged_paged_attention_sinks_hd64(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_seqs: torch.Tensor,
+    sinks: torch.Tensor,
+    *,
+    sm_scale: float,
+    sliding_window: int | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """Ragged paged attention with attention sink support.
+
+    This function wraps the JAX ragged_paged_attention_hd64 kernel which
+    supports attention sinks. It uses pallas.custom_jax_kernel to convert
+    the JAX function to a PyTorch operation.
+
+    Args:
+        query: shape = [num_tokens, num_heads, head_size]
+        key: shape = [num_tokens, num_kv_heads, head_size]
+        value: shape = [num_tokens, num_kv_heads, head_size]
+        kv_cache: shape = [num_blocks, block_size, num_kv_heads // kv_packing, kv_packing, head_size * 2]
+        context_lens: KV lengths for each sequence
+        block_tables: Page indices for KV cache
+        query_start_loc: Cumulative query lengths
+        num_seqs: Distribution array [decode_end, prefill_end, mixed_end]
+        sinks: Attention sink values, shape = [num_heads]
+        sm_scale: Softmax scale
+        sliding_window: Optional sliding window size
+        k_scale: Key scale for quantization
+        v_scale: Value scale for quantization
+
+    Returns:
+        Output tensor with shape = [num_tokens, num_heads, head_size]
+    """
+
+    # Use functools.partial to freeze all non-tensor args (trace-time constants)
+    wrapped_kernel = functools.partial(
+        ragged_paged_attention_hd64,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        strict_sliding_window=True,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    # Convert to Torch Op using pallas.custom_jax_kernel
+    torch_fn = pallas.custom_jax_kernel(wrapped_kernel)
+
+    # Call the kernel with tensor arguments
+    # The kernel returns (output, updated_kv_cache)
+    output, updated_kv_cache = torch_fn(
+        query,
+        key,
+        value,
+        kv_cache,
+        context_lens,
+        block_tables,
+        query_start_loc,
+        num_seqs,
+        sinks,
+    )
+
+    # Copy updated kv_cache back (in-place update pattern)
+    kv_cache.copy_(updated_kv_cache)
+
+    return output
+
+
+# =========================================================================================
+# Utilities
+# =========================================================================================
+
+
+def write_to_kv_cache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_slices_per_kv_cache_update_block: int,
+    num_kv_update_slices: torch.Tensor,
+    kv_cache_quantized_dtype: torch.dtype | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> None:
+    """Write the key and values to the KV cache.
+
+    Args:
+        key: shape = [num_tokens, num_kv_heads, head_size]
+        value: shape = [num_tokens, num_kv_heads, head_size]
+        kv_cache: shape = [num_blocks, block_size, num_kv_heads * 2, head_size]
+        num_slices_per_kv_cache_update_block: int
+    """
+    _, page_size, num_combined_kv_heads, head_size = kv_cache.shape
+    head_size = cdiv(head_size,
+                     TPU_HEAD_SIZE_ALIGNMENT) * TPU_HEAD_SIZE_ALIGNMENT
+
+    if kv_cache_quantized_dtype is not None:
+        dtype_info = torch.finfo(kv_cache_quantized_dtype)
+        key = key.to(torch.float32) / k_scale
+        # NOTE: clamp is added here to avoid out of range of quantized dtype
+        key = torch.clamp(key, dtype_info.min, dtype_info.max)
+        key = key.to(kv_cache_quantized_dtype)
+        value = value.to(torch.float32) / v_scale
+        value = torch.clamp(value, dtype_info.min, dtype_info.max)
+        value = value.to(kv_cache_quantized_dtype)
+
+    kv = torch.cat([key, value], axis=-1).reshape(-1, num_combined_kv_heads,
+                                                  head_size)
+
+    kv_cache = kv_cache.flatten(0, 1)
+
+    new_kv_cache = pallas_kv_cache_update(
+        kv,
+        slot_mapping,
+        kv_cache,
+        num_kv_update_slices,
+        page_size,
+        num_slices_per_kv_cache_update_block,
+    )
+    # NOTE: the in-place copy will be optimized away by XLA compiler.
+    kv_cache.copy_(new_kv_cache)
+
+
+# We can move this function to a common utils file if it's also useful for other
+# hardware.
+def dtype_bits(dtype: torch.dtype):
+    if dtype.is_floating_point:
+        try:
+            return torch.finfo(dtype).bits
+        except TypeError:
+            pass
+    elif dtype.is_complex:
+        if dtype is torch.complex32:
+            return 32
+        elif dtype is torch.complex64:
+            return 64
+        elif dtype is torch.complex128:
+            return 128
+    else:
+        try:
+            return torch.iinfo(dtype).bits
+        # torch.iinfo cannot support int4, int2, bits8...
+        except TypeError:
+            pass
+    str_dtype = str(dtype)
+    # support torch.int4, torch.int5, torch.uint5...
+    if str_dtype.startswith("torch.int") or str_dtype.startswith("torch.uint"):
+        return int(str_dtype[-1])
+    raise TypeError(f"Getting the bit width of {dtype} is not supported")
+
+
+def get_dtype_packing(dtype):
+    bits = dtype_bits(dtype)
+    if 32 % bits != 0:
+        raise ValueError(
+            f"The bit width must be divisible by 32, but got bits={bits}, "
+            "dtype={dtype}")
+    return 32 // bits
+
+
+def get_page_size_bytes(block_size: int, num_kv_heads: int, head_size: int,
+                        kv_cache_dtype: torch.dtype) -> int:
+    """Returns the size in bytes of one page of the KV cache."""
+    padded_head_size = (cdiv(head_size, TPU_HEAD_SIZE_ALIGNMENT) *
+                        TPU_HEAD_SIZE_ALIGNMENT)
+    num_combined_kv_heads = num_kv_heads * 2
+
+    # NOTE: for the implicit padding in XLA
+    packing = get_dtype_packing(kv_cache_dtype)
+    num_combined_kv_heads = cdiv(num_combined_kv_heads, packing) * packing
+
+    kv_cache_dtype_bits = dtype_bits(kv_cache_dtype)
+    return (block_size * num_combined_kv_heads * padded_head_size *
+            kv_cache_dtype_bits // 8)
+
+
+# =========================================================================================
+# VLLM Attention Backend Implementation
+# =========================================================================================
 
 
 class PallasAttentionBackend(AttentionBackend):
@@ -276,6 +467,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         # For determine_available_memory case.
         if kv_cache.numel() == 0:
+            logger.warning("Returning early due to kv_cache.numel() == 0")
             if output is None:
                 output = torch.ones_like(query)
             return output
@@ -316,8 +508,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "k_scale_float and v_scale_float must be non-zero")
 
         # Use custom kernel with sink support when sinks is available
-        if self.sinks is not None:
-            output = ragged_paged_attention_with_sinks(
+        # explicit check for 64 head size because the kernel is specialized
+        current_head_size = query.shape[-1]
+        if self.sinks is not None and current_head_size == 64:
+            output = pallas_ragged_paged_attention_sinks_hd64(
                 query,
                 key,
                 value,
@@ -333,20 +527,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 v_scale=layer._v_scale_float,
             )
         else:
-            output = torch.ops.xla.ragged_paged_attention(
+            if self.sinks is not None:
+                # Log warning if we are skipping sinks due to incompatibility
+                if not hasattr(self, "_logged_sink_warning"):
+                    logger.warning(
+                        "Attention sinks enabled but skipped. "
+                        "Sink kernel requires head_dim=64, got %d. "
+                        "Model output may be degraded.", current_head_size)
+                    self._logged_sink_warning = True
+
+            output = pallas_ragged_paged_attention(
                 query,
                 kv_cache,
                 attn_metadata.context_lens,
                 attn_metadata.block_tables,
                 attn_metadata.query_start_loc,
                 attn_metadata.num_seqs,
-                # By default, the system utilizes optimized block size and
-                # vmem_limit_bytes parameters from the kernel repository. However,
-                # these can be manually adjusted for debugging if necessary.
-                num_kv_pages_per_block=None,
-                num_queries_per_block=None,
-                vmem_limit_bytes=None,
-                use_kernel=True,
                 sm_scale=self.scale,
                 sliding_window=self.sliding_window,
                 soft_cap=self.logits_soft_cap,
@@ -358,185 +554,3 @@ class PallasAttentionBackendImpl(AttentionImpl):
             output = output[:, :, :self.head_size]
 
         return output.reshape(num_tokens, hidden_size)
-
-
-def write_to_kv_cache(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    num_slices_per_kv_cache_update_block: int,
-    num_kv_update_slices: torch.Tensor,
-    kv_cache_quantized_dtype: torch.dtype | None = None,
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-) -> None:
-    """Write the key and values to the KV cache.
-
-    Args:
-        key: shape = [num_tokens, num_kv_heads, head_size]
-        value: shape = [num_tokens, num_kv_heads, head_size]
-        kv_cache: shape = [num_blocks, block_size, num_kv_heads * 2, head_size]
-        num_slices_per_kv_cache_update_block: int
-    """
-    _, page_size, num_combined_kv_heads, head_size = kv_cache.shape
-    head_size = cdiv(head_size,
-                     TPU_HEAD_SIZE_ALIGNMENT) * TPU_HEAD_SIZE_ALIGNMENT
-
-    if kv_cache_quantized_dtype is not None:
-        dtype_info = torch.finfo(kv_cache_quantized_dtype)
-        key = key.to(torch.float32) / k_scale
-        # NOTE: clamp is added here to avoid out of range of quantized dtype
-        key = torch.clamp(key, dtype_info.min, dtype_info.max)
-        key = key.to(kv_cache_quantized_dtype)
-        value = value.to(torch.float32) / v_scale
-        value = torch.clamp(value, dtype_info.min, dtype_info.max)
-        value = value.to(kv_cache_quantized_dtype)
-
-    kv = torch.cat([key, value], axis=-1).reshape(-1, num_combined_kv_heads,
-                                                  head_size)
-
-    torch.ops.xla.dynamo_set_buffer_donor_(kv_cache, True)
-
-    kv_cache = kv_cache.flatten(0, 1)
-    new_kv_cache = torch.ops.xla.kv_cache_update_op(
-        kv,
-        slot_mapping,
-        kv_cache,
-        num_kv_update_slices,
-        page_size,
-        num_slices_per_kv_cache_update_block,
-    )
-    # NOTE: the in-place copy will be optimized away by XLA compiler.
-    kv_cache.copy_(new_kv_cache)
-
-
-# We can move this function to a common utils file if it's also useful for other
-# hardware.
-def dtype_bits(dtype: torch.dtype):
-    if dtype.is_floating_point:
-        try:
-            return torch.finfo(dtype).bits
-        except TypeError:
-            pass
-    elif dtype.is_complex:
-        if dtype is torch.complex32:
-            return 32
-        elif dtype is torch.complex64:
-            return 64
-        elif dtype is torch.complex128:
-            return 128
-    else:
-        try:
-            return torch.iinfo(dtype).bits
-        # torch.iinfo cannot support int4, int2, bits8...
-        except TypeError:
-            pass
-    str_dtype = str(dtype)
-    # support torch.int4, torch.int5, torch.uint5...
-    if str_dtype.startswith("torch.int") or str_dtype.startswith("torch.uint"):
-        return int(str_dtype[-1])
-    raise TypeError(f"Getting the bit width of {dtype} is not supported")
-
-
-def get_dtype_packing(dtype):
-    bits = dtype_bits(dtype)
-    if 32 % bits != 0:
-        raise ValueError(
-            f"The bit width must be divisible by 32, but got bits={bits}, "
-            "dtype={dtype}")
-    return 32 // bits
-
-
-def get_page_size_bytes(block_size: int, num_kv_heads: int, head_size: int,
-                        kv_cache_dtype: torch.dtype) -> int:
-    """Returns the size in bytes of one page of the KV cache."""
-    padded_head_size = (cdiv(head_size, TPU_HEAD_SIZE_ALIGNMENT) *
-                        TPU_HEAD_SIZE_ALIGNMENT)
-    num_combined_kv_heads = num_kv_heads * 2
-
-    # NOTE: for the implicit padding in XLA
-    packing = get_dtype_packing(kv_cache_dtype)
-    num_combined_kv_heads = cdiv(num_combined_kv_heads, packing) * packing
-
-    kv_cache_dtype_bits = dtype_bits(kv_cache_dtype)
-    return (block_size * num_combined_kv_heads * padded_head_size *
-            kv_cache_dtype_bits // 8)
-
-
-def ragged_paged_attention_with_sinks(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    kv_cache: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    num_seqs: torch.Tensor,
-    sinks: torch.Tensor,
-    *,
-    sm_scale: float,
-    sliding_window: int | None = None,
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-) -> torch.Tensor:
-    """Ragged paged attention with attention sink support.
-
-    This function wraps the JAX ragged_paged_attention_hd64 kernel which
-    supports attention sinks. It uses pallas.custom_jax_kernel to convert
-    the JAX function to a PyTorch operation.
-
-    Args:
-        query: shape = [num_tokens, num_heads, head_size]
-        key: shape = [num_tokens, num_kv_heads, head_size]
-        value: shape = [num_tokens, num_kv_heads, head_size]
-        kv_cache: shape = [num_blocks, block_size, num_kv_heads // kv_packing, kv_packing, head_size * 2]
-        context_lens: KV lengths for each sequence
-        block_tables: Page indices for KV cache
-        query_start_loc: Cumulative query lengths
-        num_seqs: Distribution array [decode_end, prefill_end, mixed_end]
-        sinks: Attention sink values, shape = [num_heads]
-        sm_scale: Softmax scale
-        sliding_window: Optional sliding window size
-        k_scale: Key scale for quantization
-        v_scale: Value scale for quantization
-
-    Returns:
-        Output tensor with shape = [num_tokens, num_heads, head_size]
-    """
-    from torch_tpu._internal import pallas
-
-    from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
-        ragged_paged_attention_hd64
-
-    # Use functools.partial to freeze all non-tensor args (trace-time constants)
-    wrapped_kernel = functools.partial(
-        ragged_paged_attention_hd64,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        strict_sliding_window=True,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
-
-    # Convert to Torch Op using pallas.custom_jax_kernel
-    torch_fn = pallas.custom_jax_kernel(wrapped_kernel)
-
-    # Call the kernel with tensor arguments
-    # The kernel returns (output, updated_kv_cache)
-    output, updated_kv_cache = torch_fn(
-        query,
-        key,
-        value,
-        kv_cache,
-        context_lens,
-        block_tables,
-        query_start_loc,
-        num_seqs,
-        sinks,
-    )
-
-    # Copy updated kv_cache back (in-place update pattern)
-    kv_cache.copy_(updated_kv_cache)
-
-    return output

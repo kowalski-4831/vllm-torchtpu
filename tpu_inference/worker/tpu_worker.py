@@ -371,9 +371,7 @@ class TPUWorker:
         kv_cache_config: KVCacheConfig,
     ) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
-        # TODO: Fix kv cache initialization
-        # self.model_runner.initialize_kv_cache(kv_cache_config)
-        pass
+        self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
         pass
