@@ -13,6 +13,8 @@
 # limitations under the License.
 """Auto-tuned block sizes for ragged paged attention."""
 
+import re
+
 import jax
 import jax.numpy as jnp
 
@@ -1428,7 +1430,6 @@ def get_tpu_version() -> int:
         kind = kind[:-len(' lite')]
 
     # Handle new format like "TPU7x" or "TPU8x"
-    import re
     match = re.match(r'TPU(\d+)', kind)
     if match:
         return int(match.group(1))
