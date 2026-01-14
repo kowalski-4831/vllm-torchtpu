@@ -5,11 +5,19 @@ import functools
 from dataclasses import dataclass
 
 import torch
+from torch_tpu._internal import pallas
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, next_power_of_2
+
+from tpu_inference.kernels.ragged_paged_attention.v2.kernel import \
+    ragged_paged_attention as jax_ragged_paged_attention
+from tpu_inference.kernels.ragged_paged_attention.v2.ragged_kv_cache_update import \
+    kv_cache_update as jax_kv_cache_update
+from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
+    ragged_paged_attention_hd64
 
 logger = init_logger(__name__)
 
@@ -43,11 +51,6 @@ def pallas_kv_cache_update(
     num_slices_per_block: int,
 ) -> torch.Tensor:
     """TorchTPU-compatible wrapper for kv_cache_update using pallas.custom_jax_kernel."""
-    from torch_tpu._internal import pallas
-
-    from tpu_inference.kernels.ragged_paged_attention.v2.ragged_kv_cache_update import \
-        kv_cache_update as jax_kv_cache_update
-
     # Use functools.partial to freeze all non-tensor args (trace-time constants)
     wrapped_fn = functools.partial(
         jax_kv_cache_update,
@@ -77,10 +80,6 @@ def pallas_ragged_paged_attention(
     v_scale: float = 1.0,
 ) -> torch.Tensor:
     """TorchTPU-compatible wrapper for ragged_paged_attention using pallas.custom_jax_kernel."""
-    from torch_tpu._internal import pallas
-
-    from tpu_inference.kernels.ragged_paged_attention.v2.kernel import \
-        ragged_paged_attention as jax_ragged_paged_attention
 
     # Use functools.partial to freeze all non-tensor args (trace-time constants)
     wrapped_fn = functools.partial(
@@ -142,10 +141,6 @@ def pallas_ragged_paged_attention_sinks_hd64(
     Returns:
         Output tensor with shape = [num_tokens, num_heads, head_size]
     """
-    from torch_tpu._internal import pallas
-
-    from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
-        ragged_paged_attention_hd64
 
     # Use functools.partial to freeze all non-tensor args (trace-time constants)
     wrapped_kernel = functools.partial(
@@ -472,8 +467,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         # For determine_available_memory case.
         if kv_cache.numel() == 0:
-            logger.warning(
-                "[DEBUG] Returning early due to kv_cache.numel() == 0")
+            logger.warning("Returning early due to kv_cache.numel() == 0")
             if output is None:
                 output = torch.ones_like(query)
             return output
