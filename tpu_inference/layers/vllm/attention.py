@@ -12,11 +12,9 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
-# Import V3 kernels - these handle KV cache update internally
+# Import V3 kernel - handles KV cache update internally
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
     ragged_paged_attention as jax_ragged_paged_attention_v3
-from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
-    ragged_paged_attention_hd64 as jax_ragged_paged_attention_v3_hd64
 
 logger = init_logger(__name__)
 
@@ -92,53 +90,6 @@ def pallas_ragged_paged_attention_v3(
     output, updated_kv_cache = torch_fn(query, key, value, kv_cache, seq_lens,
                                         page_indices, query_start_loc,
                                         request_distribution)
-
-    return output, updated_kv_cache
-
-
-def pallas_ragged_paged_attention_v3_hd64(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    request_distribution: torch.Tensor,
-    attention_sink: torch.Tensor | None = None,
-    *,
-    sm_scale: float = 1.0,
-    sliding_window: int | None = None,
-    strict_sliding_window: bool = True,
-    k_scale: float | None = None,
-    v_scale: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """TorchTPU-compatible wrapper for V3 ragged_paged_attention_hd64.
-
-    Specialized for head_dim=64 with optional attention sink support.
-    """
-    wrapped_fn = functools.partial(
-        jax_ragged_paged_attention_v3_hd64,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        strict_sliding_window=strict_sliding_window,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
-
-    torch_fn = pallas.custom_jax_kernel(wrapped_fn)
-
-    if attention_sink is not None:
-        output, updated_kv_cache = torch_fn(query, key, value, kv_cache,
-                                            seq_lens, page_indices,
-                                            query_start_loc,
-                                            request_distribution,
-                                            attention_sink)
-    else:
-        output, updated_kv_cache = torch_fn(query, key, value, kv_cache,
-                                            seq_lens, page_indices,
-                                            query_start_loc,
-                                            request_distribution)
 
     return output, updated_kv_cache
 
@@ -371,39 +322,25 @@ class PallasAttentionBackendImpl(AttentionImpl):
                                     num_kv_heads_x2 // packing, packing,
                                     padded_head_size)
 
-        # Choose kernel based on head_size
-        if self.head_size == 64:
-            output, updated_kv_cache_5d = pallas_ragged_paged_attention_v3_hd64(
-                query,
-                key,
-                value,
-                kv_cache_5d,
-                seq_lens,
-                page_indices,
-                query_start_loc,
-                request_distribution,
-                self.sinks,
-                sm_scale=self.scale,
-                sliding_window=self.sliding_window,
-                k_scale=k_scale if k_scale != 1.0 else None,
-                v_scale=v_scale if v_scale != 1.0 else None,
-            )
-        else:
-            output, updated_kv_cache_5d = pallas_ragged_paged_attention_v3(
-                query,
-                key,
-                value,
-                kv_cache_5d,
-                seq_lens,
-                page_indices,
-                query_start_loc,
-                request_distribution,
-                sm_scale=self.scale,
-                sliding_window=self.sliding_window,
-                soft_cap=self.logits_soft_cap,
-                k_scale=k_scale if k_scale != 1.0 else None,
-                v_scale=v_scale if v_scale != 1.0 else None,
-            )
+        # Use V3 regular kernel for all head sizes
+        # NOTE: hd64 kernel is disabled because it uses a different KV cache layout
+        # (K/V packed in last dim as 128 = 64+64) which is incompatible with our
+        # 4D KV cache format. TODO: Support hd64 kernel with proper KV cache reshape.
+        output, updated_kv_cache_5d = pallas_ragged_paged_attention_v3(
+            query,
+            key,
+            value,
+            kv_cache_5d,
+            seq_lens,
+            page_indices,
+            query_start_loc,
+            request_distribution,
+            sm_scale=self.scale,
+            sliding_window=self.sliding_window,
+            soft_cap=self.logits_soft_cap,
+            k_scale=k_scale if k_scale != 1.0 else None,
+            v_scale=v_scale if v_scale != 1.0 else None,
+        )
 
         # Reshape updated KV cache back to 4D and copy in-place
         updated_kv_cache_4d = updated_kv_cache_5d.view(num_blocks, block_size,
