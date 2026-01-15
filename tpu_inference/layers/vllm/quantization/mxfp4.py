@@ -397,6 +397,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         num_tokens, hidden_size = x.shape
         num_experts = layer.moe_config.num_experts
         top_k = layer.moe_config.experts_per_token
+        logger.debug(
+            "Forward pass for MXFP4 MoE: num_tokens=%d, hidden_size=%d, num_experts=%d, top_k=%d",
+            num_tokens, hidden_size, num_experts, top_k)
+
 
         # Step 1: Compute top-k routing
         # router_logits: [num_tokens, num_experts]
