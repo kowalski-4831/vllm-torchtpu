@@ -38,7 +38,7 @@ import pytest
 import torch
 
 # Import functions under test from production code
-from tpu_inference.layers.common.quantization import (
+from tpu_inference.layers.common.quantization import (  # isort: skip
     dequantize_mxfp4_packed, e8m0_to_fp32, fp4_indices_to_float,
     pack_fp4_indices, quantize_tensor_to_fp4, unpack_uint8_to_fp4)
 
