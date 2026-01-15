@@ -9,12 +9,12 @@ from torch_tpu._internal import pallas
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
-from tpu_inference.logger import init_logger
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
 # Import V3 kernel - handles KV cache update internally
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
     ragged_paged_attention as jax_ragged_paged_attention_v3
+from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
 

@@ -34,10 +34,10 @@ def pytest_addoption(parser):
 @pytest.fixture
 def device(request):
     """Get the device to run tests on (CPU or TPU).
-    
+
     For JAX: Already uses TPU automatically when available.
     For PyTorch: Uses torch_tpu.api.tpu_device() when --use-tpu flag is set.
-    
+
     Usage:
         pytest tests/layers/common/ -v              # Run on CPU
         pytest tests/layers/common/ -v --use-tpu   # Run on TPU

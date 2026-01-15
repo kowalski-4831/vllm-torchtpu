@@ -401,7 +401,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             "Forward pass for MXFP4 MoE: num_tokens=%d, hidden_size=%d, num_experts=%d, top_k=%d",
             num_tokens, hidden_size, num_experts, top_k)
 
-
         # Step 1: Compute top-k routing
         # router_logits: [num_tokens, num_experts]
         routing_weights = torch.softmax(router_logits, dim=-1)
