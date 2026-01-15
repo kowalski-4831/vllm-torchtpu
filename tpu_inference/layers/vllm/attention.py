@@ -364,7 +364,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # 4D: [num_blocks, block_size, num_kv_heads * 2, padded_head_size]
         # 5D: [num_blocks, block_size, num_kv_heads * 2 // packing, packing, padded_head_size]
         num_blocks, block_size, num_kv_heads_x2, padded_head_size = kv_cache.shape
-        packing = 2  # For bfloat16
+        # packing = 32 / element_bits (e.g., 32/16=2 for bfloat16, 32/8=4 for fp8)
+        element_bits = kv_cache.element_size() * 8
+        packing = 32 // element_bits
         kv_cache_5d = kv_cache.view(num_blocks, block_size,
                                     num_kv_heads_x2 // packing, packing,
                                     padded_head_size)
