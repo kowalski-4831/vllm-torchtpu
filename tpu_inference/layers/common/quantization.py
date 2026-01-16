@@ -50,8 +50,6 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
     e8m0 format: 8-bit unsigned exponent with bias 127.
     Value = 2^(exponent - 127)
 
-    Special case: u8=0 represents 0.0 (not 2^-127)
-
     Args:
         u8: uint8 tensor representing e8m0 exponents.
 
@@ -70,8 +68,6 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
     exponents = u8.to(torch.int32) + E8M0_MINEXP
     ones = torch.ones_like(u8, dtype=torch.float32)
     result = torch.ldexp(ones, exponents)
-    # u8=0 is a special case representing 0.0 in e8m0 format
-    result = torch.where(u8 == 0, torch.zeros_like(result), result)
     return result
 
 
