@@ -1,4 +1,4 @@
-# vLLM TPU
+<h1 align="center">vLLM TPU</h1>
 
 This repository contains the integration of **TorchTPU** and **vLLM**. The codebase references both vLLM main and `tpu-inference`, utilizing the vLLM framework for the server logic and custom kernels from `tpu-inference` for optimized performance.
 
