@@ -9,12 +9,12 @@ from torch_tpu._internal import pallas
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
 # Import V3 kernel - handles KV cache update internally
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
     ragged_paged_attention as jax_ragged_paged_attention_v3
+from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -321,6 +321,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         kv_cache_5d = kv_cache.view(num_blocks, block_size,
                                     num_kv_heads_x2 // packing, packing,
                                     padded_head_size)
+
+        logger.debug(
+            "PallasAttentionBackendImpl.forward: query.shape=%s, key.shape=%s, "
+            "value.shape=%s, kv_cache_5d.shape=%s", query.shape, key.shape,
+            value.shape, kv_cache_5d.shape)
 
         # Use V3 regular kernel for all head sizes
         # NOTE: hd64 kernel is disabled because it uses a different KV cache layout
