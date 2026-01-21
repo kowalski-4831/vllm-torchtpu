@@ -3,10 +3,12 @@
 import bisect
 from typing import TYPE_CHECKING, Any, cast
 
+import jax
 import numpy as np
 import torch
 import torch.nn as nn
 import vllm.envs as envs
+from jax.sharding import Mesh
 from torch_tpu import api
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention, MLAAttention
@@ -44,10 +46,12 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.tpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import bind_kv_cache
 
+from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
-                                                 PallasAttentionBackend,
-                                                 PallasMetadata)
+                                                 PallasAttentionBackend)
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
+from tpu_inference.models.vllm.vllm_model_wrapper_context import \
+    set_vllm_model_wrapper_context
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -291,6 +295,14 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.scheduler_output: SchedulerOutput | None = None
         self.mm_embed_inputs: tuple[list[torch.Tensor],
                                     torch.Tensor] | None = None
+
+        # Create JAX Mesh for shard_map operations in TPU kernels.
+        # For single-device inference, we create a simple 1-device mesh.
+        # FIXME: This is a hack to make it work for now. Also we don't want to use jax.devices()
+        tpu_devices = jax.devices()
+        # For single-device focus, use only the first device
+        single_device = np.array([[tpu_devices[0]]])
+        self.mesh = Mesh(single_device, axis_names=('data', 'model'))
 
     def reset_mm_cache(self) -> None:
         pass
@@ -757,8 +769,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                             dtype=torch.int32,
                                             device=self.device)
 
-        attn_metadata = PallasMetadata(
-            block_tables=block_tables,
+        attn_metadata = AttentionMetadata(
+            input_positions=self.position_ids,
+            block_tables=block_tables.flatten(),  # Convert block_tables to 1D
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
@@ -998,11 +1011,13 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             input_ids, inputs_embeds = self._get_model_inputs(
                 self.input_ids, mm_embed_inputs)
             # Run the decoder
+            # set_forward_context: vLLM's native context for attention metadata
+            # set_vllm_model_wrapper_context: TPU-specific context for mesh info
             with set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
-            ):
+            ), set_vllm_model_wrapper_context(mesh=self.mesh):
                 hidden_states = self.model(
                     input_ids=input_ids,
                     positions=self.position_ids,
@@ -1235,8 +1250,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         request_distribution = torch.tensor(
             [0, actual_num_reqs, actual_num_reqs],
             dtype=torch.int32).to(self.device)
-        attn_metadata = PallasMetadata(
-            block_tables=block_tables,
+        attn_metadata = AttentionMetadata(
+            input_positions=self.position_ids,
+            block_tables=block_tables.flatten(),
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
@@ -1247,7 +1263,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             torch._dynamo.mark_dynamic(input_ids, 0)
         torch._dynamo.mark_dynamic(position_ids, 0)
-        torch._dynamo.mark_dynamic(attn_metadata.block_tables, (0, 1))
+        torch._dynamo.mark_dynamic(attn_metadata.block_tables, 0)  # Now 1D
         torch._dynamo.mark_dynamic(attn_metadata.seq_lens, 0)
         torch._dynamo.mark_dynamic(attn_metadata.query_start_loc, 0)
 
@@ -1263,6 +1279,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
                 set_forward_context(per_layer_attn_metadata, self.vllm_config,
                                     0),
+                set_vllm_model_wrapper_context(mesh=self.mesh),
         ):
             out = self.model(input_ids=input_ids,
                              positions=position_ids,

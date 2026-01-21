@@ -18,14 +18,14 @@ pallas.custom_jax_kernel. For multi-device with sharding, see
 tpu_inference/layers/vllm/fused_moe.py (JAX-based).
 
 Key functions:
-    - fused_moe_gmm: Core MoE algorithm for single device
+    - fused_moe_gmm: Core MoE algorithm for single device (uses GMM kernel)
     - activation_fn: SiLU vs SwiGLUOAI activation
 """
 
 from typing import Optional
 
-import jax.numpy as jnp
 import torch
+from torch_tpu._internal import pallas
 
 from tpu_inference.kernels.megablox.gmm import gmm
 from tpu_inference.logger import init_logger
@@ -33,50 +33,19 @@ from tpu_inference.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _create_gmm_with_bias_fn(tiling: tuple[int, int, int], has_bias: bool):
-    """Create a JAX GMM function that takes bias as input argument.
+def _pallas_gmm_kernel(tiling):
 
-    When using pallas.custom_jax_kernel, tensor arguments must be passed
-    as function arguments, not as functools.partial frozen args. This creates
-    a wrapper function with the correct signature.
+    def impl(lhs, rhs, gs, s=None, b=None):
+        return gmm(lhs,
+                   rhs,
+                   gs,
+                   preferred_element_type=lhs.dtype,
+                   tiling=tiling,
+                   rhs_scale=s,
+                   rhs_bias=b,
+                   group_offset=0)
 
-    Args:
-        tiling: (tm, tk, tn) tile sizes
-        has_bias: Whether bias will be passed
-
-    Returns:
-        JAX function compatible with custom_jax_kernel
-    """
-    if has_bias:
-
-        def gmm_with_bias(lhs, rhs, group_sizes, rhs_bias):
-            return gmm(
-                lhs=lhs,
-                rhs=rhs,
-                group_sizes=group_sizes,
-                preferred_element_type=jnp.bfloat16,
-                rhs_scale=None,
-                rhs_bias=rhs_bias,
-                tiling=tiling,
-                group_offset=jnp.array(0),
-            )
-
-        return gmm_with_bias
-    else:
-
-        def gmm_no_bias(lhs, rhs, group_sizes):
-            return gmm(
-                lhs=lhs,
-                rhs=rhs,
-                group_sizes=group_sizes,
-                preferred_element_type=jnp.bfloat16,
-                rhs_scale=None,
-                rhs_bias=None,
-                tiling=tiling,
-                group_offset=jnp.array(0),
-            )
-
-        return gmm_no_bias
+    return impl
 
 
 def activation_fn_torch(activation: str, x1: torch.Tensor,
@@ -111,37 +80,69 @@ def _swigluoai_torch(x1: torch.Tensor,
     return gated_activation * (x2 + 1)
 
 
-def _get_tiling_size(m: int, k: int, n: int, g: int) -> tuple[int, int, int]:
-    """Calculate tiling sizes for GMM kernel.
+def _round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
+    """
+    Rounds the given integer `x` up to the nearest multiple of 128, without
+    exceeding the specified `limit`.
+
+    If `x` is less than or equal to 128, returns 128.
+    If `x` is less than `limit`, returns the smallest multiple of 128 greater
+    than or equal to `x`.
+    If `x` is greater than or equal to `limit`, searches for the largest
+    multiple of 128 less than or equal to `limit` (down to 512) that divides `x`
+    evenly, and returns it.
+    If no such candidate is found, returns `limit`.
 
     Args:
-        m: Total tokens (num_tokens * topk)
-        k: Input dimension (contracting)
-        n: Output dimension
-        g: Number of experts
+        x (int): The integer to round up.
+        limit (int): The upper bound (must be a multiple of 128).
 
     Returns:
-        (tm, tk, tn) tile sizes
+        int: The rounded value according to the rules above.
 
-    Note: GMM kernel requires m % tm == 0
+    Raises:
+        AssertionError: If `limit` is less than 128 or not a multiple of 128.
     """
-    # tm must divide m evenly
-    # Start with a reasonable default and find a divisor
-    tm_candidates = [128, 64, 32, 16, 8]
-    tm = 128
-    for candidate in tm_candidates:
-        if m % candidate == 0 and m >= candidate:
-            tm = candidate
-            break
-    else:
-        # Fallback: use m itself if small enough
-        if m <= 128:
-            tm = m
-        else:
-            tm = 128  # Will cause error if m not divisible
+    assert limit >= 128 and limit % 128 == 0
+    if x <= 128:
+        return 128
+    if x < limit:
+        return (x + 127) // 128 * 128
+    for candidate in range(limit, 511, -128):
+        if x % candidate == 0:
+            return candidate
+    return limit
 
-    tk = min(128, k)
-    tn = min(128, n)
+
+def _get_tiling_size_for_gmm_kernel(m: int, k: int, n: int,
+                                    g: int) -> tuple[int, int, int]:
+    """
+    Calculate optimal tiling sizes for a GMM kernel in a Mixture of Experts
+    (MoE) setting.
+
+    Args:
+        m (int): The total number of tokens.
+        n (int): The output feature dimension.
+        k (int): The input feature dimension.
+        g (int): The number of experts.
+
+    Returns:
+        tuple[int, int, int]: A tuple (tm, tk, tn)
+    """
+
+    # TODO(Chengji): increase the upper limit tiling size of m when we can set
+    # the vmem size to be used for gmm kernel.
+    # NOTE: In average each expert has m // g tokens, but as it might be
+    # unbalanced, here we doubled the token size when choosing tiling size of m.
+    # 2m//g can be either greater or less than 512. If there are 32 tokens and
+    # topk=2, m=topk * num_tokens=64, in this case, 2*m//g will be less than
+    # 512.
+    tm = _round_up_to_multiple_of_128_within_limit(2 * m // g, 512)
+    tm = min(tm, m)  # there's a requirement that m % tm == 0
+    # k/n correspond to n_input_features/n_output_features in the matmul so they
+    # are normally greater than 2048, unless the num shards is large.
+    tk = _round_up_to_multiple_of_128_within_limit(k, 2048)
+    tn = _round_up_to_multiple_of_128_within_limit(n, 2048)
     return tm, tk, tn
 
 
@@ -149,6 +150,8 @@ def fused_moe_gmm(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
     w1_bias: Optional[torch.Tensor],
     w2_bias: Optional[torch.Tensor],
     gating_output: torch.Tensor,
@@ -181,8 +184,6 @@ def fused_moe_gmm(
     Returns:
         Output tensor [num_tokens, hidden_size]
     """
-    from torch_tpu._internal import pallas
-
     num_tokens, hidden_size = hidden_states.shape
     num_experts = gating_output.shape[1]
     dtype = hidden_states.dtype
@@ -221,16 +222,12 @@ def fused_moe_gmm(
     # 5. GMM for w1 (gate_up projection)
     m = num_tokens * topk
     _, k1, n1 = w1.shape
-    tm1, tk1, tn1 = _get_tiling_size(m, k1, n1, num_experts)
+    tm1, tk1, tn1 = _get_tiling_size_for_gmm_kernel(m, k1, n1, num_experts)
 
-    gmm_w1_fn = _create_gmm_with_bias_fn((tm1, tk1, tn1),
-                                         has_bias=(w1_bias is not None))
-    gmm_w1_torch = pallas.custom_jax_kernel(gmm_w1_fn)
+    w1_wrapper_impl = _pallas_gmm_kernel((tm1, tk1, tn1))
+    gmm_w1_torch = pallas.custom_jax_kernel(w1_wrapper_impl)
 
-    if w1_bias is not None:
-        hidden = gmm_w1_torch(x_sorted, w1, group_sizes, w1_bias)
-    else:
-        hidden = gmm_w1_torch(x_sorted, w1, group_sizes)
+    hidden = gmm_w1_torch(x_sorted, w1, group_sizes, w1_scale, w1_bias)
 
     # 7. Activation: split and apply
     x1, x2 = hidden.chunk(2, dim=-1)
@@ -238,31 +235,17 @@ def fused_moe_gmm(
 
     # 8. GMM for w2 (down projection)
     _, k2, n2 = w2.shape
-    tm2, tk2, tn2 = _get_tiling_size(m, k2, n2, num_experts)
+    tm2, tk2, tn2 = _get_tiling_size_for_gmm_kernel(m, k2, n2, num_experts)
 
-    gmm_w2_fn = _create_gmm_with_bias_fn((tm2, tk2, tn2),
-                                         has_bias=(w2_bias is not None))
-    gmm_w2_torch = pallas.custom_jax_kernel(gmm_w2_fn)
+    w2_wrapper_impl = _pallas_gmm_kernel((tm2, tk2, tn2))
+    gmm_w2_torch = pallas.custom_jax_kernel(w2_wrapper_impl)
 
-    if w2_bias is not None:
-        output = gmm_w2_torch(hidden, w2, group_sizes, w2_bias)
-    else:
-        output = gmm_w2_torch(hidden, w2, group_sizes)
+    output = gmm_w2_torch(hidden, w2, group_sizes, w2_scale, w2_bias)
 
     # 10. Finalize: unsort, apply weights, sum
     output = output[topk_argsort_revert].reshape(num_tokens, topk, -1)
     output = output * topk_weights.unsqueeze(-1)
     output = output.sum(dim=1)
-
-    logger.debug(
-        f"[MoE DEBUG] x_sorted: shape={x_sorted.shape}, mean={x_sorted.float().mean():.6f}, absmax={x_sorted.float().abs().max():.6f}"
-    )
-    logger.debug(
-        f"[MoE DEBUG] hidden (after w1+act): shape={hidden.shape}, mean={hidden.float().mean():.6f}, absmax={hidden.float().abs().max():.6f}"
-    )
-    logger.debug(
-        f"[MoE DEBUG] output (before slice): shape={output.shape}, mean={output.float().mean():.6f}, absmax={output.float().abs().max():.6f}"
-    )
 
     # 11. Remove padding
     return output[:, :hidden_size]

@@ -67,6 +67,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 
 from tpu_inference.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
+from tpu_inference.layers.common.quantization import dequantize_mxfp4_packed
+from tpu_inference.layers.vllm.fused_moe_torch import fused_moe_gmm
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -166,198 +168,96 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         self.mxfp4_backend = Mxfp4Backend.TRITON
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        """Process weights: dequant → layout transform for GMM kernel.
+
+        Pipeline:
+        1. Dequantize MXFP4 packed → bfloat16
+        2. Transpose: [E, out_dim, in_dim] → [E, in_dim, out_dim] for GMM
+        3. Transform biases: [E, out_dim] → [E, 1, out_dim]
+
+        TODO(requantization): For memory optimization, add:
+            - quantize_tensor_to_fp4() with block_size=512
+            - pack_fp4_indices() to pack back to uint8
+            - Transform scales: swap axes 1↔2, expand_dims(axis=2)
         """
-        Process weights after they've been loaded from checkpoint.
 
-        This dequantizes MXFP4 weights to bfloat16 for TPU inference.
-        MXFP4 format:
-        - Weights are packed as uint8 (2 x fp4 per byte)
-        - Scales are e8m0 stored as uint8
-
-        SIMPLIFICATION vs Old tpu_inference Implementation:
-        =====================================================
-        This is a simplified implementation that differs from old tpu_inference:
-
-        1. NO RE-QUANTIZATION: Old tpu_inference re-quantizes dequantized weights
-           to fp4 with REQUANTIZED_BLOCK_SIZE for optimized TPU kernels.
-           We keep weights as bfloat16 for simpler apply() logic.
-
-        2. NO SWIGLU REORDERING: Old tpu_inference calls process_moe_weights() to
-           interleave gate/up projections for efficient SwiGLU.
-           We keep original layout and split manually in apply().
-
-        3. NO SHARDING: Old tpu_inference calls shard_moe_weights() for tensor
-           parallelism. We assume single-device execution.
-
-        For production performance, port the full pipeline from old tpu_inference.
-
-        Args:
-            layer: The FusedMoE layer with loaded weights.
-        """
         assert isinstance(layer, FusedMoE)
         assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
-        # Dequantize w13 (gate_up_proj)
-        w13_dequant = self._dequantize_mxfp4_packed(
-            layer.w13_weight.data,
-            layer.w13_weight_scale.data,
-        )
+        # 1. Dequantize MXFP4 packed → bfloat16
+        # Compute on CPU for faster dequantization, then move back to TPU.
+        # Compile time is an issue if we do this on TPU.
+        w13_weight = dequantize_mxfp4_packed(
+            layer.w13_weight.data.to("cpu"),
+            layer.w13_weight_scale.data.to("cpu"),
+            axis=-1,
+            out_dtype=torch.bfloat16,
+        ).to(layer.w13_weight.device)
+        w2_weight = dequantize_mxfp4_packed(
+            layer.w2_weight.data.to("cpu"),
+            layer.w2_weight_scale.data.to("cpu"),
+            axis=-1,
+            out_dtype=torch.bfloat16,
+        ).to(layer.w2_weight.device)
 
-        # Dequantize w2 (down_proj)
-        w2_dequant = self._dequantize_mxfp4_packed(
-            layer.w2_weight.data,
-            layer.w2_weight_scale.data,
-        )
+        # 2. Handle w13 interleaving for swigluoai activation
+        # GPT-OSS stores w13 interleaved: even indices are w1 (gate), odd are w3 (up)
+        # We un-interleave so first half is w1 and second half is w3
+        w13_interleave = layer.activation == "swigluoai"
+        if w13_interleave:
+            # w13_weight shape: [E, out_dim, in_dim] where out_dim = 2 * intermediate
+            w1_weight = w13_weight[:, ::2, :]  # even indices
+            w3_weight = w13_weight[:, 1::2, :]  # odd indices
+            w13_weight = torch.cat([w1_weight, w3_weight], dim=1)
 
-        # Update layer weights with dequantized values
-        # Store as bfloat16 for TPU inference
-        layer.w13_weight = torch.nn.Parameter(w13_dequant.to(torch.bfloat16),
-                                              requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_dequant.to(torch.bfloat16),
-                                             requires_grad=False)
+        # 3. Transpose: [E, out_dim, in_dim] → [E, in_dim, out_dim]
+        # GMM kernel expects contracting dim on axis 1
+        w13_weight = w13_weight.transpose(1, 2)  # [E, hidden, 2*intermediate]
+        w2_weight = w2_weight.transpose(1, 2)  # [E, intermediate, hidden]
 
-        # Scales are no longer needed after dequantization, but we keep them
-        # for compatibility with get_fused_moe_quant_config
-        # Convert to float32 for any downstream use
-        layer.w13_weight_scale = torch.nn.Parameter(self._e8m0_to_fp32(
-            layer.w13_weight_scale.data),
-                                                    requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(self._e8m0_to_fp32(
-            layer.w2_weight_scale.data),
-                                                   requires_grad=False)
+        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+
+        # 4. Scales not needed for bfloat16 weights
+        # TODO(requantization): Transform scales when using fp4:
+        #   scale = scale.transpose(1, 2).unsqueeze(2)  # [E, num_blocks, 1, out_dim]
+        layer.w13_weight_scale = None
+        layer.w2_weight_scale = None
+
+        # 5. Transform biases: [E, out_dim] → [E, 1, out_dim]
+        # Also handle interleaving for swigluoai activation
+        if layer.w13_bias is not None:
+            w13_bias = layer.w13_bias.data
+            if w13_interleave:
+                # Un-interleave bias: even indices are w1, odd are w3
+                w1_bias = w13_bias[:, ::2]
+                w3_bias = w13_bias[:, 1::2]
+                w13_bias = torch.cat([w1_bias, w3_bias], dim=1)
+
+            layer.w13_bias = torch.nn.Parameter(
+                w13_bias.unsqueeze(1).to(torch.float32),
+                requires_grad=False,
+            )
+        if layer.w2_bias is not None:
+            layer.w2_bias = torch.nn.Parameter(
+                layer.w2_bias.data.unsqueeze(1).to(torch.float32),
+                requires_grad=False,
+            )
+
+        # TODO, for distributed senario, the weight layout handling should be more complex
 
         logger.info_once(
-            "MXFP4 weights dequantized to bfloat16 for TPU inference.")
-
-    def _dequantize_mxfp4_packed(
-        self,
-        weight_packed: torch.Tensor,
-        scale_u8: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Dequantize MXFP4 packed weights to float32.
-
-        MXFP4 format:
-        - Each uint8 contains 2 x 4-bit float values (e2m1 format)
-        - Scales are e8m0 (8-bit exponent only) stored as uint8
-        - Block size is 32 (32 values share one scale)
-
-        Args:
-            weight_packed: Packed weights [E, out_dim, in_dim/2] as uint8
-            scale_u8: Scales [E, out_dim, in_dim/32] as uint8
-
-        Returns:
-            Dequantized weights [E, out_dim, in_dim] as float32
-        """
-        # Step 1: Unpack uint8 -> two fp4 values
-        # Each uint8 byte contains: [fp4_low (bits 0-3), fp4_high (bits 4-7)]
-        weight_unpacked = self._unpack_uint8_to_fp4(weight_packed)
-
-        # Step 2: Convert e8m0 scales to float32
-        scale_fp32 = self._e8m0_to_fp32(scale_u8)
-
-        # Step 3: Apply block-wise dequantization
-        # weight shape: [E, out_dim, in_dim]
-        # scale shape: [E, out_dim, in_dim/32]
-        # We need to broadcast scale to match weight dimensions
-        block_size = weight_unpacked.shape[-1] // scale_fp32.shape[-1]
-
-        # Expand scale to match weight shape
-        # [E, out_dim, num_blocks] -> [E, out_dim, num_blocks, 1]
-        scale_expanded = scale_fp32.unsqueeze(-1)
-        # [E, out_dim, num_blocks, 1] -> [E, out_dim, num_blocks, block_size]
-        scale_expanded = scale_expanded.expand(*scale_fp32.shape, block_size)
-        # [E, out_dim, num_blocks, block_size] -> [E, out_dim, in_dim]
-        scale_expanded = scale_expanded.reshape(weight_unpacked.shape)
-
-        # Dequantize: weight * scale
-        weight_dequant = weight_unpacked * scale_expanded
-
-        return weight_dequant
-
-    def _unpack_uint8_to_fp4(self, packed: torch.Tensor) -> torch.Tensor:
-        """
-        Unpack uint8 tensor containing two fp4 (e2m1) values per byte.
-
-        FP4 e2m1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit
-        Values: 0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6
-
-        Args:
-            packed: uint8 tensor [..., N/2]
-
-        Returns:
-            Unpacked float32 tensor [..., N]
-        """
-        # Extract low and high nibbles
-        low_nibble = (packed & 0x0F).to(torch.int8)  # bits 0-3
-        high_nibble = ((packed >> 4) & 0x0F).to(torch.int8)  # bits 4-7
-
-        # Convert fp4 nibbles to float32
-        low_fp32 = self._fp4_e2m1_to_fp32(low_nibble)
-        high_fp32 = self._fp4_e2m1_to_fp32(high_nibble)
-
-        # Interleave: [low0, high0, low1, high1, ...]
-        # Shape: [..., N/2] -> [..., N/2, 2] -> [..., N]
-        result = torch.stack([low_fp32, high_fp32], dim=-1)
-        return result.reshape(*packed.shape[:-1], -1)
-
-    def _fp4_e2m1_to_fp32(self, fp4: torch.Tensor) -> torch.Tensor:
-        """
-        Convert 4-bit float (e2m1) to float32.
-
-        FP4 e2m1 encoding (4 bits):
-        - Bit 3: sign (0=positive, 1=negative)
-        - Bits 1-2: exponent (2 bits, bias=1)
-        - Bit 0: mantissa (1 bit)
-
-        Lookup table for all 16 possible values:
-        0000=0, 0001=0.5, 0010=1, 0011=1.5, 0100=2, 0101=3, 0110=4, 0111=6
-        1000=-0, 1001=-0.5, 1010=-1, 1011=-1.5, 1100=-2, 1101=-3, 1110=-4, 1111=-6
-        """
-        # Use lookup table for conversion (most efficient)
-        fp4_lut = torch.tensor(
-            [
-                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
-                -2.0, -3.0, -4.0, -6.0
-            ],
-            dtype=torch.float32,
-            device=fp4.device,
+            "MXFP4 weights dequantized to bfloat16 and transposed for GMM kernel."
         )
-        return fp4_lut[fp4.to(torch.long)]
-
-    def _e8m0_to_fp32(self, u8: torch.Tensor) -> torch.Tensor:
-        """
-        Convert e8m0 (8-bit exponent only) to float32.
-
-        e8m0 format: 8-bit unsigned exponent with bias 127
-        Value = 2^(exponent - 127)
-
-        Args:
-            u8: uint8 tensor representing e8m0 exponents
-
-        Returns:
-            float32 tensor with actual scale values
-        """
-        # e8m0 bias is 127 (same as fp32 exponent bias)
-        E8M0_BIAS = 127
-        exponents = u8.to(torch.int32) - E8M0_BIAS
-        # 2^exponent = ldexp(1.0, exponent)
-        return torch.ldexp(torch.ones_like(u8, dtype=torch.float32), exponents)
 
     def get_fused_moe_quant_config(
         self,
         layer: torch.nn.Module,
     ) -> Optional[FusedMoEQuantConfig]:
-        """
-        Get the quantization config for fused MoE operations.
+        """Get the quantization config for fused MoE operations.
 
         Returns config with scale and bias tensors for the MoE kernel.
-
-        Args:
-            layer: The FusedMoE layer.
-
-        Returns:
-            FusedMoEQuantConfig with w1/w2 scales and biases.
+        Note: scales are None when using bfloat16 weights.
         """
         return mxfp4_w4a16_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
@@ -372,101 +272,17 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Forward pass for MXFP4 MoE on TPU.
-
-        SIMPLIFICATION vs Old tpu_inference Implementation:
-        =====================================================
-        This is a simplified implementation using bfloat16 weights and
-        standard PyTorch operations. Old tpu_inference uses:
-        - Quantized fp4 kernels via fused_moe_apply()
-        - JAX GMM (Group Matrix Multiply) for batched expert computation
-        - Pre-computed routing tables for efficiency
-
-        For production performance, integrate with fused_moe.py or port
-        the optimized kernels from old tpu_inference.
-
-        Args:
-            layer: The FusedMoE layer with dequantized bfloat16 weights.
-            x: Input tensor of shape [num_tokens, hidden_size].
-            router_logits: Router logits of shape [num_tokens, num_experts].
-
-        Returns:
-            Output tensor of shape [num_tokens, hidden_size].
-        """
-        num_tokens, hidden_size = x.shape
-        num_experts = layer.moe_config.num_experts
-        top_k = layer.moe_config.experts_per_token
-        logger.debug(
-            "Forward pass for MXFP4 MoE: num_tokens=%d, hidden_size=%d, num_experts=%d, top_k=%d",
-            num_tokens, hidden_size, num_experts, top_k)
-
-        # Step 1: Compute top-k routing
-        # router_logits: [num_tokens, num_experts]
-        routing_weights = torch.softmax(router_logits, dim=-1)
-        topk_weights, topk_indices = torch.topk(routing_weights, top_k, dim=-1)
-
-        # Renormalize top-k weights
-        if layer.renormalize:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1,
-                                                           keepdim=True)
-
-        # Step 2: Prepare output tensor
-        output = torch.zeros_like(x)
-
-        # Step 3: Process each expert
-        # w13_weight: [E, 2*intermediate, hidden] (gate and up projections fused)
-        # w2_weight: [E, hidden, intermediate] (down projection)
-        # w13_bias: [E, 2*intermediate]
-        # w2_bias: [E, hidden]
-
-        for k in range(top_k):
-            expert_indices = topk_indices[:, k]  # [num_tokens]
-            expert_weights = topk_weights[:, k]  # [num_tokens]
-
-            # For each unique expert, process its assigned tokens
-            for expert_id in range(num_experts):
-                # Find tokens assigned to this expert using nonzero (TPU-compatible)
-                # NOTE: Boolean indexing (x[mask]) is not currently supported on TPU.
-                # If supported in the future, we can revert to simpler boolean masking.
-                token_mask = expert_indices == expert_id
-                token_indices = torch.nonzero(token_mask, as_tuple=True)[0]
-
-                if token_indices.numel() == 0:
-                    continue
-
-                # Gather tokens for this expert using index_select (TPU-compatible)
-                expert_input = torch.index_select(x, 0, token_indices)
-                expert_routing_weight = torch.index_select(
-                    expert_weights, 0, token_indices)
-
-                # Get expert weights
-                w13 = layer.w13_weight[expert_id]  # [2*intermediate, hidden]
-                w2 = layer.w2_weight[expert_id]  # [hidden, intermediate]
-                w13_bias = layer.w13_bias[expert_id]  # [2*intermediate]
-                w2_bias = layer.w2_bias[expert_id]  # [hidden]
-
-                # Gate-Up projection: x @ w13.T + bias
-                # Output: [num_expert_tokens, 2*intermediate]
-                gate_up = torch.nn.functional.linear(expert_input, w13,
-                                                     w13_bias)
-
-                # Split gate and up projections
-                gate, up = gate_up.chunk(2, dim=-1)
-
-                # SwiGLU activation: silu(gate) * up
-                hidden_states = torch.nn.functional.silu(gate) * up
-
-                # Down projection: hidden @ w2.T + bias
-                # Output: [num_expert_tokens, hidden]
-                expert_output = torch.nn.functional.linear(
-                    hidden_states, w2, w2_bias)
-
-                # Apply routing weight
-                expert_output = expert_output * expert_routing_weight.unsqueeze(
-                    -1)
-
-                # Scatter back to output using index_add (TPU-compatible)
-                output.index_add_(0, token_indices, expert_output)
-
-        return output
+        """Forward pass using GMM kernel."""
+        return fused_moe_gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_bias=layer.w13_bias,
+            w2_bias=layer.w2_bias,
+            gating_output=router_logits,
+            topk=layer.moe_config.experts_per_token,
+            renormalize=layer.renormalize,
+            activation=layer.activation,
+        )
