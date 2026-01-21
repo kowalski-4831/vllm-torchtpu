@@ -10,7 +10,7 @@ To run the **Qwen3** model on a single device, follow these installation steps:
 
 ### 1. Install TorchTPU
 Build the `torch_tpu` Python wheel from source by following the instructions here:
-👉 [google-ml-infra/torch_tpu Installation Guide](https://github.com/google-ml-infra/torch_tpu?tab=readme-ov-file#build-from-source)
+👉 [google-ml-infra/torch_tpu Installation Guide](https://github.com/google-ml-infra/torch_tpu?tab=readme-ov-fil#installation)
 
 ### 2. Install vLLM from Source
 Install vLLM from source using the official TPU documentation.
