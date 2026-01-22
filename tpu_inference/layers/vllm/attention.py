@@ -287,6 +287,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         )
 
         # Create Torch operator
+        # TODO: The current wrapped_fn still depends on jax shard_map,
+        #       need to revise once we work on distributed.
         torch_fn = pallas.custom_jax_kernel(wrapped_fn)
 
         # Call the operator

@@ -3,11 +3,13 @@
 import bisect
 from typing import TYPE_CHECKING, Any, cast
 
+# TODO: Remove this after jax dependency is removed
 import jax
 import numpy as np
 import torch
 import torch.nn as nn
 import vllm.envs as envs
+# TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from torch_tpu import api
 from vllm.attention.backends.abstract import AttentionType
