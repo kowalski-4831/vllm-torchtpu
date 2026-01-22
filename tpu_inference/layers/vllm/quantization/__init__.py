@@ -35,6 +35,8 @@ from vllm.model_executor.layers.quantization.base_config import \
 from tpu_inference.layers.common import quant_methods
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4Config
+from tpu_inference.layers.vllm.quantization.unquantized import \
+    VllmUnquantizedConfig
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
@@ -61,9 +63,8 @@ def get_tpu_quantization_config(
 
     # Map from quant method name to TPU config class
     method_to_config: Dict[Optional[str], Type[VllmQuantConfig]] = {
-        # None: VllmUnquantizedConfig,  # TODO: Implement unquantized config
-        quant_methods.MXFP4:
-        VllmMxfp4Config,
+        None: VllmUnquantizedConfig,  # Unquantized models (e.g., Qwen3-Coder)
+        quant_methods.MXFP4: VllmMxfp4Config,
         # TODO: Add more quantization methods as needed
         # quant_methods.AWQ: VllmAWQConfig,
         # quant_methods.FP8: VllmFp8Config,
