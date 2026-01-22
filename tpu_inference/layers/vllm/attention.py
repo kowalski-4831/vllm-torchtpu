@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
-from dataclasses import dataclass
 
 import torch
 from torch_tpu._internal import pallas
@@ -11,10 +10,11 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
-# Import V3 kernel - handles KV cache update internally
-from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
-    ragged_paged_attention as jax_ragged_paged_attention_v3
+from tpu_inference.layers.common.attention_interface import attention
+from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.logger import init_logger
+from tpu_inference.models.vllm.vllm_model_wrapper_context import \
+    get_vllm_model_wrapper_context
 
 logger = init_logger(__name__)
 
@@ -34,93 +34,58 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "uint8": torch.uint8,
 }
 
-# =========================================================================================
-# Pallas Kernel Wrappers (V3 - unified attention + KV cache update)
-# =========================================================================================
 
-
-def pallas_ragged_paged_attention_v3(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    request_distribution: torch.Tensor,
+def _pallas_rpa_kernel(
+    kv_cache,
+    query,
+    key,
+    value,
+    seq_lens,
+    block_tables,
+    query_start_loc,
+    request_distribution,
+    sinks,
     *,
-    sm_scale: float = 1.0,
-    sliding_window: int | None = None,
-    soft_cap: float | None = None,
-    k_scale: float | None = None,
-    v_scale: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """TorchTPU-compatible wrapper for V3 ragged_paged_attention.
-
-    This kernel handles both attention computation AND KV cache update internally.
-
-    Args:
-        query: [num_tokens, num_q_heads, head_dim]
-        key: [num_tokens, num_kv_heads, head_dim]
-        value: [num_tokens, num_kv_heads, head_dim]
-        kv_cache: [num_blocks, block_size, num_kv_heads*2 // packing, packing, padded_head_dim]
-        seq_lens: [max_num_seqs] - sequence lengths (KV lengths)
-        page_indices: [max_num_seqs * pages_per_seq] - flattened page indices
-        query_start_loc: [max_num_seqs + 1] - cumulative query lengths
-        request_distribution: [3] - (decode_end, prefill_end, mixed_end)
-        sm_scale: softmax scale
-        sliding_window: optional sliding window size
-        soft_cap: optional logit soft cap
-        k_scale: key scale for quantization
-        v_scale: value scale for quantization
-
-    Returns:
-        (output, updated_kv_cache) tuple
-    """
-    wrapped_fn = functools.partial(
-        jax_ragged_paged_attention_v3,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        k_scale=k_scale,
-        v_scale=v_scale,
+    mesh,
+    q_scale,
+    k_scale,
+    v_scale,
+    sliding_window,
+):
+    metadata = AttentionMetadata(
+        input_positions=
+        None,  # FIXME: kernel wrapper will have error if pass this argument
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        request_distribution=request_distribution,
     )
 
-    torch_fn = pallas.custom_jax_kernel(wrapped_fn)
-    output, updated_kv_cache = torch_fn(query, key, value, kv_cache, seq_lens,
-                                        page_indices, query_start_loc,
-                                        request_distribution)
-
-    return output, updated_kv_cache
+    kv_cache = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1],
+                                kv_cache.shape[2] // 2, 2, kv_cache.shape[3])
+    new_kv_cache, outputs = attention(
+        kv_cache,
+        query,
+        key,
+        value,
+        metadata,
+        mesh,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sinks=sinks,
+        attention_chunk_size=sliding_window,
+    )
+    new_kv_cache = new_kv_cache.reshape(new_kv_cache.shape[0],
+                                        new_kv_cache.shape[1],
+                                        new_kv_cache.shape[2] * 2,
+                                        new_kv_cache.shape[4])
+    return new_kv_cache, outputs
 
 
 # =========================================================================================
 # VLLM Attention Backend
 # =========================================================================================
-
-
-@dataclass
-class PallasMetadata:
-    """Metadata for Pallas V3 attention.
-
-    V3 kernel interface expects:
-    - seq_lens: [max_num_seqs] - sequence lengths (KV lengths)
-    - block_tables: [max_num_seqs, pages_per_seq] - page indices (will be flattened)
-    - query_start_loc: [max_num_seqs + 1] - cumulative query lengths
-    - request_distribution: [3] - (decode_end, prefill_end, mixed_end)
-    """
-    # block_tables: [max_num_seqs, pages_per_seq] - 2D page indices
-    block_tables: torch.Tensor
-
-    # seq_lens: [max_num_seqs] - sequence lengths (total tokens including new ones)
-    seq_lens: torch.Tensor
-
-    # query_start_loc: [max_num_seqs + 1] - cumulative query lengths
-    query_start_loc: torch.Tensor
-
-    # request_distribution: [3] - (decode_end, prefill_end, mixed_end)
-    # For single-chip: [0, num_seqs, num_seqs] means all requests are "mixed" mode
-    request_distribution: torch.Tensor
 
 
 class PallasAttentionBackend(AttentionBackend):
@@ -143,7 +108,17 @@ class PallasAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         padded_head_size = (cdiv(head_size, TPU_HEAD_SIZE_ALIGNMENT) *
                             TPU_HEAD_SIZE_ALIGNMENT)
-        return (num_blocks, block_size, num_kv_heads * 2, padded_head_size)
+        # Two different RPA kernels have different KV cache layouts:
+        # - hd64 (head_dim=64): K/V packed along head_dim -> [L, S, K, H] where H=128
+        # - v3 (head_dim!=64): K/V packed along heads -> [L, S, K*2, H]
+        # Both are reshaped to 5D in _run_attention_jax before passing to kernel.
+        use_hd64 = (head_size == 64)
+        if use_hd64:
+            # hd64: shape[2] = num_kv_heads, will reshape to [L, S, K/2, 2, H]
+            return (num_blocks, block_size, num_kv_heads, padded_head_size)
+        else:
+            # v3: shape[2] = num_kv_heads * 2, will reshape to [L, S, K, 2, H]
+            return (num_blocks, block_size, num_kv_heads * 2, padded_head_size)
 
     @staticmethod
     def swap_blocks(
@@ -233,15 +208,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Store sinks for attention sink optimization
         self.sinks = sinks
         if self.sinks is not None:
-            if self.sinks.shape[0] != num_heads:
-                raise ValueError(
-                    f"Sinks must have the same number of heads as num_heads. "
-                    f"Got sinks.shape[0]={self.sinks.shape[0]}, num_heads={num_heads}"
-                )
-            if head_size != 64:
-                raise NotImplementedError(
-                    "Attention sink support is only available when head_dim==64. "
-                    f"Got head_size={head_size}")
+            assert self.sinks.shape[0] == num_heads, (
+                "Sinks must have the same number of heads as the number of "
+                "heads in the layer")
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""
@@ -257,7 +226,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: PallasMetadata,
+        attn_metadata: AttentionMetadata,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -286,75 +255,56 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 output = torch.ones_like(query)
             return output
 
-        num_tokens, hidden_size = query.shape
-        query = query.view(num_tokens, self.num_heads, self.head_size)
-        key = key.view(-1, self.num_kv_heads, self.head_size)
-        value = value.view(-1, self.num_kv_heads, self.head_size)
+        q_len, q_compute_dim = query.shape
+        k_len, k_compute_dim = key.shape
+        assert key.shape == value.shape
+        assert q_compute_dim == self.head_size * self.num_heads
+        assert k_compute_dim == self.head_size * self.num_kv_heads
 
-        # Prepare V3 kernel inputs
-        page_indices = attn_metadata.block_tables.flatten().to(torch.int32)
-        seq_lens = attn_metadata.seq_lens.to(torch.int32)
-        query_start_loc = attn_metadata.query_start_loc.to(torch.int32)
-        request_distribution = attn_metadata.request_distribution.to(
-            torch.int32)
+        q_scale = k_scale = v_scale = None
+        if self.kv_cache_quantized_dtype:
+            raise NotImplementedError(
+                "Quantized KV cache is not supported for PallasAttentionBackendImpl"
+            )
 
-        # Quantization scaling
-        k_scale = getattr(layer, '_k_scale_float', 1.0)
-        v_scale = getattr(layer, '_v_scale_float', 1.0)
+        sink = self.sinks
+        query = query.view(q_len, self.num_heads, self.head_size)
+        key = key.view(k_len, self.num_kv_heads, self.head_size)
+        value = value.view(k_len, self.num_kv_heads, self.head_size)
 
-        if self.kv_cache_quantized_dtype is not None and k_scale != 0.0 and v_scale != 0.0:
-            dtype_info = torch.finfo(self.kv_cache_quantized_dtype)
-            key = torch.clamp(
-                key.to(torch.float32) / k_scale, dtype_info.min,
-                dtype_info.max).to(self.kv_cache_quantized_dtype)
-            value = torch.clamp(
-                value.to(torch.float32) / v_scale, dtype_info.min,
-                dtype_info.max).to(self.kv_cache_quantized_dtype)
+        # Get mesh from global context (set by TPUModelRunner)
+        ctx = get_vllm_model_wrapper_context()
+        mesh = ctx.mesh
 
-        # Reshape KV cache from 4D (vLLM format) to 5D (V3 kernel format)
-        # 4D: [num_blocks, block_size, num_kv_heads * 2, padded_head_size]
-        # 5D: [num_blocks, block_size, num_kv_heads * 2 // packing, packing, padded_head_size]
-        num_blocks, block_size, num_kv_heads_x2, padded_head_size = kv_cache.shape
-        # packing = 32 / element_bits (e.g., 32/16=2 for bfloat16, 32/8=4 for fp8)
-        element_bits = kv_cache.element_size() * 8
-        packing = 32 // element_bits
-        kv_cache_5d = kv_cache.view(num_blocks, block_size,
-                                    num_kv_heads_x2 // packing, packing,
-                                    padded_head_size)
+        # Prepare wrapper function with static arguments
+        wrapped_fn = functools.partial(
+            _pallas_rpa_kernel,
+            mesh=mesh,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sliding_window=self.sliding_window,
+        )
 
-        logger.debug(
-            "PallasAttentionBackendImpl.forward: query.shape=%s, key.shape=%s, "
-            "value.shape=%s, kv_cache_5d.shape=%s", query.shape, key.shape,
-            value.shape, kv_cache_5d.shape)
+        # Create Torch operator
+        # TODO: The current wrapped_fn still depends on jax shard_map,
+        #       need to revise once we work on distributed.
+        torch_fn = pallas.custom_jax_kernel(wrapped_fn)
 
-        # Use V3 regular kernel for all head sizes
-        # NOTE: hd64 kernel is disabled because it uses a different KV cache layout
-        # (K/V packed in last dim as 128 = 64+64) which is incompatible with our
-        # 4D KV cache format. TODO: Support hd64 kernel with proper KV cache reshape.
-        output, updated_kv_cache_5d = pallas_ragged_paged_attention_v3(
+        # Call the operator
+        new_kv_cache, outputs = torch_fn(
+            kv_cache,
             query,
             key,
             value,
-            kv_cache_5d,
-            seq_lens,
-            page_indices,
-            query_start_loc,
-            request_distribution,
-            sm_scale=self.scale,
-            sliding_window=self.sliding_window,
-            soft_cap=self.logits_soft_cap,
-            k_scale=k_scale if k_scale != 1.0 else None,
-            v_scale=v_scale if v_scale != 1.0 else None,
+            attn_metadata.seq_lens,
+            attn_metadata.block_tables,
+            attn_metadata.query_start_loc,
+            attn_metadata.request_distribution,
+            sink,
         )
 
-        # Reshape updated KV cache back to 4D and copy in-place
-        updated_kv_cache_4d = updated_kv_cache_5d.view(num_blocks, block_size,
-                                                       num_kv_heads_x2,
-                                                       padded_head_size)
-        kv_cache.copy_(updated_kv_cache_4d)
+        # update kv cache
+        kv_cache.copy_(new_kv_cache)
 
-        # Handle padded head_dim from kernel
-        if output.shape[-1] != self.head_size:
-            output = output[:, :, :self.head_size]
-
-        return output.reshape(num_tokens, hidden_size)
+        return outputs.reshape(q_len, self.num_heads * self.head_size)
