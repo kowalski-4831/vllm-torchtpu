@@ -211,11 +211,16 @@ def fused_moe_gmm(
     x_sorted = hidden_states[token_indices_sorted]
 
     # 3. Compute group_sizes (how many tokens go to each expert)
-    # Using one-hot + sum instead of bincount - more TPU-friendly
-    # TODO: Debug with bincount to file a bug for the TorchTPU or XLA team
-    one_hot = torch.nn.functional.one_hot(topk_indices_flat.to(torch.int64),
-                                          num_classes=num_experts)
-    group_sizes = one_hot.sum(dim=0).to(torch.int32)
+    # Using scatter_add_ as it is more efficient than one_hot + sum or bincount
+    group_sizes = torch.zeros(num_experts,
+                              dtype=torch.int32,
+                              device=hidden_states.device)
+    group_sizes.scatter_add_(dim=0,
+                             index=topk_indices_flat,
+                             src=torch.ones(num_tokens * topk,
+                                            dtype=torch.int32,
+                                            device=hidden_states.device))
+    # group_sizes = torch.bincount(topk_indices_flat, minlength=num_experts).to(torch.int32)
 
     # 4. Pad input if needed
     if padded_hidden_size > hidden_size:
