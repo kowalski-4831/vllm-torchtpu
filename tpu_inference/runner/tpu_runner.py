@@ -1203,11 +1203,13 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Set TPU-specific quantization config before model loading.
         # This ensures that TPU-compatible quantization methods are used
         # instead of the default GPU-based ones (e.g., MXFP4 for MoE models).
-        if self.model_config.quantization is not None:
-            logger.info("Setting TPU quantization config for: %s",
-                        self.model_config.quantization)
-            self.vllm_config.quant_config = get_tpu_quantization_config(
-                self.vllm_config)
+        # For unquantized models (quantization=None), we still need to apply
+        # our TPU config to override vLLM's default UnquantizedFusedMoEMethod
+        # which uses torch_xla.
+        logger.info("Setting TPU quantization config for: %s",
+                    self.model_config.quantization)
+        self.vllm_config.quant_config = get_tpu_quantization_config(
+            self.vllm_config)
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
