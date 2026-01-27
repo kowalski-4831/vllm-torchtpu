@@ -5,6 +5,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+import jax
 import vllm.envs as vllm_envs
 from torch_tpu import api
 from vllm.attention.backends.abstract import AttentionType
@@ -273,7 +274,25 @@ class TPUWorker:
         raise NotImplementedError("TODO")
 
     def profile(self, is_start: bool = True):
-        raise NotImplementedError("TODO")
+        # TODO: Currently still have jax dependency. We are supposed to use
+        # torch_tpu api, but this torchtpu API only works in google3 for now. See b/470479047.
+
+        if self.profile_dir is None:
+            logger.warning("Profile directory is not set. Skipping profiling.")
+            return
+
+        if is_start:
+            logger.info(
+                f"Starting JAX profiler trace at {self.profile_dir}...")
+            options = jax.profiler.ProfileOptions()
+            # default: https://docs.jax.dev/en/latest/profiling.html#general-options
+            options.python_tracer_level = envs.PYTHON_TRACER_LEVEL
+            options.host_tracer_level = int(os.getenv("HOST_TRACER_LEVEL", 1))
+            jax.profiler.start_trace(self.profile_dir,
+                                     profiler_options=options)
+        else:
+            logger.info("Stopping JAX profiler trace...")
+            jax.profiler.stop_trace()
 
     def load_model(self) -> None:
         self.model_runner.load_model()
