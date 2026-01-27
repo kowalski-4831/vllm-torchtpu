@@ -274,17 +274,8 @@ class TPUWorker:
         raise NotImplementedError("TODO")
 
     def profile(self, is_start: bool = True):
-        # TODO: Currently still have jax dependency. We are supposed to use something like
-        # from torch_tpu._internal.profiler import _impl as profiler_impl
-        # options = profiler_impl.ProfileOptions()
-        # # Default options based on torch_tpu
-        # options.device_tracer_level = 1
-        # options.host_trace_level = 2
-        # options.enable_python_tracer = True
-        # options.host_cpu_profile = True
-        # profiler_impl.start_trace(self.profile_dir,
-        #                           profiler_options=options)
-        # But this torchtpu API only works in google3 for now. See b/470479047.
+        # TODO: Currently still have jax dependency. We are supposed to use
+        # torch_tpu api, but this torchtpu API only works in google3 for now. See b/470479047.
 
         if self.profile_dir is None:
             logger.warning("Profile directory is not set. Skipping profiling.")
