@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import functools
-
 import torch
 from torch_tpu._internal import pallas
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -45,13 +43,14 @@ def _pallas_rpa_kernel(
     query_start_loc,
     request_distribution,
     sinks,
-    *,
+    # Static args (positions 9-13) - passed directly with static_argnums
     mesh,
     q_scale,
     k_scale,
     v_scale,
     sliding_window,
 ):
+    """RPA kernel with positional static args for static_argnums support."""
     metadata = AttentionMetadata(
         input_positions=
         None,  # FIXME: kernel wrapper will have error if pass this argument
@@ -276,23 +275,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
 
-        # Prepare wrapper function with static arguments
-        wrapped_fn = functools.partial(
+        rpa_kernel = pallas.custom_jax_kernel(
             _pallas_rpa_kernel,
-            mesh=mesh,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            sliding_window=self.sliding_window,
+            name="rpa_kernel",
+            static_argnums=(9, 10, 11, 12, 13),
         )
 
-        # Create Torch operator
-        # TODO: The current wrapped_fn still depends on jax shard_map,
-        #       need to revise once we work on distributed.
-        torch_fn = pallas.custom_jax_kernel(wrapped_fn)
-
-        # Call the operator
-        new_kv_cache, outputs = torch_fn(
+        new_kv_cache, outputs = rpa_kernel(
+            # Tensor args (positions 0-8)
             kv_cache,
             query,
             key,
@@ -302,6 +292,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
             sink,
+            # Static args (positions 9-13) - cached based on values
+            mesh,
+            q_scale,
+            k_scale,
+            v_scale,
+            self.sliding_window,
         )
 
         # update kv cache
