@@ -20,7 +20,8 @@ CONFIGS=(
 )
 
 # 3. Common Args
-COMMON_ARGS=("--max-model-len" "128" "--enforce-eager")
+# COMMON_ARGS=("--max-model-len" "128" "--enforce-eager")
+COMMON_ARGS=("--max-model-len" "128") # current compile mode does not help with performance
 
 # 4. Execution Loop
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
