@@ -1064,6 +1064,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
             hidden_states = self.select_hidden_states(hidden_states,
                                                       logits_indices)
+            # breakpoint()
             logits = self.compute_logits(hidden_states)
             tpu_sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
                 self.input_batch, padded_num_reqs, self.device)
@@ -1604,15 +1605,14 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def select_hidden_states(self, hidden_states, indices_do_sample):
         return hidden_states[indices_do_sample]
 
-    # TODO: Enable this will result in garbage output.
-    # @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits(self,
                        sample_hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(sample_hidden_states)
 
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
-    # @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def sample_from_logits(
             self, logits: torch.Tensor,
             sampling_metadata: TPUSupportedSamplingMetadata) -> torch.Tensor:
@@ -1621,7 +1621,10 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         separately from `forward` for lighter compilation overhead.
         """
         if True:  # sampling_metadata.all_greedy:
-            out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+            # out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+            # NOTE(geyuhao): We use topk instead of argmax because argmax with
+            # torch.compile on TPU might produce incorrect results.
+            out_tokens = torch.topk(logits, k=1, dim=-1).indices
         else:
             out_tokens = self.sampler(logits,
                                       sampling_metadata).sampled_token_ids
