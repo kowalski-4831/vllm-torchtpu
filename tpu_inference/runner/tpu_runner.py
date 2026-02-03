@@ -1065,7 +1065,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
             hidden_states = self.select_hidden_states(hidden_states,
                                                       logits_indices)
-            # breakpoint()
+
             logits = self.compute_logits(hidden_states)
             tpu_sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
                 self.input_batch, padded_num_reqs, self.device)
