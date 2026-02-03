@@ -325,6 +325,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         total_graphs = len(stats.per_entry_stats)
         new_compiled_graphs = total_graphs - self.num_xla_graphs
         if new_compiled_graphs == 0:
+            logger.info(f"No new compiled graphs for case: {case_str}")
             return
 
         logger.info(f"Total Requests: {stats.num_cache_reqs}")
@@ -1090,6 +1091,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             combined_selected_tokens.append(selected_token_ids)
             if tpu_sampling_metadata.logprobs:
                 combined_logprobs.append(logprobs.tolists())
+
+            self._update_num_xla_graphs("decoding_step")
 
             start_index = end_index
 
