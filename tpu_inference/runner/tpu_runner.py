@@ -1601,6 +1601,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             compiled_model.compiled = False
             TorchCompileWithNoGuardsWrapper.__init__(compiled_model)
 
+    # TODO: This is still buggy when having Pallas kernels in the graph.
     # @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def forward_model(self, input_ids, positions, inputs_embeds=None):
         return self.model(input_ids=input_ids,
