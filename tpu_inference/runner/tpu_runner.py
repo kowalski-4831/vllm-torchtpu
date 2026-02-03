@@ -1057,7 +1057,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.vllm_config,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
             ), set_vllm_model_wrapper_context(mesh=self.mesh):
-                hidden_states = self.model(
+                hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
@@ -1323,9 +1323,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                     0),
                 set_vllm_model_wrapper_context(mesh=self.mesh),
         ):
-            out = self.model(input_ids=input_ids,
-                             positions=position_ids,
-                             inputs_embeds=inputs_embeds)
+            out = self.forward_model(input_ids=input_ids,
+                                     positions=position_ids,
+                                     inputs_embeds=inputs_embeds)
             sync.synchronize(out, wait=True)
         self._hidden_states_dtype = out.dtype
 
@@ -1600,6 +1600,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Reset the wrapper to re-initialize.
             compiled_model.compiled = False
             TorchCompileWithNoGuardsWrapper.__init__(compiled_model)
+
+    # @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def forward_model(self, input_ids, positions, inputs_embeds=None):
+        return self.model(input_ids=input_ids,
+                          positions=positions,
+                          inputs_embeds=inputs_embeds)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def select_hidden_states(self, hidden_states, indices_do_sample):
