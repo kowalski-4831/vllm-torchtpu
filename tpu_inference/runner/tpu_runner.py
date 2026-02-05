@@ -1063,6 +1063,10 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
+                # Synchronize to prevent hang when compiled functions consume
+                # output from eager Pallas kernels.
+                # TODO (geyuhao): Remove this once we figure out the root cause.
+                sync.synchronize(hidden_states)
             hidden_states = self.select_hidden_states(hidden_states,
                                                       logits_indices)
 
