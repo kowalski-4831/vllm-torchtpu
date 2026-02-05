@@ -57,54 +57,6 @@ from tpu_inference.logger import init_logger
 logger = init_logger(__name__)
 
 
-# =============================================================================
-# Monkey-patch FusedMoE to synchronize after each expert weight load.
-#
-# Problem: vLLM loads MoE weights by iterating through experts and calling
-# copy_() into narrow() slices. With XLA's lazy execution, this accumulates
-# a massive HLO graph of nested as_strided_inverse operations. For models
-# with many experts (e.g., Qwen3-30B with 128 experts), this graph explodes
-# to 161GB+ of HLO temps, causing OOM.
-#
-# Why GPT-OSS 20B doesn't need this: It has fewer experts (~8-16), so the
-# accumulated HLO graph stays small enough to fit in memory.
-#
-# Fix: synchronize() after each expert load forces XLA to execute the graph
-# and flush temporary buffers, preventing accumulation.
-#
-# TODO(XLA): This should ideally be fixed in the XLA compiler by either:
-# - Automatically inserting barriers when graph size exceeds a threshold
-# - Optimizing as_strided_inverse chains more efficiently
-# - Supporting in-place updates without creating new graph nodes
-# =============================================================================
-def _patch_fused_moe_weight_loading():
-    try:
-        from torch_tpu._internal.sync import synchronize
-
-        _original_load_w13 = FusedMoE._load_w13
-        _original_load_w2 = FusedMoE._load_w2
-
-        def _patched_load_w13(self, *args, **kwargs):
-            result = _original_load_w13(self, *args, **kwargs)
-            synchronize(self.w13_weight)
-            return result
-
-        def _patched_load_w2(self, *args, **kwargs):
-            result = _original_load_w2(self, *args, **kwargs)
-            synchronize(self.w2_weight)
-            return result
-
-        FusedMoE._load_w13 = _patched_load_w13
-        FusedMoE._load_w2 = _patched_load_w2
-        logger.info(
-            "Applied FusedMoE weight loading patch for TPU synchronization")
-    except Exception as e:
-        logger.warning(f"Failed to apply FusedMoE weight loading patch: {e}")
-
-
-_patch_fused_moe_weight_loading()
-
-
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
 class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
     """
