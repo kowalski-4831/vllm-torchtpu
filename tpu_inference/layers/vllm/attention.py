@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+
 import torch
 from torch_tpu._internal import pallas
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -43,14 +45,13 @@ def _pallas_rpa_kernel(
     query_start_loc,
     request_distribution,
     sinks,
-    # Static args (positions 9-13) - passed directly with static_argnums
+    *,
     mesh,
     q_scale,
     k_scale,
     v_scale,
     sliding_window,
 ):
-    """RPA kernel with positional static args for static_argnums support."""
     metadata = AttentionMetadata(
         input_positions=
         None,  # FIXME: kernel wrapper will have error if pass this argument
@@ -211,6 +212,27 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer")
 
+        self.rpa_kernel = None
+
+    def init_rpa_kernel(self, q_scale: float, k_scale: float, v_scale: float):
+        ctx = get_vllm_model_wrapper_context()
+        mesh = ctx.mesh
+
+        # Prepare wrapper function with static arguments
+        wrapped_fn = functools.partial(
+            _pallas_rpa_kernel,
+            mesh=mesh,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sliding_window=self.sliding_window,
+        )
+
+        # Create Torch operator
+        # TODO: The current wrapped_fn still depends on jax shard_map,
+        #       need to revise once we work on distributed.
+        self.rpa_kernel = pallas.custom_jax_kernel(wrapped_fn)
+
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""
         if self.sinks is not None:
@@ -271,18 +293,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         key = key.view(k_len, self.num_kv_heads, self.head_size)
         value = value.view(k_len, self.num_kv_heads, self.head_size)
 
-        # Get mesh from global context (set by TPUModelRunner)
-        ctx = get_vllm_model_wrapper_context()
-        mesh = ctx.mesh
+        if self.rpa_kernel is None:
+            self.init_rpa_kernel(q_scale, k_scale, v_scale)
 
-        rpa_kernel = pallas.custom_jax_kernel(
-            _pallas_rpa_kernel,
-            name="rpa_kernel",
-            static_argnums=(9, 10, 11, 12, 13),
-        )
-
-        new_kv_cache, outputs = rpa_kernel(
-            # Tensor args (positions 0-8)
+        # Call the operator
+        new_kv_cache, outputs = self.rpa_kernel(
             kv_cache,
             query,
             key,
@@ -292,12 +307,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
             sink,
-            # Static args (positions 9-13) - cached based on values
-            mesh,
-            q_scale,
-            k_scale,
-            v_scale,
-            self.sliding_window,
         )
 
         # update kv cache

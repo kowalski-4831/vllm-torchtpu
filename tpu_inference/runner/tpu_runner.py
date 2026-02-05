@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import bisect
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
@@ -12,6 +13,7 @@ import vllm.envs as envs
 # TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from torch_tpu import api
+from torch_tpu._internal import sync
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention, MLAAttention
 from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
@@ -132,6 +134,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.use_spmd = envs.VLLM_XLA_USE_SPMD
 
         self.enforce_eager = model_config.enforce_eager
+
+        self.num_xla_graphs = 0
+        self._update_num_xla_graphs("init")
+        # TODO: this is a temp fix as we don't support SymInt in torchTPU
+        torch._dynamo.config.cache_size_limit = 1024
 
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
@@ -308,6 +315,37 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def reset_mm_cache(self) -> None:
         pass
+
+    def _update_num_xla_graphs(self, case_str):
+        check_comp = self.check_recompilation and not self.enforce_eager
+        if not check_comp:
+            return
+
+        stats = torch.tpu._get_cache_stats()
+        total_graphs = len(stats.per_entry_stats)
+        new_compiled_graphs = total_graphs - self.num_xla_graphs
+        if new_compiled_graphs == 0:
+            logger.info(f"No new compiled graphs for case: {case_str}")
+            return
+
+        logger.info(f"Total Requests: {stats.num_cache_reqs}")
+        logger.info(f"Total Hits: {stats.num_cache_hits}")
+        logger.info(
+            f"Total number of cached graphs: {total_graphs}, new: {new_compiled_graphs}, case: {case_str}"
+        )
+        self.num_xla_graphs += new_compiled_graphs
+
+    def _verify_num_xla_graphs(self, case_str):
+        check_comp = self.check_recompilation and not self.enforce_eager
+        if not check_comp:
+            return
+
+        stats = torch.tpu._get_cache_stats()
+        curr_cached_graph = len(stats.per_entry_stats)
+        assert self.num_xla_graphs == curr_cached_graph, (
+            "Recompilation after warm up is detected during {}."
+            " num_xla_graphs = {} curr_cached_graph = {}".format(
+                case_str, self.num_xla_graphs, curr_cached_graph))
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> bool:
         """Update the cached states and the persistent batch with the scheduler
@@ -1020,13 +1058,14 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.vllm_config,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
             ), set_vllm_model_wrapper_context(mesh=self.mesh):
-                hidden_states = self.model(
+                hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
             hidden_states = self.select_hidden_states(hidden_states,
                                                       logits_indices)
+
             logits = self.compute_logits(hidden_states)
             tpu_sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
                 self.input_batch, padded_num_reqs, self.device)
@@ -1052,6 +1091,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             combined_selected_tokens.append(selected_token_ids)
             if tpu_sampling_metadata.logprobs:
                 combined_logprobs.append(logprobs.tolists())
+
+            self._update_num_xla_graphs("decoding_step")
 
             start_index = end_index
 
@@ -1255,7 +1296,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             [0, actual_num_reqs, actual_num_reqs],
             dtype=torch.int32).to(self.device)
         attn_metadata = AttentionMetadata(
-            input_positions=self.position_ids,
+            input_positions=position_ids,
             block_tables=block_tables.flatten(),
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
@@ -1285,9 +1326,10 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                     0),
                 set_vllm_model_wrapper_context(mesh=self.mesh),
         ):
-            out = self.model(input_ids=input_ids,
-                             positions=position_ids,
-                             inputs_embeds=inputs_embeds)
+            out = self.forward_model(input_ids=input_ids,
+                                     positions=position_ids,
+                                     inputs_embeds=inputs_embeds)
+            sync.synchronize(out, wait=True)
         self._hidden_states_dtype = out.dtype
 
     def _set_active_loras(self, prompt_lora_mapping, token_lora_mapping,
@@ -1295,12 +1337,145 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         super()._set_active_loras(prompt_lora_mapping, token_lora_mapping,
                                   lora_requests)
 
+    def _precompile_backbone(self) -> None:
+        logger.info("Compiling the model with different input shapes.")
+        start = time.perf_counter()
+        for num_tokens in self.num_tokens_paddings:
+            logger.info("  -- num_tokens: %d", num_tokens)
+            self._dummy_run(num_tokens, self.num_reqs_max_model_len,
+                            self.max_num_blocks_per_req)
+            if self.most_model_len is not None:
+                self._dummy_run(
+                    num_tokens,
+                    self.num_reqs_most_model_len,
+                    self.num_blocks_per_most_len_req,
+                )
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("model backbone")
+
+    def _precompile_select_hidden_states(self) -> None:
+        logger.info(
+            "Compiling select_hidden_states with different input shapes.")
+        start = time.perf_counter()
+        hsize = self.model_config.get_hidden_size()
+        for num_tokens in self.num_tokens_paddings:
+            dummy_hidden = torch.zeros((num_tokens, hsize),
+                                       device=self.device,
+                                       dtype=self._hidden_states_dtype)
+            for num_reqs in self.num_reqs_paddings:
+                indices = torch.zeros(num_reqs,
+                                      dtype=torch.int32,
+                                      device=self.device)
+                out = self.select_hidden_states(dummy_hidden, indices)
+                sync.synchronize(out, wait=True)
+                logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens,
+                            num_reqs)
+                if num_reqs >= min(num_tokens, self.max_num_reqs):
+                    break
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("select_hidden_states")
+
+    def _precompile_compute_logits(self) -> None:
+        logger.info("Compiling compute_logits with different input shapes.")
+        start = time.perf_counter()
+        hsize = self.model_config.get_hidden_size()
+        for num_reqs in self.num_reqs_paddings:
+            dummy_hidden = torch.zeros((num_reqs, hsize),
+                                       device=self.device,
+                                       dtype=self._hidden_states_dtype)
+            out = self.compute_logits(dummy_hidden)
+            sync.synchronize(out, wait=True)
+            logger.info("  -- num_seqs: %d", num_reqs)
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("compute_logits")
+
+    def _precompile_structured_decoding(self) -> None:
+        logger.info(
+            "Compiling structured_decoding with different input shapes.")
+        start = time.perf_counter()
+        for num_reqs in self.num_reqs_paddings:
+            dummy_logits = torch.zeros(
+                (num_reqs, self.vocab_size),
+                device=self.device,
+                dtype=self._hidden_states_dtype,
+            )
+            dummy_require_struct_decoding = self.require_structured_out_cpu[:num_reqs].to(
+                self.device)
+            dummy_grammar_bitmask = self.grammar_bitmask_cpu[:num_reqs].to(
+                self.device)
+            arange = self.structured_decode_arange.to(self.device)
+            out = self.structured_decode(
+                dummy_require_struct_decoding,
+                dummy_grammar_bitmask,
+                dummy_logits,
+                arange,
+            )
+            sync.synchronize(out, wait=True)
+            logger.info("  -- num_seqs: %d", num_reqs)
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("structured_decoding")
+
+    def _precompile_sample_from_logits(self) -> None:
+        logger.info(
+            "Compiling sample_from_logits with different input shapes.")
+        start = time.perf_counter()
+        for num_reqs in self.num_reqs_paddings:
+            dummy_logits = torch.zeros(
+                (num_reqs, self.vocab_size),
+                device=self.device,
+                dtype=self._hidden_states_dtype,
+            )
+            padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
+                num_reqs, self.max_num_reqs)
+
+            # NOTE: We only support all_greedy=True path in sample_from_logits currently
+            # but we compile it anyway.
+            sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
+                self.input_batch, padded_num_reqs, self.device)
+
+            out = self.sample_from_logits_func(dummy_logits, sampling_metadata)
+            sync.synchronize(out, wait=True)
+            logger.info("  -- num_seqs: %d", num_reqs)
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("sample_from_logits")
+
+    def _precompile_gather_logprobs(self) -> None:
+        logger.info("Compiling gather_logprobs with different input shapes.")
+        start = time.perf_counter()
+        for num_reqs in self.num_reqs_paddings:
+            dummy_logits = torch.zeros(
+                (num_reqs, self.vocab_size),
+                device=self.device,
+                dtype=self._hidden_states_dtype,
+            )
+            dummy_tokens = torch.zeros((num_reqs, 1),
+                                       dtype=torch.int64).to(self.device)
+            out = self.gather_logprobs(dummy_logits, dummy_tokens)
+            sync.synchronize(out.logprobs, wait=True)
+            logger.info("  -- num_seqs: %d", num_reqs)
+        end = time.perf_counter()
+        logger.info("Compilation finished in %.2f [secs].", end - start)
+        self._update_num_xla_graphs("gather_logprobs")
+
     def capture_model(self) -> None:
         """
         Precompile all the subgraphs with possible input shapes.
         """
-        # TODO: precompile properly
-        return None
+        if self.enforce_eager:
+            return
+
+        with self.maybe_setup_dummy_loras(self.lora_config):
+            self._precompile_backbone()
+            self._precompile_select_hidden_states()
+            self._precompile_compute_logits()
+            self._precompile_structured_decoding()
+            self._precompile_sample_from_logits()
+            self._precompile_gather_logprobs()
 
     def profile_run(
         self,
@@ -1429,18 +1604,25 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             compiled_model.compiled = False
             TorchCompileWithNoGuardsWrapper.__init__(compiled_model)
 
-    # @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    # TODO: This is still buggy when having Pallas kernels in the graph.
+    # @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def forward_model(self, input_ids, positions, inputs_embeds=None):
+        return self.model(input_ids=input_ids,
+                          positions=positions,
+                          inputs_embeds=inputs_embeds)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def select_hidden_states(self, hidden_states, indices_do_sample):
         return hidden_states[indices_do_sample]
 
-    # @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits(self,
                        sample_hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(sample_hidden_states)
 
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
-    # @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def sample_from_logits(
             self, logits: torch.Tensor,
             sampling_metadata: TPUSupportedSamplingMetadata) -> torch.Tensor:
@@ -1449,13 +1631,16 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         separately from `forward` for lighter compilation overhead.
         """
         if True:  # sampling_metadata.all_greedy:
-            out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+            # out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+            # NOTE(geyuhao): We use topk instead of argmax because argmax with
+            # torch.compile on TPU might produce incorrect results.
+            out_tokens = torch.topk(logits, k=1, dim=-1).indices
         else:
             out_tokens = self.sampler(logits,
                                       sampling_metadata).sampled_token_ids
         return out_tokens
 
-    # @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def gather_logprobs(self, logits: torch.Tensor,
                         sampled_tokens: torch.Tensor) -> LogprobsTensors:
         """
@@ -1470,7 +1655,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             token_ids=sampled_tokens.squeeze(-1),
         )
 
-    # @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def structured_decode(
         self,
         require_struct_decoding: torch.Tensor,
