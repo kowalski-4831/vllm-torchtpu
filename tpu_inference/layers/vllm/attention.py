@@ -234,9 +234,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
         wrapped_fn = functools.partial(
             _pallas_rpa_kernel,
             mesh=mesh,
-            q_scale=None,  # TODO: Pass the scale factor
-            k_scale=None,  # TODO: Pass the scale factor
-            v_scale=None,  # TODO: Pass the scale factor
             sliding_window=self.sliding_window,
         )
 
@@ -247,16 +244,27 @@ class PallasAttentionBackendImpl(AttentionImpl):
             mutates_args=(),
             schema="(Tensor kv_cache, Tensor query, Tensor key, Tensor value, "
             "Tensor seq_lens, Tensor block_tables, Tensor query_start_loc, "
-            "Tensor request_distribution, Tensor? sinks) -> (Tensor, Tensor)",
+            "Tensor request_distribution, Tensor? sinks, float? q_scale, "
+            "float? k_scale, float? v_scale) -> (Tensor, Tensor)",
             device_types=["tpu"],
         )
         @pallas.custom_jax_kernel
         def rpa_kernel_impl(kv_cache, query, key, value, seq_lens,
                             block_tables, query_start_loc,
-                            request_distribution, sinks):
-            return wrapped_fn(kv_cache, query, key, value, seq_lens,
-                              block_tables, query_start_loc,
-                              request_distribution, sinks)
+                            request_distribution, sinks, q_scale, k_scale,
+                            v_scale):
+            return wrapped_fn(kv_cache,
+                              query,
+                              key,
+                              value,
+                              seq_lens,
+                              block_tables,
+                              query_start_loc,
+                              request_distribution,
+                              sinks,
+                              q_scale=q_scale,
+                              k_scale=k_scale,
+                              v_scale=v_scale)
 
         # Register fake tensor implementation for torch.compile tracing
         def _fake_rpa_kernel(
@@ -269,6 +277,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
             sinks: torch.Tensor | None = None,
+            q_scale: float | None = None,
+            k_scale: float | None = None,
+            v_scale: float | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             return kv_cache, torch.empty_like(query)
 
@@ -328,7 +339,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         assert q_compute_dim == self.head_size * self.num_heads
         assert k_compute_dim == self.head_size * self.num_kv_heads
 
-        # q_scale = k_scale = v_scale = None
+        q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype:
             raise NotImplementedError(
                 "Quantized KV cache is not supported for PallasAttentionBackendImpl"
@@ -350,6 +361,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
             sink,
+            q_scale,
+            k_scale,
+            v_scale,
         )
 
         # update kv cache
