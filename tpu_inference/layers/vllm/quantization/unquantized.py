@@ -50,7 +50,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 
 from tpu_inference.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
-from tpu_inference.layers.vllm.fused_moe import fused_moe_gmm
+from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 prebuild_fused_moe_kernel)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -198,6 +199,12 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         logger.info_once(
             "Unquantized weights transposed for GMM kernel: "
             f"w13={list(layer.w13_weight.shape)}, w2={list(layer.w2_weight.shape)}"
+        )
+        prebuild_fused_moe_kernel(
+            topk=layer.moe_config.experts_per_token,
+            renormalize=layer.renormalize,
+            activation=layer.activation,
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
 
     def apply(
