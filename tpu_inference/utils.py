@@ -2,10 +2,11 @@
 import time
 from collections import defaultdict
 from functools import wraps
-from typing import Any, Callable, List, Tuple
+from typing import Any, Callable, List, Tuple, Union
 
 import jax
 from jax._src import dtypes
+from jax.sharding import Mesh
 from vllm import envs as vllm_envs
 from vllm import utils
 
@@ -95,6 +96,36 @@ def get_device_name(num_devices: int | None = None):
     if num_devices is not None:
         kind += f'-{num_devices}'
     return kind
+
+
+def get_mesh_shape_product(
+    mesh: Mesh,
+    axes: Union[str, list[str], None],
+) -> int:
+    """
+    Get the product of mesh dimensions for one or more axes.
+
+    Examples:
+        # Single axis (defaults to 1 if not present)
+        get_mesh_shape_product(mesh, "model")
+
+        # Multiple axes - computes product of their sizes
+        get_mesh_shape_product(mesh, ["model", "attn_dp"])
+
+        # None means no sharding on this dimension
+        get_mesh_shape_product(mesh, None)  # returns 1
+    """
+    if axes is None:
+        return 1
+
+    if isinstance(axes, str):
+        axes = [axes]
+
+    product = 1
+    for axis in axes:
+        product *= mesh.shape.get(axis, 1)
+
+    return product
 
 
 def get_device_hbm_limit() -> int:

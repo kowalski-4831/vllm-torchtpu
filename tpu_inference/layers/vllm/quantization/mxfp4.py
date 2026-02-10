@@ -68,7 +68,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 from tpu_inference.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from tpu_inference.layers.common.quantization import dequantize_mxfp4_packed
-from tpu_inference.layers.vllm.fused_moe_torch import fused_moe_gmm
+from tpu_inference.layers.vllm.fused_moe import fused_moe_gmm
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -285,4 +285,5 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             renormalize=layer.renormalize,
             activation=layer.activation,
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
