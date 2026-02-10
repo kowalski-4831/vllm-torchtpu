@@ -545,7 +545,8 @@ def get_vmem_estimate_bytes(
         2 * m_per_device * k * dtypes.itemsize_bits(x_dtype) //
         8  # x_vmem_scratch_ref
         + y_vmem_bytes  # y_vmem_scratch_ref
-        + 2 * m * bn * dtypes.itemsize_bits(out_dtype) // 8  # o_vmem_scratch_ref
+        +
+        2 * m * bn * dtypes.itemsize_bits(out_dtype) // 8  # o_vmem_scratch_ref
         + acc_bytes  # acc_vmem_scratch_ref, jnp.float32
     )
     return total_bytes
