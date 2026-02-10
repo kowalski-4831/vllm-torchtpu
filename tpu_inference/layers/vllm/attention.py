@@ -45,16 +45,16 @@ def _pallas_rpa_kernel(
     query_start_loc,
     request_distribution,
     sinks,
-    *,
-    mesh,
     q_scale,
     k_scale,
     v_scale,
+    *,
+    mesh,
     sliding_window,
 ):
     metadata = AttentionMetadata(
         input_positions=
-        None,  # FIXME: kernel wrapper will have error if pass this argument
+        None,  # NOTE: vLLM applies RoPE before attention, so input_positions is not consumed here.
         block_tables=block_tables,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
@@ -169,6 +169,7 @@ class PallasAttentionBackend(AttentionBackend):
 
 
 class PallasAttentionBackendImpl(AttentionImpl):
+    _kernel_instance_counter = 0
 
     def __init__(
         self,
@@ -213,11 +214,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer")
 
-        self.rpa_kernel = None
-        if self.rpa_kernel is None:
-            self.rpa_kernel = self._build_rpa_kernel()
+        # NOTE: build the per-instance custom op during init so compile-mode
+        # forward does not execute Python-side op registration logic.
+        self.rpa_kernel = self._build_rpa_kernel()
+
+    @classmethod
+    def _allocate_kernel_instance_id(cls) -> int:
+        kernel_instance_id = cls._kernel_instance_counter
+        cls._kernel_instance_counter += 1
+        return kernel_instance_id
 
     def _build_rpa_kernel(self):
+        kernel_instance_id = type(self)._allocate_kernel_instance_id()
+        op_name = f"pallas::rpa_kernel_{kernel_instance_id}"
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
 
@@ -234,7 +243,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Register as a custom op to mark it as an op boundary in Dynamo.
         # This prevents torch.compile from tracing into the Pallas kernel internals.
         @torch.library.custom_op(
-            "pallas::rpa_kernel",
+            op_name,
             mutates_args=(),
             schema="(Tensor kv_cache, Tensor query, Tensor key, Tensor value, "
             "Tensor seq_lens, Tensor block_tables, Tensor query_start_loc, "
