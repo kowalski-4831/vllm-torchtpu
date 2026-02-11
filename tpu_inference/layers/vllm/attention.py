@@ -214,8 +214,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "heads in the layer")
 
         self.rpa_kernel = None
+        if self.rpa_kernel is None:
+            self.rpa_kernel = self._build_rpa_kernel()
 
-    def init_rpa_kernel(self, q_scale: float, k_scale: float, v_scale: float):
+    def _build_rpa_kernel(self):
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
 
@@ -223,16 +225,47 @@ class PallasAttentionBackendImpl(AttentionImpl):
         wrapped_fn = functools.partial(
             _pallas_rpa_kernel,
             mesh=mesh,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
+            q_scale=None,  # TODO: Pass the scale factor
+            k_scale=None,  # TODO: Pass the scale factor
+            v_scale=None,  # TODO: Pass the scale factor
             sliding_window=self.sliding_window,
         )
 
-        # Create Torch operator
-        # TODO: The current wrapped_fn still depends on jax shard_map,
-        #       need to revise once we work on distributed.
-        self.rpa_kernel = pallas.custom_jax_kernel(wrapped_fn)
+        # Register as a custom op to mark it as an op boundary in Dynamo.
+        # This prevents torch.compile from tracing into the Pallas kernel internals.
+        @torch.library.custom_op(
+            "pallas::rpa_kernel",
+            mutates_args=(),
+            schema="(Tensor kv_cache, Tensor query, Tensor key, Tensor value, "
+            "Tensor seq_lens, Tensor block_tables, Tensor query_start_loc, "
+            "Tensor request_distribution, Tensor? sinks) -> (Tensor, Tensor)",
+            device_types=["tpu"],
+        )
+        @pallas.custom_jax_kernel
+        def rpa_kernel_impl(kv_cache, query, key, value, seq_lens,
+                            block_tables, query_start_loc,
+                            request_distribution, sinks):
+            return wrapped_fn(kv_cache, query, key, value, seq_lens,
+                              block_tables, query_start_loc,
+                              request_distribution, sinks)
+
+        # Register fake tensor implementation for torch.compile tracing
+        def _fake_rpa_kernel(
+            kv_cache: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+            sinks: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return kv_cache, torch.empty_like(query)
+
+        rpa_kernel_impl.register_fake(_fake_rpa_kernel)
+
+        return rpa_kernel_impl
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""
@@ -286,7 +319,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         assert q_compute_dim == self.head_size * self.num_heads
         assert k_compute_dim == self.head_size * self.num_kv_heads
 
-        q_scale = k_scale = v_scale = None
+        # q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype:
             raise NotImplementedError(
                 "Quantized KV cache is not supported for PallasAttentionBackendImpl"
@@ -296,12 +329,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
         query = query.view(q_len, self.num_heads, self.head_size)
         key = key.view(k_len, self.num_kv_heads, self.head_size)
         value = value.view(k_len, self.num_kv_heads, self.head_size)
-
-        if self.rpa_kernel is None:
-            self.init_rpa_kernel(q_scale, k_scale, v_scale)
-
-        # Mark kv_cache avaliable for donation
-        pallas.set_buffer_donor_(kv_cache, True)
 
         # Call the operator
         new_kv_cache, outputs = self.rpa_kernel(
@@ -320,6 +347,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         kv_cache.copy_(new_kv_cache)
 
         # TODO (geyuhao) ideally we don't want this
-        sync.synchronize(kv_cache)
+        if not torch.compiler.is_compiling():
+            sync.synchronize(kv_cache)
 
         return outputs.reshape(q_len, self.num_heads * self.head_size)
