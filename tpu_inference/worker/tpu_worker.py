@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple
 
 import vllm.envs as vllm_envs
 from torch_tpu import api
+from torch_tpu._internal.profiler import profiler_api
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention, MLAAttention
 from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
@@ -23,8 +24,6 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MLAAttentionSpec,
                                         SlidingWindowSpec)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-
-from torch_tpu._internal.profiler import profiler_api
 
 from tpu_inference import envs, utils
 from tpu_inference.distributed import jax_parallel_state
