@@ -37,6 +37,7 @@ and uses our native TorchTPU + Pallas kernels.
 from typing import Any, Optional
 
 import torch
+from torch_tpu._internal import sync
 from vllm.attention.layer import Attention
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import (
@@ -169,8 +170,12 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         # Transpose: [E, out_dim, in_dim] → [E, in_dim, out_dim]
         # GMM kernel expects contracting dim on axis 1
-        w13_weight = w13_weight.transpose(1, 2)  # [E, hidden, 2*intermediate]
-        w2_weight = w2_weight.transpose(1, 2)  # [E, intermediate, hidden]
+        # Keep weights contiguous after transpose. A non-contiguous parameter view
+        # can trigger large as_strided/copy_from_as_strided_inverse graphs later.
+        w13_weight = w13_weight.transpose(
+            1, 2).contiguous()  # [E, hidden, 2*intermediate]
+        w2_weight = w2_weight.transpose(
+            1, 2).contiguous()  # [E, intermediate, hidden]
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
@@ -195,6 +200,18 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w2_bias.unsqueeze(1).to(torch.float32),
                 requires_grad=False,
             )
+
+        # TorchTPU can defer large copy_/as_strided_inverse materializations
+        # from the swigluoai de-interleaving path. Force materialization now so
+        # it does not first execute later during token sampling host copies.
+        if layer.w13_weight.device.type == "tpu":
+            # Synchronize one tensor at a time to avoid creating large combined
+            # sync graphs spanning many layers.
+            sync.synchronize(layer.w13_weight, wait=True)
+            sync.synchronize(layer.w2_weight, wait=True)
+            if self.moe.has_bias:
+                sync.synchronize(layer.w13_bias, wait=True)
+                sync.synchronize(layer.w2_bias, wait=True)
 
         logger.info_once(
             "Unquantized weights transposed for GMM kernel: "
