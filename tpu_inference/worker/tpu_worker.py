@@ -5,9 +5,9 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
-import jax
 import vllm.envs as vllm_envs
 from torch_tpu import api
+from torch_tpu._internal.profiler import profiler_api
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention, MLAAttention
 from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
@@ -103,6 +103,7 @@ class TPUWorker:
         # TPU Worker is initialized. The profiler server needs to start after
         # MP runtime is initialized.
         self.profile_dir = None
+        self.profile_context = None
         if (vllm_envs.VLLM_TORCH_PROFILER_DIR and self.rank < 1
                 and self.pp_config.pp_world_size == 1):
             if not self.devices or 0 in self.device_ranks:
@@ -274,25 +275,29 @@ class TPUWorker:
         raise NotImplementedError("TODO")
 
     def profile(self, is_start: bool = True):
-        # TODO: Currently still have jax dependency. We are supposed to use
-        # torch_tpu api, but this torchtpu API only works in google3 for now. See b/470479047.
-
         if self.profile_dir is None:
             logger.warning("Profile directory is not set. Skipping profiling.")
             return
 
         if is_start:
             logger.info(
-                f"Starting JAX profiler trace at {self.profile_dir}...")
-            options = jax.profiler.ProfileOptions()
-            # default: https://docs.jax.dev/en/latest/profiling.html#general-options
-            options.python_tracer_level = envs.PYTHON_TRACER_LEVEL
-            options.host_tracer_level = int(os.getenv("HOST_TRACER_LEVEL", 1))
-            jax.profiler.start_trace(self.profile_dir,
-                                     profiler_options=options)
+                f"Starting TorchTPU profiler trace at {self.profile_dir}...")
+            handler = profiler_api.xprof_trace_handler(
+                dir_name=self.profile_dir)
+            self.profile_context = profiler_api.profile(activities=[
+                profiler_api.ProfilerActivity.CPU,
+                profiler_api.ProfilerActivity.TPU
+            ],
+                                                        on_trace_ready=handler)
+            self.profile_context.__enter__()
         else:
-            logger.info("Stopping JAX profiler trace...")
-            jax.profiler.stop_trace()
+            if self.profile_context is not None:
+                logger.info("Stopping TorchTPU profiler trace...")
+                self.profile_context.__exit__(None, None, None)
+                logger.info(f"Profiler trace saved to {self.profile_dir}")
+            else:
+                logger.warning(
+                    "Profiler context is not set. Cannot stop profiler.")
 
     def load_model(self) -> None:
         self.model_runner.load_model()
