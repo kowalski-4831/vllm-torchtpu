@@ -1,0 +1,56 @@
+# CI - Nightly Build
+name: CI - Nightly Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      halt-for-connection:
+        description: 'Should this workflow run wait for a remote connection?'
+        type: choice
+        default: 'no'
+        options:
+          - 'yes'
+          - 'no'
+      VERSION:
+        description: 'Use this to override the version set in `VLLM_VERSION_OVERRIDE`'
+        type: string
+        default: ''
+  schedule:
+      - cron: '0 8 * * *' # 8 AM UTC / 12 AM PST
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    defaults:
+      run:
+        shell: bash
+
+    runs-on: linux-x86-n2-16
+    container: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
+    name: Build wheel
+
+    steps:
+    - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+    - name: Mark git directory as safe
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+    - name: Determine Version
+      id: vars
+      env:
+        GH_EVENT_NAME: ${{ github.event_name }}
+        GH_REF_NAME: ${{ github.ref_name }}
+        GH_REF: ${{ github.ref }}
+      run: bash .github/scripts/determine_release_vars.sh
+    - name: Install dependencies (build)
+      run:
+        python3 -m pip install build
+    # Halt for testing
+    - name: Wait For Connection
+      uses: google-ml-infra/actions/ci_connection@7f5ca0c263a81ed09ea276524c1b9192f1304e3c
+      with:
+        halt-dispatch-input: ${{ inputs.halt-for-connection }}
+    - name: Build package (sdist and wheel)
+      env:
+        VLLM_VERSION_OVERRIDE: ${{ inputs.VERSION }}
+      run: python3 -m build
