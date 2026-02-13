@@ -300,8 +300,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if self.rpa_kernel is None:
             self.init_rpa_kernel(q_scale, k_scale, v_scale)
 
-        # Mark kv_cache avaliable for donation
-        pallas.set_buffer_donor_(kv_cache, True)
+        # TODO (geyuhao) the support of this API is pending discussion. 
+        # This line will only influence performance, not functionality
+        # # Mark kv_cache avaliable for donation
+        # pallas.set_buffer_donor_(kv_cache, True)
 
         # Call the operator
         new_kv_cache, outputs = self.rpa_kernel(
