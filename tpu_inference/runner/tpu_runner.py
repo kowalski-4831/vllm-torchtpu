@@ -13,7 +13,7 @@ import vllm.envs as envs
 # TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from torch_tpu import api
-from torch_tpu._internal import sync
+from torch_tpu._internal import pallas, sync
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention, MLAAttention
 from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
@@ -1255,8 +1255,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
-        model = model_loader.load_model(vllm_config=self.vllm_config,
-                                        model_config=self.model_config)
+        with set_vllm_model_wrapper_context(mesh=self.mesh):
+            model = model_loader.load_model(vllm_config=self.vllm_config,
+                                            model_config=self.model_config)
         self.model = model
         self.sampler = TPUSampler()
 
@@ -1568,6 +1569,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Set up cross-layer KV cache sharing if needed
         self.maybe_setup_cross_layer_kv_sharing(kv_caches, kv_cache_config)
 
+        # Mark KV cache buffers as donation candidates outside torch.compile
+        # regions to avoid Dynamo tracing through pybind calls.
+        for kv_cache in kv_caches.values():
+            pallas.set_buffer_donor_(kv_cache, True)
+
         # Reset kv_caches list (bind_kv_cache expects empty list)
         self.kv_caches = []
 
@@ -1605,8 +1611,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             compiled_model.compiled = False
             TorchCompileWithNoGuardsWrapper.__init__(compiled_model)
 
-    # TODO: This is still buggy when having Pallas kernels in the graph.
-    # @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def forward_model(self, input_ids, positions, inputs_embeds=None):
         return self.model(input_ids=input_ids,
                           positions=positions,

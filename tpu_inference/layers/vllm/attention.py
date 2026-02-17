@@ -45,16 +45,16 @@ def _pallas_rpa_kernel(
     query_start_loc,
     request_distribution,
     sinks,
-    *,
-    mesh,
     q_scale,
     k_scale,
     v_scale,
+    *,
+    mesh,
     sliding_window,
 ):
     metadata = AttentionMetadata(
         input_positions=
-        None,  # FIXME: kernel wrapper will have error if pass this argument
+        None,  # NOTE: vLLM applies RoPE before attention, so input_positions is not consumed here.
         block_tables=block_tables,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
@@ -169,6 +169,7 @@ class PallasAttentionBackend(AttentionBackend):
 
 
 class PallasAttentionBackendImpl(AttentionImpl):
+    _kernel_instance_counter = 0
 
     def __init__(
         self,
@@ -213,9 +214,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer")
 
-        self.rpa_kernel = None
+        # NOTE: build the per-instance custom op during init so compile-mode
+        # forward does not execute Python-side op registration logic.
+        self.rpa_kernel = self._build_rpa_kernel()
 
-    def init_rpa_kernel(self, q_scale: float, k_scale: float, v_scale: float):
+    @classmethod
+    def _allocate_kernel_instance_id(cls) -> int:
+        kernel_instance_id = cls._kernel_instance_counter
+        cls._kernel_instance_counter += 1
+        return kernel_instance_id
+
+    def _build_rpa_kernel(self):
+        kernel_instance_id = type(self)._allocate_kernel_instance_id()
+        op_name = f"pallas::rpa_kernel_{kernel_instance_id}"
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
 
@@ -223,16 +234,58 @@ class PallasAttentionBackendImpl(AttentionImpl):
         wrapped_fn = functools.partial(
             _pallas_rpa_kernel,
             mesh=mesh,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
             sliding_window=self.sliding_window,
         )
 
-        # Create Torch operator
-        # TODO: The current wrapped_fn still depends on jax shard_map,
-        #       need to revise once we work on distributed.
-        self.rpa_kernel = pallas.custom_jax_kernel(wrapped_fn)
+        # Register as a custom op to mark it as an op boundary in Dynamo.
+        # This prevents torch.compile from tracing into the Pallas kernel internals.
+        @torch.library.custom_op(
+            op_name,
+            mutates_args=(),
+            schema="(Tensor kv_cache, Tensor query, Tensor key, Tensor value, "
+            "Tensor seq_lens, Tensor block_tables, Tensor query_start_loc, "
+            "Tensor request_distribution, Tensor? sinks, float? q_scale, "
+            "float? k_scale, float? v_scale) -> (Tensor, Tensor)",
+            device_types=["tpu"],
+        )
+        @pallas.custom_jax_kernel
+        def rpa_kernel_impl(kv_cache, query, key, value, seq_lens,
+                            block_tables, query_start_loc,
+                            request_distribution, sinks, q_scale, k_scale,
+                            v_scale):
+            return wrapped_fn(kv_cache,
+                              query,
+                              key,
+                              value,
+                              seq_lens,
+                              block_tables,
+                              query_start_loc,
+                              request_distribution,
+                              sinks,
+                              q_scale=q_scale,
+                              k_scale=k_scale,
+                              v_scale=v_scale)
+
+        # Register fake tensor implementation for torch.compile tracing
+        def _fake_rpa_kernel(
+            kv_cache: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+            sinks: torch.Tensor | None = None,
+            q_scale: float | None = None,
+            k_scale: float | None = None,
+            v_scale: float | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return kv_cache, torch.empty_like(query)
+
+        rpa_kernel_impl.register_fake(_fake_rpa_kernel)
+
+        return rpa_kernel_impl
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""
@@ -316,12 +369,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
             sink,
+            q_scale,
+            k_scale,
+            v_scale,
         )
 
         # update kv cache
         kv_cache.copy_(new_kv_cache)
 
         # TODO (geyuhao) ideally we don't want this
-        sync.synchronize(kv_cache)
+        if not torch.compiler.is_compiling():
+            sync.synchronize(kv_cache)
 
         return outputs.reshape(q_len, self.num_heads * self.head_size)
