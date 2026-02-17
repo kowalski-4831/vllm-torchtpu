@@ -13,7 +13,7 @@ import vllm.envs as envs
 # TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from torch_tpu import api
-from torch_tpu._internal import pallas, sync
+from torch_tpu._internal import sync
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention, MLAAttention
 from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
@@ -1571,8 +1571,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Mark KV cache buffers as donation candidates outside torch.compile
         # regions to avoid Dynamo tracing through pybind calls.
-        for kv_cache in kv_caches.values():
-            pallas.set_buffer_donor_(kv_cache, True)
+        # TODO(geyuhao): Comment out for now as TorchTPU does not support this right now
+        # for kv_cache in kv_caches.values():
+        #     pallas.set_buffer_donor_(kv_cache, True)
 
         # Reset kv_caches list (bind_kv_cache expects empty list)
         self.kv_caches = []
