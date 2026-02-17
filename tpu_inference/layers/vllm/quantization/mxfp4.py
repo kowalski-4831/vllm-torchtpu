@@ -48,6 +48,7 @@ scaling.
 from typing import Optional
 
 import torch
+from torch_tpu._internal import sync
 from vllm.attention.layer import Attention
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
@@ -68,7 +69,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 from tpu_inference.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from tpu_inference.layers.common.quantization import dequantize_mxfp4_packed
-from tpu_inference.layers.vllm.fused_moe import fused_moe_gmm
+from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 prebuild_fused_moe_kernel)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -211,9 +213,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w13_weight = torch.cat([w1_weight, w3_weight], dim=1)
 
         # 3. Transpose: [E, out_dim, in_dim] → [E, in_dim, out_dim]
-        # GMM kernel expects contracting dim on axis 1
-        w13_weight = w13_weight.transpose(1, 2)  # [E, hidden, 2*intermediate]
-        w2_weight = w2_weight.transpose(1, 2)  # [E, intermediate, hidden]
+        # Keep weights contiguous after transpose. Non-contiguous parameter views
+        # can trigger large as_strided/copy_from_as_strided_inverse graphs.
+        w13_weight = w13_weight.transpose(
+            1, 2).contiguous()  # [E, hidden, 2*intermediate]
+        w2_weight = w2_weight.transpose(
+            1, 2).contiguous()  # [E, intermediate, hidden]
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
@@ -244,10 +249,28 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 requires_grad=False,
             )
 
+        # Materialize transformed weights during load to avoid deferred execution
+        # surfacing later during runtime host copies.
+        if layer.w13_weight.device.type == "tpu":
+            # Sync one tensor at a time to avoid creating oversized combined
+            # synchronization graphs across layers.
+            sync.synchronize(layer.w13_weight, wait=True)
+            sync.synchronize(layer.w2_weight, wait=True)
+            if layer.w13_bias is not None:
+                sync.synchronize(layer.w13_bias, wait=True)
+            if layer.w2_bias is not None:
+                sync.synchronize(layer.w2_bias, wait=True)
+
         # TODO, for distributed senario, the weight layout handling should be more complex
 
         logger.info_once(
             "MXFP4 weights dequantized to bfloat16 and transposed for GMM kernel."
+        )
+        prebuild_fused_moe_kernel(
+            topk=layer.moe_config.experts_per_token,
+            renormalize=layer.renormalize,
+            activation=layer.activation,
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
 
     def get_fused_moe_quant_config(
