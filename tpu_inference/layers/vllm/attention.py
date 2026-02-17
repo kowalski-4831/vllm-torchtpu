@@ -350,6 +350,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         key = key.view(k_len, self.num_kv_heads, self.head_size)
         value = value.view(k_len, self.num_kv_heads, self.head_size)
 
+        if self.rpa_kernel is None:
+            self.init_rpa_kernel(q_scale, k_scale, v_scale)
+
+        # TODO (geyuhao) the support of this API is pending discussion.
+        # This line will only influence performance, not functionality
+        # # Mark kv_cache avaliable for donation
+        # pallas.set_buffer_donor_(kv_cache, True)
+
         # Call the operator
         new_kv_cache, outputs = self.rpa_kernel(
             kv_cache,
