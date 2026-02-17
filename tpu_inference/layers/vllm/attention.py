@@ -4,7 +4,7 @@
 import functools
 
 import torch
-from torch_tpu._internal import pallas
+from torch_tpu._internal import pallas, sync
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
@@ -60,9 +60,6 @@ def _pallas_rpa_kernel(
         query_start_loc=query_start_loc,
         request_distribution=request_distribution,
     )
-
-    kv_cache = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1],
-                                kv_cache.shape[2] // 2, 2, kv_cache.shape[3])
     new_kv_cache, outputs = attention(
         kv_cache,
         query,
@@ -76,10 +73,6 @@ def _pallas_rpa_kernel(
         sinks=sinks,
         attention_chunk_size=sliding_window,
     )
-    new_kv_cache = new_kv_cache.reshape(new_kv_cache.shape[0],
-                                        new_kv_cache.shape[1],
-                                        new_kv_cache.shape[2] * 2,
-                                        new_kv_cache.shape[4])
     return new_kv_cache, outputs
 
 
@@ -109,16 +102,24 @@ class PallasAttentionBackend(AttentionBackend):
         padded_head_size = (cdiv(head_size, TPU_HEAD_SIZE_ALIGNMENT) *
                             TPU_HEAD_SIZE_ALIGNMENT)
         # Two different RPA kernels have different KV cache layouts:
-        # - hd64 (head_dim=64): K/V packed along head_dim -> [L, S, K, H] where H=128
-        # - v3 (head_dim!=64): K/V packed along heads -> [L, S, K*2, H]
-        # Both are reshaped to 5D in _run_attention_jax before passing to kernel.
+        # - hd64 (head_dim=64): K/V packed along head_dim
+        # - v3 (head_dim!=64): K/V packed along heads
+        # The Pallas kernels expect a 5D KV cache: [L, S, Kx2 / kv_packing, kv_packing, H]
+        # where Kx2 = num_kv_heads for hd64 and Kx2 = num_kv_heads * 2 for v3.
         use_hd64 = (head_size == 64)
-        if use_hd64:
-            # hd64: shape[2] = num_kv_heads, will reshape to [L, S, K/2, 2, H]
-            return (num_blocks, block_size, num_kv_heads, padded_head_size)
-        else:
-            # v3: shape[2] = num_kv_heads * 2, will reshape to [L, S, K, 2, H]
-            return (num_blocks, block_size, num_kv_heads * 2, padded_head_size)
+        if cache_dtype_str != "auto":
+            raise NotImplementedError
+
+        kv_packing = 2
+        num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
+        num_kv_heads_x2 = cdiv(num_kv_heads_x2, kv_packing) * kv_packing
+        return (
+            num_blocks,
+            block_size,
+            num_kv_heads_x2 // kv_packing,
+            kv_packing,
+            padded_head_size,
+        )
 
     @staticmethod
     def swap_blocks(
@@ -259,7 +260,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
             key: shape = [num_tokens, num_kv_heads * head_size]
             value: shape = [num_tokens, num_kv_heads * head_size]
             kv_cache: shape =
-                [num_blocks, block_size, num_kv_heads * 2, padded_head_size]
+                [num_blocks, block_size, num_kv_heads_x2 // kv_packing,
+                 kv_packing, padded_head_size] (preferred)
+                or legacy 4D
+                [num_blocks, block_size, num_kv_heads_x2, padded_head_size]
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -296,6 +300,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if self.rpa_kernel is None:
             self.init_rpa_kernel(q_scale, k_scale, v_scale)
 
+        # TODO (geyuhao) the support of this API is pending discussion.
+        # This line will only influence performance, not functionality
+        # # Mark kv_cache avaliable for donation
+        # pallas.set_buffer_donor_(kv_cache, True)
+
         # Call the operator
         new_kv_cache, outputs = self.rpa_kernel(
             kv_cache,
@@ -311,5 +320,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         # update kv cache
         kv_cache.copy_(new_kv_cache)
+
+        # TODO (geyuhao) ideally we don't want this
+        sync.synchronize(kv_cache)
 
         return outputs.reshape(q_len, self.num_heads * self.head_size)
