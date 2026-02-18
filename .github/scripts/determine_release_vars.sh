@@ -12,7 +12,9 @@ if [[ "$GH_EVENT_NAME"  == "schedule" ]]; then
     LATEST_STABLE_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
     if [[ -z "$LATEST_STABLE_TAG" ]]; then
         echo "Warning: No stable tag found."
-        exit 1
+        # TODO: Remove when we have a release on github
+        echo "Setting base version to 0.1.0"
+        BASE_VERSION="0.1.0"
     else
         BASE_VERSION=${LATEST_STABLE_TAG#v}
     fi
