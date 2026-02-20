@@ -170,6 +170,10 @@ class PallasAttentionBackend(AttentionBackend):
 
 class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_instance_counter = 0
+    # Registry of shared custom ops keyed to avoid registering duplicate Pallas
+    # kernels for layers with identical configs.
+    # Mapping of (sliding window, mesh) -> custom op
+    _kernel_registry: dict = {}
 
     def __init__(
         self,
@@ -225,10 +229,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
         return kernel_instance_id
 
     def _build_rpa_kernel(self):
-        kernel_instance_id = type(self)._allocate_kernel_instance_id()
-        op_name = f"pallas::rpa_kernel_{kernel_instance_id}"
+        # Reuse an existing custom op if one with the same config already exists.
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
+        registry_key = (self.sliding_window, id(mesh))
+        existing = self._kernel_registry.get(registry_key)
+        if existing is not None:
+            return existing
+
+        kernel_instance_id = type(self)._allocate_kernel_instance_id()
+        op_name = f"pallas::rpa_kernel_{kernel_instance_id}"
 
         # Prepare wrapper function with static arguments
         wrapped_fn = functools.partial(
@@ -285,6 +295,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         rpa_kernel_impl.register_fake(_fake_rpa_kernel)
 
+        self._kernel_registry[registry_key] = rpa_kernel_impl
         return rpa_kernel_impl
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
