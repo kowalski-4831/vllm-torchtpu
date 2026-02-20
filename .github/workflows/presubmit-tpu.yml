@@ -75,7 +75,6 @@ jobs:
       # will return "total 0").
       - uses: actions/checkout@v5
 
-      # TODO: Remove hardcoded torch_tpu wheel version.
       - name: Install PyTorch (CPU) and torch_tpu
         shell: bash
         run: |
@@ -83,17 +82,8 @@ jobs:
           python3 -m venv ci-tpu
           source ci-tpu/bin/activate
           python -m pip install --upgrade pip
-          pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-          mkdir torch_tpu
-          gcloud artifacts files download \
-              --project=ml-oss-artifacts-transient \
-              --location=us \
-              --repository=torch-tpu-testing-registry \
-              --destination=torch_tpu \
-              torch-tpu/torch_tpu-0.1.0.dev2052026-cp312-cp312-manylinux_2_35_x86_64.whl
-          cd torch_tpu
-          mv "torch-tpu%2Ftorch_tpu-0.1.0.dev2052026-cp312-cp312-manylinux_2_35_x86_64.whl" "torch_tpu-0.1.0.dev2052026-cp312-cp312-manylinux_2_35_x86_64.whl"
-          pip install torch_tpu-0.1.0.dev2052026-cp312-cp312-manylinux_2_35_x86_64.whl
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
+          pip install --pre --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch-tpu
 
       # TODO: Remove hardcoded vllm branch.
       - name: Install vllm and torchtpu-vllm
