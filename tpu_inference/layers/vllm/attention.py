@@ -339,7 +339,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         # For determine_available_memory case.
         if kv_cache.numel() == 0:
-            logger.warning("Returning early due to kv_cache.numel() == 0")
             if output is None:
                 output = torch.ones_like(query)
             return output

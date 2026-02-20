@@ -1307,15 +1307,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             request_distribution=request_distribution,
         )
 
-        if self.supports_mm_inputs:
-            torch._dynamo.mark_dynamic(inputs_embeds, 0)
-        else:
-            torch._dynamo.mark_dynamic(input_ids, 0)
-        torch._dynamo.mark_dynamic(position_ids, 0)
-        torch._dynamo.mark_dynamic(attn_metadata.block_tables, 0)  # Now 1D
-        torch._dynamo.mark_dynamic(attn_metadata.seq_lens, 0)
-        torch._dynamo.mark_dynamic(attn_metadata.query_start_loc, 0)
-
         layer_names = get_layers_from_vllm_config(self.vllm_config,
                                                   Attention).keys()
         per_layer_attn_metadata = {
