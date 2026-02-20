@@ -1483,7 +1483,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         num_tokens: int,
     ) -> None:
-        pass
+        self._dummy_run(num_tokens, self.num_reqs_max_model_len,
+                        self.max_num_blocks_per_req)
 
     def maybe_setup_cross_layer_kv_sharing(
         self,

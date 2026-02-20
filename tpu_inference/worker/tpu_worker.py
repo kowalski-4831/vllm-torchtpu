@@ -5,6 +5,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+import torch
 import vllm.envs as vllm_envs
 from torch_tpu import api
 from torch_tpu._internal.profiler import profiler_api
@@ -220,18 +221,17 @@ class TPUWorker:
                                    self.rank - 1)
 
     def determine_available_memory(self) -> int:
+        # VLLM directive of the percentage of HBM memory the model executor can use
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
 
-        # TODO: Fix device memory when corresponding APIs become available
-        hbm_usage = [
-        ]  # 15 * 1024 *1024 *1024#utils.hbm_usage_bytes(self.devices)
-        total_hbm_limit = total_hbm_used = 0
-        for used, limit in hbm_usage:
-            total_hbm_used += used
-            total_hbm_limit += limit
+        self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
-        total_hbm_used = 15 * 1024 * 1024 * 1024
-        total_hbm_limit = 28 * 1024 * 1024 * 1024
+        total_hbm_limit = total_hbm_used = 0
+        for device in self.devices:
+            free_memory, limit_memory = torch.accelerator.get_memory_info(
+                device)
+            total_hbm_used += (limit_memory - free_memory)
+            total_hbm_limit += limit_memory
 
         total_hbm_limit_cap = total_hbm_limit * gpu_memory_utilization
         total_hbm_avail = int(total_hbm_limit_cap - total_hbm_used)
@@ -387,7 +387,6 @@ class TPUWorker:
                 )
             else:
                 continue
-
         return kv_cache_spec
 
     def initialize_from_config(
