@@ -6,12 +6,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
+import libtpu
 import numpy as np
 import torch
 import torch.nn as nn
 import vllm.envs as envs
 # TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
+from packaging import version
 from torch_tpu import api
 from torch_tpu._internal import sync
 from vllm.attention.backends.abstract import AttentionType
@@ -1639,10 +1641,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         separately from `forward` for lighter compilation overhead.
         """
         if True:  # sampling_metadata.all_greedy:
-            # out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
-            # NOTE(geyuhao): We use topk instead of argmax because argmax with
-            # torch.compile on TPU might produce incorrect results.
-            out_tokens = torch.topk(logits, k=1, dim=-1).indices
+            # Prior versions of libtpu give incorrect results, see: b/481003178.
+            if version.parse(libtpu.__version__) < version.parse('0.0.35'):
+                raise RuntimeError(
+                    "Argmax is not supported with libtpu < 0.0.35")
+
+            out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
         else:
             out_tokens = self.sampler(logits,
                                       sampling_metadata).sampled_token_ids

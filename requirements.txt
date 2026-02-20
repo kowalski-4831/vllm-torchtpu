@@ -6,13 +6,13 @@ absl-py
 numpy
 google-cloud-storage
 qwix==0.1.1
-jax[tpu]==0.9.0.1
+jax==0.9.0.1
 jaxlib==0.9.0.1
 torchvision==0.25.0
 pathwaysutils
 parameterized
 numba==0.62.1
 runai-model-streamer[s3,gcs]==0.15.0
-libtpu==0.0.34
+libtpu==0.0.35
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.10.0+cpu
