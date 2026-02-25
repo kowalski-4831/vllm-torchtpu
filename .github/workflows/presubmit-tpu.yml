@@ -97,13 +97,12 @@ jobs:
           cd ..
           pip install -r vllm/requirements/tpu.txt
           VLLM_TARGET_DEVICE="tpu" pip install -e vllm
-          pip install -r torchtpu-vllm/requirements.txt
           pip install -r torchtpu-vllm/requirements_v7x.txt
+          pip install -r torchtpu-vllm/requirements.txt
           pip install -e torchtpu-vllm
-          pip install libtpu==0.0.34
 
       - name: Run tests with
         shell: bash
         run: |
           source ../ci-tpu/bin/activate
-          pytest tests
+          MODEL_IMPL_TYPE="vllm" pytest tests
