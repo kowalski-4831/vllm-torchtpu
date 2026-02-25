@@ -1,7 +1,7 @@
 ARG NIGHTLY_DATE="20250714"
 ARG BASE_IMAGE="us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla:nightly_3.12_tpuvm_$NIGHTLY_DATE"
 # The latest main will be used if arg unspecified
-ARG VLLM_COMMIT_HASH=""
+ARG VLLM_COMMIT_HASH="v0.13.0"
 
 FROM $BASE_IMAGE
 
