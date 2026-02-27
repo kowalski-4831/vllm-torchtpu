@@ -222,6 +222,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             renormalize=layer.renormalize,
             activation=layer.activation,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            scoring_fn=getattr(layer, "scoring_func", "softmax"),
         )
 
     def apply(
@@ -257,5 +258,6 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             renormalize=layer.renormalize,
             activation=layer.activation,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            scoring_fn=getattr(layer, "scoring_func", "softmax"),
         )
         return output
