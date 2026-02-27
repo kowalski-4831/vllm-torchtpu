@@ -1,4 +1,5 @@
 #!/bin/bash
+set -o pipefail
 
 # Text Colors
 GREEN='\033[0;32m'
@@ -16,12 +17,13 @@ MODELS=(
 # 2. Define Configurations
 # Format: "batch_size input_len output_len"
 CONFIGS=(
-    "8 32 16"
+    "8 1024 1024"
+    # "8 1024 8192"
+    # "8 8192 1024"
 )
 
 # 3. Common Args
-COMMON_ARGS=("--max-model-len" "128" "--enforce-eager")
-# COMMON_ARGS=("--max-model-len" "128") # current compile mode does not help with performance
+COMMON_ARGS=("--enforce-eager")
 
 # 4. Execution Loop
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -34,6 +36,7 @@ for model in "${MODELS[@]}"; do
     for config in "${CONFIGS[@]}"; do
         # read splits the config string into variables
         read -r batch_size input_len output_len <<< "$config"
+        max_model_len=$((input_len + output_len))
 
         # Sanitize model name (replace / with _) for folder naming
         # e.g. Qwen/Qwen3-0.6B -> Qwen_Qwen3-0.6B
@@ -46,15 +49,16 @@ for model in "${MODELS[@]}"; do
         echo -e "${CYAN}Running Experiment:${NC}"
         echo "  Model:       $model"
         echo "  Config:      BS=$batch_size, In=$input_len, Out=$output_len"
+        echo "  MaxLen:      $max_model_len"
         echo "  Artifacts:   $output_dir"
 
         # Run command
         if MODEL_IMPL_TYPE="vllm" python3 examples/tpu_profiling.py \
-            --num-iters 1 \
             --model "$model" \
             --batch-size "$batch_size" \
             --input-len "$input_len" \
             --output-len "$output_len" \
+            --max-model-len "$max_model_len" \
             --profile-result-dir "$output_dir" \
             "${COMMON_ARGS[@]}"; then
             echo -e "${GREEN}[SUCCESS] Experiment completed.${NC}"

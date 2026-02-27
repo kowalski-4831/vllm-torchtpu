@@ -42,10 +42,6 @@ def main(args: argparse.Namespace):
         max_tokens=args.output_len,
     )
     print(sampling_params)
-
-    sp_ttft = SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=1)
-    print(sp_ttft)
-
     dummy_prompt_token_ids = np.random.randint(10000,
                                                size=(args.batch_size,
                                                      args.input_len))
@@ -53,70 +49,31 @@ def main(args: argparse.Namespace):
         "prompt_token_ids": batch
     } for batch in dummy_prompt_token_ids.tolist()]
 
-    # We will simply perform the measurement on the "Profile Iterations" by
-    # 1. Running a prompt with max_tokens=1 to measure TTFT (approx).
-    # 2. Running a prompt with max_tokens=N to measure Total Time.
-    # TPOT = (Total - TTFT) / (N - 1)
-
-    # Warmup
-    print("Warming up...")
-    for _ in tqdm(range(args.num_iters_warmup), desc="Warmup iterations"):
+    def run_to_completion():
+        start_time = time.perf_counter()
         llm.generate(dummy_prompts,
                      sampling_params=sampling_params,
                      use_tqdm=False)
-    for _ in tqdm(range(args.num_iters_warmup), desc="TTFT Warmup iterations"):
-        llm.generate(dummy_prompts, sampling_params=sp_ttft, use_tqdm=False)
+        end_time = time.perf_counter()
+        latency = end_time - start_time
+        return latency
 
-    print("\nStarting Benchmark...")
+    # Warmup
+    print("Warming up...")
+    warmup_latencies = []
+    for _ in tqdm(range(args.num_iters_warmup), desc="Warmup iterations"):
+        warmup_latencies.append(run_to_completion())
+    print(f"Average warmup latency: {np.mean(warmup_latencies):.4f}s")
 
-    # 1. Measure TTFT (Prefill + 1 decode step)
-    ttft_latencies = []
-    for _ in range(args.num_iters):
-        start = time.perf_counter()
-        llm.generate(dummy_prompts, sampling_params=sp_ttft, use_tqdm=False)
-        end = time.perf_counter()
-        ttft_latencies.append(end - start)
-
-    avg_ttft_sec = np.mean(ttft_latencies)
-
-    # 2. Measure Total Time (Prefill + N decode steps)
     # Enable tracing on server
     llm.start_profile()
     if DELAY_MS == 0:
         time.sleep(1.0)
-
-    total_latencies = []
-    for _ in range(args.num_iters):
-        start = time.perf_counter()
-        llm.generate(dummy_prompts,
-                     sampling_params=sampling_params,
-                     use_tqdm=False)
-        end = time.perf_counter()
-        total_latencies.append(end - start)
-
-    avg_total_sec = np.mean(total_latencies)
+    profile_latencies = []
+    for _ in tqdm(range(args.num_iters), desc="Profile iterations"):
+        profile_latencies.append(run_to_completion())
     llm.stop_profile()
-
-    num_decode_tokens = args.output_len - 1
-    if num_decode_tokens > 0:
-        decode_time = avg_total_sec - avg_ttft_sec
-        avg_tpot_sec = decode_time / num_decode_tokens
-        decode_throughput = (args.batch_size * num_decode_tokens) / decode_time
-    else:
-        avg_tpot_sec = 0.0
-        decode_throughput = 0.0
-
-    print(f"\n{'='*40}")
-    print(f"Benchmark Results: {args.model}")
-    print(
-        f"Config: BS={args.batch_size}, InLen={args.input_len}, OutLen={args.output_len}"
-    )
-    print(f"{'-'*40}")
-    print(f"TTFT (ms):          {avg_ttft_sec * 1000:.2f}")
-    print(f"TPOT (ms):          {avg_tpot_sec * 1000:.2f}")
-    print(f"Throughput (tok/s): {decode_throughput:.2f} (decode only)")
-    print(f"Total Latency (s):  {avg_total_sec:.4f}")
-    print(f"{'='*40}\n")
+    print(f"Average profile latency: {np.mean(profile_latencies):.4f}s")
 
     return
 
