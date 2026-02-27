@@ -8,23 +8,23 @@ FROM $BASE_IMAGE
 ARG IS_FOR_V7X="false"
 
 # Remove existing versions of dependencies
-RUN pip uninstall -y torch torch_xla torchvision
+RUN pip uninstall -y torch torch_xla torchax torchvision
 
 # Install some basic utilities
 RUN apt-get update && apt-get install -y \
     git \
     libopenblas-base libopenmpi-dev libomp-dev
 
+# Install uv for faster pip installs
+RUN pip install uv
+
 # Build vLLM
 WORKDIR /workspace/vllm
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_COMMIT_HASH
-RUN git clone $VLLM_REPO /workspace/vllm
-RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
-        git checkout $VLLM_COMMIT_HASH; \
-    fi
+RUN git clone --depth 1 --branch $VLLM_COMMIT_HASH $VLLM_REPO /workspace/vllm
 RUN pip install -r requirements/tpu.txt --retries 3
-RUN VLLM_TARGET_DEVICE="tpu" pip install -e .
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_COMMIT_HASH#v} VLLM_TARGET_DEVICE="tpu" pip install -e .
 
 # Install test dependencies
 RUN python3 -m pip install -e tests/vllm_test_utils
