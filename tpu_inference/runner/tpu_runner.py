@@ -791,7 +791,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                        1].to(self.device)
             seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
                 self.device)
-        block_tables = block_tables.to(self.device)
+        # Flatten on CPU before H2D to avoid device-side as_strided/reshape
+        # materialization on every decode step.
+        block_tables = block_tables.reshape(-1).to(self.device)
 
         if self.lora_config is not None:
             # We need to respect padding when activating LoRA adapters
@@ -813,7 +815,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         attn_metadata = AttentionMetadata(
             input_positions=self.position_ids,
-            block_tables=block_tables.flatten(),  # Convert block_tables to 1D
+            block_tables=block_tables,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
@@ -1287,7 +1289,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         actual_num_reqs = min(num_tokens, num_reqs)
         position_ids = torch.zeros(num_tokens,
                                    dtype=torch.int32).to(self.device)
-        block_tables = torch.zeros((num_reqs, num_blocks),
+        block_tables = torch.zeros((num_reqs * num_blocks, ),
                                    dtype=torch.int32).to(self.device)
         query_lens = [1] * num_reqs
         query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
@@ -1301,7 +1303,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int32).to(self.device)
         attn_metadata = AttentionMetadata(
             input_positions=position_ids,
-            block_tables=block_tables.flatten(),
+            block_tables=block_tables,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
