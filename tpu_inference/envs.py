@@ -99,7 +99,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION") or "0")),
     # Model implementation type (e.g., "flax_nnx")
     "MODEL_IMPL_TYPE":
-    env_with_choices("MODEL_IMPL_TYPE", "flax_nnx",
+    env_with_choices("MODEL_IMPL_TYPE", "vllm",
                      ["vllm", "flax_nnx", "jetpack"]),
     # Enable new experimental model design
     "NEW_MODEL_DESIGN":
