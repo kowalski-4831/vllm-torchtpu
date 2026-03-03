@@ -18,7 +18,6 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.platforms import current_platform
 from vllm.tasks import SupportedTask
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -208,12 +207,9 @@ class TPUWorker:
 
         # Initialize vLLM distributed state using true rank/world-size so TP
         # uses native vLLM model-parallel groups.
-        dist_backend = current_platform.dist_backend
-        if self.parallel_config.world_size == 1 and dist_backend == "tpu_dist":
-            # For single-rank execution, no TPU collectives are needed.
-            # CI is having issue when initilizing tpu_dist backend in single-rank.
-            # TODO: Fix this issue and remove this hack.
-            dist_backend = "gloo"
+        from vllm.platforms import current_platform
+        dist_backend = current_platform.get_worker_distributed_backend(
+            self.parallel_config.world_size)
 
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(

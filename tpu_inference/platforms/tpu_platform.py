@@ -7,8 +7,6 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union, cast
 import portpicker
 import torch
 import vllm.envs as vllm_envs
-from torch_tpu._internal.distributed.launchers.singlehost_wrapper import \
-    prepare_tpu_environment
 from tpu_info import device
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.platforms.interface import Platform, PlatformEnum
@@ -54,6 +52,18 @@ class TpuPlatform(Platform):
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
         "NEW_MODEL_DESIGN"
     ]
+
+    @classmethod
+    def get_worker_distributed_backend(cls, world_size: int) -> str:
+        """Pick torch.distributed backend used by worker bootstrap.
+
+        TPU collectives are not needed when world_size==1, and single-rank
+        `tpu_dist` bootstrap is unstable in CI. Use `gloo` in that case while
+        keeping `tpu_dist` for multi-rank runs.
+        """
+        if world_size == 1 and cls.dist_backend == "tpu_dist":
+            return "gloo"
+        return cls.dist_backend
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
@@ -186,7 +196,9 @@ class TpuPlatform(Platform):
                 # Prepare TorchTPU MP environment
                 # We can also set environment variables manually like
                 # (TORCH_TPU_TOPOLOGY and TORCH_TPU_SLICEBUILDER_ADDRESSES)
-                prepare_tpu_environment(parallel_config.world_size)
+                from torch_tpu._internal.distributed.launchers.singlehost_wrapper import \
+                    prepare_tpu_environment
+                prepare_tpu_environment()
             else:
                 if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
                     os.environ["TORCH_TPU_XPROF_SESSION_ID"] = str(
