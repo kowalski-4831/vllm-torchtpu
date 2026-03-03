@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import torch
 import vllm.envs as vllm_envs
@@ -18,6 +18,7 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.platforms import current_platform
 from vllm.tasks import SupportedTask
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -168,24 +169,65 @@ class TPUWorker:
                 tpu_visible_chips if tpu_visible_chips else
                 self.pp_config.default_tpu_visible_chips)
 
+        # For natural vLLM MP TP on single-host, pin each worker process to
+        # one TPU chip based on local_rank.
+        if (multihost_backend != "ray"
+                and self.parallel_config.pipeline_parallel_size == 1
+                and self.parallel_config.tensor_parallel_size >= 1):
+            if tpu_visible_chips:
+                os.environ["TPU_VISIBLE_CHIPS"] = tpu_visible_chips
+            else:
+                os.environ["TPU_VISIBLE_CHIPS"] = str(self.local_rank)
+            logger.info(
+                "Pin TPU worker to local chip | rank=%s | local_rank=%s "
+                "| TPU_VISIBLE_CHIPS=%s", self.rank, self.local_rank,
+                os.environ["TPU_VISIBLE_CHIPS"])
+
+            # Single-host TP assumption: workers are spawned locally, one
+            # process per chip. TorchTPU bootstrap expects torchrun-style env
+            # vars before TPU runtime initialization (api.tpu_device()).
+            # TODO: (geyuhao) support multihost
+            os.environ["RANK"] = str(self.rank)
+            os.environ["LOCAL_RANK"] = str(self.local_rank)
+            os.environ["WORLD_SIZE"] = str(self.parallel_config.world_size)
+            os.environ["LOCAL_WORLD_SIZE"] = str(
+                self.parallel_config.world_size)
+
+            parsed = urlparse(self.distributed_init_method)
+            if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
+                raise ValueError(
+                    "Expected tcp://<host>:<port> distributed_init_method for "
+                    "single-host TPU MP, got: "
+                    f"{self.distributed_init_method!r}")
+            os.environ.setdefault("MASTER_ADDR", parsed.hostname)
+            os.environ.setdefault("MASTER_PORT", str(parsed.port))
+
         if not self.devices:
             self.devices = []
             self.devices.append(api.tpu_device())
 
-        # Initialize the vLLM distribution layer as a single chip environment,
-        # we'll swap the model's parallel modules with TPU SPMD equivalents.
+        # Initialize vLLM distributed state using true rank/world-size so TP
+        # uses native vLLM model-parallel groups.
+        dist_backend = current_platform.dist_backend
+        if self.parallel_config.world_size == 1 and dist_backend == "tpu_dist":
+            # For single-rank execution, no TPU collectives are needed.
+            # CI is having issue when initilizing tpu_dist backend in single-rank.
+            # TODO: Fix this issue and remove this hack.
+            dist_backend = "gloo"
+
         with set_current_vllm_config(self.vllm_config):
-            temp_file = tempfile.mkstemp()[1]
             init_distributed_environment(
-                world_size=1,
-                rank=0,
-                local_rank=0,
-                distributed_init_method=f"file://{temp_file}",
-                backend="gloo",
+                world_size=self.parallel_config.world_size,
+                rank=self.rank,
+                local_rank=self.local_rank,
+                distributed_init_method=self.distributed_init_method,
+                backend=dist_backend,
             )
             ensure_model_parallel_initialized(
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=1,
+                tensor_model_parallel_size=self.parallel_config.
+                tensor_parallel_size,
+                pipeline_model_parallel_size=self.parallel_config.
+                pipeline_parallel_size,
             )
 
         # jax_parallel_state.init_pp_distributed_environment(

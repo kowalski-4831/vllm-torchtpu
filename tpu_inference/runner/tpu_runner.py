@@ -308,15 +308,38 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                     torch.Tensor] | None = None
 
         # Create JAX Mesh for shard_map operations in TPU kernels.
-        # For single-device inference, we create a simple 1-device mesh.
-        # FIXME: This is a hack to make it work for now. Also we don't want to use jax.devices()
-        tpu_devices = jax.devices()
-        # For single-device focus, use only the first device
-        single_device = np.array([[tpu_devices[0]]])
-        self.mesh = Mesh(single_device, axis_names=('data', 'model'))
+        # Support TP by shaping the mesh as (data=1, model=tp_size).
+        self.mesh = self._create_mesh_for_parallelism()
 
     def reset_mm_cache(self) -> None:
         pass
+
+    def _get_requested_tp_size(self) -> int:
+        # This integration supports TP>1 only via vLLM native multiprocess
+        # parallelism. Per-worker JAX mesh must stay single-chip.
+        if self.parallel_config.world_size == 1 and \
+                self.parallel_config.tensor_parallel_size > 1:
+            raise ValueError(
+                "Single-process TPU mesh TP>1 is not supported in this path. "
+                "Use vLLM multiprocess mode for --tensor-parallel-size > 1.")
+        return 1
+
+    def _create_mesh_for_parallelism(self) -> Mesh:
+        tp_size = self._get_requested_tp_size()  # always 1 in current setting
+        local_devices = list(jax.local_devices())
+        if not local_devices:
+            raise ValueError("No TPU devices are visible to create JAX mesh.")
+
+        mesh_devices = np.asarray(local_devices[:tp_size]).reshape(
+            (1, tp_size))
+        mesh = Mesh(mesh_devices, axis_names=("data", "model"))
+        mesh_device_ids = [
+            getattr(device, "id", str(device))
+            for device in local_devices[:tp_size]
+        ]
+        logger.info("Init mesh | tp_size=%d | device_ids=%s", tp_size,
+                    mesh_device_ids)
+        return mesh
 
     def _update_num_xla_graphs(self, case_str):
         check_comp = self.check_recompilation and not self.enforce_eager

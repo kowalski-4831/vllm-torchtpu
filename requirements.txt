@@ -1,4 +1,5 @@
 tpu-info==0.7.1
+portpicker
 yapf==0.43.0
 pytest
 pytest-mock

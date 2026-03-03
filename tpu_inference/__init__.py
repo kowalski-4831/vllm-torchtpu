@@ -1,12 +1,44 @@
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
+from vllm.distributed.parallel_state import GroupCoordinator
+from vllm.platforms import current_platform
+
 import tpu_inference.env_override  # noqa: F401
 from tpu_inference import envs
 from tpu_inference import tpu_info as ti
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _patch_vllm_tpu_group_custom_ops() -> None:
+    """Disable vLLM custom collective ops for TPU in this TorchTPU integration.
+
+    vLLM's `torch.ops.vllm.all_reduce/all_gather` custom ops are not available
+    on the TorchTPU backend in this repo. Force GroupCoordinator to use
+    communicator-backed collectives instead.
+
+    TODO (geyuhao): Do we actually need to support torch.ops.vllm.* on TPU? Currently
+    this patch will use torch.distributed.all_reduce/all_gather.
+    """
+
+    if getattr(GroupCoordinator, "_tpu_no_custom_collective_patch", False):
+        return
+
+    original_init = GroupCoordinator.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if current_platform.is_tpu():
+            self.use_custom_op_call = False
+
+    GroupCoordinator.__init__ = patched_init
+    GroupCoordinator._tpu_no_custom_collective_patch = True
+    logger.info("Applied TPU patch: disable vLLM custom collective ops.")
+
+
+_patch_vllm_tpu_group_custom_ops()
 
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")

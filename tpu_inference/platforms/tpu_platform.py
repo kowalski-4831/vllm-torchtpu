@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import time
 from typing import TYPE_CHECKING, Optional, Tuple, Union, cast
 
+import portpicker
 import torch
 import vllm.envs as vllm_envs
+from torch_tpu._internal.distributed.launchers.singlehost_wrapper import \
+    prepare_tpu_environment
 from tpu_info import device
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.platforms.interface import Platform, PlatformEnum
@@ -36,6 +41,7 @@ class TpuPlatform(Platform):
     device_type: str = "tpu"
     dispatch_key: str = "XLA"
     ray_device_key: str = "TPU"
+    dist_backend: str = "tpu_dist"
     device_control_env_var: str = "TPU_VISIBLE_CHIPS"
     simple_compile_backend: str = "openxla"
 
@@ -176,13 +182,28 @@ class TpuPlatform(Platform):
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if not multihost_backend:  # Single host
-            if parallel_config.pipeline_parallel_size == 1:
+            if parallel_config.world_size > 1:
+                # Prepare TorchTPU MP environment
+                # We can also set environment variables manually like
+                # (TORCH_TPU_TOPOLOGY and TORCH_TPU_SLICEBUILDER_ADDRESSES)
+                prepare_tpu_environment(parallel_config.world_size)
+            else:
+                if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
+                    os.environ["TORCH_TPU_XPROF_SESSION_ID"] = str(
+                        time.time_ns())
+                if "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ:
+                    os.environ[
+                        "TORCH_TPU_SLICEBUILDER_ADDRESSES"] = f"localhost:{portpicker.pick_unused_port()}"
+                if "TORCH_TPU_TOPOLOGY" not in os.environ:
+                    os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1"
+            if (parallel_config.pipeline_parallel_size == 1
+                    and parallel_config.tensor_parallel_size == 1):
                 logger.info("Force using UniProcExecutor for JAX on \
-                        single host without pipeline parallelism.")
+                        single host without tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "uni"
             else:
                 logger.info("Force using MultiprocExecutor for JAX on \
-                        single host with pipeline parallelism.")
+                        single host with tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "mp"
         elif multihost_backend == "ray":
             from tpu_inference.executors.ray_distributed_executor import \
@@ -218,7 +239,10 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "vllm.distributed.device_communicators.tpu_communicator.TpuCommunicator"  # noqa
+        # vLLM's default TPU communicator depends on torch_xla. For TorchTPU,
+        # use the generic communicator on top of torch.distributed groups, with
+        # `dist_backend=tpu_dist` for device-side collectives.
+        return "vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"  # noqa
 
     @classmethod
     def use_all_gather(cls) -> bool:

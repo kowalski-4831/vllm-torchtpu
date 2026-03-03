@@ -22,6 +22,8 @@ CONFIGS=(
     # "8 8192 1024"
 )
 
+TP_SIZE=4
+
 # 3. Common Args
 COMMON_ARGS=("--enforce-eager")
 
@@ -60,6 +62,7 @@ for model in "${MODELS[@]}"; do
             --output-len "$output_len" \
             --max-model-len "$max_model_len" \
             --profile-result-dir "$output_dir" \
+            --tensor-parallel-size "$TP_SIZE" \
             "${COMMON_ARGS[@]}"; then
             echo -e "${GREEN}[SUCCESS] Experiment completed.${NC}"
         else
