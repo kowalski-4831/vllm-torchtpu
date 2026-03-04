@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -33,26 +32,6 @@ from tpu_inference.logger import init_logger
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class PPConfig:
-    rank: int
-    ip: str
-    prev_worker_ip: str
-    pp_world_size: int
-
-    # default env vars for
-    # TPU_PROCESS_BOUNDS, TPU_CHIPS_PER_PROCESS_BOUNDS, TPU_VISIBLE_CHIPS
-    # if PP is used in single host.
-    default_tpu_process_bounds: str = field(init=False)
-    default_tpu_chips_per_process_bounds: str = field(init=False)
-    default_tpu_visible_chips: str = field(init=False)
-
-    def __post_init__(self):
-        self.default_tpu_process_bounds = f"1,{self.pp_world_size},1"
-        self.default_tpu_chips_per_process_bounds = "1,1,1"
-        self.default_tpu_visible_chips = f"{self.rank}"
 
 
 class TPUWorker:
@@ -88,8 +67,7 @@ class TPUWorker:
         self.is_driver_worker = is_driver_worker
         self.devices = devices if devices is not None else []
         self.device_ranks = set(device.id for device in self.devices)
-        self.pp_config = PPConfig(rank, ip, prev_worker_ip,
-                                  self.parallel_config.pipeline_parallel_size)
+        self.prev_worker_ip = prev_worker_ip
 
         self.kv_cache_dtype = self.model_config.dtype
 
@@ -106,7 +84,7 @@ class TPUWorker:
         self.profile_dir = None
         self.profile_context = None
         if (vllm_envs.VLLM_TORCH_PROFILER_DIR and self.rank < 1
-                and self.pp_config.pp_world_size == 1):
+                and self.parallel_config.pipeline_parallel_size == 1):
             if not self.devices or 0 in self.device_ranks:
                 # For TPU, we can only have 1 active profiler session for 1 profiler
                 # server. So we only profile on rank0.
@@ -115,10 +93,11 @@ class TPUWorker:
                             self.profile_dir)
 
         # For PP, we use MPMD so we want to profile every worker.
-        if self.pp_config.pp_world_size > 1 and vllm_envs.VLLM_TORCH_PROFILER_DIR:
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if pp_size > 1 and vllm_envs.VLLM_TORCH_PROFILER_DIR:
             self.profile_dir = os.path.join(
                 vllm_envs.VLLM_TORCH_PROFILER_DIR,
-                f"pprank_{self.rank}_ppworldsize_{self.pp_config.pp_world_size}",
+                f"pprank_{self.rank}_ppworldsize_{pp_size}",
             )
             os.makedirs(self.profile_dir, exist_ok=True)
 
@@ -130,80 +109,29 @@ class TPUWorker:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
-    def init_device(
-        self,
-        tpu_process_bounds="",
-        tpu_chips_per_process_bounds="",
-        tpu_visible_chips="",
-    ):
-        # set tpu visible devices for Jax runtime in single host PP.
-        multihost_backend = os.environ.get("TPU_MULTIHOST_BACKEND", "").lower()
-        if (multihost_backend != "ray"
-                and self.parallel_config.pipeline_parallel_size > 1):
-            tpu_ports = [
-                jax_parallel_state.BASE_JAX_PORT + i
-                for i in range(self.pp_config.pp_world_size)
-            ]
-            os.environ["TPU_PROCESS_ADDRESSES"] = ",".join(
-                [f"localhost:{port}" for port in tpu_ports])
-            os.environ["TPU_PROCESS_PORT"] = f"{tpu_ports[self.rank]}"
-            os.environ["CLOUD_TPU_TASK_ID"] = f"{self.rank}"
+    def init_device(self):
+        # vLLM's MultiprocExecutor passes rank/local_rank as constructor
+        # args, but torch_tpu's C++ layer (discovery.cc) reads torchrun-style
+        # env vars. Bridge the gap by setting them here before
+        # api.tpu_device() triggers PJRT initialization.
+        # TORCH_TPU_SLICEBUILDER_ADDRESSES and TORCH_TPU_TOPOLOGY are
+        # already inherited from the parent process (set by
+        # prepare_tpu_environment() in tpu_platform.py).
+        os.environ["RANK"] = str(self.rank)
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
+        os.environ["WORLD_SIZE"] = str(self.parallel_config.world_size)
+        os.environ["LOCAL_WORLD_SIZE"] = str(self.parallel_config.world_size)
 
-            # Note: Below is the setting for v6e8 host (8 chips of v6e)
-            # Replace with your own topology.
-            # There are 2 ways of subslicing a v6e
-            # 1) 2 slices with 4 TPU chips each, we can do PP=2, TP=1/2/3/4
-            #   TPU_PROCESS_BOUNDS = "1,1,1"
-            #   TPU_CHIPS_PER_PROCESS_BOUNDS = "1,4,1"
-            #   TPU_VISIBLE_CHIPS = "0,1,2,3" or "4,5,6,7"
-            # 2) 1 chip for each subslice, with at most 8 subslices,
-            #    we can do TP=1, PP=1/2/3/4/5/6/7/8
-            os.environ["TPU_PROCESS_BOUNDS"] = (
-                tpu_process_bounds if tpu_process_bounds else
-                self.pp_config.default_tpu_process_bounds)
-            os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] = (
-                tpu_chips_per_process_bounds if tpu_chips_per_process_bounds
-                else self.pp_config.default_tpu_chips_per_process_bounds)
-            os.environ["TPU_VISIBLE_CHIPS"] = (
-                tpu_visible_chips if tpu_visible_chips else
-                self.pp_config.default_tpu_visible_chips)
-
-        # For natural vLLM MP TP on single-host, pin each worker process to
-        # one TPU chip based on local_rank.
-        if (multihost_backend != "ray"
-                and self.parallel_config.pipeline_parallel_size == 1
-                and self.parallel_config.tensor_parallel_size >= 1):
-            if tpu_visible_chips:
-                os.environ["TPU_VISIBLE_CHIPS"] = tpu_visible_chips
-            else:
-                os.environ["TPU_VISIBLE_CHIPS"] = str(self.local_rank)
-            logger.info(
-                "Pin TPU worker to local chip | rank=%s | local_rank=%s "
-                "| TPU_VISIBLE_CHIPS=%s", self.rank, self.local_rank,
-                os.environ["TPU_VISIBLE_CHIPS"])
-
-            # Single-host TP assumption: workers are spawned locally, one
-            # process per chip. TorchTPU bootstrap expects torchrun-style env
-            # vars before TPU runtime initialization (api.tpu_device()).
-            # TODO: (geyuhao) support multihost
-            os.environ["RANK"] = str(self.rank)
-            os.environ["LOCAL_RANK"] = str(self.local_rank)
-            os.environ["WORLD_SIZE"] = str(self.parallel_config.world_size)
-            os.environ["LOCAL_WORLD_SIZE"] = str(
-                self.parallel_config.world_size)
-
-            parsed = urlparse(self.distributed_init_method)
-            if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
-                raise ValueError(
-                    "Expected tcp://<host>:<port> distributed_init_method for "
-                    "single-host TPU MP, got: "
-                    f"{self.distributed_init_method!r}")
-            os.environ.setdefault("MASTER_ADDR", parsed.hostname)
-            os.environ.setdefault("MASTER_PORT", str(parsed.port))
+        parsed = urlparse(self.distributed_init_method)
+        if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
+            raise ValueError(
+                "Expected tcp://<host>:<port> distributed_init_method, "
+                f"got: {self.distributed_init_method!r}")
+        os.environ.setdefault("MASTER_ADDR", parsed.hostname)
+        os.environ.setdefault("MASTER_PORT", str(parsed.port))
 
         if not self.devices:
-            self.devices = []
-            self.devices.append(api.tpu_device())
+            self.devices = [api.tpu_device()]
 
         # Initialize vLLM distributed state using true rank/world-size so TP
         # uses native vLLM model-parallel groups.
@@ -226,20 +154,16 @@ class TPUWorker:
                 pipeline_parallel_size,
             )
 
-        # jax_parallel_state.init_pp_distributed_environment(
-        #    self.pp_config.ip,
-        #    self.rank,
-        #    self.parallel_config.pipeline_parallel_size,
-        #    self.devices[0],
-        #    need_pp=self.parallel_config.pipeline_parallel_size > 1)
-
-        # ensure_kv_transfer_initialized(self.vllm_config)
-
+        # TODO: Enable PP support. The old JAX-based PP init
+        # (jax_parallel_state.init_pp_distributed_environment) was removed
+        # during the torch_tpu migration. PP will need KV transfer init
+        # and proper rank assignment via torch.distributed.
         is_first_rank = True
         is_last_rank = True
         if self.parallel_config.pipeline_parallel_size > 1:
             is_first_rank = self.rank == 0
-            is_last_rank = self.rank == self.pp_config.pp_world_size - 1
+            is_last_rank = (
+                self.rank == self.parallel_config.pipeline_parallel_size - 1)
 
         # TODO: Fix device assignment
         self.model_runner = TPUModelRunner(self.vllm_config, self.devices[0])
@@ -255,8 +179,7 @@ class TPUWorker:
     def initialize_pp_transfer_connect(self):
         if self.rank == 0:
             return
-        jax_parallel_state.connect(self.pp_config.prev_worker_ip,
-                                   self.rank - 1)
+        jax_parallel_state.connect(self.prev_worker_ip, self.rank - 1)
 
     def determine_available_memory(self) -> int:
         # VLLM directive of the percentage of HBM memory the model executor can use

@@ -210,11 +210,11 @@ class TpuPlatform(Platform):
                     os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1"
             if (parallel_config.pipeline_parallel_size == 1
                     and parallel_config.tensor_parallel_size == 1):
-                logger.info("Force using UniProcExecutor for JAX on \
+                logger.info("Force using UniProcExecutor for TPU on \
                         single host without tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "uni"
             else:
-                logger.info("Force using MultiprocExecutor for JAX on \
+                logger.info("Force using MultiprocExecutor for TPU on \
                         single host with tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "mp"
         elif multihost_backend == "ray":
@@ -222,7 +222,7 @@ class TpuPlatform(Platform):
                 RayDistributedExecutor
             parallel_config.distributed_executor_backend = RayDistributedExecutor
             logger.info(
-                "Force using RayDistributedExecutor for JAX on multihost.")
+                "Force using RayDistributedExecutor for TPU on multihost.")
         else:
             logger.warning(
                 f"Unknown TPU multihost backend: {multihost_backend}. "
