@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union, cast
 import portpicker
 import torch
 import vllm.envs as vllm_envs
+from torch_tpu._internal.distributed import tpu_topology
 from tpu_info import device
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.platforms.interface import Platform, PlatformEnum
@@ -64,6 +65,58 @@ class TpuPlatform(Platform):
         if world_size == 1 and cls.dist_backend == "tpu_dist":
             return "gloo"
         return cls.dist_backend
+
+    @classmethod
+    def _prepare_singlehost_tpu_env(cls, world_size: int) -> None:
+        """Set TORCH_TPU_* env vars needed by PjRt initialization.
+
+        TPUWorker.init_device() always sets WORLD_SIZE in the env, which
+        causes PjRt to require TORCH_TPU_SLICEBUILDER_ADDRESSES and
+        TORCH_TPU_TOPOLOGY. For world_size > 1, topology is looked up
+        via PCI scan using world_size (not auto-detected chip count) so
+        slicebuilder and topology match the actual number of workers.
+        """
+        os.environ.setdefault("TORCH_TPU_XPROF_SESSION_ID",
+                              str(time.time_ns()))
+
+        sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+            f"localhost:{p}" for p in sb_ports)
+
+        if world_size == 1:
+            os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1"
+        else:
+            os.environ["TORCH_TPU_TOPOLOGY"] = \
+                cls._get_tpu_topology(world_size)
+
+    @classmethod
+    def _get_tpu_topology(cls, world_size: int) -> str:
+        """Detect TPU device type via PCI scan and return topology for world_size.
+
+        Replicates the logic from torch_tpu's get_tpu_topology() but
+        indexes the topology map by world_size rather than the
+        auto-detected chip count. This allows sub-slicing (e.g. TP=4
+        on an 8-chip host).
+        """
+        import glob
+        import pathlib
+
+        for vendor_path in glob.glob("/sys/bus/pci/devices/*/vendor"):
+            vendor_id = pathlib.Path(vendor_path).read_text().strip()
+            if vendor_id != tpu_topology._GOOGLE_PCI_VENDOR_ID:
+                continue
+            device_dir = os.path.dirname(vendor_path)
+            device_id = pathlib.Path(os.path.join(
+                device_dir, "device")).read_text().strip()
+            if device_id in tpu_topology._TPU_PCI_DEVICE_IDS_TO_TOPOLOGY:
+                topology_map = (
+                    tpu_topology._TPU_PCI_DEVICE_IDS_TO_TOPOLOGY[device_id])
+                if world_size not in topology_map:
+                    raise RuntimeError(
+                        f"No TPU topology found for world_size={world_size}")
+                return topology_map[world_size]
+
+        raise ValueError("No TPU devices found.")
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
@@ -192,22 +245,7 @@ class TpuPlatform(Platform):
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if not multihost_backend:  # Single host
-            if parallel_config.world_size > 1:
-                # Prepare TorchTPU MP environment
-                # We can also set environment variables manually like
-                # (TORCH_TPU_TOPOLOGY and TORCH_TPU_SLICEBUILDER_ADDRESSES)
-                from torch_tpu._internal.distributed.launchers.singlehost_wrapper import \
-                    prepare_tpu_environment
-                prepare_tpu_environment()
-            else:
-                if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
-                    os.environ["TORCH_TPU_XPROF_SESSION_ID"] = str(
-                        time.time_ns())
-                if "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ:
-                    os.environ[
-                        "TORCH_TPU_SLICEBUILDER_ADDRESSES"] = f"localhost:{portpicker.pick_unused_port()}"
-                if "TORCH_TPU_TOPOLOGY" not in os.environ:
-                    os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1"
+            cls._prepare_singlehost_tpu_env(parallel_config.world_size)
             if (parallel_config.pipeline_parallel_size == 1
                     and parallel_config.tensor_parallel_size == 1):
                 logger.info("Force using UniProcExecutor for TPU on \
