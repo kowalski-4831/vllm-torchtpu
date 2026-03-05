@@ -74,5 +74,5 @@ def get_num_chips() -> int:
         ]
         return len(numeric_entries)
     except FileNotFoundError as e:
-        logger.error("Failed to detect number of TPUs: %s", e)
+        logger.warning("Failed to detect number of TPUs: %s", e)
         return 0

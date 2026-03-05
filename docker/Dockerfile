@@ -2,6 +2,7 @@ ARG NIGHTLY_DATE="20250714"
 ARG BASE_IMAGE="us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla:nightly_3.12_tpuvm_$NIGHTLY_DATE"
 # The latest main will be used if arg unspecified
 ARG VLLM_COMMIT_HASH="v0.13.0"
+ARG TORCH_TPU_WHEEL_DIR=""
 
 FROM $BASE_IMAGE
 
@@ -9,6 +10,9 @@ ARG IS_FOR_V7X="false"
 
 # Remove existing versions of dependencies
 RUN pip uninstall -y torch torch_xla torchax torchvision
+
+# Install torch_tpu from TORCH_TPU_WHEEL_DIR
+RUN pip install torch_tpu --no-cache-dir --find-links $TORCH_TPU_WHEEL_DIR --retries 3
 
 # Install some basic utilities
 RUN apt-get update && apt-get install -y \
