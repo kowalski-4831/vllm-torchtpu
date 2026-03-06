@@ -2,15 +2,13 @@
 End-to-end tests for vLLM LLM generation API on TPU.
 
 This module tests the LLM.generate() API with various configurations using
-the Qwen3-0.6B model.
+the Qwen3-0.6B model, under both eager and compiled execution modes.
 
 Tests include:
 - Multiple sampling parameters
 - Priority queue handling
 - Max model length enforcement
 - Statistics logging
-
-Note: GPU memory utilization limit is set higher than ideal. This needs to be reduced after proper memory optimization.
 
 Run with: pytest tests/entrypoints/llm/test_generate.py -v
 """
@@ -59,7 +57,7 @@ def llm():
         # TODO: Reduce GPU memory utilization after KV cache optimization.
         # For reference, this value is set to 0.10 in the equivalent test in vllm.
         gpu_memory_utilization=0.6,
-        enforce_eager=True,
+        enforce_eager=False,
         disable_log_stats=False,
     )
 

@@ -54,10 +54,6 @@ class TPUWorker:
             raise ValueError("Only vLLM models are supported")
 
         self.vllm_config = vllm_config
-        # TODO: Fix this when enabling TorchTPU compilation
-        from vllm.config import CompilationMode
-        self.vllm_config.compilation_config.mode = CompilationMode.NONE
-
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config

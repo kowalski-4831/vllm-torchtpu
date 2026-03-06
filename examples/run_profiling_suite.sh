@@ -25,7 +25,7 @@ CONFIGS=(
 TP_SIZE=4
 
 # 3. Common Args
-COMMON_ARGS=("--enforce-eager")
+COMMON_ARGS=()
 
 # 4. Execution Loop
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")

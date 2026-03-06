@@ -3,6 +3,7 @@ portpicker
 yapf==0.43.0
 pytest
 pytest-mock
+pytest-timeout
 absl-py
 numpy
 google-cloud-storage

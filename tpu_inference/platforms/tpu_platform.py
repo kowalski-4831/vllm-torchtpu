@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union, cast
 import portpicker
 import torch
 import vllm.envs as vllm_envs
+# Ensure the "tpu" torch.compile backend is registered before vllm
+# tries to use it (e.g. in @torch.compile decorators at import time).
+from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.distributed import tpu_topology
 from tpu_info import device
 from vllm.inputs import ProcessorInputs, PromptType
@@ -42,7 +45,7 @@ class TpuPlatform(Platform):
     ray_device_key: str = "TPU"
     dist_backend: str = "tpu_dist"
     device_control_env_var: str = "TPU_VISIBLE_CHIPS"
-    simple_compile_backend: str = "openxla"
+    simple_compile_backend: str = "tpu"
 
     supported_quantization: list[str] = [
         "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4"
@@ -180,6 +183,10 @@ class TpuPlatform(Platform):
         return True
 
     @classmethod
+    def get_compile_backend(cls) -> str:
+        return "tpu_inference.compilation.tpu_compiler.TpuCompilerAdaptor"
+
+    @classmethod
     def _initialize_sharding_config(cls, vllm_config: VllmConfig) -> None:
 
         sharding_config = ShardingConfigManager.from_vllm_config(vllm_config)
@@ -204,13 +211,37 @@ class TpuPlatform(Platform):
 
         compilation_config = vllm_config.compilation_config
 
-        # TPU only supports DYNAMO_TRACE_ONCE compilation level
-        # NOTE(xiang): the compilation_config is not used by jax.
-        if compilation_config.mode != CompilationMode.DYNAMO_TRACE_ONCE:
-            compilation_config.mode = CompilationMode.DYNAMO_TRACE_ONCE
+        if compilation_config.mode == CompilationMode.NONE:
+            # --enforce-eager is set
+            pass
+        else:
+            compilation_config.mode = CompilationMode.VLLM_COMPILE
 
-        if compilation_config.backend == "":
-            compilation_config.backend = "openxla"
+        # No graph splitting — TPU handles the full graph including
+        compilation_config.splitting_ops = []
+
+        # Disable inductor-specific fusion passes (only available on CUDA).
+        compilation_config.pass_config.fuse_norm_quant = False
+        compilation_config.pass_config.fuse_act_quant = False
+        compilation_config.pass_config.fuse_attn_quant = False
+        compilation_config.pass_config.eliminate_noops = False
+
+        # Set compile_sizes to match the token padding buckets used by
+        # TPUModelRunner. These are the exact shapes PiecewiseBackend
+        # will compile for.
+        if compilation_config.compile_sizes is None:
+            scheduler_config = vllm_config.scheduler_config
+            compilation_config.compile_sizes = _get_token_paddings(
+                min_token_size=16,
+                max_token_size=scheduler_config.max_num_batched_tokens,
+                padding_gap=vllm_envs.VLLM_TPU_BUCKET_PADDING_GAP,
+            )
+        else:
+            compilation_config.compile_sizes = sorted(
+                compilation_config.compile_sizes)
+        # Clear compile_ranges_split_points — TPU always pads to exact
+        # compile_sizes so catch-all ranges are never used.
+        compilation_config.compile_ranges_split_points = []
 
         model_config = vllm_config.model_config
         if model_config is not None and model_config.dtype in (
@@ -334,3 +365,42 @@ class TpuPlatform(Platform):
     def support_hybrid_kv_cache(cls) -> bool:
         # TODO: Fix this
         return False
+
+
+def _get_token_paddings(min_token_size: int, max_token_size: int,
+                        padding_gap: int) -> list[int]:
+    """Generate a list of padding size, starting from min_token_size,
+    ending with a number that can cover max_token_size
+
+    If padding_gap == 0 then:
+        increase 2X each time (exponential)
+    else:
+        first increase the size to twice,
+        then increase the padding size by padding_gap.
+    """
+    # assert min_token_size is power of 2
+    assert (min_token_size & (min_token_size - 1) == 0) and min_token_size > 0
+    paddings = []
+    num = min_token_size
+
+    if padding_gap == 0:
+        logger.info("Using exponential token paddings:")
+        while True:
+            logger.info("    %d", num)
+            paddings.append(num)
+            if num >= max_token_size:
+                break
+            num *= 2
+    else:
+        logger.info("Using incremental token paddings:")
+        while num <= padding_gap:
+            logger.info("    %d", num)
+            paddings.append(num)
+            num *= 2
+        num //= 2
+        while num < max_token_size:
+            num += padding_gap
+            logger.info("    %d", num)
+            paddings.append(num)
+
+    return paddings

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import bisect
+import contextlib
 import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -67,6 +68,28 @@ logger = init_logger(__name__)
 INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
+
+
+@contextlib.contextmanager
+def _bypass_torch_compile(model: nn.Module):
+    """HACK: vLLM wraps the model backbone with
+    `TorchCompileWithNoGuardsWrapper` which overrides `__call__` to route
+    through `torch.compile`, making neither
+    `torch.compiler.set_stance("force_eager")` nor
+    `torch._dynamo.config.patch(disable=True)` work here.
+    """
+    if hasattr(model, "get_language_model"):
+        compiled_model = model.get_language_model().model
+    else:
+        compiled_model = model.model
+
+    compiled_model_cls = compiled_model.__class__
+    original_call = compiled_model_cls.__call__
+    compiled_model_cls.__call__ = compiled_model_cls.forward
+    try:
+        yield
+    finally:
+        compiled_model_cls.__call__ = original_call
 
 
 #########################################################
@@ -166,11 +189,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # InputBatch needs to work with sampling tensors greater than padding
         # to avoid dynamic shapes. Also, avoid suboptimal alignment.
         self.max_num_reqs = max(scheduler_config.max_num_seqs, MIN_NUM_SEQS)
-        self.num_tokens_paddings = _get_token_paddings(
-            min_token_size=16,
-            max_token_size=scheduler_config.max_num_batched_tokens,
-            padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP,
-        )
+        self.num_tokens_paddings = vllm_config.compilation_config.compile_sizes
         # In case `max_num_tokens < max(num_tokens_paddings)` use the actual
         # padded max value to pre-allocate data structures and pre-compile.
         self.max_num_tokens = self.num_tokens_paddings[-1]
@@ -238,11 +257,13 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             PallasAttentionBackend.get_max_num_seqs(self.most_model_len,
                                                     self.block_size),
             self.max_num_reqs,
+            self.max_num_tokens,
         ) if self.most_model_len is not None else None)
         self.num_reqs_max_model_len = min(
             PallasAttentionBackend.get_max_num_seqs(self.max_model_len,
                                                     self.block_size),
             self.max_num_reqs,
+            self.max_num_tokens,
         )
         self.query_start_loc_cpu = torch.zeros(
             self.max_num_tokens + 1,
@@ -1501,8 +1522,16 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         num_tokens: int,
     ) -> None:
-        self._dummy_run(num_tokens, self.num_reqs_max_model_len,
-                        self.max_num_blocks_per_req)
+        # TODO: figure out if this can be fixed
+        # Run eagerly (without torch.compile) during profiling.
+        # The profiling run executes before KV cache is allocated, so
+        # kv_cache.numel() == 0. If torch.compile traces this path, it
+        # specializes the graph with the early-return branch in attention.
+        # So we will not compile here and instead let the compilation happen in
+        # the `precompile_backbone` step.
+        with _bypass_torch_compile(self.model):
+            self._dummy_run(num_tokens, self.num_reqs_max_model_len,
+                            self.max_num_blocks_per_req)
 
     def maybe_setup_cross_layer_kv_sharing(
         self,
@@ -1631,11 +1660,16 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             compiled_model.compiled = False
             TorchCompileWithNoGuardsWrapper.__init__(compiled_model)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def forward_model(self, input_ids, positions, inputs_embeds=None):
-        return self.model(input_ids=input_ids,
-                          positions=positions,
-                          inputs_embeds=inputs_embeds)
+        # @support_torch_compile annotations will be put on the vLLM model if it
+        # supports torch.compile
+        out = self.model(input_ids=input_ids,
+                         positions=positions,
+                         inputs_embeds=inputs_embeds)
+        # @support_torch_compile may return a list/tuple; extract tensor
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        return out
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def select_hidden_states(self, hidden_states, indices_do_sample):
@@ -1763,45 +1797,6 @@ def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
     res = MIN_NUM_SEQS if x <= MIN_NUM_SEQS else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
-
-
-def _get_token_paddings(min_token_size: int, max_token_size: int,
-                        padding_gap: int) -> list[int]:
-    """Generate a list of padding size, starting from min_token_size,
-    ending with a number that can cover max_token_size
-
-    If padding_gap == 0 then:
-        increase 2X each time (exponential)
-    else:
-        first increase the size to twice,
-        then increase the padding size by padding_gap.
-    """
-    # assert min_token_size is power of 2
-    assert (min_token_size & (min_token_size - 1) == 0) and min_token_size > 0
-    paddings = []
-    num = min_token_size
-
-    if padding_gap == 0:
-        logger.info("Using exponential token paddings:")
-        while True:
-            logger.info("    %d", num)
-            paddings.append(num)
-            if num >= max_token_size:
-                break
-            num *= 2
-    else:
-        logger.info("Using incremental token paddings:")
-        while num <= padding_gap:
-            logger.info("    %d", num)
-            paddings.append(num)
-            num *= 2
-        num //= 2
-        while num < max_token_size:
-            num += padding_gap
-            logger.info("    %d", num)
-            paddings.append(num)
-
-    return paddings
 
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:

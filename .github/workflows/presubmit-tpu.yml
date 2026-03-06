@@ -105,4 +105,4 @@ jobs:
         shell: bash
         run: |
           source ../ci-tpu/bin/activate
-          MODEL_IMPL_TYPE="vllm" pytest tests
+          MODEL_IMPL_TYPE="vllm" pytest tests -sv --timeout=300
