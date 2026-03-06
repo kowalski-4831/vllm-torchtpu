@@ -385,7 +385,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         )
 
         # update kv cache
-        kv_cache.copy_(new_kv_cache)
+        kv_cache = new_kv_cache
 
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():

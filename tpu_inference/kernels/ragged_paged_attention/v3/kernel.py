@@ -238,7 +238,6 @@ def _ragged_paged_attention_kernel(
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Scratch
     bkv_x2_ref,  # [2, bkv_sz, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
@@ -504,8 +503,8 @@ def _ragged_paged_attention_kernel(
         p_ignore = kv_p_start - bkv_id * bkv_p
         page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
-        cache_hbm_shape = updated_kv_cache_hbm_ref.shape
-        cache_hbm_ref = updated_kv_cache_hbm_ref.reshape(
+        cache_hbm_shape = kv_cache_hbm_ref.shape
+        cache_hbm_ref = kv_cache_hbm_ref.reshape(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:])
 
         debug_print(
@@ -1399,7 +1398,6 @@ def ragged_paged_attention(
 
     out_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
     ]
 
     bkv_double_buf = pltpu.VMEM(
@@ -1483,19 +1481,18 @@ def ragged_paged_attention(
             ),
             out_shape=[
                 jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                jax.ShapeDtypeStruct(shape=kv_cache.shape,
-                                     dtype=kv_cache.dtype),
             ],
             input_output_aliases={
                 7: 0,
-                9: 1
             },
             name=scope_name,
         ))
 
-    output, updated_kv_cache = kernel(*scalar_prefetches, q, kv, kv_cache)
+    output, = kernel(*scalar_prefetches, q, kv, kv_cache)
+    # NOTE: Temporary fix for the copy issue. In longer term, we should
+    # support this by pytorch level api.
     return (
         prepare_outputs(output, actual_num_q_heads_per_kv_head,
                         actual_head_dim),
-        updated_kv_cache,
+        kv_cache,
     )
