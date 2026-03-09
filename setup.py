@@ -36,7 +36,8 @@ def get_requirements() -> List[str]:
 
 
 def get_version():
-    if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
+    if env_version := os.getenv("VERSION") or os.getenv(
+            "VLLM_VERSION_OVERRIDE"):
         return env_version
     return "0.0.0"
 

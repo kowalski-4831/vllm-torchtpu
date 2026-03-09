@@ -1,8 +1,8 @@
 #!/bin/bash
 set -eu pipefail
 
-# --- SCHEDULE TRIGGER ---
-if [[ "$GH_EVENT_NAME"  == "schedule" ]]; then
+# --- SCHEDULE/MANUAL TRIGGER ---
+if [[ "$GH_EVENT_NAME"  == "schedule" || "$GH_EVENT_NAME" == "workflow_dispatch" ]]; then
     echo "Trigger: Schedule - Generating nightly build"
 
     # --- Get Base Version from Tag ---
@@ -38,3 +38,4 @@ fi
 # --- output ---
 echo "Final determined values: VERSION=${VERSION}"
 echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+echo "VERSION=${VERSION}" >> "$GITHUB_ENV"

@@ -29,6 +29,8 @@ jobs:
 
     runs-on: linux-x86-n2-16
     container: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
+    outputs:
+      gcs_path: ${{ steps.upload-to-gcs.outputs.gcs_path }}
     name: Build wheel
 
     steps:
@@ -36,15 +38,11 @@ jobs:
     - name: Mark git directory as safe
       run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
     - name: Determine Version
-      id: vars
       env:
         GH_EVENT_NAME: ${{ github.event_name }}
         GH_REF_NAME: ${{ github.ref_name }}
         GH_REF: ${{ github.ref }}
       run: bash .github/scripts/determine_release_vars.sh
-    - name: Install dependencies (build)
-      run:
-        python3 -m pip install build
     # Halt for testing
     - name: Wait For Connection
       uses: google-ml-infra/actions/ci_connection@7f5ca0c263a81ed09ea276524c1b9192f1304e3c
@@ -54,3 +52,94 @@ jobs:
       env:
         VLLM_VERSION_OVERRIDE: ${{ inputs.VERSION }}
       run: python3 -m build
+    - name: Upload to GCS
+      id: upload-to-gcs
+      run: |
+        # Upload to GCS
+        gcloud storage cp -r "dist/*.whl" "gs://torch-tpu-vllm-ci-transient/artifacts/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}/"
+        gcloud storage cp -r "dist/*.tar.gz" "gs://torch-tpu-vllm-ci-transient/artifacts/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}/"
+
+        echo "gcs_path=gs://torch-tpu-vllm-ci-transient/artifacts/${{ github.workflow }}/${{ github.run_number }}/${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+    - name: Upload artifacts to Artifact Registry
+      # Upload to artifact registry only if it's scheduled run on the main branch
+      if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+      run: |
+        # Install package needed to authenticate to artifactregistry for Python.
+        # See https://cloud.google.com/artifact-registry/docs/python/authentication
+        pip install keyrings.google-artifactregistry-auth
+
+        # Configure pypirc for twine upload.
+        pypirc_content=$(cat <<EOF
+        [distutils]
+        index-servers =
+            torch-tpu-vllm-testing-repo
+
+        [torch-tpu-vllm-testing-repo]
+        repository = https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry/
+        EOF
+        )
+        echo "$pypirc_content" > "$HOME"/.pypirc
+
+        # Upload to Artifact registry
+        python3 -m twine upload --repository-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry dist/*.whl
+        python3 -m twine upload --repository-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry dist/*.tar.gz
+
+  run-tests:
+    needs: build
+    defaults:
+      run:
+        shell: bash
+
+    runs-on: linux-x86-tpu7x-224-4tpu
+    container: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
+    name: Run tests
+
+    steps:
+    - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+    - name: Mark git directory as safe
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+    - name: Setup Virtual Environment
+      run: |
+        uv venv ci-tpu
+        echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/ci-tpu" >> "$GITHUB_ENV"
+        echo "$GITHUB_WORKSPACE/ci-tpu/bin" >> "$GITHUB_PATH"
+
+    - name: Download torchtpu-vllm wheel from GCS
+      run: |
+        mkdir dist
+        gcloud storage cp "${{ needs.build.outputs.gcs_path }}/*.whl" dist/
+
+    - name: Install PyTorch CPU and torch_tpu and torchtpu-vllm
+      run: |
+        # Install Pytorch CPU and Torch TPU
+        ACCESS_TOKEN="$(gcloud auth print-access-token)"
+        uv pip install --pre --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch-tpu
+
+        # Install torchtpu-vllm and dependencies
+        uv pip install --pre dist/*.whl
+        uv pip install -r requirements_v7x.txt
+        uv pip install -r requirements.txt
+
+    - name: Install vllm
+      run: |
+        git clone --depth 1 --branch releases/v0.13.0 https://github.com/vllm-project/vllm.git
+
+        # Install vllm dependencies
+        uv pip install -r vllm/requirements/tpu.txt
+
+        export VLLM_TARGET_DEVICE="tpu"
+        uv pip install -e vllm
+
+    - name: Run tests
+      run: |
+        # Print installed packages
+        uv pip freeze
+
+        export MODEL_IMPL_TYPE="vllm"
+
+        # Run tests from a temp dir to force Python to test the installed package, not local source files.
+        # see https://blog.ganssle.io/articles/2019/08/test-as-installed.html
+        TEST_DIR="$PWD/tests"
+        cd "$(mktemp -d)"
+        pytest "$TEST_DIR"
