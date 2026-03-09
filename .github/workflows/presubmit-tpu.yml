@@ -75,29 +75,27 @@ jobs:
       # will return "total 0").
       - uses: actions/checkout@v5
 
-      - name: Install PyTorch (CPU) and torch_tpu
+      - name: Create CI virtualenv
         shell: bash
         run: |
           cd ..
           python3 -m venv ci-tpu
           source ci-tpu/bin/activate
           python -m pip install --upgrade pip
-          ACCESS_TOKEN="$(gcloud auth print-access-token)"
-          pip install --pre --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch-tpu
 
       # TODO: Remove hardcoded vllm branch.
-      - name: Install vllm and torchtpu-vllm
+      - name: Install vllm, torch_tpu, and torchtpu-vllm
         shell: bash
         run: |
           cd ..
           source ci-tpu/bin/activate
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
           git clone https://github.com/vllm-project/vllm.git
           cd vllm
           git switch releases/v0.13.0
           cd ..
-          pip install -r vllm/requirements/tpu.txt
           VLLM_TARGET_DEVICE="tpu" pip install -e vllm
-          pip install -r torchtpu-vllm/requirements_v7x.txt
+          pip install --pre --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch-tpu
           pip install -r torchtpu-vllm/requirements.txt
           pip install -e torchtpu-vllm
 

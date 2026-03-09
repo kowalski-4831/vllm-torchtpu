@@ -3,11 +3,11 @@
 import bisect
 import contextlib
 import time
+from importlib import metadata as importlib_metadata
 from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
-import libtpu
 import numpy as np
 import torch
 import torch.nn as nn
@@ -68,6 +68,23 @@ logger = init_logger(__name__)
 INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
+
+
+def _validate_libtpu_version() -> None:
+    """Validate libtpu opportunistically if it is present."""
+    libtpu_version = importlib_metadata.version("libtpu")
+    parsed_version = version.parse(libtpu_version)
+    if parsed_version < version.parse("0.0.35"):
+        raise RuntimeError(
+            "Argmax is having accuracy issue with libtpu < 0.0.35")
+    if parsed_version < version.parse("0.0.36"):
+        logger.warning_once(
+            "libtpu < 0.0.36 may enable "
+            "--xla_tpu_impure_enable_large_2nd_minor_layout by default, "
+            "which can hurt performance. "
+            "Upgrade libtpu to >= 0.0.36, or set "
+            "LIBTPU_INIT_ARGS=--xla_tpu_impure_enable_large_2nd_minor_layout=false."
+        )
 
 
 @contextlib.contextmanager
@@ -146,6 +163,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
+        _validate_libtpu_version()
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -1691,11 +1709,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         separately from `forward` for lighter compilation overhead.
         """
         if True:  # sampling_metadata.all_greedy:
-            # Prior versions of libtpu give incorrect results, see: b/481003178.
-            if version.parse(libtpu.__version__) < version.parse('0.0.35'):
-                raise RuntimeError(
-                    "Argmax is not supported with libtpu < 0.0.35")
-
             out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
         else:
             out_tokens = self.sampler(logits,
