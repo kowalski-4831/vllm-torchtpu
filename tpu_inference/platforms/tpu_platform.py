@@ -313,6 +313,19 @@ class TpuPlatform(Platform):
             update_vllm_config_for_dp_scheduler
         update_vllm_config_for_dp_scheduler(vllm_config)
 
+        cls._disable_other_compilations()
+
+    @classmethod
+    def _disable_other_compilations(cls):
+        """HACK: Remove @torch.compile(dynamic=True) wrappers around
+        annotated functions in vllm (ex. get_masked_input_and_mask).
+        This is because torchtpu does not support dynamic shapes.
+        """
+        import vllm.model_executor.layers.vocab_parallel_embedding as vpe
+        if hasattr(vpe.get_masked_input_and_mask, "__wrapped__"):
+            vpe.get_masked_input_and_mask = (
+                vpe.get_masked_input_and_mask.__wrapped__)
+
     @classmethod
     def is_pin_memory_available(cls):
         logger.warning("Pin memory is not supported on TPU.")
