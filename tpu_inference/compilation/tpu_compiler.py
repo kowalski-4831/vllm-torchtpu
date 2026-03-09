@@ -169,28 +169,27 @@ class TpuCompilerAdaptor(CompilerInterface):
         with open(path, "rb") as f:
             inner_exe = pickle.load(f)
 
-        # Wrap to filter non-tensor args if needed (matching compile path)
-        has_non_tensor = any(not isinstance(a, torch.Tensor)
-                             for a in example_inputs)
-        if has_non_tensor:
-            from torch_tpu._internal.compile._backend import \
-                _TensorFilterExecutable
-            cached_exe = _TensorFilterExecutable(inner_exe)
-        else:
-            cached_exe = inner_exe
-
         # TODO: this can be further optimized
         # Re-create the aot_autograd wrapper around the cached executable.
         # The compile path runs: aot_autograd(fw_compiler=...)(graph, inputs)
         # which sets up runtime logic to handle input mutations  by mapping
         # extra outputs back to input tensors.
         from torch._dynamo.backends.common import aot_autograd
+        from torch_tpu._internal.compile._backend import \
+            _TensorFilterExecutable
 
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         def _cached_compiler(gm, example_inputs):
-            return cached_exe
+            # aot_autograd may pass non-tensor args (concrete ints from
+            # specialization). Wrap to filter them out, matching the
+            # compile path in TpuBackend._compile_graph_module.
+            tensor_indices = tuple(i for i, a in enumerate(example_inputs)
+                                   if isinstance(a, torch.Tensor))
+            if len(tensor_indices) < len(example_inputs):
+                return _TensorFilterExecutable(inner_exe, tensor_indices)
+            return inner_exe
 
         compiled_fn = aot_autograd(
             fw_compiler=_cached_compiler,
