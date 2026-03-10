@@ -134,8 +134,10 @@ def moe_gmm_local(
                                                             axis=-1)
     token_hidden = token_topk_hidden.sum(axis=-2)
 
-    reduction_axis = (ShardingAxisName.MLP_TENSOR
-                      if parallelism == "tp" else ShardingAxisName.EXPERT)
+    if parallelism == "tp":
+        return token_hidden
+
+    reduction_axis = ShardingAxisName.EXPERT
     # Then global reduction on all ranks for all tokens and all experts
     return jax.lax.psum(token_hidden, axis_name=reduction_axis)
 
