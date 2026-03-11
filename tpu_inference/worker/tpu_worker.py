@@ -56,6 +56,7 @@ class TPUWorker:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
+        self.parallel_config.rank = rank
         self.cache_config = vllm_config.cache_config
         self.local_rank = local_rank
         self.rank = rank
