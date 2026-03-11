@@ -251,30 +251,34 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # This prevents torch.compile from tracing into the Pallas kernel internals.
         @torch.library.custom_op(
             op_name,
-            mutates_args=(),
-            schema="(Tensor kv_cache, Tensor query, Tensor key, Tensor value, "
-            "Tensor seq_lens, Tensor block_tables, Tensor query_start_loc, "
-            "Tensor request_distribution, Tensor? sinks, float? q_scale, "
-            "float? k_scale, float? v_scale) -> (Tensor, Tensor)",
+            mutates_args=("kv_cache", ),
             device_types=["tpu"],
         )
-        @pallas.custom_jax_kernel
-        def rpa_kernel_impl(kv_cache, query, key, value, seq_lens,
-                            block_tables, query_start_loc,
-                            request_distribution, sinks, q_scale, k_scale,
-                            v_scale):
-            return wrapped_fn(kv_cache,
-                              query,
-                              key,
-                              value,
-                              seq_lens,
-                              block_tables,
-                              query_start_loc,
-                              request_distribution,
-                              sinks,
-                              q_scale=q_scale,
-                              k_scale=k_scale,
-                              v_scale=v_scale)
+        def rpa_kernel_impl(kv_cache: torch.Tensor, query: torch.Tensor,
+                            key: torch.Tensor, value: torch.Tensor,
+                            seq_lens: torch.Tensor, block_tables: torch.Tensor,
+                            query_start_loc: torch.Tensor,
+                            request_distribution: torch.Tensor,
+                            sinks: torch.Tensor | None, q_scale: float | None,
+                            k_scale: float | None,
+                            v_scale: float | None) -> torch.Tensor:
+            jax_kernel = pallas.custom_jax_kernel(wrapped_fn,
+                                                  input_output_aliases={0: 0},
+                                                  donate_argnums=(0, ),
+                                                  name=f'jax_{op_name}')
+            _new_kv_cache, outputs = jax_kernel(kv_cache,
+                                                query,
+                                                key,
+                                                value,
+                                                seq_lens,
+                                                block_tables,
+                                                query_start_loc,
+                                                request_distribution,
+                                                sinks,
+                                                q_scale=q_scale,
+                                                k_scale=k_scale,
+                                                v_scale=v_scale)
+            return outputs
 
         # Register fake tensor implementation for torch.compile tracing
         def _fake_rpa_kernel(
@@ -290,8 +294,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             q_scale: float | None = None,
             k_scale: float | None = None,
             v_scale: float | None = None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return kv_cache, torch.empty_like(query)
+        ) -> tuple[torch.Tensor]:
+            return torch.empty_like(query)
 
         rpa_kernel_impl.register_fake(_fake_rpa_kernel)
 
@@ -369,7 +373,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # pallas.set_buffer_donor_(kv_cache, True)
 
         # Call the operator
-        new_kv_cache, outputs = self.rpa_kernel(
+        outputs = self.rpa_kernel(
             kv_cache,
             query,
             key,
@@ -383,9 +387,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             k_scale,
             v_scale,
         )
-
-        # update kv cache
-        kv_cache.copy_(new_kv_cache)
 
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():
