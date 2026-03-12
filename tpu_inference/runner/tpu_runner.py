@@ -826,10 +826,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             total_num_scheduled_tokens:padded_total_num_scheduled_tokens] = 0
         self.input_ids = self.input_ids_cpu[:
                                             padded_total_num_scheduled_tokens].to(
-                                                self.device)
+                                                self.device, non_blocking=True)
         self.position_ids = self.positions_cpu[:
                                                padded_total_num_scheduled_tokens].to(
-                                                   self.device)
+                                                   self.device,
+                                                   non_blocking=True)
         if use_max_model_len:
             block_tables = self.block_table_cpu[:self.num_reqs_max_model_len, :
                                                 self.max_num_blocks_per_req]
@@ -837,9 +838,10 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.input_batch.block_table[0].get_cpu_tensor()[:num_reqs])
             query_start_loc = self.query_start_loc_cpu[:self.
                                                        num_reqs_max_model_len +
-                                                       1].to(self.device)
+                                                       1].to(self.device,
+                                                             non_blocking=True)
             seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
-                self.device)
+                self.device, non_blocking=True)
         else:
             assert self.num_reqs_most_model_len is not None
             block_tables = self.block_table_cpu[:self.
@@ -850,12 +852,14 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 [:num_reqs, :self.num_blocks_per_most_len_req])
             query_start_loc = self.query_start_loc_cpu[:self.
                                                        num_reqs_most_model_len +
-                                                       1].to(self.device)
+                                                       1].to(self.device,
+                                                             non_blocking=True)
             seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
-                self.device)
+                self.device, non_blocking=True)
         # Flatten on CPU before H2D to avoid device-side as_strided/reshape
         # materialization on every decode step.
-        block_tables = block_tables.reshape(-1).to(self.device)
+        block_tables = block_tables.reshape(-1).to(self.device,
+                                                   non_blocking=True)
 
         if self.lora_config is not None:
             # We need to respect padding when activating LoRA adapters
@@ -872,8 +876,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # request_distribution: [decode_end, prefill_end, mixed_end]
         # For single chip, we treat all requests as "mixed" mode
         request_distribution = torch.tensor([0, num_reqs, num_reqs],
-                                            dtype=torch.int32,
-                                            device=self.device)
+                                            dtype=torch.int32).to(
+                                                self.device, non_blocking=True)
 
         attn_metadata = AttentionMetadata(
             input_positions=self.position_ids,
@@ -892,7 +896,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Indices at which we sample (positions of last token in the sequence).
         # Padded to avoid recompiling when `num_reqs` varies.
         logits_indices = self.query_start_loc_cpu[1:padded_num_reqs + 1] - 1
-        logits_indices = logits_indices.to(self.device)
+        logits_indices = logits_indices.to(self.device, non_blocking=True)
 
         if self.lora_config is not None:
             # We need to respect padding when activating LoRA adapters
