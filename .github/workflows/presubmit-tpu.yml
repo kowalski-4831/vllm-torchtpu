@@ -36,6 +36,9 @@ permissions:
   pull-requests: read
   issues: read
 
+env:
+  VLLM_REF: v0.17.1
+
 # Cancel old jobs when they are replaced by new runs
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -90,10 +93,7 @@ jobs:
           cd ..
           source ci-tpu/bin/activate
           ACCESS_TOKEN="$(gcloud auth print-access-token)"
-          git clone https://github.com/vllm-project/vllm.git
-          cd vllm
-          git switch releases/v0.13.0
-          cd ..
+          git clone --depth 1 --branch "${VLLM_REF}" https://github.com/vllm-project/vllm.git
           VLLM_TARGET_DEVICE="tpu" pip install -e vllm
           pip install --pre --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch-tpu
           pip install -r torchtpu-vllm/requirements.txt

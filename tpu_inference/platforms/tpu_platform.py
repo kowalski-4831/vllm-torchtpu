@@ -12,7 +12,7 @@ import vllm.envs as vllm_envs
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.distributed import tpu_topology
 from tpu_info import device
-from vllm.inputs import ProcessorInputs, PromptType
+from vllm.inputs import ProcessorInputs
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from tpu_inference import envs
@@ -20,11 +20,11 @@ from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.attention.backends.registry import AttentionBackendEnum
-    from vllm.attention.selector import AttentionSelectorConfig
     from vllm.config import BlockSize, ModelConfig, VllmConfig
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams, SamplingType
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     BlockSize = None
     ModelConfig = None
@@ -56,6 +56,17 @@ class TpuPlatform(Platform):
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
         "NEW_MODEL_DESIGN"
     ]
+
+    @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        del parser
+        from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
+                                                         register_backend)
+
+        register_backend(
+            AttentionBackendEnum.FLASH_ATTN,
+            "tpu_inference.layers.vllm.attention.PallasAttentionBackend",
+        )
 
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
@@ -125,12 +136,11 @@ class TpuPlatform(Platform):
     def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
                              attn_selector_config: "AttentionSelectorConfig",
                              **kwargs) -> str:
-        from vllm.attention.backends.registry import AttentionBackendEnum
-
-        if selected_backend != AttentionBackendEnum.PALLAS:
+        backend_name = getattr(selected_backend, "name", None)
+        if backend_name not in (None, "FLASH_ATTN"):
             logger.info("Cannot use %s backend on TPU.", selected_backend)
 
-        logger.info("Using Pallas V1 backend.")
+        logger.info("Using TPU Pallas attention backend via FLASH_ATTN.")
         return "tpu_inference.layers.vllm.attention.PallasAttentionBackend"
 
     @classmethod
@@ -195,6 +205,9 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        from tpu_inference import _patch_vllm_tpu_group_custom_ops
+
+        _patch_vllm_tpu_group_custom_ops()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             assert not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING, (
@@ -255,8 +268,7 @@ class TpuPlatform(Platform):
             )
             model_config.dtype = torch.bfloat16
 
-        # TODO(cuiq): remove this dependency.
-        from vllm.v1.attention.backends.pallas import PallasAttentionBackend
+        from tpu_inference.layers.vllm.attention import PallasAttentionBackend
         cache_config.block_size = PallasAttentionBackend.get_page_size(
             vllm_config)  # type: ignore[assignment]
         min_page_size = PallasAttentionBackend.get_min_page_size(vllm_config)
@@ -350,16 +362,20 @@ class TpuPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        prompt: PromptType,
-        params: Union["SamplingParams", PoolingParams],
         processed_inputs: ProcessorInputs,
+        params: Union["SamplingParams", PoolingParams],
     ) -> None:
         """Raises if this request is unsupported on this platform"""
         from vllm.sampling_params import SamplingParams, SamplingType
 
+        del processed_inputs
         if isinstance(params, SamplingParams):
             if params.sampling_type == SamplingType.RANDOM_SEED:
                 raise ValueError("JAX does not support per-request seed.")
+            if params.sampling_type != SamplingType.GREEDY:
+                raise ValueError(
+                    "Only greedy sampling (temperature=0) is supported on TPU."
+                )
 
     @classmethod
     def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str,

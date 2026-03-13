@@ -3,7 +3,6 @@
 
 import os
 
-import vllm.envs as vllm_envs
 from vllm import LLM, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -20,7 +19,7 @@ def create_parser():
     # Add sampling params
     sampling_group = parser.add_argument_group("Sampling parameters")
     sampling_group.add_argument("--max-tokens", type=int)
-    sampling_group.add_argument("--temperature", type=float)
+    sampling_group.add_argument("--temperature", type=float, default=0.0)
     sampling_group.add_argument("--top-p", type=float)
     sampling_group.add_argument("--top-k", type=int)
     return parser
@@ -38,6 +37,7 @@ def main(args: dict):
 
     # Create a sampling params object
     sampling_params = llm.get_default_sampling_params()
+    sampling_params.temperature = 0.0
     if max_tokens is not None:
         sampling_params.max_tokens = max_tokens
     if temperature is not None:
@@ -87,10 +87,11 @@ def main(args: dict):
         'Who wrote the novel "Pride and Prejudice"?',
     ]
 
-    if vllm_envs.VLLM_TORCH_PROFILER_DIR is not None:
+    torch_profiler_dir = os.getenv("VLLM_TORCH_PROFILER_DIR")
+    if torch_profiler_dir is not None:
         llm.start_profile()
     outputs = llm.generate(prompts, sampling_params)
-    if vllm_envs.VLLM_TORCH_PROFILER_DIR is not None:
+    if torch_profiler_dir is not None:
         llm.stop_profile()
 
     # Print the outputs.

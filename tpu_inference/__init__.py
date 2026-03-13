@@ -1,9 +1,6 @@
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
-from vllm.distributed.parallel_state import GroupCoordinator
-from vllm.platforms import current_platform
-
 import tpu_inference.env_override  # noqa: F401
 from tpu_inference import envs
 from tpu_inference import tpu_info as ti
@@ -23,6 +20,9 @@ def _patch_vllm_tpu_group_custom_ops() -> None:
     this patch will use torch.distributed.all_reduce/all_gather.
     """
 
+    from vllm.distributed.parallel_state import GroupCoordinator
+    from vllm.platforms import current_platform
+
     if getattr(GroupCoordinator, "_tpu_no_custom_collective_patch", False):
         return
 
@@ -37,8 +37,6 @@ def _patch_vllm_tpu_group_custom_ops() -> None:
     GroupCoordinator._tpu_no_custom_collective_patch = True
     logger.info("Applied TPU patch: disable vLLM custom collective ops.")
 
-
-_patch_vllm_tpu_group_custom_ops()
 
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")

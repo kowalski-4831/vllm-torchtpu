@@ -21,6 +21,9 @@ on:
 permissions:
   contents: read
 
+env:
+  VLLM_REF: v0.17.1
+
 jobs:
   build:
     defaults:
@@ -123,7 +126,7 @@ jobs:
 
     - name: Install vllm
       run: |
-        git clone --depth 1 --branch releases/v0.13.0 https://github.com/vllm-project/vllm.git
+        git clone --depth 1 --branch "${VLLM_REF}" https://github.com/vllm-project/vllm.git
 
         # Install vllm dependencies
         uv pip install -r vllm/requirements/tpu.txt

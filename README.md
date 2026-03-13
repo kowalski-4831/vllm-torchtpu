@@ -13,10 +13,29 @@ Build the `torch_tpu` Python wheel from source by following the instructions her
 👉 [google-ml-infra/torch_tpu Installation Guide](https://github.com/google-ml-infra/torch_tpu?tab=readme-ov-fil#installation)
 
 ### 2. Install vLLM from Source
-Install vLLM from source using the official TPU documentation.
-> **Note:** Currently, `vllm==v0.13.0` is supported.
+Install vLLM from source using the pinned upstream version used by CI.
+> **Note:** Currently, `vllm==v0.17.1` is supported.
 
-👉 [vLLM TPU Installation Guide](https://docs.vllm.ai/projects/tpu/en/latest/getting_started/installation/#install-from-source)
+```bash
+python3.12 -m venv ../vllm_env --symlinks
+source ../vllm_env/bin/activate
+pip install --upgrade pip
+
+git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git ../vllm
+
+pip install -r ../vllm/requirements/tpu.txt
+VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
+
+ACCESS_TOKEN="$(gcloud auth print-access-token)"
+
+# sometimes need to reinstall after vllm to make sure some dependencies are installed correctly
+pip install --pre \
+  --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
+  torch_tpu
+
+pip install -r requirements.txt
+pip install -e .
+```
 
 ---
 

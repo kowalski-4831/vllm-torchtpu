@@ -49,7 +49,7 @@ from typing import Optional
 
 import torch
 from torch_tpu._internal import sync
-from vllm.attention.layer import Attention
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,

@@ -17,9 +17,6 @@ from jax.sharding import Mesh
 from packaging import version
 from torch_tpu import api
 from torch_tpu._internal import sync
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.layer import Attention, MLAAttention
-from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import (ParallelConfig, VllmConfig,
                          get_layers_from_vllm_config, update_config)
@@ -28,6 +25,9 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import (Attention,
+                                                  ChunkedLocalAttention,
+                                                  MLAAttention)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (SupportsMultiModal,
@@ -41,12 +41,13 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv, prev_power_of_2
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors, ModelRunnerOutput
-from vllm.v1.sample.tpu.metadata import TPUSupportedSamplingMetadata
-from vllm.v1.sample.tpu.sampler import Sampler as TPUSampler
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
+                             LogprobsTensors, ModelRunnerOutput)
+from vllm.v1.sample.sampler import Sampler as TPUSampler
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin, KVConnectorOutput)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -352,6 +353,18 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def reset_mm_cache(self) -> None:
         pass
+
+    def maybe_setup_kv_connector(self, scheduler_output) -> None:
+        # TODO: Prefill/decode KV connector support is still WIP on TPU.
+        # Keep this hook so the old call site stays aligned with upstream flow.
+        del scheduler_output
+
+    def maybe_wait_for_kv_save(self) -> None:
+        pass
+
+    def get_finished_kv_transfers(self, scheduler_output):
+        del scheduler_output
+        return None, None
 
     def _get_requested_tp_size(self) -> int:
         # This integration supports TP>1 only via vLLM native multiprocess
@@ -1090,6 +1103,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                "after execute_model() returns None.")
         # Update cached state
         self._update_states(scheduler_output)
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            if not has_kv_transfer_group():
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            return self.kv_connector_no_forward(scheduler_output,
+                                                self.vllm_config)
+
         self.scheduler_output = scheduler_output
         return None
 
@@ -1106,7 +1125,15 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Prepare inputs, the requests might be split into multiple
         # executions, combine the result of each execution.
+        if not self.input_batch.all_greedy:
+            raise NotImplementedError(
+                "Only greedy sampling (temperature=0) is supported on TPU. "
+                "Non-greedy sampling requires porting to vLLM v0.17.1's "
+                "Sampler API.")
+
         start_index = 0
+        max_num_logprobs = self.input_batch.max_num_logprobs
+        needs_logprobs = max_num_logprobs is not None and max_num_logprobs > 0
         combined_selected_tokens: list[torch.Tensor] = []
         combined_logprobs: list[LogprobsLists] = []
 
@@ -1138,8 +1165,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                       logits_indices)
 
             logits = self.compute_logits(hidden_states)
-            tpu_sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
-                self.input_batch, padded_num_reqs, self.device)
             if grammar_output is not None:
                 require_struct_decoding, grammar_bitmask_padded, arange = (
                     self.prepare_structured_decoding_input(
@@ -1147,20 +1172,19 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits = self.structured_decode(require_struct_decoding,
                                                 grammar_bitmask_padded, logits,
                                                 arange)
-            selected_token_ids = self.sample_from_logits_func(
-                logits, tpu_sampling_metadata)
+            selected_token_ids = self.sample_from_logits_func(logits)
             # NOTE (NickLucche) Use the original logits (before any penalties or
             # temperature scaling) for the top-k logprobs. We can't enforce it
             # due to recompilations outside torch.compiled code, so just make
             # sure `sample_from_logits` does not modify the logits in-place.
             logprobs = (self.gather_logprobs(logits, selected_token_ids)
-                        if tpu_sampling_metadata.logprobs else None)
+                        if needs_logprobs else None)
 
             # Remove padding on cpu and keep dynamic op outside of xla graph.
             selected_token_ids = selected_token_ids.cpu()[:num_reqs]
 
             combined_selected_tokens.append(selected_token_ids)
-            if tpu_sampling_metadata.logprobs:
+            if needs_logprobs:
                 combined_logprobs.append(logprobs.tolists())
 
             self._update_num_xla_graphs("decoding_step")
@@ -1193,7 +1217,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
 
         selected_token_ids = torch.cat(combined_selected_tokens, dim=0)
-        if tpu_sampling_metadata.logprobs:
+        if needs_logprobs:
 
             def concat_lists(input_lists):
                 result = []
@@ -1260,7 +1284,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 token_id = valid_sampled_token_ids[i][0]
                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
                 req_state.output_token_ids.append(token_id)
-                self.input_batch.num_tokens[i] += 1
+                self.input_batch.num_tokens_no_spec[i] += 1
 
         else:
             valid_mask = selected_token_ids != INVALID_TOKEN_ID
@@ -1269,7 +1293,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 seq.tolist()
                 for seq in selected_token_ids[valid_mask].split(gen_lens)
             ]
-            self.input_batch.num_tokens[:num_reqs] += gen_lens
+            self.input_batch.num_tokens_no_spec[:num_reqs] += gen_lens
             for i, req_state, seq_len in request_seq_lens:
                 target_slice = slice(seq_len - gen_lens[i] + 1, seq_len + 1)
                 self.input_batch.token_ids_cpu[i, target_slice] = (
@@ -1285,7 +1309,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
             sampled_token_ids=valid_sampled_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
@@ -1492,15 +1516,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 device=self.device,
                 dtype=self._hidden_states_dtype,
             )
-            padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-                num_reqs, self.max_num_reqs)
-
-            # NOTE: We only support all_greedy=True path in sample_from_logits currently
-            # but we compile it anyway.
-            sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
-                self.input_batch, padded_num_reqs, self.device)
-
-            out = self.sample_from_logits_func(dummy_logits, sampling_metadata)
+            out = self.sample_from_logits_func(dummy_logits)
             sync.synchronize(out, wait=True)
             logger.info("  -- num_seqs: %d", num_reqs)
         end = time.perf_counter()
@@ -1705,19 +1721,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def sample_from_logits(
-            self, logits: torch.Tensor,
-            sampling_metadata: TPUSupportedSamplingMetadata) -> torch.Tensor:
+    def sample_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
         """
-        if True:  # sampling_metadata.all_greedy:
-            out_tokens = torch.argmax(logits, dim=-1, keepdim=True)
-        else:
-            out_tokens = self.sampler(logits,
-                                      sampling_metadata).sampled_token_ids
-        return out_tokens
+        return torch.argmax(logits, dim=-1, keepdim=True)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def gather_logprobs(self, logits: torch.Tensor,

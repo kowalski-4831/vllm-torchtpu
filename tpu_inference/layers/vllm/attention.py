@@ -5,10 +5,10 @@ import functools
 
 import torch
 from torch_tpu._internal import pallas, sync
-from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
+                                       AttentionLayer, AttentionType)
 
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
@@ -85,7 +85,7 @@ class PallasAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "PALLAS"
+        return "FLASH_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type["PallasAttentionBackendImpl"]:
