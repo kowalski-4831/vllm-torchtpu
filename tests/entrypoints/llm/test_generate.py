@@ -303,3 +303,4 @@ def test_generate_qwen3_coder_30b_tp_v7(llm_large_tp_v7):
     assert tp_size >= 2
     assert len(outputs) == 1
     assert len(outputs[0].outputs) == 1
+    assert outputs[0].outputs[0].text.strip()
