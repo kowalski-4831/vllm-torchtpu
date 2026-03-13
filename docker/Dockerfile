@@ -1,61 +1,44 @@
-ARG NIGHTLY_DATE="20250714"
-ARG BASE_IMAGE="us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla:nightly_3.12_tpuvm_$NIGHTLY_DATE"
-# The latest main will be used if arg unspecified
-ARG VLLM_COMMIT_HASH="v0.13.0"
-ARG TORCH_TPU_WHEEL_DIR=""
+ARG BASE_IMAGE="us-central1-docker.pkg.dev/meta-tpu-rbbq5/zongwei-repo/torchtpu:colin2328-latest"
+ARG VLLM_COMMIT_HASH="v0.17.1"
 
 FROM $BASE_IMAGE
 
-ARG IS_FOR_V7X="false"
+# Clear PYTHONPATH=/workspace inherited from base image — it causes
+# /workspace dirs to shadow installed packages.
+ENV PYTHONPATH=""
 
-# Remove existing versions of dependencies
-RUN pip uninstall -y torch torch_xla torchax torchvision
-
-# Install torch_tpu from TORCH_TPU_WHEEL_DIR
-RUN pip install torch_tpu --no-cache-dir --find-links $TORCH_TPU_WHEEL_DIR --retries 3
-
-# Install some basic utilities
+# System libraries needed by vLLM/torchtpu-vllm
 RUN apt-get update && apt-get install -y \
-    git \
-    libopenblas-base libopenmpi-dev libomp-dev
+    libopenblas0 libopenmpi-dev libomp-dev
 
-# Install uv for faster pip installs
 RUN pip install uv
 
-# Build vLLM
-WORKDIR /workspace/vllm
+# Install vLLM under /root (not /workspace — base image sets PYTHONPATH=/workspace
+# which would cause /workspace/vllm to shadow the installed vllm package)
+WORKDIR /root/vllm
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_COMMIT_HASH
-RUN git clone --depth 1 --branch $VLLM_COMMIT_HASH $VLLM_REPO /workspace/vllm
-RUN pip install -r requirements/tpu.txt --retries 3
-RUN SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_COMMIT_HASH#v} VLLM_TARGET_DEVICE="tpu" pip install -e .
+RUN git clone --depth 1 --branch $VLLM_COMMIT_HASH $VLLM_REPO /root/vllm
+RUN sed -i '/tpu-inference/d' requirements/tpu.txt && \
+    uv pip install --system -r requirements/tpu.txt
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_COMMIT_HASH#v} VLLM_TARGET_DEVICE="tpu" \
+    uv pip install --system -e .
 
 # Install test dependencies
-RUN python3 -m pip install -e tests/vllm_test_utils
-RUN python3 -m pip install --no-cache-dir \
+RUN uv pip install --system -e tests/vllm_test_utils
+RUN uv pip install --system --no-cache \
     git+https://github.com/thuml/depyf.git \
     pytest-asyncio \
     git+https://github.com/EleutherAI/lm-evaluation-harness.git@206b7722158f58c35b7ffcd53b035fdbdda5126d#egg=lm-eval[api] \
-    pytest-cov \
-    tblib
+    pytest-cov tblib
 
-# Install tpu_inference
+# Install tpu_inference (this repo)
 WORKDIR /workspace/tpu_inference
-# Install requirements first and cache so we don't need to re-install on code change.
 COPY requirements.txt .
-RUN pip install -r requirements.txt --retries 3
+RUN uv pip install --system -r requirements.txt
 COPY requirements_benchmarking.txt .
-# These are needed for the E2E benchmarking tests (i.e. tests/e2e/benchmarking/mlperf.sh)
-RUN pip install -r requirements_benchmarking.txt --retries 3
+RUN uv pip install --system -r requirements_benchmarking.txt
 COPY . .
-RUN pip install -e .
-
-# TODO (jacobplatin): remove when v7x is supported in JAX/Libtpu officially
-# NOTE: it's important that this is done after installing tpu_inference above,
-# so that the v7x-specific dependencies can override any existing ones.
-COPY requirements_v7x.txt .
-RUN if [ "$IS_FOR_V7X" = "true" ]; then \
-        pip install -r requirements_v7x.txt; \
-    fi
+RUN uv pip install --system -e .
 
 CMD ["/bin/bash"]
