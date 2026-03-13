@@ -347,6 +347,21 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.mm_embed_inputs: tuple[list[torch.Tensor],
                                     torch.Tensor] | None = None
 
+        # Cache attention layer names to avoid calling
+        # get_layers_from_vllm_config every step.
+        self._attn_layer_names: list[str] | None = None
+
+        # Pre-allocate request_distribution tensor on device to avoid
+        # creating a new tensor + H2D copy every step.
+        self._request_distribution_cpu = torch.zeros(3, dtype=torch.int32)
+
+        # Cache for decode-constant device tensors to avoid redundant H2D
+        # copies. Keyed by (num_reqs, padded_num_reqs, use_max_model_len).
+        self._decode_device_cache_key: tuple | None = None
+        self._cached_query_start_loc: torch.Tensor | None = None
+        self._cached_logits_indices: torch.Tensor | None = None
+        self._cached_request_distribution: torch.Tensor | None = None
+
         # Create JAX Mesh for shard_map operations in TPU kernels.
         # Support TP by shaping the mesh as (data=1, model=tp_size).
         self.mesh = self._create_mesh_for_parallelism()
@@ -784,42 +799,56 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         num_reqs = len(num_scheduled_tokens_per_req)
 
-        # Get request indices.
-        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        # For each scheduled token, what are the corresponding req index.
-        req_indices = np.repeat(self.arange_np[:num_reqs],
-                                num_scheduled_tokens_per_req)
+        # Fast path for decode-only: all requests have exactly 1 token.
+        if max_num_scheduled_tokens_all_reqs == 1:
+            # Pure decode: each request schedules exactly 1 token.
+            # req_indices = [0, 1, ..., num_reqs-1]
+            req_indices = self.arange_np[:num_reqs]
+            # positions = num_computed_tokens for each request
+            positions_np = self.positions_np[:num_reqs]
+            np.copyto(positions_np,
+                      self.input_batch.num_computed_tokens_cpu[:num_reqs])
+            # token_indices = positions + req_index * max_model_len
+            token_indices = (
+                positions_np +
+                req_indices * self.input_batch.token_ids_cpu.shape[1])
+            torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                torch.from_numpy(token_indices),
+                out=self.input_ids_cpu[:num_reqs],
+            )
+        else:
+            # General path: mixed prefill + decode.
+            # Get request indices.
+            # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+            req_indices = np.repeat(self.arange_np[:num_reqs],
+                                    num_scheduled_tokens_per_req)
 
-        # Get batched arange.
-        # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # For each scheduled token, what is its position in corresponding req.
-        arange = np.concatenate(
-            [self.arange_np[:n] for n in num_scheduled_tokens_per_req])
+            # Get batched arange.
+            # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            arange = np.concatenate(
+                [self.arange_np[:n] for n in num_scheduled_tokens_per_req])
 
-        # Get positions.
-        positions_np = self.positions_np[:total_num_scheduled_tokens]
-        np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
-            arange,
-            out=positions_np,
-        )
+            # Get positions.
+            positions_np = self.positions_np[:total_num_scheduled_tokens]
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[req_indices],
+                arange,
+                out=positions_np,
+            )
 
-        # Get token indices.
-        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-        # where M is the max_model_len.
-        token_indices = (positions_np +
-                         req_indices * self.input_batch.token_ids_cpu.shape[1])
+            # Get token indices.
+            token_indices = (
+                positions_np +
+                req_indices * self.input_batch.token_ids_cpu.shape[1])
 
-        # NOTE(woosuk): We use torch.index_select instead of np.take here
-        # because torch.index_select is much faster than np.take for large
-        # tensors.
-        torch.index_select(
-            self.input_batch.token_ids_cpu_tensor.flatten(),
-            0,
-            torch.from_numpy(token_indices),
-            out=self.input_ids_cpu[:total_num_scheduled_tokens],
-        )
+            torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                torch.from_numpy(token_indices),
+                out=self.input_ids_cpu[:total_num_scheduled_tokens],
+            )
 
         # Prepare the attention metadata.
         self.query_start_loc_np[0] = 0
@@ -849,10 +878,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                 self.max_num_blocks_per_req]
             block_tables[:num_reqs, :self.max_num_blocks_per_req] = (
                 self.input_batch.block_table[0].get_cpu_tensor()[:num_reqs])
-            query_start_loc = self.query_start_loc_cpu[:self.
-                                                       num_reqs_max_model_len +
-                                                       1].to(self.device,
-                                                             non_blocking=True)
             seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
                 self.device, non_blocking=True)
         else:
@@ -863,10 +888,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             block_tables[:num_reqs, :self.num_blocks_per_most_len_req] = (
                 self.input_batch.block_table[0].get_cpu_tensor()
                 [:num_reqs, :self.num_blocks_per_most_len_req])
-            query_start_loc = self.query_start_loc_cpu[:self.
-                                                       num_reqs_most_model_len +
-                                                       1].to(self.device,
-                                                             non_blocking=True)
             seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
                 self.device, non_blocking=True)
         # Flatten on CPU before H2D to avoid device-side as_strided/reshape
@@ -874,23 +895,56 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         block_tables = block_tables.reshape(-1).to(self.device,
                                                    non_blocking=True)
 
-        if self.lora_config is not None:
-            # We need to respect padding when activating LoRA adapters
-            padded_num_scheduled_tokens_per_req = np.copy(
-                num_scheduled_tokens_per_req
-            )  # Copying to avoid accidental state corruption bugs
-            padded_num_scheduled_tokens_per_req[-1] += (
-                padded_total_num_scheduled_tokens - total_num_scheduled_tokens)
+        # For decode-only case, cache constant device tensors to skip H2D.
+        # query_start_loc, logits_indices, and request_distribution don't
+        # change between decode steps for a given (num_reqs, padded_num_reqs).
+        is_decode_only = (max_num_scheduled_tokens_all_reqs == 1)
+        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
+            num_reqs, self.max_num_reqs)
+        decode_cache_key = (num_reqs, padded_num_reqs, use_max_model_len)
 
-            self.set_active_loras(self.input_batch,
-                                  padded_num_scheduled_tokens_per_req)
+        if is_decode_only and decode_cache_key == self._decode_device_cache_key:
+            # Reuse cached device tensors — skip 3 H2D copies.
+            query_start_loc = self._cached_query_start_loc
+            logits_indices = self._cached_logits_indices
+            request_distribution = self._cached_request_distribution
+        else:
+            # Compute and copy to device (first call or shape changed).
+            if use_max_model_len:
+                query_start_loc = self.query_start_loc_cpu[:self.
+                                                           num_reqs_max_model_len
+                                                           + 1].to(
+                                                               self.device,
+                                                               non_blocking=True
+                                                           )
+            else:
+                query_start_loc = self.query_start_loc_cpu[:self.
+                                                           num_reqs_most_model_len
+                                                           + 1].to(
+                                                               self.device,
+                                                               non_blocking=True
+                                                           )
 
-        # For V3 kernel, we create request_distribution tensor
-        # request_distribution: [decode_end, prefill_end, mixed_end]
-        # For single chip, we treat all requests as "mixed" mode
-        request_distribution = torch.tensor([0, num_reqs, num_reqs],
-                                            dtype=torch.int32).to(
-                                                self.device, non_blocking=True)
+            # Indices at which we sample (positions of last token in the
+            # sequence). Padded to avoid recompiling when `num_reqs` varies.
+            logits_indices = (self.query_start_loc_cpu[1:padded_num_reqs + 1] -
+                              1).to(self.device, non_blocking=True)
+
+            # For the V3 kernel, request_distribution is
+            # [decode_end, prefill_end, mixed_end]. For single-chip TPU, treat
+            # all requests as mixed mode.
+            self._request_distribution_cpu[0] = 0
+            self._request_distribution_cpu[1] = num_reqs
+            self._request_distribution_cpu[2] = num_reqs
+            request_distribution = self._request_distribution_cpu.to(
+                self.device, non_blocking=True)
+
+            if is_decode_only:
+                # Cache for future decode steps.
+                self._decode_device_cache_key = decode_cache_key
+                self._cached_query_start_loc = query_start_loc
+                self._cached_logits_indices = logits_indices
+                self._cached_request_distribution = request_distribution
 
         attn_metadata = AttentionMetadata(
             input_positions=self.position_ids,
@@ -899,17 +953,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
         )
-        # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
-        # request in the batch. While we should not sample any token from this
-        # partial request, we do so for simplicity. We will ignore the sampled
-        # token from the partial request.
-        # TODO: Support prompt logprobs.
-        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs)
-        # Indices at which we sample (positions of last token in the sequence).
-        # Padded to avoid recompiling when `num_reqs` varies.
-        logits_indices = self.query_start_loc_cpu[1:padded_num_reqs + 1] - 1
-        logits_indices = logits_indices.to(self.device, non_blocking=True)
 
         if self.lora_config is not None:
             # We need to respect padding when activating LoRA adapters
@@ -922,11 +965,15 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.set_active_loras(self.input_batch,
                                   padded_num_scheduled_tokens_per_req)
 
-        layer_names = get_layers_from_vllm_config(self.vllm_config,
-                                                  Attention).keys()
+        # Cache attention layer names on first call to avoid iterating
+        # all model layers every step.
+        if self._attn_layer_names is None:
+            self._attn_layer_names = list(
+                get_layers_from_vllm_config(self.vllm_config,
+                                            Attention).keys())
         per_layer_attn_metadata = {
             layer_name: attn_metadata
-            for layer_name in layer_names
+            for layer_name in self._attn_layer_names
         }
         return (
             per_layer_attn_metadata,
@@ -1108,6 +1155,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 return EMPTY_MODEL_RUNNER_OUTPUT
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
+        if has_kv_transfer_group():
+            raise NotImplementedError(
+                "TPU KV connector support is only implemented for no-forward "
+                "transfer-only steps. Forward batches with an active KV "
+                "connector are not supported yet.")
 
         self.scheduler_output = scheduler_output
         return None
@@ -1133,7 +1185,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         start_index = 0
         max_num_logprobs = self.input_batch.max_num_logprobs
-        needs_logprobs = max_num_logprobs is not None and max_num_logprobs > 0
+        if max_num_logprobs == -1:
+            raise NotImplementedError(
+                "TPU runner does not support full logprobs (`logprobs=-1`) "
+                "with the merged vLLM v1 sampler path yet.")
+        needs_logprobs = max_num_logprobs is not None
         combined_selected_tokens: list[torch.Tensor] = []
         combined_logprobs: list[LogprobsLists] = []
 
