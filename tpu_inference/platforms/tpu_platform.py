@@ -11,7 +11,6 @@ import vllm.envs as vllm_envs
 # tries to use it (e.g. in @torch.compile decorators at import time).
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.distributed import tpu_topology
-from tpu_info import device
 from vllm.inputs import ProcessorInputs
 from vllm.platforms.interface import Platform, PlatformEnum
 
@@ -145,16 +144,18 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
+        # TODO: Expose get_tpu_device_name() in torch_tpu (via
+        # tpu_topology.py PCI scan) and remove the tpu-info dependency.
         try:
             if vllm_envs.VLLM_TPU_USING_PATHWAYS:
-                # Causes mutliprocess accessing IFRT when calling jax.devices()
                 return "TPU v6 lite"
             else:
-                chip_type, _ = device.get_local_chips()
+                from tpu_info import device as tpu_info_device
+                chip_type, _ = tpu_info_device.get_local_chips()
                 return f"TPU {chip_type.name}"
         except Exception as e:
             logger.warning(f"Error getting device name: {e}")
-            return 'TPU'
+            return "TPU"
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
