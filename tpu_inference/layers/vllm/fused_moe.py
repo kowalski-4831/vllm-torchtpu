@@ -19,22 +19,16 @@ import torch
 from torch_tpu._internal import pallas
 
 from tpu_inference.layers.common.fused_moe_gmm import fused_moe_func
-from tpu_inference.models.vllm.vllm_model_wrapper_context import \
-    get_vllm_model_wrapper_context
 
 
 def _pallas_fused_moe_kernel(
     topk: int,
-    renormalize: bool,
     activation: str,
-    use_ep: bool,
-    scoring_fn: str,
 ):
     """Build a pallas custom kernel wrapper around fused_moe_func."""
-    mesh = get_vllm_model_wrapper_context().mesh
 
     def impl(hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias,
-             gating_output):
+             topk_weights, topk_ids):
         return fused_moe_func(
             hidden_states=hidden_states,
             w1=w1,
@@ -43,21 +37,17 @@ def _pallas_fused_moe_kernel(
             w2_scale=w2_scale,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
-            gating_output=gating_output,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             topk=topk,
-            renormalize=renormalize,
-            mesh=mesh,
-            use_ep=use_ep,
             activation=activation,
-            scoring_fn=scoring_fn,
         )
 
     return impl
 
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, int, bool, str, bool, str],
-                              Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str], Callable] = {}
 
 
 def _allocate_kernel_instance_id() -> int:
@@ -70,21 +60,14 @@ def _allocate_kernel_instance_id() -> int:
 def _build_fused_moe_custom_op(
     *,
     topk: int,
-    renormalize: bool,
     activation: str,
-    use_ep: bool,
-    scoring_fn: str,
 ):
-    mesh = get_vllm_model_wrapper_context().mesh
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
 
     wrapped_fn = _pallas_fused_moe_kernel(
         topk=topk,
-        renormalize=renormalize,
         activation=activation,
-        use_ep=use_ep,
-        scoring_fn=scoring_fn,
     )
 
     @torch.library.custom_op(
@@ -92,14 +75,14 @@ def _build_fused_moe_custom_op(
         mutates_args=(),
         schema="(Tensor hidden_states, Tensor w1, Tensor w2, "
         "Tensor? w1_scale, Tensor? w2_scale, Tensor? w1_bias, "
-        "Tensor? w2_bias, Tensor gating_output) -> Tensor",
+        "Tensor? w2_bias, Tensor topk_weights, Tensor topk_ids) -> Tensor",
         device_types=["tpu"],
     )
     @pallas.custom_jax_kernel
     def fused_moe_kernel_impl(hidden_states, w1, w2, w1_scale, w2_scale,
-                              w1_bias, w2_bias, gating_output):
+                              w1_bias, w2_bias, topk_weights, topk_ids):
         return wrapped_fn(hidden_states, w1, w2, w1_scale, w2_scale, w1_bias,
-                          w2_bias, gating_output)
+                          w2_bias, topk_weights, topk_ids)
 
     def _fake_fused_moe(
         hidden_states: torch.Tensor,
@@ -109,12 +92,13 @@ def _build_fused_moe_custom_op(
         w2_scale: torch.Tensor | None,
         w1_bias: torch.Tensor | None,
         w2_bias: torch.Tensor | None,
-        gating_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
-    cache_key = (id(mesh), topk, renormalize, activation, use_ep, scoring_fn)
+    cache_key = (topk, activation)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -122,40 +106,27 @@ def _build_fused_moe_custom_op(
 def _get_fused_moe_custom_op(
     *,
     topk: int,
-    renormalize: bool,
     activation: str,
-    use_ep: bool,
-    scoring_fn: str,
 ):
-    mesh = get_vllm_model_wrapper_context().mesh
-    cache_key = (id(mesh), topk, renormalize, activation, use_ep, scoring_fn)
+    cache_key = (topk, activation)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
     return _build_fused_moe_custom_op(
         topk=topk,
-        renormalize=renormalize,
         activation=activation,
-        use_ep=use_ep,
-        scoring_fn=scoring_fn,
     )
 
 
 def prebuild_fused_moe_kernel(
     *,
     topk: int,
-    renormalize: bool,
     activation: str,
-    use_ep: bool,
-    scoring_fn: str = "softmax",
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
         topk=topk,
-        renormalize=renormalize,
         activation=activation,
-        use_ep=use_ep,
-        scoring_fn=scoring_fn,
     )
 
 
@@ -167,20 +138,15 @@ def fused_moe_gmm(
     w2_scale: Optional[torch.Tensor],
     w1_bias: Optional[torch.Tensor],
     w2_bias: Optional[torch.Tensor],
-    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     topk: int,
-    renormalize: bool,
     activation: str,
-    use_ep: bool = False,
-    scoring_fn: str = "softmax",
 ) -> torch.Tensor:
-    """Fused MoE forward pass using fused_moe_func from fused_moe_gmm.py."""
+    """Fused MoE forward pass with precomputed routing."""
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
-        renormalize=renormalize,
         activation=activation,
-        use_ep=use_ep,
-        scoring_fn=scoring_fn,
     )
     return fused_moe(
         hidden_states,
@@ -190,5 +156,6 @@ def fused_moe_gmm(
         w2_scale,
         w1_bias,
         w2_bias,
-        gating_output,
+        topk_weights,
+        topk_ids,
     )

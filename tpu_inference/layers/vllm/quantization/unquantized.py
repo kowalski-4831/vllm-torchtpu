@@ -31,7 +31,7 @@ and uses our native TorchTPU + Pallas kernels.
 1. vLLM loads model with quantization=None (unquantized)
 2. get_tpu_quantization_config() returns VllmUnquantizedConfig
 3. For FusedMoE layers, VllmUnquantizedFusedMoEMethod.apply() is called
-4. apply() routes to fused_moe_gmm() which uses our TPU Pallas kernels
+4. apply() routes to our TPU Pallas local-topk MoE kernels
 """
 
 from typing import Any, Optional
@@ -53,6 +53,8 @@ from tpu_inference.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
 from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
+from tpu_inference.layers.vllm.moe_routing import (select_experts,
+                                                   select_experts_ep)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -122,76 +124,64 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         return None
 
 
+def _get_activation_str(activation) -> str:
+    """Convert MoEActivation enum or string to plain string."""
+    return activation.value if hasattr(activation,
+                                       'value') else str(activation)
+
+
 class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """
     TPU-native implementation of unquantized FusedMoE.
 
-    This class overrides the default forward_tpu() behavior which uses
-    torch_xla, and instead uses our native TorchTPU + Pallas GMM kernels.
-
-    Key Design:
-    - Inherits from UnquantizedFusedMoEMethod for weight creation/processing
-    - Overrides apply() to use fused_moe_gmm() instead of fused_moe_pallas()
+    Uses is_monolithic=True so vLLM's DefaultMoERunner calls
+    apply_monolithic(layer, x, router_logits) directly, bypassing the
+    CUDA-only router.select_experts() path.
     """
 
     def __init__(self, moe: FusedMoEConfig):
-        """
-        Initialize the unquantized MoE method for TPU.
-
-        Args:
-            moe: The MoE configuration from vLLM.
-        """
         super().__init__(moe)
+        # Parent sets _is_monolithic=False on TPU and skips wiring
+        # apply_monolithic.  Override both after super().__init__().
+        self._is_monolithic = True
+        self.apply_monolithic = self._select_monolithic()
+
+    def _select_monolithic(self):
+        return self._forward_monolithic_tpu
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """
-        Process weights after loading for GMM kernel compatibility.
-
-        Transforms weights from vLLM's default layout to GMM kernel layout:
-        - Transpose: [E, out_dim, in_dim] → [E, in_dim, out_dim]
-        - Handle interleaving for swigluoai activation
-        - Transform biases: [E, out_dim] → [E, 1, out_dim]
-        TODO: This is similiar to process_weights_after_loading in mxfp4.py, consider refactoring
-        """
         assert isinstance(layer, FusedMoE)
-        # Get weight tensors
+
+        # Pre-compute activation string: layer.activation is a MoEActivation
+        # enum in v0.17.1 but the Pallas kernel expects a plain string.
+        # Resolve here (outside torch.compile) and stash on the layer.
+        activation_str = _get_activation_str(layer.activation)
+        layer._tpu_activation_str = activation_str
+
         w13_weight = layer.w13_weight.data
         w2_weight = layer.w2_weight.data
 
-        # Handle w13 interleaving for swigluoai activation
-        # Some models store w13 interleaved: even indices are w1 (gate), odd are w3 (up)
-        # We un-interleave so first half is w1 and second half is w3
-        w13_interleave = layer.activation == "swigluoai"
+        w13_interleave = activation_str == "swigluoai"
         if w13_interleave:
-            # w13_weight shape: [E, out_dim, in_dim] where out_dim = 2 * intermediate
-            w1_weight = w13_weight[:, ::2, :]  # even indices
-            w3_weight = w13_weight[:, 1::2, :]  # odd indices
+            w1_weight = w13_weight[:, ::2, :]
+            w3_weight = w13_weight[:, 1::2, :]
             w13_weight = torch.cat([w1_weight, w3_weight], dim=1)
 
-        # Transpose: [E, out_dim, in_dim] → [E, in_dim, out_dim]
-        # GMM kernel expects contracting dim on axis 1
-        # Keep weights contiguous after transpose. A non-contiguous parameter view
-        # can trigger large as_strided/copy_from_as_strided_inverse graphs later.
-        w13_weight = w13_weight.transpose(
-            1, 2).contiguous()  # [E, hidden, 2*intermediate]
-        w2_weight = w2_weight.transpose(
-            1, 2).contiguous()  # [E, intermediate, hidden]
+        w13_weight = w13_weight.transpose(1, 2).contiguous()
+        w2_weight = w2_weight.transpose(1, 2).contiguous()
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-        # Handle biases if present
         if self.moe.has_bias:
             w13_bias = layer.w13_bias.data
             w2_bias = layer.w2_bias.data
 
-            # Handle w13 bias interleaving
             if w13_interleave:
                 w1_bias = w13_bias[:, ::2]
                 w3_bias = w13_bias[:, 1::2]
                 w13_bias = torch.cat([w1_bias, w3_bias], dim=1)
 
-            # Transform: [E, out_dim] → [E, 1, out_dim]
             layer.w13_bias = torch.nn.Parameter(
                 w13_bias.unsqueeze(1).to(torch.float32),
                 requires_grad=False,
@@ -201,63 +191,58 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 requires_grad=False,
             )
 
-        # TorchTPU can defer large copy_/as_strided_inverse materializations
-        # from the swigluoai de-interleaving path. Force materialization now so
-        # it does not first execute later during token sampling host copies.
         if layer.w13_weight.device.type == "tpu":
-            # Synchronize one tensor at a time to avoid creating large combined
-            # sync graphs spanning many layers.
             sync.synchronize(layer.w13_weight, wait=True)
             sync.synchronize(layer.w2_weight, wait=True)
             if self.moe.has_bias:
                 sync.synchronize(layer.w13_bias, wait=True)
                 sync.synchronize(layer.w2_bias, wait=True)
 
-        logger.info_once(
-            "Unquantized weights transposed for GMM kernel: "
-            f"w13={list(layer.w13_weight.shape)}, w2={list(layer.w2_weight.shape)}"
-        )
+        logger.info_once("Unquantized weights transposed for GMM kernel: "
+                         f"w13={list(layer.w13_weight.shape)}, "
+                         f"w2={list(layer.w2_weight.shape)}")
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
-            renormalize=layer.renormalize,
-            activation=layer.activation,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            activation=activation_str,
         )
 
-    def apply(
+    def _forward_monolithic_tpu(
         self,
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Forward pass using TPU-native GMM kernel.
-
-        This bypasses vLLM's forward_tpu() which uses torch_xla and instead
-        uses our fused_moe_gmm() which uses TorchTPU + Pallas kernels.
-
-        Args:
-            layer: The FusedMoE layer.
-            x: Input tensor [num_tokens, hidden_size].
-            router_logits: Router logits [num_tokens, num_experts].
-
-        Returns:
-            Output tensor [num_tokens, hidden_size].
-        """
-        output = fused_moe_gmm(
+        """Forward pass using TPU-native GMM kernel."""
+        activation_str = layer._tpu_activation_str
+        if layer.moe_config.moe_parallel_config.use_ep:
+            if layer.expert_map is None:
+                raise ValueError("EP path requires layer.expert_map.")
+            topk_weights, topk_ids = select_experts_ep(
+                hidden_states=x,
+                router_logits=router_logits,
+                expert_map=layer.expert_map,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            )
+        return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
-            w1_scale=None,  # Unquantized = no scales
+            w1_scale=None,
             w2_scale=None,
             w1_bias=getattr(layer, 'w13_bias', None),
             w2_bias=getattr(layer, 'w2_bias', None),
-            gating_output=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             topk=layer.moe_config.experts_per_token,
-            renormalize=layer.renormalize,
-            activation=layer.activation,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            activation=activation_str,
         )
-        return output

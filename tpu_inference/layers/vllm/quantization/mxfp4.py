@@ -71,6 +71,8 @@ from tpu_inference.layers.common.quant_methods import (MXFP4,
 from tpu_inference.layers.common.quantization import dequantize_mxfp4_packed
 from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
+from tpu_inference.layers.vllm.moe_routing import (select_experts,
+                                                   select_experts_ep)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -138,57 +140,44 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
         return None
 
 
+def _get_activation_str(activation) -> str:
+    """Convert MoEActivation enum or string to plain string."""
+    return activation.value if hasattr(activation,
+                                       'value') else str(activation)
+
+
 class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     """
     TPU-specific implementation of MXFP4 MoE quantization.
 
-    This class handles:
-    1. Weight creation with correct shapes for MXFP4 (inherited from Mxfp4MoEMethod)
-    2. Weight processing after loading (dequant -> requant for TPU)
-    3. Forward pass using TPU MoE kernels
+    Uses is_monolithic=True so vLLM's DefaultMoERunner calls
+    apply_monolithic(layer, x, router_logits) directly, bypassing the
+    CUDA-only router.select_experts() path.
 
-    Key Design Decision:
-        We inherit from Mxfp4MoEMethod to reuse its create_weights() method,
-        but bypass its __init__ to avoid the GPU backend assertion.
-        We set mxfp4_backend = TRITON as a marker for minimal weight processing.
+    Inherits from Mxfp4MoEMethod to reuse its create_weights() method,
+    but bypasses its __init__ to avoid the GPU backend assertion.
     """
 
+    @property
+    def is_monolithic(self) -> bool:
+        return True
+
     def __init__(self, moe: FusedMoEConfig):
-        """
-        Initialize the MXFP4 MoE method for TPU.
-
-        Args:
-            moe: The MoE configuration from vLLM.
-        """
-        # Call FusedMoEMethodBase.__init__ directly to skip Mxfp4MoEMethod's
-        # assertion that requires a GPU backend
+        # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
         FusedMoEMethodBase.__init__(self, moe)
-
-        # We use TRITON backend marker because it has minimal weight
-        # post-processing requirements. This is just for compatibility,
-        # actual execution uses TPU kernels.
         self.mxfp4_backend = Mxfp4Backend.TRITON
+        self.apply_monolithic = self._select_monolithic()
+
+    def _select_monolithic(self):
+        return self._forward_monolithic_tpu
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        """Process weights: dequant → layout transform for GMM kernel.
-
-        Pipeline:
-        1. Dequantize MXFP4 packed → bfloat16
-        2. Transpose: [E, out_dim, in_dim] → [E, in_dim, out_dim] for GMM
-        3. Transform biases: [E, out_dim] → [E, 1, out_dim]
-
-        TODO(requantization): For memory optimization, add:
-            - quantize_tensor_to_fp4() with block_size=512
-            - pack_fp4_indices() to pack back to uint8
-            - Transform scales: swap axes 1↔2, expand_dims(axis=2)
-        """
-
         assert isinstance(layer, FusedMoE)
         assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
-        # 1. Dequantize MXFP4 packed → bfloat16
-        # Compute on CPU for faster dequantization, then move back to TPU.
-        # Compile time is an issue if we do this on TPU.
+        activation_str = _get_activation_str(layer.activation)
+        layer._tpu_activation_str = activation_str
+
         w13_weight = dequantize_mxfp4_packed(
             layer.w13_weight.data.to("cpu"),
             layer.w13_weight_scale.data.to("cpu"),
@@ -202,39 +191,24 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             out_dtype=torch.bfloat16,
         ).to(layer.w2_weight.device)
 
-        # 2. Handle w13 interleaving for swigluoai activation
-        # GPT-OSS stores w13 interleaved: even indices are w1 (gate), odd are w3 (up)
-        # We un-interleave so first half is w1 and second half is w3
-        w13_interleave = layer.activation == "swigluoai"
+        w13_interleave = activation_str == "swigluoai"
         if w13_interleave:
-            # w13_weight shape: [E, out_dim, in_dim] where out_dim = 2 * intermediate
-            w1_weight = w13_weight[:, ::2, :]  # even indices
-            w3_weight = w13_weight[:, 1::2, :]  # odd indices
+            w1_weight = w13_weight[:, ::2, :]
+            w3_weight = w13_weight[:, 1::2, :]
             w13_weight = torch.cat([w1_weight, w3_weight], dim=1)
 
-        # 3. Transpose: [E, out_dim, in_dim] → [E, in_dim, out_dim]
-        # Keep weights contiguous after transpose. Non-contiguous parameter views
-        # can trigger large as_strided/copy_from_as_strided_inverse graphs.
-        w13_weight = w13_weight.transpose(
-            1, 2).contiguous()  # [E, hidden, 2*intermediate]
-        w2_weight = w2_weight.transpose(
-            1, 2).contiguous()  # [E, intermediate, hidden]
+        w13_weight = w13_weight.transpose(1, 2).contiguous()
+        w2_weight = w2_weight.transpose(1, 2).contiguous()
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-        # 4. Scales not needed for bfloat16 weights
-        # TODO(requantization): Transform scales when using fp4:
-        #   scale = scale.transpose(1, 2).unsqueeze(2)  # [E, num_blocks, 1, out_dim]
         layer.w13_weight_scale = None
         layer.w2_weight_scale = None
 
-        # 5. Transform biases: [E, out_dim] → [E, 1, out_dim]
-        # Also handle interleaving for swigluoai activation
         if layer.w13_bias is not None:
             w13_bias = layer.w13_bias.data
             if w13_interleave:
-                # Un-interleave bias: even indices are w1, odd are w3
                 w1_bias = w13_bias[:, ::2]
                 w3_bias = w13_bias[:, 1::2]
                 w13_bias = torch.cat([w1_bias, w3_bias], dim=1)
@@ -249,11 +223,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 requires_grad=False,
             )
 
-        # Materialize transformed weights during load to avoid deferred execution
-        # surfacing later during runtime host copies.
         if layer.w13_weight.device.type == "tpu":
-            # Sync one tensor at a time to avoid creating oversized combined
-            # synchronization graphs across layers.
             sync.synchronize(layer.w13_weight, wait=True)
             sync.synchronize(layer.w2_weight, wait=True)
             if layer.w13_bias is not None:
@@ -261,28 +231,18 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             if layer.w2_bias is not None:
                 sync.synchronize(layer.w2_bias, wait=True)
 
-        # TODO, for distributed senario, the weight layout handling should be more complex
-
         logger.info_once(
             "MXFP4 weights dequantized to bfloat16 and transposed for GMM kernel."
         )
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
-            renormalize=layer.renormalize,
-            activation=layer.activation,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            activation=activation_str,
         )
 
     def get_fused_moe_quant_config(
         self,
         layer: torch.nn.Module,
     ) -> Optional[FusedMoEQuantConfig]:
-        """Get the quantization config for fused MoE operations.
-
-        Returns config with scale and bias tensors for the MoE kernel.
-        Note: scales are None when using bfloat16 weights.
-        """
         return mxfp4_w4a16_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
@@ -290,13 +250,33 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_bias=layer.w2_bias,
         )
 
-    def apply(
+    def _forward_monolithic_tpu(
         self,
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
+        activation_str = layer._tpu_activation_str
+        if layer.moe_config.moe_parallel_config.use_ep:
+            if layer.expert_map is None:
+                raise ValueError("EP path requires layer.expert_map.")
+            topk_weights, topk_ids = select_experts_ep(
+                hidden_states=x,
+                router_logits=router_logits,
+                expert_map=layer.expert_map,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            )
         return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -305,10 +285,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_scale=layer.w2_weight_scale,
             w1_bias=layer.w13_bias,
             w2_bias=layer.w2_bias,
-            gating_output=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             topk=layer.moe_config.experts_per_token,
-            renormalize=layer.renormalize,
-            activation=layer.activation,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            activation=activation_str,
         )
