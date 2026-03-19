@@ -1,6 +1,7 @@
 UNQUANTIZED = "unquantized"
 MXFP4 = "mxfp4"
 AWQ = "awq"
+FP8 = "fp8"
 COMPRESSED_TENSORS = "compressed-tensors"
 
 

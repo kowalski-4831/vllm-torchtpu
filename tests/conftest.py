@@ -11,11 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Pytest configuration for MXFP4 requantization tests.
-
-Provides fixtures for TPU device testing.
-"""
+"""Shared pytest configuration for all tests."""
 
 import pytest
 import torch
@@ -35,12 +31,9 @@ def pytest_addoption(parser):
 def device(request):
     """Get the device to run tests on (CPU or TPU).
 
-    For JAX: Already uses TPU automatically when available.
-    For PyTorch: Uses torch_tpu.api.tpu_device() when --use-tpu flag is set.
-
     Usage:
-        pytest tests/layers/common/ -v              # Run on CPU
-        pytest tests/layers/common/ -v --use-tpu   # Run on TPU
+        pytest tests/ -v              # Run on CPU
+        pytest tests/ -v --use-tpu    # Run on TPU
     """
     use_tpu = request.config.getoption("--use-tpu")
     if use_tpu:
