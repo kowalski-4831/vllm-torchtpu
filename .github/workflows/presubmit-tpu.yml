@@ -36,9 +36,6 @@ permissions:
   pull-requests: read
   issues: read
 
-env:
-  VLLM_REF: v0.17.1
-
 # Cancel old jobs when they are replaced by new runs
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -47,6 +44,13 @@ concurrency:
 
 jobs:
   run_tests:
+    # Disable on forks
+    if: github.event.repository.fork == false
+
+    defaults:
+      run:
+        shell: bash
+
     name: "Presubmit on ${{ matrix.job_info.runner }}"
     # Available self-hosted runners: b/455965440#comment6
     strategy:
@@ -64,8 +68,40 @@ jobs:
     runs-on: ${{ matrix.job_info.runner }}
     container:
       image: ${{ matrix.job_info.container }}
+
+    env:
+      # Enable color in logs
+      FORCE_COLOR: "1"
+
     steps:
-      - run: echo "Start running tests."
+      # Clone the GitHub repository to runner's environment $GITHUB_WORKSPACE, making its files
+      # accessible for workflow to use. Otherwise, the workflow cannot find the files (e.g. ls -lR
+      # will return "total 0").
+      # Pin to to a SHA for security, see https://opensource.google/documentation/reference/github/services#actions
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Mark git directory as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Setup Virtual Environment
+        run: |
+          # Set up python virtual environment
+          uv venv
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+          # UV uses these to auth into the torch-tpu index defined in pyproject.toml
+          echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
+          echo UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(gcloud auth print-access-token)" >> "$GITHUB_ENV"
+
+      - name: Install Dependencies
+        run: uv sync --extra test --prerelease allow
+
       # Enable remote connections.
       # See go/ml-github-actions:connect#add-waiting-step.
       - name: Wait For Connection
@@ -73,34 +109,16 @@ jobs:
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
 
-      # Clone the GitHub repository to runner's environment $GITHUB_WORKSPACE, making its files
-      # accessible for workflow to use. Otherwise, the workflow cannot find the files (e.g. ls -lR
-      # will return "total 0").
-      - uses: actions/checkout@v5
-
-      - name: Create CI virtualenv
-        shell: bash
+      - name: Run tests
         run: |
-          cd ..
-          python3 -m venv ci-tpu
-          source ci-tpu/bin/activate
-          python -m pip install --upgrade pip
+          # Print installed packages
+          echo "Installed packages:"
+          uv pip freeze
 
-      # TODO: Remove hardcoded vllm branch.
-      - name: Install vllm, torch_tpu, and torchtpu-vllm
-        shell: bash
-        run: |
-          cd ..
-          source ci-tpu/bin/activate
-          ACCESS_TOKEN="$(gcloud auth print-access-token)"
-          git clone --depth 1 --branch "${VLLM_REF}" https://github.com/vllm-project/vllm.git
-          VLLM_TARGET_DEVICE="tpu" pip install -e vllm
-          pip install --pre --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch-tpu
-          pip install -r torchtpu-vllm/requirements.txt
-          pip install -e torchtpu-vllm
+          export MODEL_IMPL_TYPE="vllm"
 
-      - name: Run tests with
-        shell: bash
-        run: |
-          source ../ci-tpu/bin/activate
-          MODEL_IMPL_TYPE="vllm" pytest tests -sv --timeout=300
+          # Run tests from a temp dir to force Python to test the installed package, not local source files.
+          # see https://blog.ganssle.io/articles/2019/08/test-as-installed.html
+          TEST_DIR="$PWD/tests"
+          cd "$(mktemp -d)"
+          pytest "$TEST_DIR"  -sv --timeout=300

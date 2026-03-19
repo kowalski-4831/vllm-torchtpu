@@ -1,6 +1,0 @@
-# This file contains additional dependencies needed for TPU v7x support.
-# It is expected to be used in conjunction with the main requirements.txt file.
---pre
--i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/
-jax==0.8.0.dev20251013
-jaxlib==0.8.0.dev20251013

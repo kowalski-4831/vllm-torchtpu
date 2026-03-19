@@ -8,34 +8,59 @@ This repository contains the integration of **TorchTPU** and **vLLM**. The codeb
 
 To run the **Qwen3** model on a single device, follow these installation steps:
 
-### 1. Install TorchTPU
-Build the `torch_tpu` Python wheel from source by following the instructions here:
-👉 [google-ml-infra/torch_tpu Installation Guide](https://github.com/google-ml-infra/torch_tpu?tab=readme-ov-fil#installation)
+### 1. Install TorchTPU-vLLM and dependencies
 
-### 2. Install vLLM from Source
-Install vLLM from source using the pinned upstream version used by CI.
-> **Note:** Currently, `vllm==v0.17.1` is supported.
-> Start from parant folder
+We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
+
+#### Option A: Using `uv` (Recommended)
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+
+# Set up authentication for the Torch TPU virtual registry
+export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
+export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(gcloud auth print-access-token)"
+
+# Clone vLLM to allow making local patches for debugging
+git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git ../vllm
+
+# Patch vLLM's TPU requirements to accept our local workspace instead of overriding it
+sed -i 's/tpu-inference==0.12.0/tpu-inference/' ../vllm/requirements/tpu.txt
+
+# Install vLLM in editable mode (forcing the 0.17.1 base version to prevent .dev prerelease mismatch during dependency resolution)
+SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" uv pip install -e ../vllm
+
+# Install TorchTPU-vLLM and dependencies
+uv pip install --pre -e .
+```
+
+#### Option B: Using `pip`
+
+> **Note:** Currently, `vllm==0.17.1` is supported.
 
 ```bash
 python3.12 -m venv vllm_env --symlinks
 source ../vllm_env/bin/activate
 pip install --upgrade pip
 
-git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git vllm
-
-VLLM_TARGET_DEVICE="tpu" pip install -e vllm
-
+# Set up authentication for the Torch TPU virtual registry
 ACCESS_TOKEN="$(gcloud auth print-access-token)"
 
-# sometimes need to reinstall after vllm to make sure some dependencies are installed correctly
-pip install --pre \
-  --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
-  torch_tpu
+# Set the PIP_INDEX_URL environment variable to point to the Torch TPU virtual registry
+PIP_INDEX_URL="https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
-cd torchtpu-vllm
-pip install -r requirements.txt
-pip install -e .
+# Clone vLLM to allow making local patches for debugging
+git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git ../vllm
+
+# Patch vLLM's TPU requirements to accept our local workspace instead of overriding it
+sed -i 's/tpu-inference==0.12.0/tpu-inference/' ../vllm/requirements/tpu.txt
+
+# Install vLLM in editable mode (forcing the 0.17.1 base version to prevent .dev prerelease mismatch during dependency resolution)
+SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
+
+# Install TorchTPU-vLLM and dependencies
+pip install --pre -e .
 ```
 
 > **Note:** Prioritize compile mode for better performance. Add `--enforce-eager` if you want eager mode.

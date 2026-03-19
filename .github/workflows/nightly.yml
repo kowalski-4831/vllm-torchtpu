@@ -12,7 +12,7 @@ on:
           - 'yes'
           - 'no'
       VERSION:
-        description: 'Use this to override the version set in `VLLM_VERSION_OVERRIDE`'
+        description: 'Use this to override the torchtpu-vllm version'
         type: string
         default: ''
   schedule:
@@ -20,9 +20,6 @@ on:
 
 permissions:
   contents: read
-
-env:
-  VLLM_REF: v0.17.1
 
 jobs:
   build:
@@ -35,6 +32,10 @@ jobs:
     outputs:
       gcs_path: ${{ steps.upload-to-gcs.outputs.gcs_path }}
     name: Build wheel
+
+    env:
+      # Enable color in logs
+      FORCE_COLOR: "1"
 
     steps:
     - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
@@ -53,7 +54,7 @@ jobs:
         halt-dispatch-input: ${{ inputs.halt-for-connection }}
     - name: Build package (sdist and wheel)
       env:
-        VLLM_VERSION_OVERRIDE: ${{ inputs.VERSION }}
+        SETUPTOOLS_SCM_PRETEND_VERSION: ${{ env.VERSION || inputs.VERSION }}
       run: python3 -m build
     - name: Upload to GCS
       id: upload-to-gcs
@@ -69,7 +70,7 @@ jobs:
       run: |
         # Install package needed to authenticate to artifactregistry for Python.
         # See https://cloud.google.com/artifact-registry/docs/python/authentication
-        pip install keyrings.google-artifactregistry-auth
+        uv pip install keyrings.google-artifactregistry-auth
 
         # Configure pypirc for twine upload.
         pypirc_content=$(cat <<EOF
@@ -97,42 +98,43 @@ jobs:
     container: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
     name: Run tests
 
+    env:
+      # Enable color in logs
+      FORCE_COLOR: "1"
+
     steps:
     - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
     - name: Mark git directory as safe
       run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-    - name: Setup Virtual Environment
+    - name: Setup uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Setup Environment
       run: |
-        uv venv ci-tpu
-        echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/ci-tpu" >> "$GITHUB_ENV"
-        echo "$GITHUB_WORKSPACE/ci-tpu/bin" >> "$GITHUB_PATH"
+        # Set up python virtual environment
+        uv venv
+        echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+        echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+        # UV uses these to auth into the torch-tpu index defined in pyproject.toml
+        echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
+        echo UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(gcloud auth print-access-token)" >> "$GITHUB_ENV"
 
     - name: Download torchtpu-vllm wheel from GCS
       run: |
         mkdir dist
         gcloud storage cp "${{ needs.build.outputs.gcs_path }}/*.whl" dist/
 
-    - name: Install PyTorch CPU and torch_tpu and torchtpu-vllm
+    - name: Install Dependencies
+      run: uv sync --no-install-project --extra test  --prerelease allow # Exclude current project; we install the wheel in the next step
+
+    - name: Install torchtpu-vllm
       run: |
-        # Install Pytorch CPU and Torch TPU
-        ACCESS_TOKEN="$(gcloud auth print-access-token)"
-        uv pip install --pre --index-url "https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch-tpu
-
-        # Install torchtpu-vllm and dependencies
-        uv pip install --pre dist/*.whl
-        uv pip install -r requirements_v7x.txt
-        uv pip install -r requirements.txt
-
-    - name: Install vllm
-      run: |
-        git clone --depth 1 --branch "${VLLM_REF}" https://github.com/vllm-project/vllm.git
-
-        # Install vllm dependencies
-        uv pip install -r vllm/requirements/tpu.txt
-
-        export VLLM_TARGET_DEVICE="tpu"
-        uv pip install -e vllm
+        WHEEL_FILE=$(ls dist/*.whl)
+        uv pip install "${WHEEL_FILE}"
 
     - name: Run tests
       run: |
@@ -145,4 +147,4 @@ jobs:
         # see https://blog.ganssle.io/articles/2019/08/test-as-installed.html
         TEST_DIR="$PWD/tests"
         cd "$(mktemp -d)"
-        pytest "$TEST_DIR"
+        pytest "$TEST_DIR" -sv

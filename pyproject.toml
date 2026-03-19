@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpu_inference"
+dynamic = ["version"]
+description = ""
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "tpu_inference Contributors" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "tpu-info>=0.7.1",
+    "portpicker",
+    "yapf>=0.43.0",
+    "absl-py",
+    "numpy",
+    "google-cloud-storage",
+    "pathwaysutils",
+    "parameterized",
+    "numba>=0.62.1",
+    "runai-model-streamer[s3,gcs]>=0.15.0",
+    "torch>=2.10.0",
+    "vllm==0.17.1",
+    "torch-tpu"
+]
+
+[project.optional-dependencies]
+# Required for running tests
+test = [
+    "pytest",
+    "pytest-mock",
+    "pytest-timeout",
+]
+
+# These are required for running any benchmarking
+# See more information at scripts/vllm/benchmarking/README.md
+benchmarking = [
+    "nltk",
+    "evaluate",
+    "datasets",
+    "rouge-score",
+    "scikit-learn",
+    "pandas",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["tpu_inference*"]
+
+[tool.setuptools_scm]
+
+[tool.uv]
+# vLLM 0.17.1 pins numba==0.61.2, which conflicts with our requirements.
+# We override the numba version to >=0.62.1 to allow resolution to succeed.
+override-dependencies = [
+    "numba>=0.62.1"
+]
+
+
+[[tool.uv.index]]
+name = "torch-tpu-registry"
+# torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
+# and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
+url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
