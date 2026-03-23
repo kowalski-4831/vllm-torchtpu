@@ -23,17 +23,9 @@ classifiers = [
 dependencies = [
     "tpu-info>=0.7.1",
     "portpicker",
-    "yapf>=0.43.0",
-    "absl-py",
-    "numpy",
-    "google-cloud-storage",
     "pathwaysutils",
-    "parameterized",
-    "numba>=0.62.1",
-    "runai-model-streamer[s3,gcs]>=0.15.0",
-    "torch>=2.10.0",
     "vllm==0.17.1",
-    "torch-tpu"
+    "torch-tpu",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +34,12 @@ test = [
     "pytest",
     "pytest-mock",
     "pytest-timeout",
+    "parameterized",
+]
+
+# Dev tools (linting, formatting)
+dev = [
+    "yapf>=0.43.0",
 ]
 
 # These are required for running any benchmarking

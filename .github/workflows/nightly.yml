@@ -129,7 +129,18 @@ jobs:
         gcloud storage cp "${{ needs.build.outputs.gcs_path }}/*.whl" dist/
 
     - name: Install Dependencies
-      run: uv sync --no-install-project --extra test  --prerelease allow # Exclude current project; we install the wheel in the next step
+      run: uv sync --no-install-project --extra test --prerelease allow --no-install-package vllm
+
+    - name: Install vLLM from source (TPU)
+      run: |
+        # vLLM must be built from source with VLLM_TARGET_DEVICE=tpu for TPU platform support.
+        git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git /tmp/vllm
+        cd /tmp/vllm
+        sed -i '/tpu-inference/d' requirements/tpu.txt
+        uv pip install -r requirements/tpu.txt
+        SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" uv pip install .
+        # Remove source tree so it doesn't shadow the installed package
+        rm -rf /tmp/vllm
 
     - name: Install torchtpu-vllm
       run: |

@@ -13,8 +13,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip install uv
 
-# Install vLLM under /root (not /workspace — base image sets PYTHONPATH=/workspace
-# which would cause /workspace/vllm to shadow the installed vllm package)
+# Install vLLM from source with TPU support
 WORKDIR /root/vllm
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_COMMIT_HASH
@@ -24,21 +23,15 @@ RUN sed -i '/tpu-inference/d' requirements/tpu.txt && \
 RUN SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_COMMIT_HASH#v} VLLM_TARGET_DEVICE="tpu" \
     uv pip install --system -e .
 
-# Install test dependencies
-RUN uv pip install --system -e tests/vllm_test_utils
-RUN uv pip install --system --no-cache \
-    git+https://github.com/thuml/depyf.git \
-    pytest-asyncio \
-    git+https://github.com/EleutherAI/lm-evaluation-harness.git@206b7722158f58c35b7ffcd53b035fdbdda5126d#egg=lm-eval[api] \
-    pytest-cov tblib
-
-# Install tpu_inference (this repo)
-WORKDIR /workspace/tpu_inference
-COPY requirements.txt .
-RUN uv pip install --system -r requirements.txt
-COPY requirements_benchmarking.txt .
-RUN uv pip install --system -r requirements_benchmarking.txt
+# Install tpu_inference and remaining dependencies via pyproject.toml.
+# torch-tpu and vllm are already installed above; uv will skip them.
+WORKDIR /root/tpu_inference
 COPY . .
-RUN uv pip install --system -e .
+# --no-config skips [[tool.uv.index]] in pyproject.toml (private registry
+# requires auth not available during docker build).
+# SETUPTOOLS_SCM_PRETEND_VERSION is needed because .git is absent in the
+# Docker context, so setuptools-scm cannot infer the version.
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
+    uv pip install --system --no-cache --no-config -e ".[test,benchmarking]"
 
 CMD ["/bin/bash"]
