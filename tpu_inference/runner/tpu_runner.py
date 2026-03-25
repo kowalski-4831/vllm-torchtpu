@@ -571,6 +571,43 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
 
+    def _reorder_batch_for_rpa(self,
+                               scheduler_output: "SchedulerOutput") -> int:
+        """Reorder active requests into an RPA-friendly decode-first layout.
+
+        decode-only requests come first and all remaining requests stay in the
+        mixed bucket. We do not create a dedicated prefill-only bucket here.
+
+        Returns:
+            Number of decode-only requests after reordering.
+        """
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs <= 0:
+            return 0
+
+        # Two-pointer partition: move decode requests (1 scheduled token) to
+        # the front while preserving the existing mixed-mode fallback for the
+        # remaining requests.
+        i, j = 0, num_reqs - 1
+        while i < j:
+            i_req_id = self.input_batch.req_ids[i]
+            j_req_id = self.input_batch.req_ids[j]
+            assert i_req_id is not None
+            assert j_req_id is not None
+
+            if scheduler_output.num_scheduled_tokens[i_req_id] == 1:
+                i += 1
+            elif scheduler_output.num_scheduled_tokens[j_req_id] > 1:
+                j -= 1
+            else:
+                self.input_batch.swap_states(i, j)
+                i += 1
+                j -= 1
+
+        last_req_id = self.input_batch.req_ids[i]
+        assert last_req_id is not None
+        return i + int(scheduler_output.num_scheduled_tokens[last_req_id] == 1)
+
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -750,7 +787,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return slot_mapping_metadata
 
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput",
-                        start_index: int):
+                        start_index: int, num_decode_reqs: int):
         assert scheduler_output.total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -931,10 +968,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                               1).to(self.device, non_blocking=True)
 
             # For the V3 kernel, request_distribution is
-            # [decode_end, prefill_end, mixed_end]. For single-chip TPU, treat
-            # all requests as mixed mode.
-            self._request_distribution_cpu[0] = 0
-            self._request_distribution_cpu[1] = num_reqs
+            # [decode_end, prefill_end, mixed_end]. We put decode requests first,
+            # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
+            chunk_num_decode = max(
+                0, min(num_decode_reqs - start_index, num_reqs))
+            self._request_distribution_cpu[0] = chunk_num_decode
+            self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True)
@@ -1175,6 +1214,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.scheduler_output = None
         self.mm_embed_inputs = None
 
+        num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
+
         # Prepare inputs, the requests might be split into multiple
         # executions, combine the result of each execution.
         if not self.input_batch.all_greedy:
@@ -1200,7 +1241,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         while start_index < self.input_batch.num_reqs:
             attn_metadata, logits_indices, padded_num_reqs, num_reqs, end_index = (
-                self._prepare_inputs(scheduler_output, start_index))
+                self._prepare_inputs(scheduler_output, start_index,
+                                     num_decode_reqs))
             input_ids, inputs_embeds = self._get_model_inputs(
                 self.input_ids, mm_embed_inputs)
             # Run the decoder
@@ -1443,9 +1485,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                        dim=0,
                                        dtype=torch.int32).to(self.device)
         seq_lens = torch.ones((num_reqs, ), dtype=torch.int32).to(self.device)
-        # V3: request_distribution = [decode_end, prefill_end, mixed_end]
+        # V3: request_distribution = [decode_end, prefill_end, mixed_end].
+        # Dummy runs use one scheduled token per active request, so model
+        # them as pure decode to match the real single-chip path.
         request_distribution = torch.tensor(
-            [0, actual_num_reqs, actual_num_reqs],
+            [actual_num_reqs, actual_num_reqs, actual_num_reqs],
             dtype=torch.int32).to(self.device)
         attn_metadata = AttentionMetadata(
             input_positions=position_ids,
