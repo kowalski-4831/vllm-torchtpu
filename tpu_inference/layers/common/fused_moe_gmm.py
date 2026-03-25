@@ -17,57 +17,26 @@ import functools
 import jax
 from jax import numpy as jnp
 
-from tpu_inference.kernels.megablox.gmm import gmm
-from tpu_inference.kernels.megablox.gmm_v2 import (gmm_v2,
-                                                   is_supported_by_gmm_v2)
+from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
 
 
-def apply_act_fn(activation: str, x1: jax.Array, x2: jax.Array) -> jax.Array:
-    match activation:
-        case "silu":
-            return jax.nn.silu(x1) * x2
-        case "swigluoai":
-            return _swigluoai(x1, x2)
-        case _:
-            raise NotImplementedError(
-                f"FusedMoE does not support {activation} activation function")
-
-
-def _swigluoai(x1: jax.Array,
-               x2: jax.Array,
-               alpha=1.702,
-               limit=7.0) -> jax.Array:
-    x1 = jnp.clip(x1, a_max=limit)
-    x2 = jnp.clip(x2, a_min=-limit, a_max=limit)
-
-    gated_activation = x1 * jax.nn.sigmoid(alpha * x1)
-
-    return gated_activation * (x2 + 1)
-
-
-def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset):
-    if is_supported_by_gmm_v2(lhs, rhs, rhs_scale):
-        gmm_res = gmm_v2(
-            lhs=lhs,
-            rhs=rhs,
-            rhs_scale=rhs_scale,
-            rhs_bias=rhs_bias,
-            group_sizes=group_sizes,
-            group_offset=group_offset[0],
-        )
-    else:
-        gmm_res = gmm(
-            lhs=lhs,
-            rhs=rhs,
-            rhs_scale=rhs_scale,
-            rhs_bias=rhs_bias,
-            group_sizes=group_sizes,
-            preferred_element_type=lhs.dtype,
-            tiling=None,
-            group_offset=group_offset[0],
-        )
-
-    return gmm_res
+def gmm_wrapper(lhs,
+                rhs,
+                rhs_scale,
+                rhs_bias,
+                group_sizes,
+                group_offset,
+                fuse_act=None):
+    return gmm_v2(
+        lhs=lhs,
+        rhs=rhs,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        group_sizes=group_sizes,
+        group_offset=group_offset[0],
+        zero_initialize=False,
+        fuse_act=fuse_act,
+    )
 
 
 def prepare_routed_gmm_inputs(
@@ -122,10 +91,16 @@ def moe_gmm(
     """Run grouped GEMM for routed tokens and scatter-add back to tokens."""
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res_gate_up = gmm_wrapper(x, w1, w1_scale, w1_bias, group_sizes,
-                                   group_offset)
-    gmm1_res_gate, gmm1_res_up = jnp.split(gmm1_res_gate_up, 2, -1)
-    gmm1_res = apply_act_fn(activation, gmm1_res_gate, gmm1_res_up)
+    gmm1_res = gmm_wrapper(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        group_sizes,
+        group_offset,
+        fuse_act=activation,
+    )
+    gmm1_res = gmm1_res[:, :w2.shape[1]]
 
     gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
                            group_offset)
