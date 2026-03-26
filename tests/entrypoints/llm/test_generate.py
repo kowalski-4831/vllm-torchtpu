@@ -2,14 +2,16 @@
 End-to-end tests for vLLM LLM generation API on TPU.
 
 This module tests the LLM.generate() API with various configurations using
-the Qwen3-0.6B model, under both eager and compiled execution modes.
+the Qwen3-0.6B model with a single TPU device.
 
 Tests include:
 - Multiple sampling parameters
 - Priority queue handling
 - Max model length enforcement
 - Statistics logging
-- MoE tensor-parallel and expert-parallel generation
+
+For TP tests, see test_generate_tp.py.
+For MoE tests, see test_generate_tp_moe.py.
 
 Run with: pytest tests/entrypoints/llm/test_generate.py -v
 """
@@ -21,19 +23,12 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
-MOE_MODEL_NAME = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 
 PROMPTS = [
     "Hello, my name is",
     "The president of the United States is",
     "The capital of France is",
     "The future of AI is",
-]
-MOE_PROMPTS = [
-    "MoE tensor parallel test prompt.",
-    "Write one sentence about compilers.",
-    "List two uses of sparse experts.",
-    "Explain TPU execution briefly.",
 ]
 TOKEN_IDS = [
     [0],
@@ -43,33 +38,6 @@ TOKEN_IDS = [
 ]
 
 GREEDY_SAMPLING_PARAMS = SamplingParams(temperature=0.0, max_tokens=4)
-
-
-def _get_local_tpu_chip_count() -> int:
-    try:
-        from tpu_info import device as tpu_device
-
-        _, chips = tpu_device.get_local_chips()
-        return len(chips)
-    except Exception as e:
-        pytest.skip(f"Unable to detect local TPU chip count: {e}")
-
-
-def _is_local_tpu_v7() -> bool:
-    try:
-        from tpu_info import device as tpu_device
-
-        chip_type, _ = tpu_device.get_local_chips()
-        return "tpu7" in chip_type.name.lower()
-    except Exception:
-        return False
-
-
-def _print_generation_outputs(test_name: str, outputs) -> None:
-    print(f"\n{test_name} outputs:")
-    for output in outputs:
-        print(f"Prompt: {output.prompt!r}")
-        print(f"Generated: {output.outputs[0].text!r}")
 
 
 @pytest.fixture(scope="module")
@@ -89,100 +57,6 @@ def llm():
     )
 
     yield weakref.proxy(llm)
-
-    del llm
-
-    cleanup_dist_env_and_memory()
-
-
-@pytest.fixture(scope="module")
-def llm_tp_local_size():
-    tp_size = _get_local_tpu_chip_count()
-
-    llm = LLM(
-        model=MODEL_NAME,
-        max_num_batched_tokens=64,
-        max_model_len=64,
-        tensor_parallel_size=tp_size,
-        gpu_memory_utilization=0.6,
-        enforce_eager=True,
-        disable_log_stats=False,
-    )
-
-    yield weakref.proxy(llm), tp_size
-
-    del llm
-
-    cleanup_dist_env_and_memory()
-
-
-@pytest.fixture(scope="module")
-def llm_tp_local_size_compile():
-    tp_size = _get_local_tpu_chip_count()
-    if tp_size < 2:
-        pytest.skip(
-            "TP compile smoke test requires at least 2 local TPU chips.")
-
-    llm = LLM(
-        model=MODEL_NAME,
-        max_num_batched_tokens=64,
-        max_model_len=64,
-        tensor_parallel_size=tp_size,
-        gpu_memory_utilization=0.6,
-        enforce_eager=False,
-        disable_log_stats=False,
-    )
-
-    yield weakref.proxy(llm), tp_size
-
-    del llm
-
-    cleanup_dist_env_and_memory()
-
-
-@pytest.fixture
-def llm_moe_tp_local_size():
-    tp_size = _get_local_tpu_chip_count()
-    if tp_size < 2:
-        pytest.skip("MoE TP test requires at least 2 local TPU chips")
-
-    llm = LLM(
-        model=MOE_MODEL_NAME,
-        max_num_batched_tokens=64,
-        max_model_len=64,
-        tensor_parallel_size=tp_size,
-        gpu_memory_utilization=0.6,
-        enforce_eager=True,
-        disable_log_stats=False,
-        seed=0,
-    )
-
-    yield weakref.proxy(llm), tp_size
-
-    del llm
-
-    cleanup_dist_env_and_memory()
-
-
-@pytest.fixture
-def llm_moe_ep_local_size():
-    tp_size = _get_local_tpu_chip_count()
-    if tp_size < 2:
-        pytest.skip("MoE EP test requires at least 2 local TPU chips")
-
-    llm = LLM(
-        model=MOE_MODEL_NAME,
-        max_num_batched_tokens=64,
-        max_model_len=64,
-        tensor_parallel_size=tp_size,
-        enable_expert_parallel=True,
-        gpu_memory_utilization=0.6,
-        enforce_eager=True,
-        disable_log_stats=False,
-        seed=0,
-    )
-
-    yield weakref.proxy(llm), tp_size
 
     del llm
 
@@ -267,60 +141,3 @@ def test_max_model_len(llm: LLM):
 def test_log_stats(llm: LLM):
     outputs = llm.generate(PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS)
     assert all(output.metrics is not None for output in outputs)
-
-
-def test_generate_with_tp_equal_local_tpu_count(llm_tp_local_size):
-    llm, tp_size = llm_tp_local_size
-
-    outputs = llm.generate(
-        ["Tensor parallel test prompt."],
-        sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
-    )
-
-    assert tp_size >= 1
-    assert len(outputs) == 1
-    assert len(outputs[0].outputs) == 1
-
-
-def test_generate_with_tp_equal_local_tpu_count_compile(
-        llm_tp_local_size_compile):
-    llm, tp_size = llm_tp_local_size_compile
-
-    outputs = llm.generate(
-        ["Tensor parallel compile test prompt."],
-        sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
-    )
-
-    assert tp_size >= 2
-    assert len(outputs) == 1
-    assert len(outputs[0].outputs) == 1
-
-
-def test_moe_generate_with_tp_equal_local_tpu_count(llm_moe_tp_local_size):
-    llm, tp_size = llm_moe_tp_local_size
-
-    outputs = llm.generate(
-        MOE_PROMPTS,
-        sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
-    )
-    _print_generation_outputs("MoE TP", outputs)
-
-    assert tp_size >= 2
-    assert len(outputs) == len(MOE_PROMPTS)
-    assert all(len(output.outputs) == 1 for output in outputs)
-    assert all(output.outputs[0].text.strip() for output in outputs)
-
-
-def test_moe_generate_with_ep_equal_local_tpu_count(llm_moe_ep_local_size):
-    llm, tp_size = llm_moe_ep_local_size
-
-    outputs = llm.generate(
-        MOE_PROMPTS,
-        sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
-    )
-    _print_generation_outputs("MoE EP", outputs)
-
-    assert tp_size >= 2
-    assert len(outputs) == len(MOE_PROMPTS)
-    assert all(len(output.outputs) == 1 for output in outputs)
-    assert all(output.outputs[0].text.strip() for output in outputs)
