@@ -47,7 +47,6 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
                              LogprobsTensors, ModelRunnerOutput)
-from vllm.v1.sample.sampler import Sampler as TPUSampler
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin, KVConnectorOutput)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -132,8 +131,8 @@ def _bypass_torch_compile(model: nn.Module):
 # Step 2
 # The TPU execution should be decomposed into subgraphs (4 at the moment):
 # 1. the main model
-# 2. selecting hidden states for each request
-# 3. sampler
+# 2. selected-logits computation for each request
+# 3. sampler / logprob post-processing
 # 4. encoder.
 # Each subgraph should be decorated in a torch.compile. This is used to make
 # sure that we have the same subgraph topology in both dummy_run and
@@ -1259,10 +1258,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                 )
 
-            hidden_states = self.select_hidden_states(hidden_states,
-                                                      logits_indices)
+            logits = self.compute_selected_logits(hidden_states,
+                                                  logits_indices)
 
-            logits = self.compute_logits(hidden_states)
             if grammar_output is not None:
                 require_struct_decoding, grammar_bitmask_padded, arange = (
                     self.prepare_structured_decoding_input(
@@ -1286,7 +1284,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 combined_logprobs.append(logprobs.tolists())
 
             self._update_num_xla_graphs("decoding_step")
-
             start_index = end_index
 
         # NOTE: current kv load and save get h2d/d2h copies involved.
@@ -1451,7 +1448,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
-        self.sampler = TPUSampler()
 
     def reload_weights(self) -> None:
         assert (getattr(self, "model", None)
@@ -1541,9 +1537,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logger.info("Compilation finished in %.2f [secs].", end - start)
         self._update_num_xla_graphs("model backbone")
 
-    def _precompile_select_hidden_states(self) -> None:
+    def _precompile_compute_selected_logits(self) -> None:
         logger.info(
-            "Compiling select_hidden_states with different input shapes.")
+            "Compiling compute_selected_logits with different input shapes.")
         start = time.perf_counter()
         hsize = self.model_config.get_hidden_size()
         for num_tokens in self.num_tokens_paddings:
@@ -1554,7 +1550,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 indices = torch.zeros(num_reqs,
                                       dtype=torch.int32,
                                       device=self.device)
-                out = self.select_hidden_states(dummy_hidden, indices)
+                out = self.compute_selected_logits(dummy_hidden, indices)
                 sync.synchronize(out, wait=True)
                 logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens,
                             num_reqs)
@@ -1562,22 +1558,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     break
         end = time.perf_counter()
         logger.info("Compilation finished in %.2f [secs].", end - start)
-        self._update_num_xla_graphs("select_hidden_states")
-
-    def _precompile_compute_logits(self) -> None:
-        logger.info("Compiling compute_logits with different input shapes.")
-        start = time.perf_counter()
-        hsize = self.model_config.get_hidden_size()
-        for num_reqs in self.num_reqs_paddings:
-            dummy_hidden = torch.zeros((num_reqs, hsize),
-                                       device=self.device,
-                                       dtype=self._hidden_states_dtype)
-            out = self.compute_logits(dummy_hidden)
-            sync.synchronize(out, wait=True)
-            logger.info("  -- num_seqs: %d", num_reqs)
-        end = time.perf_counter()
-        logger.info("Compilation finished in %.2f [secs].", end - start)
-        self._update_num_xla_graphs("compute_logits")
+        self._update_num_xla_graphs("compute_selected_logits")
 
     def _precompile_structured_decoding(self) -> None:
         logger.info(
@@ -1650,8 +1631,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         with self.maybe_setup_dummy_loras(self.lora_config):
             self._precompile_backbone()
-            self._precompile_select_hidden_states()
-            self._precompile_compute_logits()
+            self._precompile_compute_selected_logits()
             self._precompile_structured_decoding()
             self._precompile_sample_from_logits()
             self._precompile_gather_logprobs()
@@ -1810,13 +1790,10 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return out
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def select_hidden_states(self, hidden_states, indices_do_sample):
-        return hidden_states[indices_do_sample]
-
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def compute_logits(self,
-                       sample_hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.model.compute_logits(sample_hidden_states)
+    def compute_selected_logits(
+            self, hidden_states: torch.Tensor,
+            indices_do_sample: torch.Tensor) -> torch.Tensor:
+        return self.model.compute_logits(hidden_states[indices_do_sample])
 
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
@@ -1836,11 +1813,28 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         of logprobs as an alternative to having multiple pre-compiled graphs.
         Select the number of logprobs actually demanded by each request on CPU.
         """
-        logprobs = self.sampler.compute_logprobs(logits)
-        return self.sampler.gather_logprobs(
-            logprobs,
-            self.model_config.max_logprobs,
-            token_ids=sampled_tokens.squeeze(-1),
+        token_ids = sampled_tokens.to(torch.int64)
+        token_logits = logits.gather(-1, token_ids)
+        token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
+        log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
+        token_logprobs = (token_logits - log_normalizers).to(torch.float32)
+
+        max_logprobs = self.model_config.max_logprobs
+        if max_logprobs > 0:
+            topk_logits, topk_indices = torch.topk(logits,
+                                                   max_logprobs,
+                                                   dim=-1)
+            topk_logprobs = (topk_logits - log_normalizers).to(torch.float32)
+            logprob_token_ids = torch.cat((token_ids, topk_indices), dim=1)
+            logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+        else:
+            logprob_token_ids = token_ids
+            logprobs = token_logprobs
+
+        return LogprobsTensors(
+            logprob_token_ids=logprob_token_ids.to(torch.int32),
+            logprobs=logprobs,
+            selected_token_ranks=token_ranks,
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
