@@ -72,6 +72,8 @@ jobs:
     env:
       # Enable color in logs
       FORCE_COLOR: "1"
+      # Disable UV cache to save disk space on self-hosted runners
+      UV_NO_CACHE: "1"
 
     steps:
       # Clone the GitHub repository to runner's environment $GITHUB_WORKSPACE, making its files
@@ -85,8 +87,6 @@ jobs:
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
 
       - name: Setup Virtual Environment
         run: |
@@ -110,9 +110,12 @@ jobs:
           cd /tmp/vllm
           sed -i '/tpu-inference/d' requirements/tpu.txt
           uv pip install -r requirements/tpu.txt
-          SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" uv pip install .
-          # Remove source tree so it doesn't shadow the installed package
+          # --no-build-isolation avoids creating a temp venv with duplicate build deps (~GBs)
+          SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
+          # Clean up source tree and build caches to reclaim disk space
           rm -rf /tmp/vllm
+          rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
+          echo "Disk usage after vLLM install:" && df -h .
 
       # Enable remote connections.
       # See go/ml-github-actions:connect#add-waiting-step.

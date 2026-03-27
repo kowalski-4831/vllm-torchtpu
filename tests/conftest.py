@@ -13,6 +13,11 @@
 # limitations under the License.
 """Shared pytest configuration for all tests."""
 
+import os
+
+# Disable TPU compilation cache to save disk space (important for CI runners).
+os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", "disabled")
+
 import pytest
 import torch
 

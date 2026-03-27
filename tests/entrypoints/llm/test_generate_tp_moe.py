@@ -90,8 +90,7 @@ def llm_moe_ep_local_size():
     cleanup_dist_env_and_memory()
 
 
-# TODO: MoE model compilation with torch.compile hangs on TPU.
-@pytest.mark.skip(reason="MoE torch.compile hangs on TPU")
+@pytest.mark.timeout(1800)
 def test_moe_generate_with_tp_equal_local_tpu_count(llm_moe_tp_local_size):
     llm, tp_size = llm_moe_tp_local_size
 
@@ -107,8 +106,7 @@ def test_moe_generate_with_tp_equal_local_tpu_count(llm_moe_tp_local_size):
     assert all(output.outputs[0].text.strip() for output in outputs)
 
 
-# TODO: MoE model compilation with torch.compile hangs on TPU.
-@pytest.mark.skip(reason="MoE torch.compile hangs on TPU")
+@pytest.mark.timeout(1800)
 def test_moe_generate_with_ep_equal_local_tpu_count(llm_moe_ep_local_size):
     llm, tp_size = llm_moe_ep_local_size
 
