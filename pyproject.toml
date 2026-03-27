@@ -62,6 +62,7 @@ include = ["tpu_inference*"]
 [tool.setuptools_scm]
 
 [tool.uv]
+keyring-provider = "subprocess"
 # vLLM 0.17.1 pins numba==0.61.2, which conflicts with our requirements.
 # We override the numba version to >=0.62.1 to allow resolution to succeed.
 override-dependencies = [

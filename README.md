@@ -8,19 +8,42 @@ This repository contains the integration of **TorchTPU** and **vLLM**. The codeb
 
 To run the **Qwen3** model on a single device, follow these installation steps:
 
-### 1. Install TorchTPU-vLLM and dependencies
+### 1. Google Cloud Authentication
+
+We need to authenticate with Google Cloud to access the private Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`). This registry contains packages like `torch-tpu`, `torch`, and other dependencies required by `torchtpu-vllm`.
+
+Make sure you are logged into `gcloud` using your corporate account (i.e., one that has read permissions for the Torch TPU registry). If you need access to this registry, please reach out to the Torch TPU team.
+
+You can check your active account by running:
+
+```bash
+gcloud auth list
+```
+
+If the active account is not your corporate account, switch to it or log in by running:
+
+```bash
+gcloud auth login
+
+# For keyring authentication, see https://github.com/GoogleCloudPlatform/artifact-registry-python-tools?tab=readme-ov-file#authentication
+gcloud auth application-default login
+```
+
+### 2. Install TorchTPU-vLLM and dependencies
 
 We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
 
 #### Option A: Using `uv` (Recommended)
 
 ```bash
-uv venv --python 3.12
-source .venv/bin/activate
+uv venv --python 3.12 ~/uv_venv
+source ~/uv_venv/bin/activate
 
-# Set up authentication for the Torch TPU virtual registry
+# Set the username for the index
 export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
-export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(gcloud auth print-access-token)"
+
+# Install keyring and Google Artifact Registry plugin for persistent auth
+uv tool install keyring --with keyrings.google-artifactregistry-auth
 
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git ../vllm
@@ -40,15 +63,15 @@ uv pip install --pre -e .
 > **Note:** Currently, `vllm==0.17.1` is supported.
 
 ```bash
-python3.12 -m venv vllm_env --symlinks
-source ../vllm_env/bin/activate
+python3.12 -m venv ~/pip_venv --symlinks
+source ~/pip_venv/bin/activate
 pip install --upgrade pip
 
-# Set up authentication for the Torch TPU virtual registry
-ACCESS_TOKEN="$(gcloud auth print-access-token)"
+# Install keyring and Google Artifact Registry plugin for persistent auth
+pip install keyring keyrings.google-artifactregistry-auth
 
-# Set the PIP_INDEX_URL environment variable to point to the Torch TPU virtual registry
-PIP_INDEX_URL="https://oauth2accesstoken:${ACCESS_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+# Set the PIP_INDEX_URL environment variable (using keyring)
+export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git ../vllm
@@ -62,6 +85,17 @@ SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" pip install -e ..
 # Install TorchTPU-vLLM and dependencies
 pip install --pre -e .
 ```
+
+> [!TIP]
+> A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials.
+>
+> To resolve this, open `~/.netrc` in your preferred text editor and delete the block associated with `us-python.pkg.dev`. It will look something like this:
+>
+> ```text
+> machine us-python.pkg.dev
+> login oauth2accesstoken
+> password <your_expired_token>
+> ```
 
 > **Note:** Prioritize compile mode for better performance. Add `--enforce-eager` if you want eager mode.
 > On TPUv7, Qwen3-Coder-30B can fit on a single device. On v6, use a smaller model like Qwen3-4B or test with TP/EP.
@@ -78,6 +112,9 @@ vllm serve "Qwen/Qwen3-Coder-30B-A3B-Instruct" \
   --max-model-len=256 \
   --max-num-batched-tokens=256
 ```
+
+> [!TIP]
+> If you see `RuntimeError: operator torchvision::nms does not exist`, run either `uv pip uninstall torchvision` or `pip uninstall torchvision`.
 
 ### Send a Request
 
