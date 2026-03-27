@@ -25,7 +25,7 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     "vllm==0.17.1",
-    "torch-tpu==0.1.1.dev20260325092501",
+    "torch-tpu==0.1.1.dev20260327092459",
 ]
 
 [project.optional-dependencies]

@@ -48,5 +48,5 @@ def device(request):
         except ImportError:
             pytest.skip("torch_tpu not available")
         except Exception as e:
-            pytest.skip(f"TPU not available: {e}")
+            pytest.fail(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
