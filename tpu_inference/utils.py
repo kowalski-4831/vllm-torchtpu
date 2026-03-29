@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
-from collections import defaultdict
 from functools import wraps
 from typing import Any, Callable, List, Tuple, Union
 
 import jax
 from jax._src import dtypes
 from jax.sharding import Mesh
-from vllm import envs as vllm_envs
 from vllm import utils
 
 from tpu_inference import envs
@@ -45,9 +43,6 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
 
 def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
     usage = []
-    if vllm_envs.VLLM_TPU_USING_PATHWAYS:
-        return pathways_hbm_usage_gb(devices)
-
     multihost_backend = envs.TPU_MULTIHOST_BACKEND
     if multihost_backend == "ray":
         # MemoryStats is only supported for addressable PjRt devices.
@@ -126,33 +121,6 @@ def get_mesh_shape_product(
         product *= mesh.shape.get(axis, 1)
 
     return product
-
-
-def get_device_hbm_limit() -> int:
-
-    device_kind = get_device_name()
-    if device_kind == "TPU v5p" or device_kind == "TPU v5":
-        return 95 * GBYTES
-    elif device_kind == "TPU v5e":
-        return 16 * GBYTES
-    elif device_kind == "TPU v6e" or device_kind == "TPU v4":
-        return 32 * GBYTES
-    elif device_kind == "TPU v7":
-        # 192 * GBYTES / 2 because each JAX device (v7x core) has
-        # 1/2 of the total chip HBM
-        return 96 * GBYTES
-    else:
-        raise ValueError(f"Unknown device kind: {device_kind}")
-
-
-def pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
-    live_arrays = jax.live_arrays()
-    hbm_used = defaultdict(int)
-    hbm_limit = get_device_hbm_limit()
-    for array in live_arrays:
-        for buffer in array.addressable_shards:
-            hbm_used[buffer.data.device] += buffer.data.nbytes
-    return [(hbm_used[device], hbm_limit) for device in devices]
 
 
 def hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:

@@ -147,12 +147,9 @@ class TpuPlatform(Platform):
         # TODO: Expose get_tpu_device_name() in torch_tpu (via
         # tpu_topology.py PCI scan) and remove the tpu-info dependency.
         try:
-            if vllm_envs.VLLM_TPU_USING_PATHWAYS:
-                return "TPU v6 lite"
-            else:
-                from tpu_info import device as tpu_info_device
-                chip_type, _ = tpu_info_device.get_local_chips()
-                return f"TPU {chip_type.name}"
+            from tpu_info import device as tpu_info_device
+            chip_type, _ = tpu_info_device.get_local_chips()
+            return f"TPU {chip_type.name}"
         except Exception as e:
             logger.warning(f"Error getting device name: {e}")
             return "TPU"
@@ -211,9 +208,9 @@ class TpuPlatform(Platform):
         _patch_vllm_tpu_group_custom_ops()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
-            assert not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING, (
-                "VLLM_ENABLE_V1_MULTIPROCESSING must be 0 when using Pathways(JAX_PLATFORMS=proxy)"
-            )
+            raise NotImplementedError(
+                "Pathways is not supported by torchtpu-vllm. "
+                "Unset VLLM_TPU_USING_PATHWAYS.")
         cls._initialize_sharding_config(vllm_config)
 
         from vllm.config import CompilationMode
