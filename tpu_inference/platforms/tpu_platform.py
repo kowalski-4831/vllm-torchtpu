@@ -35,6 +35,58 @@ else:
 
 logger = init_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Modules/attrs whose @torch.compile(dynamic=True) wrappers must be removed.
+# Each entry is (module_path, function_name).
+# ---------------------------------------------------------------------------
+_DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
+    ("vllm.model_executor.layers.vocab_parallel_embedding",
+     "get_masked_input_and_mask"),
+    ("vllm.v1.sample.ops.logprobs", "batched_count_greater_than"),
+    ("vllm.v1.sample.ops.topk_topp_sampler", "compiled_random_sample"),
+    ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),
+]
+
+_dynamic_compile_unwrapped = False
+
+
+def _unwrap_dynamic_compile_fns() -> None:
+    """Unwrap all known ``@torch.compile(dynamic=True)`` decorators in vllm.
+
+    Safe to call multiple times; only the first call per process does work.
+    Failures to import a module are silently ignored (the module may not be
+    used at all in this configuration).
+    """
+    global _dynamic_compile_unwrapped
+    if _dynamic_compile_unwrapped:
+        return
+    _dynamic_compile_unwrapped = True
+
+    import importlib
+
+    for module_path, fn_name in _DYNAMIC_COMPILE_TARGETS:
+        try:
+            mod = importlib.import_module(module_path)
+        except (ImportError, ModuleNotFoundError):
+            continue
+        fn = getattr(mod, fn_name, None)
+        if fn is not None and hasattr(fn, "__wrapped__"):
+            setattr(mod, fn_name, fn.__wrapped__)
+            logger.debug("Unwrapped @torch.compile(dynamic=True) from %s.%s",
+                         module_path, fn_name)
+
+
+def apply_tpu_patches() -> None:
+    """Apply all module-level patches required for TorchTPU.
+
+    Must run in **every** process (including spawned workers) because
+    module-level state is re-initialized on import in spawned processes.
+    All patches are idempotent.
+    """
+    from tpu_inference import _patch_vllm_tpu_group_custom_ops
+    _patch_vllm_tpu_group_custom_ops()
+    _unwrap_dynamic_compile_fns()
+
 
 class TpuPlatform(Platform):
     _enum = PlatformEnum.TPU
@@ -203,9 +255,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        from tpu_inference import _patch_vllm_tpu_group_custom_ops
-
-        _patch_vllm_tpu_group_custom_ops()
+        apply_tpu_patches()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -322,19 +372,6 @@ class TpuPlatform(Platform):
         from tpu_inference.core.sched.dp_scheduler import \
             update_vllm_config_for_dp_scheduler
         update_vllm_config_for_dp_scheduler(vllm_config)
-
-        cls._disable_other_compilations()
-
-    @classmethod
-    def _disable_other_compilations(cls):
-        """HACK: Remove @torch.compile(dynamic=True) wrappers around
-        annotated functions in vllm (ex. get_masked_input_and_mask).
-        This is because torchtpu does not support dynamic shapes.
-        """
-        import vllm.model_executor.layers.vocab_parallel_embedding as vpe
-        if hasattr(vpe.get_masked_input_and_mask, "__wrapped__"):
-            vpe.get_masked_input_and_mask = (
-                vpe.get_masked_input_and_mask.__wrapped__)
 
     @classmethod
     def is_pin_memory_available(cls):

@@ -48,6 +48,12 @@ class TPUWorker:
         ip: str = "localhost",
         prev_worker_ip: str = "localhost",
     ):
+        # Re-apply patches that were done in check_and_update_config.
+        # Workers may be spawned (not forked) so module-level patches
+        # from the parent process are lost.
+        from tpu_inference.platforms.tpu_platform import apply_tpu_patches
+        apply_tpu_patches()
+
         # If we use vLLM's model implementation in PyTorch, we should set it
         # with torch version of the dtype.
         impl = envs.MODEL_IMPL_TYPE
