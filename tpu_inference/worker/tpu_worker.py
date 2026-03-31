@@ -201,15 +201,7 @@ class TPUWorker:
             total_hbm_limit += limit_memory
 
         total_hbm_limit_cap = total_hbm_limit * gpu_memory_utilization
-
-        # HACK: The profiling run executes without KV cache since it is used to infer it.
-        # To do so the attention kernel returns early.
-        # As of Feb 23rd 2026 the attention kernel in the regular forward pass will create
-        # a copy of the KV cache. Since the profiling run has no way of catching this
-        # we adjust for this copy by dividing the `total_hbm_avail` with 2 to account
-        # for the extra copy in the attention kernel.
-        # This should be removed once the copy in the attention kernel is removed.
-        total_hbm_avail = int(total_hbm_limit_cap - total_hbm_used) // 2
+        total_hbm_avail = int(total_hbm_limit_cap - total_hbm_used)
 
         total_hbm_limit_gb = round(total_hbm_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(total_hbm_limit_cap / utils.GBYTES, 2)
