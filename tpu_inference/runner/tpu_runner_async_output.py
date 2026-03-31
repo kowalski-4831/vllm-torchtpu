@@ -11,30 +11,28 @@ INVALID_TOKEN_ID = -1
 @dataclass
 class AsyncTPUCopyState:
     sampled_token_ids_cpu: torch.Tensor
-    copy_id: int
+    copy_ready_event: Any
+    sampled_token_ids_tpu: torch.Tensor | None = None
     completed: bool = False
 
     @classmethod
     def from_device(cls,
                     sampled_token_ids: torch.Tensor) -> "AsyncTPUCopyState":
-        sampled_token_ids_cpu = torch.empty(
-            sampled_token_ids.shape,
-            dtype=sampled_token_ids.dtype,
-            device="cpu",
-        ).pin_memory()
-        copy_id = torch.tpu._start_async_host_copy(  # type: ignore[attr-defined]
-            sampled_token_ids, sampled_token_ids_cpu)
+        sampled_token_ids_cpu = sampled_token_ids.to("cpu", non_blocking=True)
+        copy_ready_event = torch.tpu.Event()
+        copy_ready_event.record()
         return cls(
             sampled_token_ids_cpu=sampled_token_ids_cpu,
-            copy_id=copy_id,
+            copy_ready_event=copy_ready_event,
+            sampled_token_ids_tpu=sampled_token_ids,
         )
 
     def wait(self) -> None:
-        if self.completed or self.copy_id == 0:
+        if self.completed:
             self.completed = True
             return
-        torch.tpu._wait_async_host_copy(
-            self.copy_id)  # type: ignore[attr-defined]
+        self.copy_ready_event.synchronize()
+        self.sampled_token_ids_tpu = None
         self.completed = True
 
 
