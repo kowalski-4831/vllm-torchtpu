@@ -48,8 +48,9 @@ uv tool install keyring --with keyrings.google-artifactregistry-auth
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git ../vllm
 
-# Patch vLLM's TPU requirements to accept our local workspace instead of overriding it
-sed -i 's/tpu-inference==0.12.0/tpu-inference/' ../vllm/requirements/tpu.txt
+# Patch vLLM's TPU requirements to remove tpu-inference to avoid conflicts
+# with the torchtpu-vllm package which is also named tpu-inference
+sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
 
 # Install vLLM in editable mode (forcing the 0.17.1 base version to prevent .dev prerelease mismatch during dependency resolution)
 SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" uv pip install -e ../vllm
@@ -76,8 +77,9 @@ export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifac
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git ../vllm
 
-# Patch vLLM's TPU requirements to accept our local workspace instead of overriding it
-sed -i 's/tpu-inference==0.12.0/tpu-inference/' ../vllm/requirements/tpu.txt
+# Patch vLLM's TPU requirements to remove tpu-inference to avoid conflicts
+# with the torchtpu-vllm package which is also named tpu-inference
+sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
 
 # Install vLLM in editable mode (forcing the 0.17.1 base version to prevent .dev prerelease mismatch during dependency resolution)
 SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
