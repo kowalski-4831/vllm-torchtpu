@@ -8,8 +8,6 @@ module-scoped fixture conflicts with single-device tests.
 Run with: pytest tests/entrypoints/llm/test_generate_tp_moe.py -v
 """
 
-import weakref
-
 import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -41,64 +39,44 @@ def _print_generation_outputs(test_name: str, outputs) -> None:
         print(f"Generated: {output.outputs[0].text!r}")
 
 
-@pytest.fixture
-def llm_moe_tp_local_size():
+def _run_moe_generation(async_scheduling: bool,
+                        enable_expert_parallel: bool = False):
     tp_size = _get_local_tpu_chip_count()
     if tp_size < 2:
-        pytest.skip("MoE TP test requires at least 2 local TPU chips")
+        pytest.skip("MoE distributed test requires at least 2 local TPU chips")
 
     llm = LLM(
         model=MOE_MODEL_NAME,
         max_num_batched_tokens=64,
         max_model_len=64,
         tensor_parallel_size=tp_size,
+        enable_expert_parallel=enable_expert_parallel,
+        async_scheduling=async_scheduling,
         gpu_memory_utilization=0.6,
         enforce_eager=False,
         disable_log_stats=False,
         seed=0,
     )
 
-    yield weakref.proxy(llm), tp_size
+    try:
+        outputs = llm.generate(
+            MOE_PROMPTS,
+            sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
+        )
+    finally:
+        del llm
+        cleanup_dist_env_and_memory()
 
-    del llm
-
-    cleanup_dist_env_and_memory()
-
-
-@pytest.fixture
-def llm_moe_ep_local_size():
-    tp_size = _get_local_tpu_chip_count()
-    if tp_size < 2:
-        pytest.skip("MoE EP test requires at least 2 local TPU chips")
-
-    llm = LLM(
-        model=MOE_MODEL_NAME,
-        max_num_batched_tokens=64,
-        max_model_len=64,
-        tensor_parallel_size=tp_size,
-        enable_expert_parallel=True,
-        gpu_memory_utilization=0.6,
-        enforce_eager=False,
-        disable_log_stats=False,
-        seed=0,
-    )
-
-    yield weakref.proxy(llm), tp_size
-
-    del llm
-
-    cleanup_dist_env_and_memory()
+    return tp_size, outputs
 
 
 @pytest.mark.timeout(1800)
-def test_moe_generate_with_tp_equal_local_tpu_count(llm_moe_tp_local_size):
-    llm, tp_size = llm_moe_tp_local_size
-
-    outputs = llm.generate(
-        MOE_PROMPTS,
-        sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
-    )
-    _print_generation_outputs("MoE TP", outputs)
+@pytest.mark.parametrize("async_scheduling", [False, True],
+                         ids=["sync", "async"])
+def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
+    tp_size, outputs = _run_moe_generation(async_scheduling=async_scheduling)
+    _print_generation_outputs(
+        f"MoE TP ({'async' if async_scheduling else 'sync'})", outputs)
 
     assert tp_size >= 2
     assert len(outputs) == len(MOE_PROMPTS)
@@ -107,14 +85,15 @@ def test_moe_generate_with_tp_equal_local_tpu_count(llm_moe_tp_local_size):
 
 
 @pytest.mark.timeout(1800)
-def test_moe_generate_with_ep_equal_local_tpu_count(llm_moe_ep_local_size):
-    llm, tp_size = llm_moe_ep_local_size
-
-    outputs = llm.generate(
-        MOE_PROMPTS,
-        sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
+@pytest.mark.parametrize("async_scheduling", [False, True],
+                         ids=["sync", "async"])
+def test_moe_generate_with_ep_equal_local_tpu_count(async_scheduling: bool):
+    tp_size, outputs = _run_moe_generation(
+        async_scheduling=async_scheduling,
+        enable_expert_parallel=True,
     )
-    _print_generation_outputs("MoE EP", outputs)
+    _print_generation_outputs(
+        f"MoE EP ({'async' if async_scheduling else 'sync'})", outputs)
 
     assert tp_size >= 2
     assert len(outputs) == len(MOE_PROMPTS)

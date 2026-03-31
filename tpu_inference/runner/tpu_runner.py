@@ -3,6 +3,7 @@
 import bisect
 import contextlib
 import time
+from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from typing import TYPE_CHECKING, Any, cast
 
@@ -59,13 +60,57 @@ from tpu_inference.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from tpu_inference.runner.tpu_runner_async_output import (
+    INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
+    AsyncTPUModelRunnerOutput)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
+
+@dataclass
+class ExecuteModelState:
+    scheduler_output: "SchedulerOutput"
+    logits_list: list[torch.Tensor]
+    num_reqs_list: list[int]
+
+
+def _substitute_placeholder_token(
+        input_ids: torch.Tensor, token_in_tpu_cur_input_indices: torch.Tensor,
+        token_in_tpu_pre_next_tokens_indices: torch.Tensor,
+        next_tokens: torch.Tensor, placeholder_num: int):
+    """Substitute placeholder tokens from TPU for async scheduler
+
+    Padding for parallelisation of the substitute_placeholder_token_fn
+    [1, 3] => [1, 3, 0, 2, 4, 5, 6, 7, 8]
+    The reason for such a special padding instead of padding with -1 is:
+    An edge case when the end index needs to be updated and padding is required.
+    If we pad the array with -1, the _substitute_placeholder_token_fn will repeatedly update the end element with the original value
+    Although such a scenario is unlikely to happen in vLLM, it is best to eliminate any potential risks.
+
+    Args:
+        input_ids: possible input_ids size
+        token_in_tpu_cur_input_indices: replace holder idx in input_ids. Length the same to input_ids.
+        token_in_tpu_pre_next_tokens_indices: value idx in next_tokens. Length the same to input_ids.
+        next_tokens: next tokens on the TPU from previous step.
+        placeholder_num: number of placeholders. placeholder_num <= len(token_in_tpu_cur_input_indices)
+    Return:
+        input_ids after replace placeholder tokens
+    """
+    assert input_ids.shape[0] == token_in_tpu_cur_input_indices.shape[
+        0] == token_in_tpu_pre_next_tokens_indices.shape[0]
+    device = input_ids.device
+    mask = torch.arange(input_ids.shape[0], device=device) < placeholder_num
+    new_token_values = next_tokens[token_in_tpu_pre_next_tokens_indices].to(
+        input_ids.dtype)
+    original_values = input_ids[token_in_tpu_cur_input_indices]
+    update_values = torch.where(mask, new_token_values, original_values)
+    input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
+    return input_ids
+
+
 logger = init_logger(__name__)
 
-INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
 
@@ -342,9 +387,10 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # For passing scheduler_output between successive
         # execute_model() and sample_tokens() calls.
-        self.scheduler_output: SchedulerOutput | None = None
         self.mm_embed_inputs: tuple[list[torch.Tensor],
                                     torch.Tensor] | None = None
+        self.execute_model_state: ExecuteModelState | None = None
+        self._pre_async_results: AsyncPreResults | None = None
 
         # Cache attention layer names to avoid calling
         # get_layers_from_vllm_config every step.
@@ -785,6 +831,136 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             [kv_cache_start_indices, new_kv_start_indices, slice_lens], axis=1)
         return slot_mapping_metadata
 
+    def _prepare_async_token_substitution_indices(
+        self, start_index: int, num_reqs: int,
+        num_scheduled_tokens_per_req: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self._pre_async_results is None:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+        token_in_tpu_cur_input_indices_list = []
+        token_in_tpu_pre_next_tokens_indices_list = []
+        acc_cur_len = 0
+
+        for i in range(num_reqs):
+            req_id = self.input_batch.req_ids[start_index + i]
+            acc_cur_len += num_scheduled_tokens_per_req[i]
+            assert req_id is not None
+            if req_id not in self._pre_async_results.req_id_to_index_copy:
+                continue
+
+            token_in_tpu_cur_input_indices_list.append(acc_cur_len - 1)
+            token_in_tpu_pre_next_tokens_indices_list.append(
+                self._pre_async_results.req_id_to_index_copy[req_id])
+
+        if len(token_in_tpu_cur_input_indices_list) > 0:
+            return (np.array(token_in_tpu_cur_input_indices_list,
+                             dtype=np.int32),
+                    np.array(token_in_tpu_pre_next_tokens_indices_list,
+                             dtype=np.int32))
+        else:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+    def _apply_async_token_substitution(
+            self, input_ids: torch.Tensor,
+            token_in_tpu_cur_input_indices: np.ndarray,
+            token_in_tpu_pre_next_tokens_indices: np.ndarray) -> torch.Tensor:
+        """Apply async token substitution if needed."""
+        if len(token_in_tpu_cur_input_indices) == 0:
+            return input_ids
+
+        idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
+
+        # Pad according to the instructions written inside _substitute_placeholder_token
+        full_range = np.arange(0, len(input_ids), dtype=np.int32)
+        missing_values = np.setdiff1d(full_range,
+                                      token_in_tpu_cur_input_indices)
+        padded_token_in_tpu_cur_input_indices = np.concatenate(
+            (token_in_tpu_cur_input_indices, missing_values))
+
+        padded_token_in_tpu_pre_next_tokens_indices = np.pad(
+            token_in_tpu_pre_next_tokens_indices, (0, idx_pad_len),
+            mode='constant',
+            constant_values=-1)
+
+        cur_input_indices = torch.from_numpy(
+            padded_token_in_tpu_cur_input_indices).to(self.device,
+                                                      non_blocking=True)
+        pre_next_tokens_indices = torch.from_numpy(
+            padded_token_in_tpu_pre_next_tokens_indices).to(self.device,
+                                                            non_blocking=True)
+
+        return _substitute_placeholder_token(
+            input_ids, cur_input_indices, pre_next_tokens_indices,
+            self._pre_async_results.next_tokens_tpu,
+            len(token_in_tpu_cur_input_indices))
+
+    def _modify_prev_results(self):
+        if self._pre_async_results is None:
+            return
+
+        pre_req_ids = self._pre_async_results.req_ids
+        pre_request_seq_lens = self._pre_async_results.request_seq_lens
+        pre_discard_sampled_tokens_req_indices = self._pre_async_results.discard_sampled_tokens_req_indices
+
+        pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
+        assert pre_next_tokens_cpu is not None
+
+        pre_next_tokens_cpu = pre_next_tokens_cpu[:len(pre_req_ids)]
+        max_gen_len = pre_next_tokens_cpu.shape[-1]
+
+        if max_gen_len == 1:
+            valid_sampled_token_ids = pre_next_tokens_cpu.tolist()
+        else:
+            valid_mask = pre_next_tokens_cpu != INVALID_TOKEN_ID
+            gen_lens = valid_mask.sum(dim=1).tolist()
+            valid_sampled_token_ids = [
+                seq.tolist()
+                for seq in pre_next_tokens_cpu[valid_mask].split(gen_lens)
+            ]
+
+        for i in pre_discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids[i].clear()
+
+        for pre_req_idx, req_state, seq_len, req_id in pre_request_seq_lens:
+            sampled_ids = valid_sampled_token_ids[pre_req_idx]
+            if not sampled_ids:
+                continue
+
+            # Replace the 0 placeholder we appended in the previous step
+            req_state.output_token_ids[-1] = sampled_ids[0]
+            if len(sampled_ids) > 1:
+                req_state.output_token_ids.extend(sampled_ids[1:])
+
+            if req_id not in self.input_batch.req_id_to_index:
+                continue
+
+            req_idx = self.input_batch.req_id_to_index[req_id]
+
+            if len(sampled_ids) > 1:
+                self.input_batch.num_tokens_no_spec[req_idx] += len(
+                    sampled_ids) - 1
+
+            target_slice = slice(seq_len - len(sampled_ids) + 1, seq_len + 1)
+            self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
+
+    def _update_placeholder(self, discard_sampled_tokens_req_indices,
+                            request_seq_lens):
+        placeholder_req_id_to_index: dict[str, int] = {}
+        discard_set = set(discard_sampled_tokens_req_indices)
+        for req_idx, req_state, seq_len, req_id in request_seq_lens:
+            if req_idx in discard_set:
+                continue
+
+            end_idx = seq_len + 1
+            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+
+            req_state.output_token_ids.append(0)
+
+            placeholder_req_id_to_index[req_state.req_id] = req_idx
+
+        return placeholder_req_id_to_index
+
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput",
                         start_index: int, num_decode_reqs: int):
         assert scheduler_output.total_num_scheduled_tokens > 0
@@ -839,11 +1015,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if max_num_scheduled_tokens_all_reqs == 1:
             # Pure decode: each request schedules exactly 1 token.
             # req_indices = [0, 1, ..., num_reqs-1]
-            req_indices = self.arange_np[:num_reqs]
+            req_indices = self.arange_np[start_index:start_index + num_reqs]
             # positions = num_computed_tokens for each request
             positions_np = self.positions_np[:num_reqs]
-            np.copyto(positions_np,
-                      self.input_batch.num_computed_tokens_cpu[:num_reqs])
+            np.copyto(
+                positions_np, self.input_batch.
+                num_computed_tokens_cpu[start_index:start_index + num_reqs])
             # token_indices = positions + req_index * max_model_len
             token_indices = (
                 positions_np +
@@ -857,9 +1034,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             # General path: mixed prefill + decode.
             # Get request indices.
-            # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-            req_indices = np.repeat(self.arange_np[:num_reqs],
-                                    num_scheduled_tokens_per_req)
+            req_indices = np.repeat(
+                self.arange_np[start_index:start_index + num_reqs],
+                num_scheduled_tokens_per_req)
 
             # Get batched arange.
             # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -893,7 +1070,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.query_start_loc_np[num_reqs + 1:] = 1
 
         self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+            self.input_batch.num_computed_tokens_cpu[start_index:start_index +
+                                                     num_reqs] +
             num_scheduled_tokens_per_req)
 
         # Do the padding and copy the tensors to the TPU.
@@ -913,7 +1091,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             block_tables = self.block_table_cpu[:self.num_reqs_max_model_len, :
                                                 self.max_num_blocks_per_req]
             block_tables[:num_reqs, :self.max_num_blocks_per_req] = (
-                self.input_batch.block_table[0].get_cpu_tensor()[:num_reqs])
+                self.input_batch.block_table[0].get_cpu_tensor()
+                [start_index:start_index + num_reqs])
             seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
                 self.device, non_blocking=True)
         else:
@@ -922,8 +1101,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                 num_reqs_most_model_len, :self.
                                                 num_blocks_per_most_len_req]
             block_tables[:num_reqs, :self.num_blocks_per_most_len_req] = (
-                self.input_batch.block_table[0].get_cpu_tensor()
-                [:num_reqs, :self.num_blocks_per_most_len_req])
+                self.input_batch.block_table[0].get_cpu_tensor()[
+                    start_index:start_index +
+                    num_reqs, :self.num_blocks_per_most_len_req])
             seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
                 self.device, non_blocking=True)
         # Flatten on CPU before H2D to avoid device-side as_strided/reshape
@@ -1013,12 +1193,19 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             layer_name: attn_metadata
             for layer_name in self._attn_layer_names
         }
+
+        # Prepare token substitution indices
+        cur_input_indices, pre_next_tokens_indices = self._prepare_async_token_substitution_indices(
+            start_index, num_reqs, num_scheduled_tokens_per_req)
+
         return (
             per_layer_attn_metadata,
             logits_indices,
             padded_num_reqs,
             num_reqs,
             end_index,
+            cur_input_indices,
+            pre_next_tokens_indices,
         )
 
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
@@ -1183,7 +1370,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | None:
-        if self.scheduler_output is not None:
+        if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
         # Update cached state
@@ -1199,39 +1386,14 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "transfer-only steps. Forward batches with an active KV "
                 "connector are not supported yet.")
 
-        self.scheduler_output = scheduler_output
-        return None
-
-    @torch.no_grad()
-    def sample_tokens(
-            self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput:
-        if self.scheduler_output is None:
-            # Nothing to do (PP non-final rank case), output isn't used.
-            return None  # type: ignore[return-value]
-        scheduler_output = self.scheduler_output
         mm_embed_inputs = self.mm_embed_inputs
-        self.scheduler_output = None
         self.mm_embed_inputs = None
 
         num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
 
-        # Prepare inputs, the requests might be split into multiple
-        # executions, combine the result of each execution.
-        if not self.input_batch.all_greedy:
-            raise NotImplementedError(
-                "Only greedy sampling (temperature=0) is supported on TPU. "
-                "Non-greedy sampling requires porting to vLLM v0.17.1's "
-                "Sampler API.")
-
         start_index = 0
-        max_num_logprobs = self.input_batch.max_num_logprobs
-        if max_num_logprobs == -1:
-            raise NotImplementedError(
-                "TPU runner does not support full logprobs (`logprobs=-1`) "
-                "with the merged vLLM v1 sampler path yet.")
-        needs_logprobs = max_num_logprobs is not None
-        combined_selected_tokens: list[torch.Tensor] = []
-        combined_logprobs: list[LogprobsLists] = []
+        logits_list = []
+        num_reqs_list = []
 
         # NOTE: setup current batch's metadata for kv connector.
         # Currently, only verified with NixlConnector
@@ -1239,11 +1401,16 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.maybe_setup_kv_connector(scheduler_output)
 
         while start_index < self.input_batch.num_reqs:
-            attn_metadata, logits_indices, padded_num_reqs, num_reqs, end_index = (
-                self._prepare_inputs(scheduler_output, start_index,
-                                     num_decode_reqs))
+            (attn_metadata, logits_indices, padded_num_reqs, num_reqs,
+             end_index, cur_input_indices,
+             pre_next_tokens_indices) = (self._prepare_inputs(
+                 scheduler_output, start_index, num_decode_reqs))
+
+            input_ids = self._apply_async_token_substitution(
+                self.input_ids, cur_input_indices, pre_next_tokens_indices)
+
             input_ids, inputs_embeds = self._get_model_inputs(
-                self.input_ids, mm_embed_inputs)
+                input_ids, mm_embed_inputs)
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
@@ -1261,6 +1428,49 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logits = self.compute_selected_logits(hidden_states,
                                                   logits_indices)
 
+            logits_list.append(logits)
+            num_reqs_list.append(num_reqs)
+
+            start_index = end_index
+
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output=scheduler_output,
+            logits_list=logits_list,
+            num_reqs_list=num_reqs_list,
+        )
+        return None
+
+    @torch.no_grad()
+    def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        if self.execute_model_state is None:
+            # Nothing to do (PP non-final rank case), output isn't used.
+            return None  # type: ignore[return-value]
+
+        state = self.execute_model_state
+        scheduler_output = state.scheduler_output
+        self.execute_model_state = None
+
+        # Prepare inputs, the requests might be split into multiple
+        # executions, combine the result of each execution.
+        if not self.input_batch.all_greedy:
+            raise NotImplementedError(
+                "Only greedy sampling (temperature=0) is supported on TPU. "
+                "Non-greedy sampling requires porting to vLLM v0.17.1's "
+                "Sampler API.")
+
+        max_num_logprobs = self.input_batch.max_num_logprobs
+        if max_num_logprobs == -1:
+            raise NotImplementedError(
+                "TPU runner does not support full logprobs (`logprobs=-1`) "
+                "with the merged vLLM v1 sampler path yet.")
+        needs_logprobs = max_num_logprobs is not None
+
+        combined_selected_tokens: list[torch.Tensor] = []
+        combined_logprobs: list[Any] = []
+
+        for logits, num_reqs in zip(state.logits_list, state.num_reqs_list):
             if grammar_output is not None:
                 require_struct_decoding, grammar_bitmask_padded, arange = (
                     self.prepare_structured_decoding_input(
@@ -1276,15 +1486,16 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logprobs = (self.gather_logprobs(logits, selected_token_ids)
                         if needs_logprobs else None)
 
-            # Remove padding on cpu and keep dynamic op outside of xla graph.
-            selected_token_ids = selected_token_ids.cpu()[:num_reqs]
-
-            combined_selected_tokens.append(selected_token_ids)
+            combined_selected_tokens.append(selected_token_ids[:num_reqs])
             if needs_logprobs:
-                combined_logprobs.append(logprobs.tolists())
+                sliced_logprobs = LogprobsTensors(
+                    logprobs.logprob_token_ids[:num_reqs],
+                    logprobs.logprobs[:num_reqs],
+                    logprobs.selected_token_ranks[:num_reqs],
+                    logprobs.cu_num_generated_tokens)
+                combined_logprobs.append(sliced_logprobs)
 
             self._update_num_xla_graphs("decoding_step")
-            start_index = end_index
 
         # NOTE: current kv load and save get h2d/d2h copies involved.
         # Those copies are blocking. Once they become async., kv_save
@@ -1294,25 +1505,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         finished_sending, finished_recving = self.get_finished_kv_transfers(
             scheduler_output)
 
-        if not combined_selected_tokens:
-            kv_connector_output = (None if (finished_sending is None
-                                            and finished_recving is None) else
-                                   KVConnectorOutput(
-                                       finished_sending=finished_sending,
-                                       finished_recving=finished_recving,
-                                   ))
-            return ModelRunnerOutput(
-                req_ids=[],
-                req_id_to_index={},
-                sampled_token_ids=[],
-                logprobs=None,
-                prompt_logprobs_dict={},
-                pooler_output=[],
-                kv_connector_output=kv_connector_output,
-            )
-
-        selected_token_ids = torch.cat(combined_selected_tokens, dim=0)
-        if needs_logprobs:
+        logprobs = []
+        if needs_logprobs and len(combined_logprobs):
+            combined_logprobs_lists = []
+            for i in range(len(combined_logprobs)):
+                logprobs = combined_logprobs[i].tolists()
+                combined_logprobs_lists.append(logprobs)
 
             def concat_lists(input_lists):
                 result = []
@@ -1322,78 +1520,37 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             logprobs_lists = LogprobsLists(
                 logprob_token_ids=concat_lists(
-                    [lp.logprob_token_ids for lp in combined_logprobs]),
+                    [lp.logprob_token_ids for lp in combined_logprobs_lists]),
                 logprobs=concat_lists(
-                    [lp.logprobs for lp in combined_logprobs]),
-                sampled_token_ranks=concat_lists(
-                    [lp.sampled_token_ranks for lp in combined_logprobs]),
+                    [lp.logprobs for lp in combined_logprobs_lists]),
+                sampled_token_ranks=concat_lists([
+                    lp.sampled_token_ranks for lp in combined_logprobs_lists
+                ]),
             )
-        else:
-            logprobs_lists = None
+            logprobs = logprobs_lists
 
-        # Update the cache state concurrently. Code above will not block until
-        # we use `selected_token_ids`. Add mark_step if post-processing changes
-        request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
-        for i, req_id in zip(range(num_reqs), self.input_batch.req_ids):
+        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+        request_seq_lens = []
+        for i, req_id in enumerate(req_ids):
             assert req_id is not None
             req_state = self.requests[req_id]
             seq_len = (req_state.num_computed_tokens +
                        scheduler_output.num_scheduled_tokens[req_id])
-            if seq_len >= req_state.num_tokens:
-                request_seq_lens.append((i, req_state, seq_len))
-            else:
-                # Ignore the sampled token from the partial request.
-                # Rewind the generator state as if the token was not sampled.
+            # Ignore the sampled token from the partial request.
+            # Rewind the generator state as if the token was not sampled.
+            if seq_len < req_state.num_tokens:
                 generator = self.input_batch.generators.get(i)
                 if generator is not None:
                     # This relies on cuda-specific torch-internal impl details
                     generator.set_offset(generator.get_offset() - 4)
-
                 # Record the index of the request that should not be sampled,
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
-
-        assert all(
-            req_id is not None for req_id in
-            self.input_batch.req_ids[:num_reqs]), "req_ids contains None"
-        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
-
-        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
-        for req_id in self.input_batch.req_ids[:num_reqs]:
-            prompt_logprobs_dict[req_id] = None
-
-        max_gen_len = selected_token_ids.shape[-1]
-        if max_gen_len == 1:
-            valid_sampled_token_ids = selected_token_ids.tolist()
-
-            # Mask out the sampled tokens that should not be sampled.
-            # TODO: Keep in sync with gpu_model_runner.py, in particular
-            #       the "else" case here
-            for i in discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
-
-            # Append sampled tokens
-            for i, req_state, seq_len in request_seq_lens:
-                token_id = valid_sampled_token_ids[i][0]
-                self.input_batch.token_ids_cpu[i, seq_len] = token_id
-                req_state.output_token_ids.append(token_id)
-                self.input_batch.num_tokens_no_spec[i] += 1
-
-        else:
-            valid_mask = selected_token_ids != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
-            valid_sampled_token_ids = [
-                seq.tolist()
-                for seq in selected_token_ids[valid_mask].split(gen_lens)
-            ]
-            self.input_batch.num_tokens_no_spec[:num_reqs] += gen_lens
-            for i, req_state, seq_len in request_seq_lens:
-                target_slice = slice(seq_len - gen_lens[i] + 1, seq_len + 1)
-                self.input_batch.token_ids_cpu[i, target_slice] = (
-                    valid_sampled_token_ids[i])
-                req_state.output_token_ids.extend(valid_sampled_token_ids[i])
+            else:
+                request_seq_lens.append((i, req_state, seq_len, req_id))
 
         kv_connector_output = (None if (finished_sending is None
                                         and finished_recving is None) else
@@ -1402,17 +1559,73 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                    finished_recving=finished_recving,
                                ))
 
+        next_tokens = None
+        if len(combined_selected_tokens) > 1:
+            next_tokens = torch.cat(combined_selected_tokens, dim=0)
+        elif len(combined_selected_tokens) == 1:
+            next_tokens = combined_selected_tokens[0]
+
+        next_tokens_tpu = None
+        copy_state = None
+        if next_tokens is not None:
+            copy_state = AsyncTPUCopyState.from_device(next_tokens)
+
+        if self.scheduler_config.async_scheduling:
+            self._modify_prev_results()
+            req_id_to_index_copy = self._update_placeholder(
+                discard_sampled_tokens_req_indices, request_seq_lens)
+            if next_tokens is not None:
+                next_tokens_tpu = next_tokens.view(-1)
+                self._pre_async_results = AsyncPreResults(
+                    req_ids=req_ids,
+                    next_tokens_tpu=next_tokens_tpu,
+                    request_seq_lens=request_seq_lens,
+                    discard_sampled_tokens_req_indices=
+                    discard_sampled_tokens_req_indices,
+                    req_id_to_index_copy=req_id_to_index_copy,
+                    copy_state=copy_state,
+                )
+            else:
+                self._pre_async_results = None
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index.copy(),
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
+            # Snapshot of the req_id_to_index for the VLLM scheduler.
+            req_id_to_index=dict(self.input_batch.req_id_to_index),
+            sampled_token_ids=
+            [],  # Filled in AsyncTPUModelRunnerOutput get_output
+            logprobs=logprobs,
+            prompt_logprobs_dict={req_id: None
+                                  for req_id in req_ids},
             pooler_output=[],
             kv_connector_output=kv_connector_output,
         )
 
-        return model_runner_output
+        async_output = AsyncTPUModelRunnerOutput(
+            model_runner_output=model_runner_output,
+            copy_state=copy_state,
+            discard_sampled_tokens_req_indices=
+            discard_sampled_tokens_req_indices)
+
+        if not self.scheduler_config.async_scheduling:
+            final_output = async_output.get_output()
+            for i, req_state, seq_len, req_id in request_seq_lens:
+                if i in discard_sampled_tokens_req_indices:
+                    continue
+                valid_tokens = final_output.sampled_token_ids[i]
+                if not valid_tokens:
+                    continue
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                self.input_batch.num_tokens_no_spec[req_idx] += len(
+                    valid_tokens)
+                target_slice = slice(seq_len - len(valid_tokens) + 1,
+                                     seq_len + 1)
+                self.input_batch.token_ids_cpu[req_idx,
+                                               target_slice] = valid_tokens
+                req_state.output_token_ids.extend(valid_tokens)
+            return final_output
+
+        return async_output
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         # TODO: TPU config may need extra validation
