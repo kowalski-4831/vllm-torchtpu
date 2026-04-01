@@ -1,0 +1,115 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Run Tests on TPU
+
+on:
+  workflow_call:
+    inputs:
+      halt-for-connection:
+        description: 'Should this workflow run wait for a remote connection?'
+        type: string
+        default: 'no'
+      wheel-gcs-path:
+        description: 'GCS path to the built wheel to test. If provided, installs this instead of source.'
+        type: string
+        default: ''
+
+jobs:
+  run_tests:
+    name: "Tests on ${{ matrix.job_info.runner }}"
+    strategy:
+      matrix:
+        job_info: [
+          {
+            runner: "linux-x86-tpu7x-224-4tpu",
+            container: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest",
+          }
+        ]
+        python-version: [3.12]
+    runs-on: ${{ matrix.job_info.runner }}
+    container:
+      image: ${{ matrix.job_info.container }}
+
+    env:
+      FORCE_COLOR: "1"
+      # Disable UV cache to save disk space on self-hosted runners
+      UV_NO_CACHE: "1"
+
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Mark git directory as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Setup Virtual Environment
+        run: |
+          uv venv
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+          # UV uses these to auth into the torch-tpu index defined in pyproject.toml
+          echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
+          echo UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(gcloud auth print-access-token)" >> "$GITHUB_ENV"
+
+      - name: Install torchtpu-vllm from source
+        if: ${{ inputs.wheel-gcs-path == '' }}
+        run: uv sync --extra test --prerelease allow --no-install-package vllm
+
+      # In nightly workflow, we test the torchtpu-vllm package by installing the
+      # prebuilt wheel instead of building from source.
+      - name: Install torchtpu-vllm using prebuilt wheel
+        if: ${{ inputs.wheel-gcs-path != '' }}
+        run: |
+          # Install Dependencies
+          uv sync --no-install-project --extra test --prerelease allow --no-install-package vllm
+
+          # Download the torchtpu-vllm wheel from GCS
+          mkdir -p dist
+          gcloud storage cp "${{ inputs.wheel-gcs-path }}/*.whl" dist/
+
+          WHEEL_FILE=$(ls dist/*.whl)
+          uv pip install "${WHEEL_FILE}"
+
+      - name: Install vLLM from source (TPU)
+        run: |
+          git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git /tmp/vllm
+          cd /tmp/vllm
+          sed -i '/tpu-inference/d' requirements/tpu.txt
+          uv pip install -r requirements/tpu.txt
+          # --no-build-isolation avoids creating a temp venv with duplicate build deps (~GBs)
+          SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
+          rm -rf /tmp/vllm
+          rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
+          echo "Disk usage after vLLM install:" && df -h .
+
+      - name: Wait For Connection
+        uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
+        with:
+          halt-dispatch-input: ${{ inputs.halt-for-connection }}
+
+      - name: Run tests
+        run: |
+          echo "Installed packages:"
+          uv pip freeze
+
+          export MODEL_IMPL_TYPE="vllm"
+
+          # Run tests from a temp dir to force Python to test the installed package, not local source files.
+          TEST_DIR="$PWD/tests"
+          cd "$(mktemp -d)"
+          pytest "$TEST_DIR" -sv --timeout=300
