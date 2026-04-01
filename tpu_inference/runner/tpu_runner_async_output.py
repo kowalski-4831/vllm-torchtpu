@@ -29,7 +29,6 @@ class AsyncTPUCopyState:
 
     def wait(self) -> None:
         if self.completed:
-            self.completed = True
             return
         self.copy_ready_event.synchronize()
         self.sampled_token_ids_tpu = None
