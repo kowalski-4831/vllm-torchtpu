@@ -26,6 +26,7 @@ def gmm_wrapper(lhs,
                 rhs_bias,
                 group_sizes,
                 group_offset,
+                zero_initialize=False,
                 fuse_act=None):
     return gmm_v2(
         lhs=lhs,
@@ -34,7 +35,7 @@ def gmm_wrapper(lhs,
         rhs_bias=rhs_bias,
         group_sizes=group_sizes,
         group_offset=group_offset[0],
-        zero_initialize=False,
+        zero_initialize=zero_initialize,
         fuse_act=fuse_act,
     )
 
@@ -98,12 +99,18 @@ def moe_gmm(
         w1_bias,
         group_sizes,
         group_offset,
+        zero_initialize=False,
         fuse_act=activation,
     )
     gmm1_res = gmm1_res[:, :w2.shape[1]]
 
-    gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
-                           group_offset)
+    gmm2_res = gmm_wrapper(gmm1_res,
+                           w2,
+                           w2_scale,
+                           w2_bias,
+                           group_sizes,
+                           group_offset,
+                           zero_initialize=True)
 
     routed_hidden = gmm2_res * jnp.expand_dims(topk_weights_sorted, axis=-1)
     routed_hidden = jnp.where(valid_mask_sorted[:, None], routed_hidden, 0)
