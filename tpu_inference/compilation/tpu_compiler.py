@@ -57,6 +57,8 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
     return [files_by_relpath[key] for key in sorted(files_by_relpath)]
 
 
+# TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source
+# once our local vLLM checkout exposes that helper.
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     """Wrap a graph module to return a tuple if it returns a single tensor.
 
