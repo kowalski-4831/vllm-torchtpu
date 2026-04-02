@@ -11,6 +11,7 @@ import hashlib
 import logging
 import os
 import pickle
+from pathlib import Path
 from typing import Any, Callable
 
 import torch
@@ -25,6 +26,35 @@ logger = logging.getLogger(__name__)
 Range = tuple[int, int]
 
 _tpu_backend = TpuBackend()
+
+_RUNTIME_CACHE_KEY_PATHS = (
+    "tpu_inference/layers/vllm/fused_moe.py",
+    "tpu_inference/layers/common/fused_moe_gmm.py",
+    "tpu_inference/kernels/megablox",
+    "tpu_inference/layers/vllm/attention.py",
+    "tpu_inference/layers/common/attention_interface.py",
+    "tpu_inference/kernels/ragged_paged_attention/v3",
+)
+
+
+def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
+    """Return runtime source files that affect TPU custom-op lowering."""
+    files_by_relpath: dict[str, Path] = {}
+
+    for rel_path in _RUNTIME_CACHE_KEY_PATHS:
+        path = repo_root / rel_path
+        if path.is_file():
+            files_by_relpath[rel_path] = path
+            continue
+        if path.is_dir():
+            for child in sorted(path.rglob("*.py")):
+                child_relpath = child.relative_to(repo_root).as_posix()
+                files_by_relpath[child_relpath] = child
+            continue
+        logger.warning(
+            "[TpuCompilerAdaptor] Cache key source path missing: %s", path)
+
+    return [files_by_relpath[key] for key in sorted(files_by_relpath)]
 
 
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
@@ -78,13 +108,31 @@ class TpuCompilerAdaptor(CompilerInterface):
         self._disable_cache = disable_cache
 
     def compute_hash(self, vllm_config: VllmConfig) -> str:
-        """Hash torch_tpu version for cache invalidation."""
+        """Hash TPU runtime sources that sit behind custom-op boundaries."""
+        del vllm_config
         import torch_tpu
-        version = getattr(torch_tpu, "__version__", "unknown")
 
-        hash_str = hashlib.sha256(
-            f"torch_tpu={version}".encode()).hexdigest()[:10]
-        return hash_str
+        repo_root = Path(__file__).resolve().parents[2]
+        hash_obj = hashlib.sha256()
+
+        hash_obj.update(f"torch={torch.__version__}".encode())
+        hash_obj.update(
+            f"torch_tpu={getattr(torch_tpu, '__version__', 'unknown')}".encode(
+            ))
+
+        for path in _iter_runtime_cache_key_files(repo_root):
+            relpath = path.relative_to(repo_root).as_posix()
+            hash_obj.update(relpath.encode())
+            try:
+                hash_obj.update(path.read_bytes())
+            except OSError as exc:
+                logger.warning(
+                    "[TpuCompilerAdaptor] Failed to read cache key source %s: %s",
+                    path,
+                    exc,
+                )
+
+        return hash_obj.hexdigest()[:10]
 
     def compile(
         self,
