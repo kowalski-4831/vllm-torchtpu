@@ -105,7 +105,8 @@ class TpuPlatform(Platform):
     additional_env_vars: list[str] = [
         "PHASED_PROFILING_DIR", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
-        "NEW_MODEL_DESIGN"
+        "NEW_MODEL_DESIGN", "MOE_REQUANTIZE_BLOCK_SIZE",
+        "MOE_REQUANTIZE_WEIGHT_DTYPE"
     ]
 
     @classmethod
