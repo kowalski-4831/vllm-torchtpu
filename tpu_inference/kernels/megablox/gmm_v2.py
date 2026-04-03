@@ -1130,23 +1130,22 @@ def make_gmm_configs(
             if tpu_info.int8_ops_per_second > 0:
                 lhs_q_dtype = jnp.int8.dtype
 
-    lhs_quant_block_size = 512
-    if lhs_q_dtype is not None:
-        lhs_quant_block_size = block_size
-
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
         # Input quantization involves reading all elements in a block to compute
         # scale value. Since this operation is very memory intensive, we use a
-        # block size that matches rhs quantization granularity so the kernel can
-        # apply the correct per-block rhs scale.
-        quant_block_size=lhs_quant_block_size,
+        # block size that is small enough to minimize memory overhead but large
+        # enough to minimize compute overhead of quantization.
+        quant_block_size=512,
         dtype=lhs.dtype,
     )
     if lhs_q_dtype is not None:
-        assert lhs_cfgs.quant_block_size == rhs_cfgs.quant_block_size, (
-            "Dynamic lhs quantization requires lhs and rhs quant block sizes to"
-            " match")
+        assert rhs_cfgs.quant_block_size % lhs_cfgs.quant_block_size == 0, (
+            "Dynamic lhs quantization currently requires rhs quant_block_size to"
+            " be a multiple of lhs quant_block_size; got "
+            f"lhs={lhs_cfgs.quant_block_size}, rhs={rhs_cfgs.quant_block_size}. "
+            "If rhs uses smaller blocks, this kernel would apply one rhs scale "
+            "across multiple rhs quant blocks.")
 
     if out_dtype is None:
         out_dtype = lhs.dtype
