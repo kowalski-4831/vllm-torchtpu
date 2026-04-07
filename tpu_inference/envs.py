@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     NUM_SLICES: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
+    MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
 
 
 def env_with_choices(
@@ -122,6 +124,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Ray compiled DAG channel type for TPU
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE":
     env_with_choices("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm", ["shm"]),
+    # Specify dtype for quantized MoE weights
+    "MOE_REQUANTIZE_WEIGHT_DTYPE":
+    lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
+    # Specify requantization block size for MoE weights
+    "MOE_REQUANTIZE_BLOCK_SIZE":
+    lambda: int(block_size) if (block_size := os.getenv(
+        "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
 }
 
 

@@ -27,10 +27,10 @@ contracting dimension.
 
 == Linear Weights (attention projections) ==
 
-Dequantized from FP8 to BF16 at load time since TPU doesn't have FP8
-linear kernels. The vLLM Fp8LinearMethod.create_weights() is reused for
-correct parameter allocation (weight_scale_inv), then process_weights
-dequantizes using block scales.
+Dequantized from FP8 to BF16 at load time because the active TorchTPU-vLLM
+linear runtime path currently uses BF16 linears. The vLLM
+Fp8LinearMethod.create_weights() is reused for correct parameter allocation
+(weight_scale_inv), then process_weights dequantizes using block scales.
 """
 
 from typing import Optional
@@ -65,6 +65,12 @@ from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _get_activation_str(activation) -> str:
+    """Convert MoEActivation enum or string to plain string."""
+    return activation.value if hasattr(activation,
+                                       'value') else str(activation)
 
 
 @register_quantization_config(get_tpu_quant_method(FP8))
@@ -113,7 +119,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         return None
 
 
-class VllmFp8MoEMethodTPU(FusedMoEMethodBase):
+class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     """
     TPU-native FP8 MoE method for block-quantized FP8 models.
 
@@ -127,14 +133,13 @@ class VllmFp8MoEMethodTPU(FusedMoEMethodBase):
     """
 
     def __init__(self, quant_config: Fp8Config, moe_config):
-        super().__init__(moe_config)
+        FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.weight_scale_name = ("weight_scale_inv"
                                   if self.block_quant else "weight_scale")
-        self._is_monolithic = True
-        self.apply_monolithic = self._forward_monolithic_tpu
+        self.fp8_backend = None
 
     @property
     def is_monolithic(self) -> bool:
@@ -142,13 +147,6 @@ class VllmFp8MoEMethodTPU(FusedMoEMethodBase):
 
     def get_fused_moe_quant_config(self, layer):
         return None
-
-    def create_weights(self, layer, num_experts, hidden_size,
-                       intermediate_size_per_partition, params_dtype,
-                       **extra_weight_attrs):
-        Fp8MoEMethod.create_weights(self, layer, num_experts, hidden_size,
-                                    intermediate_size_per_partition,
-                                    params_dtype, **extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """
@@ -161,15 +159,14 @@ class VllmFp8MoEMethodTPU(FusedMoEMethodBase):
         """
         assert isinstance(layer, FusedMoE)
         assert self.block_quant, "TPU FP8 MoE path expects block-quantized weights."
+        assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
-        activation_str = (layer.activation.value if hasattr(
-            layer.activation, 'value') else str(layer.activation))
+        activation_str = _get_activation_str(layer.activation)
         layer._tpu_activation_str = activation_str
 
         weights, requant_dtype_name, requant_block_size = process_fp8_moe_weights(
             layer,
-            weight_scale_name=self.weight_scale_name,
-            checkpoint_block_size=tuple(self.weight_block_size),
+            weight_block_size=tuple(self.weight_block_size),
             activation=activation_str,
         )
 
@@ -177,29 +174,20 @@ class VllmFp8MoEMethodTPU(FusedMoEMethodBase):
                                               requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(weights.w2_weight,
                                              requires_grad=False)
-        setattr(
-            layer, f"w13_{self.weight_scale_name}",
-            torch.nn.Parameter(weights.w13_weight_scale, requires_grad=False))
-        setattr(
-            layer, f"w2_{self.weight_scale_name}",
-            torch.nn.Parameter(weights.w2_weight_scale, requires_grad=False))
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            weights.w13_weight_scale, requires_grad=False)
+        layer.w2_weight_scale_inv = torch.nn.Parameter(weights.w2_weight_scale,
+                                                       requires_grad=False)
 
-        if self.moe.has_bias:
-            layer.w13_bias = torch.nn.Parameter(weights.w13_bias,
-                                                requires_grad=False)
-            layer.w2_bias = torch.nn.Parameter(weights.w2_bias,
-                                               requires_grad=False)
-
-        materialize_moe_weights(layer, self.weight_scale_name)
+        materialize_moe_weights(layer)
         log_and_prebuild_fp8_moe(
             layer,
-            weight_scale_name=self.weight_scale_name,
             requant_dtype_name=requant_dtype_name,
             requant_block_size=requant_block_size,
             activation=activation_str,
         )
 
-    def _forward_monolithic_tpu(
+    def apply_monolithic(
         self,
         layer: FusedMoE,
         x: torch.Tensor,
@@ -230,8 +218,8 @@ class VllmFp8MoEMethodTPU(FusedMoEMethodBase):
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
-            w1_scale=getattr(layer, f"w13_{self.weight_scale_name}"),
-            w2_scale=getattr(layer, f"w2_{self.weight_scale_name}"),
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
             w1_bias=getattr(layer, 'w13_bias', None),
             w2_bias=getattr(layer, 'w2_bias', None),
             topk_weights=topk_weights,
@@ -247,7 +235,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     Reuses vLLM's Fp8LinearMethod.create_weights() for correct FP8 weight and
     scale parameter allocation (needed by the weight loader), but dequantizes
-    to BF16 after loading since TPU doesn't have FP8 linear kernels.
+    to BF16 after loading because this runtime path currently uses BF16
+    linears.
 
     Inherits from Fp8LinearMethod but skips GPU-specific __init__. Only
     sets attributes needed by create_weights().
@@ -268,6 +257,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Dequantize FP8 block-quantized weights to BF16."""
+        # TODO(geyuhao): replace this BF16 path with a native FP8 linear
+        # runtime path once TorchTPU-vLLM has the corresponding kernel and
+        # weight-processing pipeline wired up.
         weights = process_blockwise_fp8_linear_weights(
             layer.weight.data,
             weight_scale=getattr(layer, "weight_scale", None).data if hasattr(

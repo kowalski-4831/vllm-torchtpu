@@ -157,6 +157,54 @@ def dequantize_tensor(
     return tensor.reshape(orig_shape)
 
 
+def quantize_tensor(
+    tensor: torch.Tensor,
+    quant_dtype: torch.dtype,
+    axis: int = -1,
+    block_size: int | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a tensor with block scaling.
+
+    Args:
+        tensor: Float tensor to quantize.
+        quant_dtype: Output quantized dtype.
+        axis: Axis along which quantization is performed.
+        block_size: Number of elements per block. If unset, quantize over the
+            entire axis.
+
+    Returns:
+        Quantized tensor and scale tensor.
+    """
+    block_size = block_size or tensor.shape[axis]
+    if tensor.shape[axis] % block_size != 0:
+        raise ValueError(
+            "Quantization expects the requested axis to be divisible by "
+            f"block_size, got tensor.shape={tuple(tensor.shape)}, axis={axis}, "
+            f"block_size={block_size}.")
+
+    if torch.empty((), dtype=quant_dtype).is_floating_point():
+        dtype_info = torch.finfo(quant_dtype)
+    else:
+        dtype_info = torch.iinfo(quant_dtype)
+
+    axis = axis % tensor.ndim
+    moved = tensor.movedim(axis, -1)
+    num_blocks = moved.shape[-1] // block_size
+    blocked = moved.reshape(*moved.shape[:-1], num_blocks, block_size)
+
+    abs_max = blocked.abs().amax(dim=-1, keepdim=True)
+    scale = abs_max / float(dtype_info.max)
+    scale_inv = torch.where(scale == 0, torch.full_like(scale, float("inf")),
+                            1.0 / scale)
+
+    blocked_q = torch.clamp(blocked * scale_inv,
+                            min=float(dtype_info.min),
+                            max=float(dtype_info.max))
+    tensor_q = blocked_q.reshape_as(moved).to(quant_dtype).movedim(-1, axis)
+    scale = scale.squeeze(-1).to(torch.float32).movedim(-1, axis)
+    return tensor_q, scale
+
+
 def dequantize_mxfp4_packed(
     weight_packed: torch.Tensor,
     scale_u8: torch.Tensor,
