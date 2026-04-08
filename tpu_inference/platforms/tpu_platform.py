@@ -10,7 +10,7 @@ import vllm.envs as vllm_envs
 # Ensure the "tpu" torch.compile backend is registered before vllm
 # tries to use it (e.g. in @torch.compile decorators at import time).
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
-from torch_tpu._internal.distributed import tpu_topology
+from torch_tpu._internal.utils import hardware
 from vllm.inputs import ProcessorInputs
 from vllm.platforms.interface import Platform, PlatformEnum
 
@@ -156,32 +156,11 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
-        """Detect TPU device type via PCI scan and return topology for world_size.
-
-        Replicates the logic from torch_tpu's get_tpu_topology() but
-        indexes the topology map by world_size rather than the
-        auto-detected chip count. This allows sub-slicing (e.g. TP=4
-        on an 8-chip host).
-        """
-        import glob
-        import pathlib
-
-        for vendor_path in glob.glob("/sys/bus/pci/devices/*/vendor"):
-            vendor_id = pathlib.Path(vendor_path).read_text().strip()
-            if vendor_id != tpu_topology._GOOGLE_PCI_VENDOR_ID:
-                continue
-            device_dir = os.path.dirname(vendor_path)
-            device_id = pathlib.Path(os.path.join(
-                device_dir, "device")).read_text().strip()
-            if device_id in tpu_topology._TPU_PCI_DEVICE_IDS_TO_TOPOLOGY:
-                topology_map = (
-                    tpu_topology._TPU_PCI_DEVICE_IDS_TO_TOPOLOGY[device_id])
-                if world_size not in topology_map:
-                    raise RuntimeError(
-                        f"No TPU topology found for world_size={world_size}")
-                return topology_map[world_size]
-
-        raise ValueError("No TPU devices found.")
+        """Return the torch_tpu-reported topology for the requested world size."""
+        topology = hardware.get_tpu_topology(world_size)
+        if topology is None:
+            raise ValueError("No TPU devices found.")
+        return topology
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
@@ -196,15 +175,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        # TODO: Expose get_tpu_device_name() in torch_tpu (via
-        # tpu_topology.py PCI scan) and remove the tpu-info dependency.
-        try:
-            from tpu_info import device as tpu_info_device
-            chip_type, _ = tpu_info_device.get_local_chips()
-            return f"TPU {chip_type.name}"
-        except Exception as e:
-            logger.warning(f"Error getting device name: {e}")
-            return "TPU"
+        return hardware.get_tpu_device_name()
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
