@@ -37,6 +37,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
                                                         FusedMoEMethodBase)
@@ -53,12 +54,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 from vllm.model_executor.utils import replace_parameter
 
-from tpu_inference.layers.common.process_weights.linear_weights import \
-    process_blockwise_fp8_linear_weights
-from tpu_inference.layers.common.process_weights.moe_weights import (
-    log_and_prebuild_fp8_moe, materialize_moe_weights, process_fp8_moe_weights)
+from tpu_inference import envs
 from tpu_inference.layers.common.quant_methods import FP8, get_tpu_quant_method
-from tpu_inference.layers.vllm.fused_moe import fused_moe_gmm
+from tpu_inference.layers.common.quantization import (dequantize_tensor,
+                                                      quantize_tensor)
+from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 prebuild_fused_moe_kernel)
 from tpu_inference.layers.vllm.moe_routing import (select_experts,
                                                    select_experts_ep)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
@@ -66,11 +67,153 @@ from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
 
+_MOE_REQUANT_WEIGHT_DTYPES = {
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "int8": torch.int8,
+}
+if hasattr(torch, "float8_e5m2"):
+    _MOE_REQUANT_WEIGHT_DTYPES["float8_e5m2"] = torch.float8_e5m2
+
 
 def _get_activation_str(activation) -> str:
     """Convert MoEActivation enum or string to plain string."""
     return activation.value if hasattr(activation,
                                        'value') else str(activation)
+
+
+def _dequantize_fp8_linear(
+    weight: torch.Tensor,
+    *,
+    weight_scale: torch.Tensor | None,
+    weight_scale_inv: torch.Tensor | None,
+    block_quant: bool,
+    weight_block_size: tuple[int, int] | None,
+) -> torch.Tensor:
+    """Dequantize FP8 linear weights to BF16."""
+    weight_bf16 = weight.to(torch.bfloat16)
+
+    if block_quant:
+        assert weight_scale_inv is not None
+        assert weight_block_size is not None
+        block_h, block_w = weight_block_size
+
+        out_dim, in_dim = weight_bf16.shape
+        weight_bf16 = weight_bf16.reshape(out_dim // block_h, block_h,
+                                          in_dim // block_w, block_w)
+        weight_bf16 = weight_bf16 * weight_scale_inv.to(
+            torch.bfloat16).unsqueeze(1).unsqueeze(3)
+        weight_bf16 = weight_bf16.reshape(out_dim, in_dim)
+    else:
+        assert weight_scale is not None
+        weight_bf16 = weight_bf16 * weight_scale.to(torch.bfloat16)
+
+    return weight_bf16
+
+
+def _process_fp8_moe_weights(
+    layer: FusedMoE,
+    *,
+    weight_block_size: tuple[int, int],
+    activation: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
+           | None]:
+    """Dequantize and requantize FP8 MoE weights for the TPU GMM kernel.
+
+    Returns (w13_weight, w13_scale, w2_weight, w2_scale,
+             requant_dtype_name, requant_block_size).
+    """
+    if desired_quant_dtype_from_env := envs.MOE_REQUANTIZE_WEIGHT_DTYPE:
+        desired_quant_dtype = desired_quant_dtype_from_env
+    else:
+        desired_quant_dtype = "float8_e4m3fn"
+
+    requant_block_size = None
+    if requant_block_size_from_env := envs.MOE_REQUANTIZE_BLOCK_SIZE:
+        requant_block_size = (int(requant_block_size_from_env)
+                              if requant_block_size_from_env else None)
+
+    requant_dtype = _MOE_REQUANT_WEIGHT_DTYPES.get(desired_quant_dtype)
+    if requant_dtype is None:
+        supported = ", ".join(sorted(_MOE_REQUANT_WEIGHT_DTYPES))
+        raise ValueError(
+            "Unsupported MOE_REQUANTIZE_WEIGHT_DTYPE="
+            f"{desired_quant_dtype!r}. Supported values: {supported}.")
+
+    moe_logging_str = (
+        f"[MoE requantization]: re-quantizing MoE weights to {desired_quant_dtype}"
+    )
+    if requant_block_size is not None:
+        moe_logging_str += f" with block size {requant_block_size}"
+    logger.info_once(moe_logging_str)
+
+    # Validate block alignment
+    block_h, block_w = weight_block_size
+    for name, weight in (("w13_weight", layer.w13_weight.data),
+                         ("w2_weight", layer.w2_weight.data)):
+        _, out_dim, in_dim = weight.shape
+        if out_dim % block_h != 0 or in_dim % block_w != 0:
+            raise ValueError(
+                "FP8 block quantized MoE weights must be divisible by the checkpoint "
+                f"block size, got {name}.shape={tuple(weight.shape)} and "
+                f"block_size={weight_block_size}.")
+
+    # Dequantize from checkpoint FP8 to float32
+    w13 = dequantize_tensor(
+        layer.w13_weight.data,
+        layer.w13_weight_scale_inv.data,
+        axis=(1, 2),
+        out_dtype=torch.float32,
+    )
+    w2 = dequantize_tensor(
+        layer.w2_weight.data,
+        layer.w2_weight_scale_inv.data,
+        axis=(1, 2),
+        out_dtype=torch.float32,
+    )
+
+    # Requantize to runtime format
+    if requant_block_size is not None:
+        if w13.shape[-1] % requant_block_size != 0:
+            raise ValueError(
+                "Unsupported MoE requantization configuration: w13 contracting "
+                f"dimension {w13.shape[-1]} is not divisible by "
+                f"block_size={requant_block_size}. Padding is not implemented yet."
+            )
+        if w2.shape[-1] % requant_block_size != 0:
+            raise ValueError(
+                "Unsupported MoE requantization configuration: w2 contracting "
+                f"dimension {w2.shape[-1]} is not divisible by "
+                f"block_size={requant_block_size}. Padding is not implemented yet."
+            )
+
+    w13, w13_scale = quantize_tensor(w13,
+                                     quant_dtype=requant_dtype,
+                                     axis=-1,
+                                     block_size=requant_block_size)
+    w2, w2_scale = quantize_tensor(w2,
+                                   quant_dtype=requant_dtype,
+                                   axis=-1,
+                                   block_size=requant_block_size)
+
+    # Deinterleave w1/w3 if activation is swigluoai
+    if activation == "swigluoai":
+        w1 = w13[:, ::2, :]
+        w3 = w13[:, 1::2, :]
+        w13 = torch.cat([w1, w3], dim=1)
+
+    # Transpose to [experts, in_dim, out_dim] for GMM kernel
+    w13 = w13.transpose(1, 2).contiguous()
+    w2 = w2.transpose(1, 2).contiguous()
+
+    # Reshape scales for GMM kernel
+    if w13_scale is not None:
+        w13_scale = w13_scale.transpose(1, 2).contiguous()
+        w13_scale = w13_scale.unsqueeze(2).to(torch.float32)
+    if w2_scale is not None:
+        w2_scale = w2_scale.transpose(1, 2).contiguous()
+        w2_scale = w2_scale.unsqueeze(2).to(torch.float32)
+
+    return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
 @register_quantization_config(get_tpu_quant_method(FP8))
@@ -164,26 +307,39 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         activation_str = _get_activation_str(layer.activation)
         layer._tpu_activation_str = activation_str
 
-        weights, requant_dtype_name, requant_block_size = process_fp8_moe_weights(
-            layer,
-            weight_block_size=tuple(self.weight_block_size),
-            activation=activation_str,
-        )
+        (w13, w13_scale, w2, w2_scale, requant_dtype_name,
+         requant_block_size) = _process_fp8_moe_weights(
+             layer,
+             weight_block_size=tuple(self.weight_block_size),
+             activation=activation_str,
+         )
 
-        layer.w13_weight = torch.nn.Parameter(weights.w13_weight,
-                                              requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(weights.w2_weight,
-                                             requires_grad=False)
-        layer.w13_weight_scale_inv = torch.nn.Parameter(
-            weights.w13_weight_scale, requires_grad=False)
-        layer.w2_weight_scale_inv = torch.nn.Parameter(weights.w2_weight_scale,
+        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale,
+                                                        requires_grad=False)
+        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale,
                                                        requires_grad=False)
 
-        materialize_moe_weights(layer)
-        log_and_prebuild_fp8_moe(
-            layer,
-            requant_dtype_name=requant_dtype_name,
-            requant_block_size=requant_block_size,
+        # Eagerly materialize weights to avoid OOM during vLLM memory probing.
+        # Without this, lazy tensors accumulate and the profiling run OOMs.
+        if layer.w13_weight.device.type == "tpu":
+            sync.synchronize(layer.w13_weight, wait=True)
+            sync.synchronize(layer.w2_weight, wait=True)
+            sync.synchronize(layer.w13_weight_scale_inv, wait=True)
+            sync.synchronize(layer.w2_weight_scale_inv, wait=True)
+
+        scale_desc = ("per-channel" if requant_block_size is None else
+                      str(requant_block_size))
+        logger.info_once(
+            "FP8 weights transposed for GMM kernel: "
+            f"w13={list(layer.w13_weight.shape)}, "
+            f"w2={list(layer.w2_weight.shape)}, "
+            f"w13_scale={list(layer.w13_weight_scale_inv.shape)}, "
+            f"w2_scale={list(layer.w2_weight_scale_inv.shape)}, "
+            f"requant_block_size={scale_desc}")
+        prebuild_fused_moe_kernel(
+            topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
 
@@ -257,10 +413,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Dequantize FP8 block-quantized weights to BF16."""
-        # TODO(geyuhao): replace this BF16 path with a native FP8 linear
-        # runtime path once TorchTPU-vLLM has the corresponding kernel and
-        # weight-processing pipeline wired up.
-        weights = process_blockwise_fp8_linear_weights(
+        weight_bf16 = _dequantize_fp8_linear(
             layer.weight.data,
             weight_scale=getattr(layer, "weight_scale", None).data if hasattr(
                 layer, "weight_scale") else None,
@@ -269,16 +422,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             block_quant=self.block_quant,
             weight_block_size=tuple(self.weight_block_size)
             if self.weight_block_size is not None else None,
-            bias=layer.bias.data
-            if getattr(layer, "bias", None) is not None else None,
         )
 
-        replace_parameter(
-            layer, "weight",
-            torch.nn.Parameter(weights.weight, requires_grad=False))
+        replace_parameter(layer, "weight",
+                          torch.nn.Parameter(weight_bf16, requires_grad=False))
 
         logger.info_once("FP8 linear weights dequantized to BF16: "
-                         f"shape={list(weights.weight.shape)}")
+                         f"shape={list(weight_bf16.shape)}")
 
     def apply(self,
               layer: torch.nn.Module,
