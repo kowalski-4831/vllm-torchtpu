@@ -65,12 +65,17 @@ QUANTIZATION=""
 ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
 MAX_NUM_BATCHED_TOKENS=""
+RANDOM_RANGE_RATIO=""
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
 if [ -z "$MODEL" ]; then
     echo "ERROR: Config must set MODEL"
+    exit 1
+fi
+if [ -z "$RANDOM_RANGE_RATIO" ]; then
+    echo "ERROR: Config must set RANDOM_RANGE_RATIO"
     exit 1
 fi
 
@@ -95,9 +100,10 @@ log_file="$RESULTS_DIR/benchmark.log"
 # =============================================================================
 # Helper functions
 # =============================================================================
-ceil_1_25x() {
+ceil_scale_by_ratio() {
     local val=$1
-    echo $(( (val * 150 + 99) / 100 ))
+    local ratio=$2
+    python3 -c "import math; print(math.ceil(${val} * (1.0 + ${ratio})))"
 }
 
 start_vllm_server() {
@@ -199,12 +205,14 @@ stop_vllm_server() {
 max_seq_len=0
 for config in $ISL_OSL_CONFIGS; do
     IFS=':' read -r input_len output_len <<< "$config"
-    total=$((input_len + output_len))
+    worst_input_len=$(ceil_scale_by_ratio "$input_len" "$RANDOM_RANGE_RATIO")
+    worst_output_len=$(ceil_scale_by_ratio "$output_len" "$RANDOM_RANGE_RATIO")
+    total=$((worst_input_len + worst_output_len))
     if [ "$total" -gt "$max_seq_len" ]; then
         max_seq_len=$total
     fi
 done
-max_model_len=$(ceil_1_25x "$max_seq_len")
+max_model_len=$max_seq_len
 max_batched_tokens=$max_model_len
 
 # Cap max_batched_tokens if configured
@@ -299,7 +307,7 @@ for config in $ISL_OSL_CONFIGS; do
             --dataset-name random \
             --random-input-len "$input_len" \
             --random-output-len "$output_len" \
-            --random-range-ratio=0.8 \
+            --random-range-ratio "$RANDOM_RANGE_RATIO" \
             --num-prompts "$((concurrency * 2))" \
             --max-concurrency "$concurrency" \
             --request-rate inf \
