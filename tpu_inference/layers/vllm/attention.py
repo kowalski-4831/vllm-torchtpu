@@ -3,6 +3,7 @@
 
 import functools
 
+import jax
 import torch
 from torch_tpu._internal import pallas, sync
 from vllm.config import VllmConfig
@@ -67,22 +68,22 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
 
 
 def _pallas_rpa_kernel(
-    kv_cache,
-    query,
-    key,
-    value,
-    seq_lens,
-    block_tables,
-    query_start_loc,
-    request_distribution,
-    sinks,
-    q_scale,
-    k_scale,
-    v_scale,
+    kv_cache: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
     *,
-    mesh,
-    sliding_window,
-):
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
         None,  # NOTE: vLLM applies RoPE before attention, so input_positions is not consumed here.
@@ -315,42 +316,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
         # This prevents torch.compile from tracing into the Pallas kernel internals.
-        @torch.library.custom_op(
-            op_name,
-            mutates_args=("kv_cache", ),
-            device_types=["tpu"],
-        )
-        def rpa_kernel_impl(kv_cache: torch.Tensor, query: torch.Tensor,
-                            key: torch.Tensor, value: torch.Tensor,
-                            seq_lens: torch.Tensor, block_tables: torch.Tensor,
-                            query_start_loc: torch.Tensor,
-                            request_distribution: torch.Tensor,
-                            sinks: torch.Tensor | None) -> torch.Tensor:
-            jax_kernel = pallas.custom_jax_kernel(wrapped_fn,
-                                                  input_output_aliases={0: 0},
-                                                  donate_argnums=(0, ),
-                                                  name=f'jax_{op_name}')
-            _new_kv_cache, outputs = jax_kernel(kv_cache, query, key, value,
-                                                seq_lens, block_tables,
-                                                query_start_loc,
-                                                request_distribution, sinks)
-            return outputs
+        rpa_kernel_op = pallas.jax_op(op_name,
+                                      wrapped_fn,
+                                      donate_argnums=(0, ))
 
-        # Register fake tensor implementation for torch.compile tracing
-        def _fake_rpa_kernel(
-            kv_cache: torch.Tensor,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            seq_lens: torch.Tensor,
-            block_tables: torch.Tensor,
-            query_start_loc: torch.Tensor,
-            request_distribution: torch.Tensor,
-            sinks: torch.Tensor | None = None,
-        ) -> tuple[torch.Tensor]:
-            return torch.empty_like(query)
+        # We must overwrite the default fake implementation as vLLM uses dynamic
+        # dimensions for the query.
+        def _fake_rpa_op(kv_cache: torch.Tensor, query: torch.Tensor, *args,
+                         **kwargs):
+            return torch.empty_like(kv_cache), torch.empty_like(query)
 
-        rpa_kernel_impl.register_fake(_fake_rpa_kernel)
+        rpa_kernel_op.register_fake(_fake_rpa_op)
+
+        def rpa_kernel_impl(kv_cache, *args, **kwargs):
+            new_kv_cache, output = rpa_kernel_op(kv_cache, *args, **kwargs)
+            kv_cache.copy_(new_kv_cache)
+            return output
 
         self._kernel_registry[registry_key] = rpa_kernel_impl
         return rpa_kernel_impl
