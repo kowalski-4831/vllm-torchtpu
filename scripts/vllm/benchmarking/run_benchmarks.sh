@@ -76,29 +76,12 @@ fi
 
 PORT="${PORT:-8000}"
 
-# =============================================================================
-# Find benchmark_serving.py from vLLM install
-# =============================================================================
-BENCHMARK_SCRIPT=""
-
-# Check common locations
-for candidate in \
-    "$(python3 -c 'import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent / "benchmarks" / "benchmark_serving.py")' 2>/dev/null)" \
-    "/root/vllm/benchmarks/benchmark_serving.py" \
-    "$REPO_DIR/../vllm/benchmarks/benchmark_serving.py"; do
-    if [ -f "$candidate" ]; then
-        BENCHMARK_SCRIPT="$candidate"
-        break
-    fi
-done
-
-if [ -z "$BENCHMARK_SCRIPT" ]; then
-    echo "ERROR: Cannot find benchmark_serving.py."
-    echo "Install vLLM from source or set the path manually."
+# Verify vllm bench serve is available
+if ! python3 -m vllm.entrypoints.cli.main bench serve --help &>/dev/null; then
+    echo "ERROR: 'vllm bench serve' not available. Is vLLM installed?"
     exit 1
 fi
-
-echo "Using benchmark tool: $BENCHMARK_SCRIPT"
+echo "Using benchmark tool: vllm bench serve"
 
 # =============================================================================
 # Setup results directory
@@ -114,7 +97,7 @@ log_file="$RESULTS_DIR/benchmark.log"
 # =============================================================================
 ceil_1_25x() {
     local val=$1
-    echo $(( (val * 125 + 99) / 100 ))
+    echo $(( (val * 150 + 99) / 100 ))
 }
 
 start_vllm_server() {
@@ -308,7 +291,7 @@ for config in $ISL_OSL_CONFIGS; do
             continue
         fi
 
-        python3 "$BENCHMARK_SCRIPT" \
+        vllm bench serve \
             --backend vllm \
             --model "$MODEL" \
             --host localhost \
@@ -323,7 +306,8 @@ for config in $ISL_OSL_CONFIGS; do
             --save-result \
             --ignore-eos \
             --result-filename "$result_file" \
-            --seed 42 2>&1 | tee -a "$bench_log"
+            --seed 42 \
+            --temperature 0 2>&1 | tee -a "$bench_log"
 
         bench_exit=${PIPESTATUS[0]}
         if [ "$bench_exit" -eq 0 ]; then
