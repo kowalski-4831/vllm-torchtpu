@@ -131,7 +131,7 @@ start_vllm_server() {
     export PYTHONUNBUFFERED=1
     export MODEL_IMPL_TYPE=vllm
 
-    local server_cmd="vllm serve --model=${MODEL} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --no-async-scheduling --no-enable-prefix-caching --gpu-memory-utilization=$gpu_mem_util $extra_args"
+    local server_cmd="vllm serve --model=${MODEL} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling --no-enable-prefix-caching --gpu-memory-utilization=$gpu_mem_util $extra_args"
 
     echo ""
     echo "================================================"
