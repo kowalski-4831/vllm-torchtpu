@@ -8,6 +8,8 @@ module-scoped fixture conflicts with single-device tests.
 Run with: pytest tests/entrypoints/llm/test_generate_tp_moe.py -v
 """
 
+from unittest.mock import patch
+
 import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -65,7 +67,8 @@ def _run_moe_generation(async_scheduling: bool,
         )
     finally:
         del llm
-        cleanup_dist_env_and_memory()
+        with patch("torch.accelerator.empty_cache", return_value=None):
+            cleanup_dist_env_and_memory()
 
     return tp_size, outputs
 

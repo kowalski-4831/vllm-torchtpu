@@ -11,7 +11,6 @@ import vllm.envs as vllm_envs
 # tries to use it (e.g. in @torch.compile decorators at import time).
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
-from vllm.inputs import ProcessorInputs
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from tpu_inference import envs
@@ -20,6 +19,7 @@ from tpu_inference.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import BlockSize, ModelConfig, VllmConfig
+    from vllm.inputs import ProcessorInputs
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams, SamplingType
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -28,6 +28,7 @@ else:
     BlockSize = None
     ModelConfig = None
     VllmConfig = None
+    ProcessorInputs = None
     PoolingParams = None
     AttentionBackendEnum = None
     SamplingParams = None

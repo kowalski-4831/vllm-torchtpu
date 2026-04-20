@@ -20,7 +20,8 @@ from torch_tpu import api
 from torch_tpu._internal import sync
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import (ParallelConfig, VllmConfig,
-                         get_layers_from_vllm_config, update_config)
+                         get_layers_from_vllm_config, set_current_vllm_config,
+                         update_config)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -40,7 +41,7 @@ from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.utils.math_utils import cdiv, prev_power_of_2
+from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
@@ -1657,7 +1658,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
-        with set_vllm_model_wrapper_context(mesh=self.mesh):
+        with set_vllm_model_wrapper_context(mesh=self.mesh), \
+             set_current_vllm_config(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
@@ -1667,7 +1669,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 is not None), "Cannot reload weights before model is loaded."
         model_loader = get_model_loader(self.load_config)
         logger.info("Reloading weights inplace...")
-        model_loader.load_weights(self.model, model_config=self.model_config)
+        with set_current_vllm_config(self.vllm_config):
+            model_loader.load_weights(self.model,
+                                      model_config=self.model_config)
 
     @torch.no_grad()
     def _dummy_run(self, num_tokens: int, num_reqs: int,
@@ -2153,6 +2157,13 @@ def _get_padded_num_kv_cache_update_slices(num_tokens: int, max_num_reqs: int,
     return padded_num_slices
 
 
+def _prev_power_of_2(n: int) -> int:
+    """The previous power of 2 (inclusive)"""
+    if n <= 0:
+        return 0
+    return 1 << (n.bit_length() - 1)
+
+
 def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
     """Find the optimum number of slices to copy per Pallas program instance.
 
@@ -2169,7 +2180,7 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
     vmem_limit = 16 * 1024 * 1024
     num_slices_per_block = vmem_limit // page_size_bytes
     assert num_slices_per_block > 0, "Number of slices should be positive"
-    num_slices_per_block = prev_power_of_2(num_slices_per_block)
+    num_slices_per_block = _prev_power_of_2(num_slices_per_block)
     if num_slices_per_block > 64:
         num_slices_per_block = 64
     return num_slices_per_block

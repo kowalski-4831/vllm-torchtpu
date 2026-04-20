@@ -8,6 +8,8 @@ in that file (module-scoped fixtures coexist within the same module).
 Run with: pytest tests/entrypoints/llm/test_generate_tp.py -v
 """
 
+from unittest.mock import patch
+
 import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -48,7 +50,8 @@ def test_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
         )
     finally:
         del llm
-        cleanup_dist_env_and_memory()
+        with patch("torch.accelerator.empty_cache", return_value=None):
+            cleanup_dist_env_and_memory()
 
     assert tp_size >= 1
     assert len(outputs) == 1

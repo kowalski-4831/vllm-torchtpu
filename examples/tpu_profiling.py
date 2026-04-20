@@ -33,8 +33,11 @@ def main(args: argparse.Namespace):
     print(f"Profiling (results will be saved to '{profile_dir}')...")
     os.environ["VLLM_TORCH_PROFILER_DIR"] = profile_dir
 
-    engine_args = EngineArgs.from_cli_args(args)
-    llm = LLM(**dataclasses.asdict(engine_args))
+    engine_kwargs = dataclasses.asdict(EngineArgs.from_cli_args(args))
+    if engine_kwargs.get("compilation_config") is None:
+        engine_kwargs["compilation_config"] = {}
+    engine_kwargs["compilation_config"]["cudagraph_capture_sizes"] = []
+    llm = LLM(**engine_kwargs)
 
     sampling_params = SamplingParams(
         temperature=0.0,
