@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
-import torch._guards
 import torch.fx as fx
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
@@ -155,25 +154,11 @@ class TpuCompilerAdaptor(CompilerInterface):
             compile_range,
         )
 
-        # TPU requires static shapes. We safely bypass compilation for any
-        # dynamic ranges added by vLLM, inputs are padded to match the static
-        # shapes.
-        is_static_range = getattr(compile_range, "is_single_size",
-                                  lambda: compile_range[0] == compile_range[1])
-        if not is_static_range():
-            return graph.forward, None
-
         # aot_autograd (inside TpuBackend) requires tuple outputs.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        # The tracing context has a FakeTensorMode from Dynamo, but the example
-        # inputs have fake tensors from a different FakeTensorMode.
-        # `_tpu_backend` calls detect_fake_mode() which asserts all
-        # FakeTensorModes match, causing a crash.
-        # Clear the tracing context and let `_tpu_backend` create its own.
-        with torch._guards.tracing(None):
-            compiled_fn = _tpu_backend(graph, example_inputs)
+        compiled_fn = _tpu_backend(graph, example_inputs)
 
         if was_wrapped:
             inner_fn = compiled_fn
@@ -246,16 +231,10 @@ class TpuCompilerAdaptor(CompilerInterface):
         def _cached_compiler(*_args, **_kwargs):
             return inner_exe
 
-        # The tracing context has a FakeTensorMode from Dynamo, but the example
-        # inputs have fake tensors from a different FakeTensorMode.
-        # `aot_autograd` calls detect_fake_mode() which asserts all
-        # FakeTensorModes match, causing a crash.
-        # Clear the tracing context and let `aot_autograd` create its own.
-        with torch._guards.tracing(None):
-            compiled_fn = aot_autograd(
-                fw_compiler=_cached_compiler,
-                keep_inference_input_mutations=False,
-            )(graph, example_inputs)
+        compiled_fn = aot_autograd(
+            fw_compiler=_cached_compiler,
+            keep_inference_input_mutations=False,
+        )(graph, example_inputs)
 
         if was_wrapped:
             inner_fn = compiled_fn

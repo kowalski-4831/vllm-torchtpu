@@ -17,7 +17,6 @@ Run with: pytest tests/entrypoints/llm/test_generate.py -v
 """
 
 import weakref
-from unittest.mock import patch
 
 import pytest
 from vllm import LLM, SamplingParams
@@ -61,8 +60,7 @@ def llm():
 
     del llm
 
-    with patch("torch.accelerator.empty_cache", return_value=None):
-        cleanup_dist_env_and_memory()
+    cleanup_dist_env_and_memory()
 
 
 def test_multiple_sampling_params(llm: LLM):
