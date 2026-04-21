@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
     TPU_WORKER_ID: str | None = None
+    TPU_TORCH_TPU_EAGER_MODE: str = "defer_and_fuse"
     TPU_MULTIHOST_BACKEND: str = ""
     PREFILL_SLICES: str = ""
     DECODE_SLICES: str = ""
@@ -84,6 +85,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID":
     lambda: os.getenv("TPU_WORKER_ID", None),
+    # TorchTPU eager mode policy for the current wheel.
+    "TPU_TORCH_TPU_EAGER_MODE":
+    env_with_choices(
+        "TPU_TORCH_TPU_EAGER_MODE",
+        "defer_and_fuse",
+        [
+            "defer_and_fuse",
+            "defer_never",
+            "defer_never_and_launch_blocking",
+        ],
+        case_sensitive=False,
+    ),
     # Backend for multi-host communication on TPU
     "TPU_MULTIHOST_BACKEND":
     env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray"]),

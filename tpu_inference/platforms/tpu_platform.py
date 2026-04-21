@@ -48,6 +48,46 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
+_torchtpu_eager_mode_configured = False
+
+
+def _get_torchtpu_execution_mode_module():
+    from torch_tpu._internal import execution_mode
+    return execution_mode
+
+
+def _resolve_torchtpu_eager_mode(policy: str, execution_mode) -> object:
+    members = execution_mode.EagerMode.__members__
+    member_name = policy.upper()
+    if member_name not in members:
+        supported = ", ".join(sorted(members))
+        raise RuntimeError(
+            "Requested TPU_TORCH_TPU_EAGER_MODE=%r but current torch_tpu "
+            "wheel only exposes: %s" % (policy, supported))
+    return members[member_name]
+
+
+def _configure_torchtpu_eager_mode() -> None:
+    global _torchtpu_eager_mode_configured
+    if _torchtpu_eager_mode_configured:
+        return
+
+    execution_mode = _get_torchtpu_execution_mode_module()
+    policy = envs.TPU_TORCH_TPU_EAGER_MODE
+    target_mode = _resolve_torchtpu_eager_mode(policy, execution_mode)
+    current_mode = execution_mode.get_eager_mode()
+
+    if current_mode != target_mode:
+        execution_mode.set_eager_mode(target_mode)
+
+    current_mode_name = current_mode.name
+    effective_mode_name = execution_mode.get_eager_mode().name
+    logger.info(
+        "TorchTPU eager mode configured: %s "
+        "(policy=%s, previous=%s)", effective_mode_name, policy,
+        current_mode_name)
+
+    _torchtpu_eager_mode_configured = True
 
 
 def _unwrap_dynamic_compile_fns() -> None:
@@ -85,6 +125,7 @@ def apply_tpu_patches() -> None:
     """
     from tpu_inference import _patch_vllm_tpu_group_custom_ops
     _patch_vllm_tpu_group_custom_ops()
+    _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
 
 
@@ -104,9 +145,9 @@ class TpuPlatform(Platform):
 
     additional_env_vars: list[str] = [
         "PHASED_PROFILING_DIR", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
-        "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
-        "NEW_MODEL_DESIGN", "MOE_REQUANTIZE_BLOCK_SIZE",
-        "MOE_REQUANTIZE_WEIGHT_DTYPE"
+        "TPU_MULTIHOST_BACKEND", "TPU_TORCH_TPU_EAGER_MODE",
+        "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE", "NEW_MODEL_DESIGN",
+        "MOE_REQUANTIZE_BLOCK_SIZE", "MOE_REQUANTIZE_WEIGHT_DTYPE"
     ]
 
     @classmethod
