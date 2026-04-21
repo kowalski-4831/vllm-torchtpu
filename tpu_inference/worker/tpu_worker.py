@@ -29,6 +29,7 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from tpu_inference import envs, utils
 from tpu_inference.distributed import jax_parallel_state
 from tpu_inference.distributed.utils import get_node_id
+from tpu_inference.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from tpu_inference.logger import init_logger
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
@@ -74,7 +75,15 @@ class TPUWorker:
         self.device_ranks = set(device.id for device in self.devices)
         self.prev_worker_ip = prev_worker_ip
 
-        self.kv_cache_dtype = self.model_config.dtype
+        if self.cache_config.cache_dtype == "auto":
+            model_dtype = self.model_config.dtype
+            if isinstance(model_dtype, str):
+                self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
+            else:
+                self.kv_cache_dtype = model_dtype
+        else:
+            self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
+                self.cache_config.cache_dtype]
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing

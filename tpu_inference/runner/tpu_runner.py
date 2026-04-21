@@ -278,6 +278,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Lazy initialization
         self.model: nn.Module  # Set after load_model
         self.kv_caches: list[torch.Tensor] = []
+        self._attention_kernels_initialized = False
         # mm_hash -> encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
@@ -1661,6 +1662,28 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        # Ensure attention custom ops exist before any compile/inference path,
+        self._initialize_attention_kernels()
+
+    def _initialize_attention_kernels(self) -> None:
+        """Pre-build Pallas RPA attention kernels before torch.compile.
+
+        Must be called after model weights are loaded and before the first
+        forward_model() call (which triggers torch.compile tracing).
+        """
+        if self._attention_kernels_initialized:
+            return
+        from tpu_inference.layers.vllm.attention import \
+            PallasAttentionBackendImpl
+
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        with set_vllm_model_wrapper_context(mesh=self.mesh):
+            for layer_name, attn_layer in layers.items():
+                if isinstance(attn_layer.impl, PallasAttentionBackendImpl):
+                    attn_layer.impl.initialize_kernel(attn_layer)
+                    logger.info("Pre-built RPA kernel for layer: %s",
+                                layer_name)
+        self._attention_kernels_initialized = True
 
     def reload_weights(self) -> None:
         assert (getattr(self, "model", None)
@@ -1668,6 +1691,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         model_loader = get_model_loader(self.load_config)
         logger.info("Reloading weights inplace...")
         model_loader.load_weights(self.model, model_config=self.model_config)
+        self._attention_kernels_initialized = False
+        self._initialize_attention_kernels()
 
     @torch.no_grad()
     def _dummy_run(self, num_tokens: int, num_reqs: int,
@@ -1853,6 +1878,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         num_tokens: int,
     ) -> None:
+        self._initialize_attention_kernels()
+
         # TODO: figure out if this can be fixed
         # Run eagerly (without torch.compile) during profiling.
         # The profiling run executes before KV cache is allocated, so
@@ -1935,6 +1962,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
+                        kv_cache_spec.dtype,
                     )
                     dtype = kv_cache_spec.dtype
 

@@ -44,6 +44,42 @@ MXFP4_BLOCK_SIZE = 32
 REQUANTIZED_BLOCK_SIZE = 512
 
 
+def is_floating_dtype(dtype: torch.dtype) -> bool:
+    return torch.is_floating_point(torch.empty((), dtype=dtype))
+
+
+def static_per_tensor_quantize_tensor(
+    tensor: torch.Tensor,
+    quant_dtype: torch.dtype,
+    scale: float,
+) -> torch.Tensor:
+    """Quantize tensor with a fixed scalar scale and clamp to dtype range."""
+    if scale == 0.0:
+        raise ValueError("Quantization scale must be non-zero.")
+    if is_floating_dtype(quant_dtype):
+        dtype_info = torch.finfo(quant_dtype)
+    else:
+        dtype_info = torch.iinfo(quant_dtype)
+    quantized = torch.clamp(
+        tensor.to(torch.float32) / scale, dtype_info.min, dtype_info.max)
+    return quantized.to(quant_dtype)
+
+
+def quantize_kv(
+    quant_dtype: torch.dtype,
+    key: torch.Tensor,
+    value: torch.Tensor | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Static quantize key/value tensors with per-tensor scales."""
+    key = static_per_tensor_quantize_tensor(key, quant_dtype, k_scale)
+    if value is None:
+        return key, None
+    value = static_per_tensor_quantize_tensor(value, quant_dtype, v_scale)
+    return key, value
+
+
 def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
     """Convert e8m0 (8-bit exponent only) to float32.
 

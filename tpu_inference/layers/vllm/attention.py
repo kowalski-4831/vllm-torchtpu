@@ -12,6 +12,8 @@ from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
 
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.quantization import (is_floating_dtype,
+                                                      quantize_kv)
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
@@ -33,6 +35,35 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "int8": torch.int8,
     "uint8": torch.uint8,
 }
+
+
+def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
+    return cache_dtype_str.lower().strip() in frozenset(
+        ("fp8", "fp8_e4m3", "fp8_e5m2"))
+
+
+def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
+    if isinstance(cache_dtype, torch.dtype):
+        return cache_dtype
+    normalized = cache_dtype.lower().strip()
+    if normalized == "auto":
+        raise ValueError(
+            "cache_dtype='auto' must be resolved to a concrete torch.dtype "
+            "before calling get_kv_cache_shape.")
+    dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(normalized)
+    if dtype is None:
+        raise ValueError(f"Unsupported KV cache dtype string: {cache_dtype}")
+    return dtype
+
+
+def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
+    """Return number of dtype values packed into a packing_bits lane."""
+    bits = torch.empty((), dtype=dtype).element_size() * 8
+    if packing_bits % bits != 0:
+        raise ValueError(
+            f"The bit width must divide {packing_bits}, but got {bits} for "
+            f"dtype={dtype}.")
+    return packing_bits // bits
 
 
 def _pallas_rpa_kernel(
@@ -82,6 +113,13 @@ def _pallas_rpa_kernel(
 
 
 class PallasAttentionBackend(AttentionBackend):
+    supported_kv_cache_dtypes = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ]
 
     @staticmethod
     def get_name() -> str:
@@ -97,7 +135,7 @@ class PallasAttentionBackend(AttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
-        cache_dtype_str: str = "auto",
+        cache_dtype_str: str | torch.dtype = "auto",
     ) -> tuple[int, ...]:
         padded_head_size = (cdiv(head_size, TPU_HEAD_SIZE_ALIGNMENT) *
                             TPU_HEAD_SIZE_ALIGNMENT)
@@ -107,10 +145,12 @@ class PallasAttentionBackend(AttentionBackend):
         # The Pallas kernels expect a 5D KV cache: [L, S, Kx2 / kv_packing, kv_packing, H]
         # where Kx2 = num_kv_heads for hd64 and Kx2 = num_kv_heads * 2 for v3.
         use_hd64 = (head_size == 64)
-        if cache_dtype_str != "auto":
-            raise NotImplementedError
+        kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        if not is_floating_dtype(kv_dtype):
+            raise NotImplementedError(
+                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
+        kv_packing = get_dtype_packing(kv_dtype)
 
-        kv_packing = 2
         num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
         num_kv_heads_x2 = cdiv(num_kv_heads_x2, kv_packing) * kv_packing
         return (
@@ -172,7 +212,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_instance_counter = 0
     # Registry of shared custom ops keyed to avoid registering duplicate Pallas
     # kernels for layers with identical configs.
-    # Mapping of (sliding window, mesh) -> custom op
+    # Mapping of (sliding_window, mesh, q_scale, k_scale, v_scale) -> custom op
     _kernel_registry: dict = {}
 
     def __init__(
@@ -207,9 +247,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                                       "PallasAttentionBackendImpl")
 
         self.kv_cache_quantized_dtype = None
-        if kv_cache_dtype != "auto":
-            self.kv_cache_quantized_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(
-                kv_cache_dtype.lower().strip())
+        # Only set kv_cache_quantized_dtype for fp8 KV cache
+        if _is_fp8_kv_cache_dtype(kv_cache_dtype):
+            self.kv_cache_quantized_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
+                kv_cache_dtype.lower().strip()]
 
         # Store sinks for attention sink optimization
         self.sinks = sinks
@@ -217,10 +258,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer")
-
-        # NOTE: build the per-instance custom op during init so compile-mode
-        # forward does not execute Python-side op registration logic.
-        self.rpa_kernel = self._build_rpa_kernel()
+        self.rpa_kernel = None
 
     @classmethod
     def _allocate_kernel_instance_id(cls) -> int:
@@ -228,16 +266,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
         cls._kernel_instance_counter += 1
         return kernel_instance_id
 
-    def _build_rpa_kernel(self):
+    def _build_rpa_kernel(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+    ):
         # Reuse an existing custom op if one with the same config already exists.
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
-        registry_key = (self.sliding_window, id(mesh))
+        registry_key = (self.sliding_window, id(mesh), q_scale, k_scale,
+                        v_scale)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             return existing
 
-        kernel_instance_id = type(self)._allocate_kernel_instance_id()
+        kernel_instance_id = self._allocate_kernel_instance_id()
         op_name = f"pallas::rpa_kernel_{kernel_instance_id}"
 
         # Prepare wrapper function with static arguments
@@ -245,6 +289,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             _pallas_rpa_kernel,
             mesh=mesh,
             sliding_window=self.sliding_window,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -259,25 +306,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
                             seq_lens: torch.Tensor, block_tables: torch.Tensor,
                             query_start_loc: torch.Tensor,
                             request_distribution: torch.Tensor,
-                            sinks: torch.Tensor | None, q_scale: float | None,
-                            k_scale: float | None,
-                            v_scale: float | None) -> torch.Tensor:
+                            sinks: torch.Tensor | None) -> torch.Tensor:
             jax_kernel = pallas.custom_jax_kernel(wrapped_fn,
                                                   input_output_aliases={0: 0},
                                                   donate_argnums=(0, ),
                                                   name=f'jax_{op_name}')
-            _new_kv_cache, outputs = jax_kernel(kv_cache,
-                                                query,
-                                                key,
-                                                value,
-                                                seq_lens,
-                                                block_tables,
+            _new_kv_cache, outputs = jax_kernel(kv_cache, query, key, value,
+                                                seq_lens, block_tables,
                                                 query_start_loc,
-                                                request_distribution,
-                                                sinks,
-                                                q_scale=q_scale,
-                                                k_scale=k_scale,
-                                                v_scale=v_scale)
+                                                request_distribution, sinks)
             return outputs
 
         # Register fake tensor implementation for torch.compile tracing
@@ -291,9 +328,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
             sinks: torch.Tensor | None = None,
-            q_scale: float | None = None,
-            k_scale: float | None = None,
-            v_scale: float | None = None,
         ) -> tuple[torch.Tensor]:
             return torch.empty_like(query)
 
@@ -301,6 +335,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         self._kernel_registry[registry_key] = rpa_kernel_impl
         return rpa_kernel_impl
+
+    def initialize_kernel(self, layer: AttentionLayer) -> None:
+        """Pre-build the RPA kernel before torch.compile traces the model.
+
+        Must be called after model weights are loaded (so scales are known)
+        and after the mesh is available via the model wrapper context, but
+        before forward().
+        """
+        q_scale = k_scale = v_scale = None
+        if self.kv_cache_quantized_dtype:
+            k_scale_value = layer._k_scale_float
+            v_scale_value = layer._v_scale_float
+            if k_scale_value != 0.0 and v_scale_value != 0.0:
+                k_scale = k_scale_value
+                v_scale = v_scale_value
+        self.rpa_kernel = self._build_rpa_kernel(q_scale, k_scale, v_scale)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""
@@ -353,19 +403,23 @@ class PallasAttentionBackendImpl(AttentionImpl):
         assert q_compute_dim == self.head_size * self.num_heads
         assert k_compute_dim == self.head_size * self.num_kv_heads
 
-        q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype:
-            raise NotImplementedError(
-                "Quantized KV cache is not supported for PallasAttentionBackendImpl"
-            )
+            k_scale_value = layer._k_scale_float
+            v_scale_value = layer._v_scale_float
+            if k_scale_value == 0.0 or v_scale_value == 0.0:
+                raise ValueError(
+                    "k_scale_float and v_scale_float must be non-zero")
+            key, value = quantize_kv(self.kv_cache_quantized_dtype, key, value,
+                                     k_scale_value, v_scale_value)
+
+        assert self.rpa_kernel is not None, (
+            "rpa_kernel not initialized. Call initialize_kernel() before "
+            "the first forward pass.")
 
         sink = self.sinks
         query = query.view(q_len, self.num_heads, self.head_size)
         key = key.view(k_len, self.num_kv_heads, self.head_size)
         value = value.view(k_len, self.num_kv_heads, self.head_size)
-
-        if self.rpa_kernel is None:
-            self.init_rpa_kernel(q_scale, k_scale, v_scale)
 
         # TODO (geyuhao) the support of this API is pending discussion.
         # This line will only influence performance, not functionality
@@ -383,9 +437,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
             sink,
-            q_scale,
-            k_scale,
-            v_scale,
         )
 
         # TODO (geyuhao) ideally we don't want this
