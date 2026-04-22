@@ -1,4 +1,13 @@
-ARG BASE_IMAGE="us-central1-docker.pkg.dev/meta-tpu-rbbq5/zongwei-repo/torchtpu:colin2328-latest"
+# Base image: torch_tpu nightly from Google Artifact Registry.
+# The registry requires authentication to pull:
+#
+#   TOKEN=$(gcloud auth print-access-token)
+#   echo $TOKEN | docker login -u oauth2accesstoken --password-stdin us-docker.pkg.dev
+#   docker build -f docker/Dockerfile -t <your-tag> .
+#
+# Meta-internal registry (used when we can't push to the public registry):
+# ARG BASE_IMAGE="us-central1-docker.pkg.dev/meta-tpu-rbbq5/zongwei-repo/torchtpu:colin2328-latest"
+ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu:nightly-latest"
 ARG VLLM_COMMIT_HASH="v0.17.1"
 
 FROM $BASE_IMAGE
