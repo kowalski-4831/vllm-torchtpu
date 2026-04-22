@@ -58,16 +58,10 @@ def _configure_torchtpu_eager_mode() -> None:
 
     from torch_tpu._internal import execution_mode
 
-    current_mode = execution_mode.get_eager_mode()
-    target_mode = execution_mode.EagerMode.DEFER_AND_FUSE
-
-    if current_mode != target_mode:
-        execution_mode.set_eager_mode(target_mode)
-
-    current_mode_name = current_mode.name
-    effective_mode_name = execution_mode.get_eager_mode().name
+    previous_mode = execution_mode.get_eager_mode()
+    execution_mode.set_eager_mode(execution_mode.EagerMode.DEFER_AND_FUSE)
     logger.info("TorchTPU eager mode configured: %s (previous=%s)",
-                effective_mode_name, current_mode_name)
+                execution_mode.get_eager_mode().name, previous_mode.name)
 
     _torchtpu_eager_mode_configured = True
 
