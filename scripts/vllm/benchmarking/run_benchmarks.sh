@@ -64,7 +64,6 @@ ENABLE_EP=false
 QUANTIZATION=""
 ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
-MAX_NUM_BATCHED_TOKENS=""
 RANDOM_RANGE_RATIO=""
 
 # shellcheck source=/dev/null
@@ -97,27 +96,11 @@ RESULTS_DIR="$REPO_DIR/benchmark_runs/${safe_model}_tp${TENSOR_PARALLELISM}_${TI
 mkdir -p "$RESULTS_DIR"
 log_file="$RESULTS_DIR/benchmark.log"
 
-# =============================================================================
-# Helper functions
-# =============================================================================
-ceil_scale_by_ratio() {
-    local val=$1
-    local ratio=$2
-    python3 -c "import math; print(math.ceil(${val} * (1.0 + ${ratio})))"
-}
-
 start_vllm_server() {
     local max_model_len=$1
     local max_num_batched_tokens=$2
     local max_num_seqs=$3
     local gpu_mem_util=0.95
-
-    # Qwen models use lower memory utilization
-    local model_lower
-    model_lower=$(echo "$MODEL" | tr '[:upper:]' '[:lower:]')
-    if echo "$model_lower" | grep -q "qwen"; then
-        gpu_mem_util=0.8
-    fi
 
     # Build extra args
     local extra_args=""
@@ -131,7 +114,7 @@ start_vllm_server() {
     export PYTHONUNBUFFERED=1
     export MODEL_IMPL_TYPE=vllm
 
-    local server_cmd="vllm serve --model=${MODEL} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling --no-enable-prefix-caching --gpu-memory-utilization=$gpu_mem_util $extra_args"
+    local server_cmd="vllm serve --model=${MODEL} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling --no-enable-prefix-caching --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=fp8 $extra_args"
 
     echo ""
     echo "================================================"
@@ -202,31 +185,9 @@ stop_vllm_server() {
 # =============================================================================
 # Compute server parameters from config
 # =============================================================================
-max_seq_len=0
-for config in $ISL_OSL_CONFIGS; do
-    IFS=':' read -r input_len output_len <<< "$config"
-    worst_input_len=$(ceil_scale_by_ratio "$input_len" "$RANDOM_RANGE_RATIO")
-    worst_output_len=$(ceil_scale_by_ratio "$output_len" "$RANDOM_RANGE_RATIO")
-    total=$((worst_input_len + worst_output_len))
-    if [ "$total" -gt "$max_seq_len" ]; then
-        max_seq_len=$total
-    fi
-done
-max_model_len=$max_seq_len
-max_batched_tokens=$max_model_len
-
-# Cap max_batched_tokens if configured
-if [ -n "$MAX_NUM_BATCHED_TOKENS" ] && [ "$MAX_NUM_BATCHED_TOKENS" -gt 0 ] 2>/dev/null; then
-    if [ "$max_batched_tokens" -gt "$MAX_NUM_BATCHED_TOKENS" ]; then
-        echo "Capping max_batched_tokens: $max_batched_tokens -> $MAX_NUM_BATCHED_TOKENS"
-        max_batched_tokens=$MAX_NUM_BATCHED_TOKENS
-    fi
-fi
-
-max_concurrency=0
-for c in $CONCURRENCY_OPTIONS; do
-    if [ "$c" -gt "$max_concurrency" ]; then max_concurrency=$c; fi
-done
+max_model_len=10240
+max_batched_tokens=8192
+max_num_seqs=512
 
 # Save config metadata
 cat > "$RESULTS_DIR/config.json" << EOF
@@ -240,6 +201,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "concurrency_options": "$CONCURRENCY_OPTIONS",
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
+    "max_num_seqs": $max_num_seqs,
     "timestamp": "$TIMESTAMP"
 }
 EOF
@@ -271,7 +233,7 @@ echo "================================================"
 export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
 
 trap stop_vllm_server EXIT
-start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_concurrency"
+start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
 
 exit_code=0
 
@@ -308,7 +270,7 @@ for config in $ISL_OSL_CONFIGS; do
             --random-input-len "$input_len" \
             --random-output-len "$output_len" \
             --random-range-ratio "$RANDOM_RANGE_RATIO" \
-            --num-prompts "$((concurrency * 2))" \
+            --num-prompts 320 \
             --max-concurrency "$concurrency" \
             --request-rate inf \
             --save-result \

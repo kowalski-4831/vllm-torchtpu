@@ -4,27 +4,14 @@ Use one terminal for the server and another for the benchmark client.
 
 ## NOTE
 1. Currently torchtpu-vllm only supports greedy sampling, so we use --temperature 0 in the client command.
-2. Currently torchtpu-vllm does not support kv-cache-dtype=fp8
 
 ## Server
 
-TorchTPU:
-
 ```bash
 MODEL_IMPL_TYPE=vllm vllm serve Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
-  --max-model-len=16589 --max-num-batched-tokens=8192 --max-num-seqs=512 \
-  --no-enable-prefix-caching \
-  --gpu-memory-utilization=0.9 --tensor-parallel-size=8 \
-  --async-scheduling --enable-expert-parallel
-```
-
-TorchAX:
-
-```bash
-MODEL_IMPL_TYPE=vllm vllm serve Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
-  --max-model-len=16589 --max-num-batched-tokens=8192 --max-num-seqs=512 \
+  --max-model-len=10240 --max-num-batched-tokens=8192 --max-num-seqs=512 \
   --kv-cache-dtype=fp8 --no-enable-prefix-caching \
-  --gpu-memory-utilization=0.9 --tensor-parallel-size=8 \
+  --gpu-memory-utilization=0.95 --tensor-parallel-size=8 \
   --async-scheduling --enable-expert-parallel
 ```
 
