@@ -48,22 +48,14 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
-_torchtpu_eager_mode_configured = False
 
 
 def _configure_torchtpu_eager_mode() -> None:
-    global _torchtpu_eager_mode_configured
-    if _torchtpu_eager_mode_configured:
-        return
-
     from torch_tpu._internal import execution_mode
-
     previous_mode = execution_mode.get_eager_mode()
     execution_mode.set_eager_mode(execution_mode.EagerMode.DEFER_AND_FUSE)
     logger.info("TorchTPU eager mode configured: %s (previous=%s)",
                 execution_mode.get_eager_mode().name, previous_mode.name)
-
-    _torchtpu_eager_mode_configured = True
 
 
 def _unwrap_dynamic_compile_fns() -> None:
