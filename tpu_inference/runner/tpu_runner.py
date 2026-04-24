@@ -1071,8 +1071,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                   out=self.query_start_loc_np[1:num_reqs + 1])
         # Keep padded entries equal to the last valid location so padded
         # requests have zero length instead of a negative q_len.
-        self.query_start_loc_np[num_reqs + 1:] = self.query_start_loc_np[
-            num_reqs]
+        self.query_start_loc_np[num_reqs +
+                                1:] = self.query_start_loc_np[num_reqs]
 
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[start_index:start_index +
