@@ -67,9 +67,9 @@ def test_multiple_sampling_params(llm: LLM):
     """Test multiple sampling parameters."""
     sampling_params = [
         SamplingParams(temperature=0.0, max_tokens=1),
-        SamplingParams(temperature=0.0, max_tokens=2),
+        SamplingParams(temperature=0.7, max_tokens=2),
         SamplingParams(temperature=0.0, max_tokens=3),
-        SamplingParams(temperature=0.0, max_tokens=4),
+        SamplingParams(temperature=0.7, max_tokens=4),
     ]
 
     # Multiple SamplingParams should be matched with each prompt
@@ -90,12 +90,10 @@ def test_multiple_sampling_params(llm: LLM):
     assert len(PROMPTS) == len(outputs)
 
 
-def test_non_greedy_sampling_not_supported(llm: LLM):
-    with pytest.raises(ValueError, match="Only greedy sampling"):
-        llm.generate(
-            PROMPTS,
-            sampling_params=SamplingParams(temperature=0.7, max_tokens=4),
-        )
+def test_non_greedy_sampling(llm: LLM):
+    sampling_params = SamplingParams(temperature=0.7, max_tokens=4)
+    outputs = llm.generate(PROMPTS, sampling_params=sampling_params)
+    assert len(PROMPTS) == len(outputs)
 
 
 def test_multiple_priority(llm: LLM):

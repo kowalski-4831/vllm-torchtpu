@@ -113,6 +113,7 @@ logger = init_logger(__name__)
 
 # Smallest output size
 MIN_NUM_SEQS = 8
+SAMPLING_EPS = 1e-5
 
 
 def _validate_libtpu_version() -> None:
@@ -1455,11 +1456,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Prepare inputs, the requests might be split into multiple
         # executions, combine the result of each execution.
-        if not self.input_batch.all_greedy:
-            raise NotImplementedError(
-                "Only greedy sampling (temperature=0) is supported on TPU. "
-                "Non-greedy sampling requires porting to vLLM v0.17.1's "
-                "Sampler API.")
 
         max_num_logprobs = self.input_batch.max_num_logprobs
         if max_num_logprobs == -1:
@@ -1471,7 +1467,20 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         combined_selected_tokens: list[torch.Tensor] = []
         combined_logprobs: list[Any] = []
 
+        cur_start_idx = 0
+        req_ids = cast(list[str],
+                       self.input_batch.req_ids[:self.input_batch.num_reqs])
+        self.input_batch.temperature.copy_(
+            self.input_batch.temperature_cpu_tensor)
         for logits, num_reqs in zip(state.logits_list, state.num_reqs_list):
+            cur_end_idx = cur_start_idx + num_reqs
+            temperatures_tpu = torch.ones((logits.shape[0], 1),
+                                          dtype=logits.dtype,
+                                          device=logits.device)
+            num_active_reqs = cur_end_idx - cur_start_idx
+            temperatures_tpu[:num_active_reqs,
+                             0] = self.input_batch.temperature[
+                                 cur_start_idx:cur_end_idx]
             if grammar_output is not None:
                 require_struct_decoding, grammar_bitmask_padded, arange = (
                     self.prepare_structured_decoding_input(
@@ -1479,7 +1488,9 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits = self.structured_decode(require_struct_decoding,
                                                 grammar_bitmask_padded, logits,
                                                 arange)
-            selected_token_ids = self.sample_from_logits_func(logits)
+            u = torch.rand_like(logits)
+            selected_token_ids = self.sample_from_logits_func(
+                logits, temperatures_tpu, u)
             # NOTE (NickLucche) Use the original logits (before any penalties or
             # temperature scaling) for the top-k logprobs. We can't enforce it
             # due to recompilations outside torch.compiled code, so just make
@@ -1497,6 +1508,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 combined_logprobs.append(sliced_logprobs)
 
             self._update_num_xla_graphs("decoding_step")
+            cur_start_idx = cur_end_idx
 
         # NOTE: current kv load and save get h2d/d2h copies involved.
         # Those copies are blocking. Once they become async., kv_save
@@ -1835,7 +1847,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 device=self.device,
                 dtype=self._hidden_states_dtype,
             )
-            out = self.sample_from_logits_func(dummy_logits)
+            dummy_temperatures = torch.ones((num_reqs, 1),
+                                            device=self.device,
+                                            dtype=self._hidden_states_dtype)
+            dummy_u = torch.rand_like(dummy_logits)
+            out = self.sample_from_logits_func(dummy_logits,
+                                               dummy_temperatures, dummy_u)
             sync.synchronize(out, wait=True)
             logger.info("  -- num_seqs: %d", num_reqs)
         end = time.perf_counter()
@@ -2036,15 +2053,27 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             indices_do_sample: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states[indices_do_sample])
 
+    def _apply_temperature(self, logits: torch.Tensor,
+                           temperatures: torch.Tensor) -> torch.Tensor:
+        safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
+        return logits / safe_temperatures
+
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def sample_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+    def sample_from_logits(self, logits: torch.Tensor,
+                           temperatures: torch.Tensor,
+                           u: torch.Tensor) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
         """
-        return torch.argmax(logits, dim=-1, keepdim=True)
+        is_greedy = temperatures <= SAMPLING_EPS
+        scaled_logits = self._apply_temperature(logits, temperatures)
+        gumbel_noise = -torch.log(-torch.log(u))
+        noisy_logits = scaled_logits + gumbel_noise
+        final_logits = torch.where(is_greedy, logits, noisy_logits)
+        return torch.argmax(final_logits, dim=-1, keepdim=True)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def gather_logprobs(self, logits: torch.Tensor,

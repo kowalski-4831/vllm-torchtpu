@@ -388,9 +388,14 @@ class TpuPlatform(Platform):
         if isinstance(params, SamplingParams):
             if params.sampling_type == SamplingType.RANDOM_SEED:
                 raise ValueError("JAX does not support per-request seed.")
-            if params.sampling_type != SamplingType.GREEDY:
+            if params.sampling_type not in (SamplingType.GREEDY,
+                                            SamplingType.RANDOM):
                 raise ValueError(
-                    "Only greedy sampling (temperature=0) is supported on TPU."
+                    f"Sampling type {params.sampling_type} is not supported on TPU."
+                )
+            if params.top_k != 0 or params.top_p != 1.0:
+                logger.warning(
+                    "Top-K and Top-P are not yet supported on TPU and will be ignored."
                 )
 
     @classmethod
