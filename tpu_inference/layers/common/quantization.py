@@ -48,6 +48,11 @@ def is_floating_dtype(dtype: torch.dtype) -> bool:
     return torch.is_floating_point(torch.empty((), dtype=dtype))
 
 
+def _safe_inverse_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Return 1 / scale while keeping zero-scale blocks exactly zero."""
+    return torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
+
+
 def static_per_tensor_quantize_tensor(
     tensor: torch.Tensor,
     quant_dtype: torch.dtype,
@@ -230,8 +235,9 @@ def quantize_tensor(
 
     abs_max = blocked.abs().amax(dim=-1, keepdim=True)
     scale = abs_max / float(dtype_info.max)
-    scale_inv = torch.where(scale == 0, torch.full_like(scale, float("inf")),
-                            1.0 / scale)
+    # Keep all-zero blocks quantized as exact zeros instead of producing
+    # 0 * inf -> NaN during requantization.
+    scale_inv = _safe_inverse_scale(scale)
 
     blocked_q = torch.clamp(blocked * scale_inv,
                             min=float(dtype_info.min),
@@ -324,10 +330,9 @@ def quantize_tensor_to_fp4(
     abs_max = tensor_blocked.abs().amax(dim=expanded_axis, keepdim=True)
     scale = abs_max / FP4_MAX
 
-    # Compute inverse scale (avoid division by zero)
-    scale_inv = torch.where(scale == 0,
-                            torch.tensor(float('inf'), device=tensor.device),
-                            1.0 / scale)
+    # Keep all-zero blocks quantized as exact zeros instead of producing
+    # 0 * inf -> NaN before the LUT lookup.
+    scale_inv = _safe_inverse_scale(scale)
 
     # Scale and clip to FP4 range
     tensor_scaled = tensor_blocked * scale_inv
