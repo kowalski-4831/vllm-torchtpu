@@ -162,6 +162,25 @@ class PallasAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
+    def get_kv_cache_page_size_bytes(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        """Return one Pallas KV-cache page size including layout padding."""
+        dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        shape = PallasAttentionBackend.get_kv_cache_shape(
+            1,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype,
+        )
+        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
+        return num_elements * torch.empty((), dtype=dtype).element_size()
+
+    @staticmethod
     def swap_blocks(
         src_kv_cache: torch.Tensor,
         dst_kv_cache: torch.Tensor,

@@ -8,22 +8,14 @@ from urllib.parse import urlparse
 import torch
 from torch_tpu import api
 from torch_tpu._internal.profiler import profiler_api
-from vllm.config import (VllmConfig, get_layers_from_vllm_config,
-                         set_current_vllm_config)
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.layers.attention import (Attention,
-                                                  ChunkedLocalAttention,
-                                                  MLAAttention)
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.tasks import SupportedTask
 from vllm.v1 import utils as vllm_utils
-from vllm.v1.attention.backend import AttentionType
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheSpec, MLAAttentionSpec,
-                                        SlidingWindowSpec)
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 from tpu_inference import envs, utils
@@ -304,75 +296,7 @@ class TPUWorker:
         return self.model_runner.get_supported_tasks()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        layers = get_layers_from_vllm_config(
-            self.vllm_config,
-            AttentionLayerBase,  # type: ignore[type-abstract]
-        )
-        block_size = self.vllm_config.cache_config.block_size
-        cache_dtype_str = self.vllm_config.cache_config.cache_dtype
-
-        kv_cache_spec: dict[str, KVCacheSpec] = {}
-        for layer_name, attn_module in layers.items():
-            # Classic Attention path
-            if isinstance(attn_module, Attention):
-                if (kv_tgt_layer :=
-                        attn_module.kv_sharing_target_layer_name) is not None:
-                    # The layer doesn't need its own KV cache and will use that of
-                    # the target layer. We skip creating a KVCacheSpec for it, so
-                    # that KV cache management logic will act as this layer does
-                    # not exist, and doesn't allocate KV cache for the layer. This
-                    # enables the memory saving of cross-layer kv sharing, allowing
-                    # a given amount of memory to accommodate longer context lengths
-                    # or enable more requests to be processed simultaneously.
-                    self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
-                    continue
-
-                if attn_module.attn_type == AttentionType.DECODER:
-                    if isinstance(attn_module, ChunkedLocalAttention):
-                        logger.warning_once(
-                            "Using irope in Pallas is not supported yet, it "
-                            "will fall back to global attention for long context."
-                        )
-                    if attn_module.sliding_window is not None:
-                        kv_cache_spec[layer_name] = SlidingWindowSpec(
-                            block_size=block_size,
-                            num_kv_heads=attn_module.num_kv_heads,
-                            head_size=attn_module.head_size,
-                            dtype=self.kv_cache_dtype,
-                            sliding_window=attn_module.sliding_window,
-                        )
-                    else:
-                        kv_cache_spec[layer_name] = FullAttentionSpec(
-                            block_size=block_size,
-                            num_kv_heads=attn_module.num_kv_heads,
-                            head_size=attn_module.head_size,
-                            dtype=self.kv_cache_dtype,
-                        )
-                elif attn_module.attn_type in (
-                        AttentionType.ENCODER,
-                        AttentionType.ENCODER_ONLY,
-                ):
-                    # encoder-only attention does not need KV cache.
-                    continue
-                elif attn_module.attn_type == AttentionType.ENCODER_DECODER:
-                    raise NotImplementedError
-                else:
-                    raise ValueError(
-                        f"Unknown attention type: {attn_module.attn_type}")
-            # MLAAttention path
-            elif isinstance(attn_module, MLAAttention):
-                if layer_name in kv_cache_spec:
-                    continue
-                kv_cache_spec[layer_name] = MLAAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=attn_module.head_size,
-                    dtype=self.kv_cache_dtype,
-                    cache_dtype_str=cache_dtype_str,
-                )
-            else:
-                continue
-        return kv_cache_spec
+        return self.model_runner.get_kv_cache_spec()
 
     def initialize_from_config(
         self,

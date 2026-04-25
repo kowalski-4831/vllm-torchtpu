@@ -728,12 +728,20 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             "Using irope in Pallas is not supported yet, it "
                             "will fall back to global attention for long context."
                         )
+                    page_size_padded = (
+                        PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                            block_size,
+                            attn_module.num_kv_heads,
+                            attn_module.head_size,
+                            self.kv_cache_dtype,
+                        ))
                     if attn_module.sliding_window is not None:
                         kv_cache_spec[layer_name] = SlidingWindowSpec(
                             block_size=block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
+                            page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
                         )
                     else:
@@ -742,6 +750,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
+                            page_size_padded=page_size_padded,
                         )
                 elif attn_module.attn_type in (
                         AttentionType.ENCODER,
@@ -1985,6 +1994,14 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         kv_cache_spec.dtype,
                     )
                     dtype = kv_cache_spec.dtype
+                    shape_nbytes = torch.empty((), dtype=dtype).element_size()
+                    for dim in kv_cache_shape:
+                        shape_nbytes *= dim
+                    assert shape_nbytes == tensor_size, (
+                        f"KV cache tensor size mismatch for {layer_name}: "
+                        f"{shape_nbytes=} {tensor_size=} "
+                        f"{kv_cache_shape=} {dtype=} "
+                        f"page_size_bytes={kv_cache_spec.page_size_bytes}")
 
                     tpu_kv_cache = torch.zeros(kv_cache_shape,
                                                dtype=dtype).to(self.device)
