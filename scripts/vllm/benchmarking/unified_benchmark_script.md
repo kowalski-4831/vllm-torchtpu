@@ -2,9 +2,6 @@
 
 Use one terminal for the server and another for the benchmark client.
 
-## NOTE
-1. Currently torchtpu-vllm only supports greedy sampling, so we use --temperature 0 in the client command.
-
 ## Server
 
 ```bash
@@ -34,7 +31,6 @@ vllm bench serve \
   --request-rate inf \
   --ignore-eos \
   --save-result \
-  --temperature 0 \
   --result-filename isl1024_osl1024_c64.json
 ```
 
@@ -53,7 +49,6 @@ vllm bench serve \
   --request-rate inf \
   --ignore-eos \
   --save-result \
-  --temperature 0 \
   --result-filename isl8192_osl1024_c64.json
 ```
 
@@ -72,6 +67,5 @@ vllm bench serve \
   --request-rate inf \
   --ignore-eos \
   --save-result \
-  --temperature 0 \
   --result-filename isl1024_osl8192_c64.json
 ```
