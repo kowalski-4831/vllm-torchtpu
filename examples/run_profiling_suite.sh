@@ -33,6 +33,10 @@ EXPERIMENTS=(
     # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 1024 1024"
     # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 1024 8096"
     # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 8096 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --kv-cache-dtype fp8 -- 8 1024 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --kv-cache-dtype fp8 -- 8 1024 8096"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --kv-cache-dtype fp8 -- 8 8096 1024"
+
 
     # --- 480B FP8 EP ---
     # Matching fbcode benchmark_configs.json settings as closely as possible.
