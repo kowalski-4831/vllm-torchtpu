@@ -214,7 +214,15 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
         activation_str = layer._tpu_activation_str
-        if layer.moe_config.moe_parallel_config.use_ep:
+        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        if custom_routing_fn is not None:
+            topk_weights, topk_ids = custom_routing_fn(
+                hidden_states=x,
+                gating_output=router_logits,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+            )
+        elif layer.moe_config.moe_parallel_config.use_ep:
             if layer.expert_map is None:
                 raise ValueError("EP path requires layer.expert_map.")
             topk_weights, topk_ids = select_experts_ep(
