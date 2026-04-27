@@ -1532,23 +1532,20 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
+            # TODO: concatenate the LogprobsTensors (torch) first, then
+            # call .tolists() once to match the GPU path and avoid the
+            # per-chunk numpy round-trip.
             combined_logprobs_lists = []
             for i in range(len(combined_logprobs)):
                 logprobs = combined_logprobs[i].tolists()
                 combined_logprobs_lists.append(logprobs)
 
-            def concat_lists(input_lists):
-                result = []
-                for input_list in input_lists:
-                    result.extend(input_list)
-                return result
-
             logprobs_lists = LogprobsLists(
-                logprob_token_ids=concat_lists(
+                logprob_token_ids=np.concatenate(
                     [lp.logprob_token_ids for lp in combined_logprobs_lists]),
-                logprobs=concat_lists(
+                logprobs=np.concatenate(
                     [lp.logprobs for lp in combined_logprobs_lists]),
-                sampled_token_ranks=concat_lists([
+                sampled_token_ranks=np.concatenate([
                     lp.sampled_token_ranks for lp in combined_logprobs_lists
                 ]),
             )

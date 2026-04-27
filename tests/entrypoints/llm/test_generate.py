@@ -8,6 +8,7 @@ Tests include:
 - Multiple sampling parameters
 - Priority queue handling
 - Max model length enforcement
+- Logprobs serialization
 - Statistics logging
 
 For TP tests, see test_generate_tp.py.
@@ -134,6 +135,15 @@ def test_max_model_len(llm: LLM):
         # It can be less if generation finishes due to other reasons (e.g., EOS)
         # before reaching the absolute model length limit.
         assert num_total_tokens <= max_model_len
+
+
+def test_logprobs(llm: LLM):
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=4, logprobs=1)
+    outputs = llm.generate(PROMPTS, sampling_params=sampling_params)
+    assert len(PROMPTS) == len(outputs)
+    for output in outputs:
+        assert output.outputs[0].logprobs is not None
+        assert len(output.outputs[0].logprobs) > 0
 
 
 def test_log_stats(llm: LLM):
