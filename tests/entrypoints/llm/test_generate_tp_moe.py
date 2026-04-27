@@ -71,8 +71,10 @@ def _run_moe_generation(async_scheduling: bool,
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("async_scheduling", [False, True],
-                         ids=["sync", "async"])
+@pytest.mark.parametrize("async_scheduling", [
+    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+    pytest.param(True, id="async"),
+])
 def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     tp_size, outputs = _run_moe_generation(async_scheduling=async_scheduling)
     _print_generation_outputs(
@@ -85,8 +87,10 @@ def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("async_scheduling", [False, True],
-                         ids=["sync", "async"])
+@pytest.mark.parametrize("async_scheduling", [
+    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+    pytest.param(True, id="async"),
+])
 def test_moe_generate_with_ep_equal_local_tpu_count(async_scheduling: bool):
     tp_size, outputs = _run_moe_generation(
         async_scheduling=async_scheduling,

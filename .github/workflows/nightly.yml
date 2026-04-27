@@ -122,3 +122,4 @@ jobs:
     with:
       halt-for-connection: ${{ inputs.halt-for-connection }}
       wheel-gcs-path: ${{ needs.build.outputs.gcs_path }}
+      nightly: 'yes'

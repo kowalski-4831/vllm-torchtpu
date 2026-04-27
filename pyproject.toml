@@ -53,6 +53,11 @@ benchmarking = [
     "pandas",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "nightly: tests that only run in the nightly CI workflow",
+]
+
 [tool.setuptools]
 include-package-data = true
 

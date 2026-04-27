@@ -25,8 +25,10 @@ def _get_local_tpu_chip_count() -> int:
         pytest.skip(f"Unable to detect local TPU chip count: {e}")
 
 
-@pytest.mark.parametrize("async_scheduling", [False, True],
-                         ids=["sync", "async"])
+@pytest.mark.parametrize("async_scheduling", [
+    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+    pytest.param(True, id="async"),
+])
 def test_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     tp_size = _get_local_tpu_chip_count()
 
