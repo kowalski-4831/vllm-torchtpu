@@ -417,16 +417,28 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         pass
 
     def maybe_setup_kv_connector(self, scheduler_output) -> None:
-        # TODO: Prefill/decode KV connector support is still WIP on TPU.
-        # Keep this hook so the old call site stays aligned with upstream flow.
-        del scheduler_output
+        if not has_kv_transfer_group():
+            return
+        kv_connector = get_kv_transfer_group()
+        assert scheduler_output.kv_connector_metadata is not None
+        kv_connector.bind_connector_metadata(
+            scheduler_output.kv_connector_metadata)
+        # forward_context is unused by TPUConnector; pass None.
+        kv_connector.start_load_kv(None)
 
     def maybe_wait_for_kv_save(self) -> None:
-        pass
+        if has_kv_transfer_group():
+            get_kv_transfer_group().wait_for_save()
 
     def get_finished_kv_transfers(self, scheduler_output):
-        del scheduler_output
-        return None, None
+        if not has_kv_transfer_group():
+            return None, None
+        kv_connector = get_kv_transfer_group()
+        finished = kv_connector.get_finished(scheduler_output.finished_req_ids)
+        # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
+        # metadata is bound per-step and must be cleared after use.
+        kv_connector.clear_connector_metadata()
+        return finished
 
     def _get_requested_tp_size(self) -> int:
         # This integration supports TP>1 only via vLLM native multiprocess
@@ -1394,11 +1406,6 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 return EMPTY_MODEL_RUNNER_OUTPUT
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
-        if has_kv_transfer_group():
-            raise NotImplementedError(
-                "TPU KV connector support is only implemented for no-forward "
-                "transfer-only steps. Forward batches with an active KV "
-                "connector are not supported yet.")
 
         mm_embed_inputs = self.mm_embed_inputs
         self.mm_embed_inputs = None
@@ -2034,8 +2041,15 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # xs.mark_sharding(cache, self.mesh, (None, "x", None, None))
 
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
-            get_kv_transfer_group().set_host_xfer_buffer_ops(copy_kv_blocks)
+            kv_connector = get_kv_transfer_group()
+            kv_connector.register_kv_caches(kv_caches)
+            # TPUConnector reads runner.kv_caches lazily and doesn't need
+            # set_host_xfer_buffer_ops; only call it on connectors that
+            # expose it.
+            if hasattr(kv_connector, "set_host_xfer_buffer_ops"):
+                kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
+            if hasattr(kv_connector, "register_runner"):
+                kv_connector.register_runner(self)
 
     def reset_dynamo_cache(self):
         # NOTE: We check `is_multimodal_model` instead of `supports_mm_inputs`
