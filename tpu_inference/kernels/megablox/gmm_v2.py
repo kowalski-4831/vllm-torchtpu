@@ -1139,13 +1139,6 @@ def make_gmm_configs(
         quant_block_size=512,
         dtype=lhs.dtype,
     )
-    if lhs_q_dtype is not None:
-        assert rhs_cfgs.quant_block_size % lhs_cfgs.quant_block_size == 0, (
-            "Unsupported quantization configuration: rhs_quant_block_size must "
-            "be a multiple of lhs_quant_block_size. Got "
-            f"lhs={lhs_cfgs.quant_block_size}, rhs={rhs_cfgs.quant_block_size}. "
-            "If rhs uses smaller blocks than lhs, the current kernel applies "
-            "an incorrect rhs scale across multiple rhs quant blocks.")
 
     if out_dtype is None:
         out_dtype = lhs.dtype

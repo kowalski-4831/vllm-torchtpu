@@ -52,6 +52,13 @@ jobs:
       UV_NO_CACHE: "1"
 
     steps:
+      - name: Redirect torch_tpu cache off /dev/shm
+        run: |
+          # /dev/shm is too small on K8s runners; symlink to disk so the
+          # tier-2 compilation cache still works without filling tmpfs.
+          mkdir -p /tmp/torch_tpu_cache
+          ln -sfn /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
+
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
 
       - name: Mark git directory as safe

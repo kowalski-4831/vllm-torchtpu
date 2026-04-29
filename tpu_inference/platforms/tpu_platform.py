@@ -101,7 +101,7 @@ class TpuPlatform(Platform):
     _enum = PlatformEnum.TPU
     device_name: str = "tpu"
     device_type: str = "tpu"
-    dispatch_key: str = "PrivateUse1"
+    dispatch_key: str = "XLA"
     ray_device_key: str = "TPU"
     dist_backend: str = "tpu_dist"
     device_control_env_var: str = "TPU_VISIBLE_CHIPS"

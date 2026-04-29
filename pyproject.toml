@@ -51,6 +51,8 @@ benchmarking = [
     "rouge-score",
     "scikit-learn",
     "pandas",
+    "lm-eval[api]",
+    "evalplus",
 ]
 
 [tool.pytest.ini_options]

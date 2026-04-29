@@ -4,16 +4,16 @@
 # combo, saves results locally.
 #
 # Usage:
-#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--dry-run]
+#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--dry-run] [--keep-alive]
 #
 # Examples:
 #   ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-0.6b-smoke
 #   ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-coder-480b-fp8-tp8-ep
 #
 # Available configs (in scripts/vllm/benchmarking/configs/):
-#   qwen3-coder-480b-fp8-tp8-ep  - Primary target (TP=8, EP, FP8)
-#   qwen3-30b-fp8-tp4            - Smaller MoE model (TP=4, FP8)
-#   qwen3-0.6b-smoke             - Quick smoke test (TP=1, no quant)
+#   qwen3-coder-480b-fp8-tp8-ep  - Nightly target (TP=8, EP, FP8)
+#   qwen3-coder-30b-tp8-ep       - Guard: Qwen3-Coder-30B-A3B-Instruct (TP=8, EP)
+#   qwen3-coder-30b-fp8-tp8-ep   - Guard: Qwen3-Coder-30B-A3B-Instruct-FP8 (TP=8, EP)
 
 set -euo pipefail
 
@@ -25,6 +25,8 @@ REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # =============================================================================
 CONFIG_NAME="qwen3-coder-480b-fp8-tp8-ep"
 DRY_RUN=0
+RESULTS_DIR_OVERRIDE="${RESULTS_DIR:-}"
+KEEP_ALIVE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -32,14 +34,22 @@ while [[ $# -gt 0 ]]; do
             CONFIG_NAME="$2"
             shift 2
             ;;
+        --results-dir)
+            RESULTS_DIR_OVERRIDE="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=1
             echo "*** DRY RUN MODE: commands will be printed but not executed ***"
             shift
             ;;
+        --keep-alive)
+            KEEP_ALIVE=1
+            shift
+            ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--config CONFIG_NAME] [--dry-run]"
+            echo "Usage: $0 [--config CONFIG_NAME] [--results-dir DIR] [--dry-run] [--keep-alive]"
             exit 1
             ;;
     esac
@@ -65,6 +75,7 @@ QUANTIZATION=""
 ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
 RANDOM_RANGE_RATIO=""
+BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
@@ -75,6 +86,10 @@ if [ -z "$MODEL" ]; then
 fi
 if [ -z "$RANDOM_RANGE_RATIO" ]; then
     echo "ERROR: Config must set RANDOM_RANGE_RATIO"
+    exit 1
+fi
+if ! [[ "$BENCHMARK_WARMUP_RUNS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: BENCHMARK_WARMUP_RUNS must be a non-negative integer"
     exit 1
 fi
 
@@ -92,7 +107,11 @@ echo "Using benchmark tool: vllm bench serve"
 # =============================================================================
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 safe_model=$(echo "$MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')
-RESULTS_DIR="$REPO_DIR/benchmark_runs/${safe_model}_tp${TENSOR_PARALLELISM}_${TIMESTAMP}"
+if [ -n "$RESULTS_DIR_OVERRIDE" ]; then
+    RESULTS_DIR="$RESULTS_DIR_OVERRIDE"
+else
+    RESULTS_DIR="$REPO_DIR/benchmark_runs/${safe_model}_tp${TENSOR_PARALLELISM}_${TIMESTAMP}"
+fi
 mkdir -p "$RESULTS_DIR"
 log_file="$RESULTS_DIR/benchmark.log"
 
@@ -136,8 +155,7 @@ start_vllm_server() {
     $server_cmd >> "$RESULTS_DIR/server.log" 2>&1 &
     SERVER_PID=$!
     echo "Server started (pid=$SERVER_PID)"
-    tail -f "$RESULTS_DIR/server.log" &
-    TAIL_PID=$!
+    echo "Server log: $RESULTS_DIR/server.log"
 
     # Wait for server to be ready (up to 90 minutes for large model compilation)
     local max_wait=$((90 * 60))
@@ -169,6 +187,11 @@ stop_vllm_server() {
     if [ "$DRY_RUN" = "1" ]; then
         return
     fi
+    if [ "$KEEP_ALIVE" = "1" ]; then
+        echo ""
+        echo "Keeping vLLM server alive in background (--keep-alive)."
+        return
+    fi
     echo ""
     echo "Stopping vLLM server..."
     pkill -TERM -f "vllm serve" 2>/dev/null || true
@@ -178,8 +201,37 @@ stop_vllm_server() {
     pkill -9 -f "vllm\.entrypoints" 2>/dev/null || true
     sleep 2
     rm -f /tmp/libtpu_lockfile*
-    kill "$TAIL_PID" 2>/dev/null || true
     echo "Server stopped."
+}
+
+run_benchmark_once() {
+    local input_len=$1
+    local output_len=$2
+    local concurrency=$3
+    local result_file=$4
+    local bench_log=$5
+
+    set +e
+    vllm bench serve \
+        --backend vllm \
+        --model "$MODEL" \
+        --host localhost \
+        --port "$PORT" \
+        --dataset-name random \
+        --random-input-len "$input_len" \
+        --random-output-len "$output_len" \
+        --random-range-ratio "$RANDOM_RANGE_RATIO" \
+        --num-prompts 320 \
+        --max-concurrency "$concurrency" \
+        --request-rate inf \
+        --save-result \
+        --ignore-eos \
+        --result-filename "$result_file" \
+        --seed 42 2>&1 | tee -a "$bench_log"
+    local bench_exit=${PIPESTATUS[0]}
+    set -e
+
+    return "$bench_exit"
 }
 
 # =============================================================================
@@ -199,6 +251,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "quantization": "${QUANTIZATION:-none}",
     "isl_osl_configs": "$ISL_OSL_CONFIGS",
     "concurrency_options": "$CONCURRENCY_OPTIONS",
+    "benchmark_warmup_runs": $BENCHMARK_WARMUP_RUNS,
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,
@@ -217,6 +270,7 @@ echo "  Model: $MODEL"
 echo "  TP=$TENSOR_PARALLELISM DP=$DATA_PARALLELISM EP=$ENABLE_EP"
 echo "  ISL/OSL: $ISL_OSL_CONFIGS"
 echo "  Concurrency: $CONCURRENCY_OPTIONS"
+echo "  Benchmark warmup runs: $BENCHMARK_WARMUP_RUNS"
 echo "  Results: $RESULTS_DIR"
 echo "================================================"
 
@@ -237,8 +291,12 @@ start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
 
 exit_code=0
 
-for config in $ISL_OSL_CONFIGS; do
-    IFS=':' read -r input_len output_len <<< "$config"
+for isl_osl_config in $ISL_OSL_CONFIGS; do
+    IFS=':' read -r input_len output_len <<< "$isl_osl_config"
+    if [ -z "$input_len" ] || [ -z "$output_len" ]; then
+        echo "ERROR: Invalid ISL/OSL config: $isl_osl_config"
+        exit 1
+    fi
     total=$((input_len + output_len))
     if [ "$total" -gt "$max_model_len" ]; then
         echo "Skipping isl${input_len}_osl${output_len} (total=$total > max_model_len=$max_model_len)"
@@ -261,25 +319,37 @@ for config in $ISL_OSL_CONFIGS; do
             continue
         fi
 
-        vllm bench serve \
-            --backend vllm \
-            --model "$MODEL" \
-            --host localhost \
-            --port "$PORT" \
-            --dataset-name random \
-            --random-input-len "$input_len" \
-            --random-output-len "$output_len" \
-            --random-range-ratio "$RANDOM_RANGE_RATIO" \
-            --num-prompts 320 \
-            --max-concurrency "$concurrency" \
-            --request-rate inf \
-            --save-result \
-            --ignore-eos \
-            --result-filename "$result_file" \
-            --seed 42 \
-            --temperature 0 2>&1 | tee -a "$bench_log"
+        for ((warmup_idx = 1; warmup_idx <= BENCHMARK_WARMUP_RUNS; warmup_idx++)); do
+            warmup_file="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.json"
+            warmup_log="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.log"
+            echo "    Warmup run $warmup_idx/$BENCHMARK_WARMUP_RUNS"
+            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log"; then
+                warmup_exit=0
+            else
+                warmup_exit=$?
+            fi
+            if [ "$warmup_exit" -ne 0 ]; then
+                echo "    WARMUP FAILED (exit $warmup_exit)"
+                exit_code=$warmup_exit
+                if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                    echo "ERROR: Server died during benchmark warmup"
+                    tail -50 "$RESULTS_DIR/server.log"
+                    break 3
+                fi
+                break
+            fi
+            echo "    Warmup OK -> $warmup_file"
+        done
 
-        bench_exit=${PIPESTATUS[0]}
+        if [ "$exit_code" -ne 0 ]; then
+            continue
+        fi
+
+        if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$result_file" "$bench_log"; then
+            bench_exit=0
+        else
+            bench_exit=$?
+        fi
         if [ "$bench_exit" -eq 0 ]; then
             echo "    OK -> $result_file"
         else
