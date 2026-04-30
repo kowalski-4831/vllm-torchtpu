@@ -98,12 +98,12 @@ jobs:
 
       - name: Install vLLM from source (TPU)
         run: |
-          git clone --depth 1 --branch v0.17.1 https://github.com/vllm-project/vllm.git /tmp/vllm
+          git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git /tmp/vllm
           cd /tmp/vllm
           sed -i '/tpu-inference/d' requirements/tpu.txt
           uv pip install -r requirements/tpu.txt
           # --no-build-isolation avoids creating a temp venv with duplicate build deps (~GBs)
-          SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
+          SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
           rm -rf /tmp/vllm
           rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
           echo "Disk usage after vLLM install:" && df -h .

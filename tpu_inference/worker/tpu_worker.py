@@ -60,6 +60,11 @@ class TPUWorker:
         self.parallel_config.rank = rank
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
+
+        # TPU compilation requires static shapes, so we clear any dynamic
+        # compile ranges that vLLM might have added.
+        self.compilation_config.compile_ranges_endpoints = []
+
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method

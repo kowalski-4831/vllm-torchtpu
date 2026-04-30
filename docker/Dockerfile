@@ -8,7 +8,7 @@
 # Meta-internal registry (used when we can't push to the public registry):
 # ARG BASE_IMAGE="us-central1-docker.pkg.dev/meta-tpu-rbbq5/zongwei-repo/torchtpu:colin2328-latest"
 ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu:nightly-latest"
-ARG VLLM_COMMIT_HASH="v0.17.1"
+ARG VLLM_COMMIT_HASH="v0.19.0"
 
 FROM $BASE_IMAGE
 

@@ -54,14 +54,15 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
                                                         FusedMoEMethodBase)
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import \
+    Mxfp4MoeBackend as Mxfp4Backend
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizeMethodBase
-from vllm.model_executor.layers.quantization.mxfp4 import (Mxfp4Backend,
-                                                           Mxfp4Config,
+from vllm.model_executor.layers.quantization.mxfp4 import (Mxfp4Config,
                                                            Mxfp4MoEMethod)
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped

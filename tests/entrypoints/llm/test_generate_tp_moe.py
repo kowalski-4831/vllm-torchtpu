@@ -61,7 +61,9 @@ def _run_moe_generation(async_scheduling: bool,
     try:
         outputs = llm.generate(
             MOE_PROMPTS,
-            sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
+            sampling_params=SamplingParams(temperature=0.0,
+                                           max_tokens=4,
+                                           ignore_eos=True),
         )
     finally:
         del llm
