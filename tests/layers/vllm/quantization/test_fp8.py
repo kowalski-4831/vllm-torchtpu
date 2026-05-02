@@ -301,6 +301,105 @@ class TestFp8WeightTranspose:
         assert torch.all(w13_deinterleaved[:, :inter, :] == 1.0)
         assert torch.all(w13_deinterleaved[:, inter:, :] == 2.0)
 
+    def test_swigluoai_deinterleave_scale(self, device):
+        """swigluoai should de-interleave w13_scale to match w13."""
+        E, inter = 2, 128
+
+        # Create scale with known interleaved pattern: one scale per row
+        w13_scale = torch.zeros(E, 2 * inter, 1, device=device)
+        w13_scale[:, ::2, :] = 1.0  # w1 scales
+        w13_scale[:, 1::2, :] = 2.0  # w3 scales
+
+        s1 = w13_scale[:, ::2, :]
+        s3 = w13_scale[:, 1::2, :]
+        w13_scale_deinterleaved = torch.cat([s1, s3], dim=1)
+
+        # First half should be w1 scales (1.0), second half w3 scales (2.0)
+        assert torch.all(w13_scale_deinterleaved[:, :inter, :] == 1.0)
+        assert torch.all(w13_scale_deinterleaved[:, inter:, :] == 2.0)
+
+
+class TestOnlineFp8Quantization:
+    """Tests for _quantize_bf16_moe_weights."""
+
+    def test_roundtrip_error(self, device):
+        """FP8 quantize -> dequantize should have small error."""
+        E, inter, H = 4, 64, 128
+        w13 = torch.randn(E, 2 * inter, H, device=device, dtype=torch.float32)
+
+        from tpu_inference.layers.common.quantization import quantize_tensor
+
+        w13_q, w13_s = quantize_tensor(w13,
+                                       quant_dtype=torch.float8_e4m3fn,
+                                       axis=-1)
+        w13_deq = w13_q.to(torch.float32) * w13_s
+
+        rel_err = (w13 - w13_deq).abs().mean() / (w13.abs().mean() + 1e-8)
+        assert rel_err < 0.05, f"Roundtrip relative error too high: {rel_err:.4f}"
+
+    def test_output_shapes(self, device):
+        """_quantize_bf16_moe_weights should produce correct shapes."""
+        from unittest.mock import MagicMock
+
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        from tpu_inference.layers.vllm.quantization.fp8 import \
+            _quantize_bf16_moe_weights
+
+        E, inter, H = 4, 64, 128
+        layer = MagicMock(spec=FusedMoE)
+        layer.w13_weight = torch.nn.Parameter(
+            torch.randn(E, 2 * inter, H, dtype=torch.bfloat16))
+        layer.w2_weight = torch.nn.Parameter(
+            torch.randn(E, H, inter, dtype=torch.bfloat16))
+
+        w13, w13_s, w2, w2_s, dtype_name, block_size = (
+            _quantize_bf16_moe_weights(layer, activation="silu"))
+
+        # Weights should be transposed: [E, in, out]
+        assert w13.shape == (E, H, 2 * inter)
+        assert w2.shape == (E, inter, H)
+        assert w13.dtype == torch.float8_e4m3fn
+        assert w2.dtype == torch.float8_e4m3fn
+
+        # Scales should be 4D: [E, num_blocks, 1, N]
+        assert w13_s.shape == (E, 1, 1, 2 * inter)
+        assert w2_s.shape == (E, 1, 1, H)
+        assert w13_s.dtype == torch.float32
+
+    def test_custom_routing_called(self, device):
+        """FP8 apply_monolithic should use custom_routing_function when present."""
+        from unittest.mock import MagicMock, patch
+
+        from tpu_inference.layers.vllm.quantization.fp8 import \
+            VllmFp8MoEMethodTPU
+
+        # Create mock layer with custom routing
+        layer = MagicMock()
+        layer._tpu_activation_str = "silu"
+        layer.moe_config.experts_per_token = 2
+        layer.moe_config.moe_parallel_config.use_ep = False
+        layer.renormalize = True
+
+        mock_routing = MagicMock(
+            return_value=(torch.ones(4, 2),
+                          torch.zeros(4, 2, dtype=torch.int32)))
+        layer.custom_routing_function = mock_routing
+
+        method = MagicMock(spec=VllmFp8MoEMethodTPU)
+        x = torch.randn(4, 64, dtype=torch.bfloat16)
+        router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
+
+        # Call the real apply_monolithic
+        with patch(
+                "tpu_inference.layers.vllm.quantization.fp8.fused_moe_gmm",
+                return_value=x,
+        ):
+            VllmFp8MoEMethodTPU.apply_monolithic(method, layer, x,
+                                                 router_logits)
+
+        mock_routing.assert_called_once()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

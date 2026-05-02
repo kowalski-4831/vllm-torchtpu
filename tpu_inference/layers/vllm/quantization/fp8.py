@@ -60,8 +60,7 @@ from tpu_inference.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
 from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
-from tpu_inference.layers.vllm.moe_routing import (select_experts,
-                                                   select_experts_ep)
+from tpu_inference.layers.vllm.moe_routing import mask_for_ep, select_experts
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -110,18 +109,9 @@ def _dequantize_fp8_linear(
     return weight_bf16
 
 
-def _process_fp8_moe_weights(
-    layer: FusedMoE,
-    *,
-    weight_block_size: tuple[int, int],
-    activation: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
-           | None]:
-    """Dequantize and requantize FP8 MoE weights for the TPU GMM kernel.
-
-    Returns (w13_weight, w13_scale, w2_weight, w2_scale,
-             requant_dtype_name, requant_block_size).
-    """
+def _get_moe_quant_config(
+    log_prefix: str, ) -> tuple[str, torch.dtype, int | None]:
+    """Parse MoE quantization env vars and return (dtype_name, dtype, block_size)."""
     if desired_quant_dtype_from_env := envs.MOE_REQUANTIZE_WEIGHT_DTYPE:
         desired_quant_dtype = desired_quant_dtype_from_env
     else:
@@ -139,12 +129,82 @@ def _process_fp8_moe_weights(
             "Unsupported MOE_REQUANTIZE_WEIGHT_DTYPE="
             f"{desired_quant_dtype!r}. Supported values: {supported}.")
 
-    moe_logging_str = (
-        f"[MoE requantization]: re-quantizing MoE weights to {desired_quant_dtype}"
-    )
+    msg = f"{log_prefix} to {desired_quant_dtype}"
     if requant_block_size is not None:
-        moe_logging_str += f" with block size {requant_block_size}"
-    logger.info_once(moe_logging_str)
+        msg += f" with block size {requant_block_size}"
+    logger.info_once(msg)
+
+    return desired_quant_dtype, requant_dtype, requant_block_size
+
+
+def _quantize_and_format_moe_weights(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    quant_dtype: torch.dtype,
+    block_size: int | None,
+    activation: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize float32 MoE weights to FP8 and format for the GMM kernel.
+
+    Handles block alignment validation, quantization, swigluoai
+    deinterleaving, transpose, and scale reshaping.
+    """
+    if block_size is not None:
+        for name, w in (("w13", w13), ("w2", w2)):
+            if w.shape[-1] % block_size != 0:
+                raise ValueError(
+                    f"Unsupported MoE quantization: {name} contracting "
+                    f"dimension {w.shape[-1]} is not divisible by "
+                    f"block_size={block_size}.")
+
+    w13, w13_scale = quantize_tensor(w13,
+                                     quant_dtype=quant_dtype,
+                                     axis=-1,
+                                     block_size=block_size)
+    w2, w2_scale = quantize_tensor(w2,
+                                   quant_dtype=quant_dtype,
+                                   axis=-1,
+                                   block_size=block_size)
+
+    if activation == "swigluoai":
+        w1 = w13[:, ::2, :]
+        w3 = w13[:, 1::2, :]
+        w13 = torch.cat([w1, w3], dim=1)
+
+        if w13_scale is not None:
+            s1 = w13_scale[:, ::2, :]
+            s3 = w13_scale[:, 1::2, :]
+            w13_scale = torch.cat([s1, s3], dim=1)
+
+    w13 = w13.transpose(1, 2).contiguous()
+    w2 = w2.transpose(1, 2).contiguous()
+
+    if w13_scale is not None:
+        w13_scale = w13_scale.transpose(1, 2).contiguous()
+        w13_scale = w13_scale.unsqueeze(2).to(torch.float32)
+    if w2_scale is not None:
+        w2_scale = w2_scale.transpose(1, 2).contiguous()
+        w2_scale = w2_scale.unsqueeze(2).to(torch.float32)
+
+    return w13, w13_scale, w2, w2_scale
+
+
+def _process_fp8_moe_weights(
+    layer: FusedMoE,
+    *,
+    weight_block_size: tuple[int, int],
+    activation: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
+           | None]:
+    """Dequantize and requantize FP8 MoE weights for the TPU GMM kernel.
+
+    Returns (w13_weight, w13_scale, w2_weight, w2_scale,
+             requant_dtype_name, requant_block_size).
+    """
+    desired_quant_dtype, requant_dtype, requant_block_size = (
+        _get_moe_quant_config(
+            "[MoE requantization]: re-quantizing MoE weights"))
 
     # Validate block alignment
     block_h, block_w = weight_block_size
@@ -171,47 +231,41 @@ def _process_fp8_moe_weights(
         out_dtype=torch.float32,
     )
 
-    # Requantize to runtime format
-    if requant_block_size is not None:
-        if w13.shape[-1] % requant_block_size != 0:
-            raise ValueError(
-                "Unsupported MoE requantization configuration: w13 contracting "
-                f"dimension {w13.shape[-1]} is not divisible by "
-                f"block_size={requant_block_size}. Padding is not implemented yet."
-            )
-        if w2.shape[-1] % requant_block_size != 0:
-            raise ValueError(
-                "Unsupported MoE requantization configuration: w2 contracting "
-                f"dimension {w2.shape[-1]} is not divisible by "
-                f"block_size={requant_block_size}. Padding is not implemented yet."
-            )
+    w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
+        w13,
+        w2,
+        quant_dtype=requant_dtype,
+        block_size=requant_block_size,
+        activation=activation,
+    )
 
-    w13, w13_scale = quantize_tensor(w13,
-                                     quant_dtype=requant_dtype,
-                                     axis=-1,
-                                     block_size=requant_block_size)
-    w2, w2_scale = quantize_tensor(w2,
-                                   quant_dtype=requant_dtype,
-                                   axis=-1,
-                                   block_size=requant_block_size)
+    return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
-    # Deinterleave w1/w3 if activation is swigluoai
-    if activation == "swigluoai":
-        w1 = w13[:, ::2, :]
-        w3 = w13[:, 1::2, :]
-        w13 = torch.cat([w1, w3], dim=1)
 
-    # Transpose to [experts, in_dim, out_dim] for GMM kernel
-    w13 = w13.transpose(1, 2).contiguous()
-    w2 = w2.transpose(1, 2).contiguous()
+def _quantize_bf16_moe_weights(
+    layer: FusedMoE,
+    *,
+    activation: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
+           | None]:
+    """Quantize BF16 MoE weights to FP8 for the TPU GMM kernel.
 
-    # Reshape scales for GMM kernel
-    if w13_scale is not None:
-        w13_scale = w13_scale.transpose(1, 2).contiguous()
-        w13_scale = w13_scale.unsqueeze(2).to(torch.float32)
-    if w2_scale is not None:
-        w2_scale = w2_scale.transpose(1, 2).contiguous()
-        w2_scale = w2_scale.unsqueeze(2).to(torch.float32)
+    Same output format as _process_fp8_moe_weights but starts from BF16
+    weights instead of dequantizing from FP8 first.
+    """
+    desired_quant_dtype, requant_dtype, requant_block_size = (
+        _get_moe_quant_config("[MoE online FP8]: quantizing BF16 MoE weights"))
+
+    w13 = layer.w13_weight.data.to(torch.float32)
+    w2 = layer.w2_weight.data.to(torch.float32)
+
+    w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
+        w13,
+        w2,
+        quant_dtype=requant_dtype,
+        block_size=requant_block_size,
+        activation=activation,
+    )
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
@@ -238,11 +292,8 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                     VllmUnquantizedFusedMoEMethod
                 moe_config = self.get_moe_config(layer)
                 return VllmUnquantizedFusedMoEMethod(moe_config)
-            if self.is_checkpoint_fp8_serialized:
-                moe_config = self.get_moe_config(layer)
-                return VllmFp8MoEMethodTPU(self, moe_config)
-            raise NotImplementedError(
-                "Online FP8 quantization not supported on TPU.")
+            moe_config = self.get_moe_config(layer)
+            return VllmFp8MoEMethodTPU(self, moe_config)
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
@@ -253,8 +304,11 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 return UnquantizedLinearMethod()
             if self.is_checkpoint_fp8_serialized:
                 return VllmFp8LinearMethodTPU(self)
-            raise NotImplementedError(
-                "Online FP8 quantization not supported on TPU.")
+            logger.info_once(
+                "BF16 checkpoint with --quantization fp8: linear layers "
+                "will run in BF16 (online FP8 linear quantization not "
+                "yet implemented on TPU).")
+            return UnquantizedLinearMethod()
 
         if isinstance(layer, Attention):
             return None
@@ -264,11 +318,10 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
 
 class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     """
-    TPU-native FP8 MoE method for block-quantized FP8 models.
+    TPU-native FP8 MoE method.
 
-    Delegates create_weights() to Fp8MoEMethod for correct FP8 parameter
-    allocation, then converts checkpoint MoE weights into the runtime FP8 rhs
-    format expected by the TPU GMM kernel.
+    Supports both FP8-serialized checkpoints (dequant → requant) and BF16
+    checkpoints (online quantization to FP8 at load time).
 
     Uses is_monolithic=True so vLLM's DefaultMoERunner calls
     apply_monolithic(layer, x, router_logits) directly, bypassing the
@@ -284,6 +337,21 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                                   if self.block_quant else "weight_scale")
         self.fp8_backend = None
 
+    def create_weights(self, layer, num_experts, hidden_size,
+                       intermediate_size_per_partition, params_dtype,
+                       **extra_weight_attrs):
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            Fp8MoEMethod.create_weights(self, layer, num_experts, hidden_size,
+                                        intermediate_size_per_partition,
+                                        params_dtype, **extra_weight_attrs)
+        else:
+            from tpu_inference.layers.vllm.quantization.unquantized import \
+                VllmUnquantizedFusedMoEMethod
+            VllmUnquantizedFusedMoEMethod.create_weights(
+                self, layer, num_experts, hidden_size,
+                intermediate_size_per_partition, params_dtype,
+                **extra_weight_attrs)
+
     @property
     def is_monolithic(self) -> bool:
         return True
@@ -293,26 +361,36 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """
-        Process FP8 MoE weights into the runtime layout used by the GMM kernel.
+        Process MoE weights into the runtime FP8 layout used by the GMM kernel.
 
-        The checkpoint stores FP8 weights with 2D block scales. We first
-        dequantize those weights, then requantize them for the GMM runtime
-        format. By default the requantized rhs uses a single scale over the
-        contracting dimension.
+        For FP8 checkpoints: dequantize block FP8 → float32, then requantize
+        to the GMM kernel's expected per-channel FP8 format.
+
+        For BF16 checkpoints (online quantization): quantize BF16 → FP8
+        directly using the same requantization path.
         """
         assert isinstance(layer, FusedMoE)
-        assert self.block_quant, "TPU FP8 MoE path expects block-quantized weights."
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
         activation_str = _get_activation_str(layer.activation)
         layer._tpu_activation_str = activation_str
 
-        (w13, w13_scale, w2, w2_scale, requant_dtype_name,
-         requant_block_size) = _process_fp8_moe_weights(
-             layer,
-             weight_block_size=tuple(self.weight_block_size),
-             activation=activation_str,
-         )
+        is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
+        if is_fp8_serialized:
+            assert self.block_quant, \
+                "TPU FP8 MoE path expects block-quantized weights."
+            (w13, w13_scale, w2, w2_scale, requant_dtype_name,
+             requant_block_size) = _process_fp8_moe_weights(
+                 layer,
+                 weight_block_size=tuple(self.weight_block_size),
+                 activation=activation_str,
+             )
+        else:
+            (w13, w13_scale, w2, w2_scale, requant_dtype_name,
+             requant_block_size) = _quantize_bf16_moe_weights(
+                 layer,
+                 activation=activation_str,
+             )
 
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
@@ -351,16 +429,14 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
-        if layer.moe_config.moe_parallel_config.use_ep:
-            if layer.expert_map is None:
-                raise ValueError("EP path requires layer.expert_map.")
-            topk_weights, topk_ids = select_experts_ep(
+        # Step 1: Routing
+        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        if custom_routing_fn is not None:
+            topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
-                router_logits=router_logits,
-                expert_map=layer.expert_map,
+                gating_output=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
             )
         else:
             topk_weights, topk_ids = select_experts(
@@ -370,6 +446,12 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
             )
+
+        # Step 2: EP masking (map global expert IDs to local, zero non-local)
+        if layer.moe_config.moe_parallel_config.use_ep:
+            topk_weights, topk_ids = mask_for_ep(topk_weights, topk_ids,
+                                                 layer.expert_map)
+
         return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,

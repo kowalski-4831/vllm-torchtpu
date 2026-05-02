@@ -72,8 +72,7 @@ from tpu_inference.layers.common.quant_methods import (MXFP4,
 from tpu_inference.layers.common.quantization import dequantize_mxfp4_packed
 from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
-from tpu_inference.layers.vllm.moe_routing import (select_experts,
-                                                   select_experts_ep)
+from tpu_inference.layers.vllm.moe_routing import mask_for_ep, select_experts
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -259,16 +258,15 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = layer._tpu_activation_str
-        if layer.moe_config.moe_parallel_config.use_ep:
-            if layer.expert_map is None:
-                raise ValueError("EP path requires layer.expert_map.")
-            topk_weights, topk_ids = select_experts_ep(
+
+        # Step 1: Routing
+        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        if custom_routing_fn is not None:
+            topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
-                router_logits=router_logits,
-                expert_map=layer.expert_map,
+                gating_output=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
             )
         else:
             topk_weights, topk_ids = select_experts(
@@ -278,6 +276,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 renormalize=layer.renormalize,
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
             )
+
+        # Step 2: EP masking (map global expert IDs to local, zero non-local)
+        if layer.moe_config.moe_parallel_config.use_ep:
+            topk_weights, topk_ids = mask_for_ep(topk_weights, topk_ids,
+                                                 layer.expert_map)
+
         return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,

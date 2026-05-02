@@ -45,34 +45,15 @@ def select_experts(
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
-def select_experts_ep(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
+def mask_for_ep(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     expert_map: torch.Tensor,
-    *,
-    topk: int,
-    renormalize: bool,
-    scoring_fn: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute global routing, then keep only local experts for this EP rank."""
-    topk_weights, topk_ids = torch.topk(_apply_scoring_fn(
-        scoring_fn, router_logits),
-                                        k=topk,
-                                        dim=-1)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-    local_topk_ids = expert_map[topk_ids.to(torch.long)].to(torch.int32)
-    valid_mask = local_topk_ids >= 0
-    local_topk_weights = topk_weights.to(hidden_states.dtype)
-    local_topk_weights = torch.where(
-        valid_mask,
-        local_topk_weights,
-        torch.zeros_like(local_topk_weights),
-    )
-    local_topk_ids = torch.where(
-        valid_mask,
-        local_topk_ids,
-        torch.full_like(local_topk_ids, -1),
-    )
-    return local_topk_weights, local_topk_ids
+    """Map global expert IDs to local and zero non-local experts."""
+    local_ids = expert_map[topk_ids.to(torch.long)].to(torch.int32)
+    valid = local_ids >= 0
+    topk_weights = torch.where(valid, topk_weights,
+                               torch.zeros_like(topk_weights))
+    topk_ids = torch.where(valid, local_ids, torch.full_like(local_ids, -1))
+    return topk_weights, topk_ids

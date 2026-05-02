@@ -925,11 +925,20 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
     tile_m = min(tile_m, dims.size_m)
 
-    # Calculate vmem limit for a single rhs buffer when using triple buffers.
+    # Subtract non-rhs VMEM overhead (LHS tiles, acc buffers, spill headroom)
+    # before computing per-buffer budget. Matches msl-tpu-kernel's approach.
     num_rhs_buffers = 3
-    rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
+    lhs_bits_item = jax.dtypes.itemsize_bits(lhs_cfgs.dtype)
+    _overhead = (2 * tile_m * dims.size_k * lhs_bits_item // 8 +
+                 5 * 1024 * 1024)
+    rhs_vmem_budget = max(vmem_limit_bytes - _overhead, vmem_limit_bytes // 2)
+    rhs_vmem_target = rhs_vmem_budget // num_rhs_buffers
     base_rhs_size_bytes = (dims.size_k * dims.size_n * rhs_bits // 8 *
                            base_rhs_bytes_multiplier)
+    if rhs_cfgs.has_scale:
+        num_quant_blocks = pl.cdiv(dims.size_k, rhs_cfgs.quant_block_size)
+        base_rhs_size_bytes += (num_quant_blocks * dims.size_n * 4 *
+                                base_rhs_bytes_multiplier)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
@@ -1139,6 +1148,16 @@ def make_gmm_configs(
         quant_block_size=512,
         dtype=lhs.dtype,
     )
+    # For block quantization (num_blocks > 1), rhs block size must be a
+    # multiple of lhs block size. Per-channel quantization (num_blocks == 1)
+    # is always safe because a single scale covers the full contracting dim.
+    if lhs_q_dtype is not None and num_blocks > 1:
+        assert rhs_cfgs.quant_block_size % lhs_cfgs.quant_block_size == 0, (
+            "Unsupported quantization configuration: rhs_quant_block_size must "
+            "be a multiple of lhs_quant_block_size for block quantization. Got "
+            f"lhs={lhs_cfgs.quant_block_size}, rhs={rhs_cfgs.quant_block_size}. "
+            "If rhs uses smaller blocks than lhs, the current kernel applies "
+            "an incorrect rhs scale across multiple rhs quant blocks.")
 
     if out_dtype is None:
         out_dtype = lhs.dtype
