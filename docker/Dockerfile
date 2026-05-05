@@ -1,7 +1,8 @@
 # Dockerfile for torchtpu-vllm.
 # This Dockerfile builds an image for running vLLM on Google Cloud TPUs.
-# It uses a multi-stage build to "siphon" the torch-tpu wheel from a source image
-# and install it on top of a base image with necessary dependencies.
+# By default it installs torch-tpu from an artifact image.
+# With USE_TORCH_TPU_REGISTRY set, it installs torch-tpu from the private registry,
+# using TORCH_TPU_VERSION or the torch-tpu pin in pyproject.toml.
 
 ARG ARTIFACT_SOURCE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu:nightly-latest"
 ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
@@ -11,6 +12,9 @@ FROM $ARTIFACT_SOURCE AS artifact-source
 
 # Stage 2: The Runtime
 FROM $BASE_IMAGE
+
+ARG USE_TORCH_TPU_REGISTRY=""
+ARG TORCH_TPU_VERSION=""
 
 # Install curl for health checks
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
@@ -25,8 +29,8 @@ RUN pip install uv
 # Copy pyproject.toml to install dependencies
 COPY pyproject.toml .
 
-# Hide torch-tpu to allow resolution of other dependencies
-RUN sed -i '/torch-tpu==/d' pyproject.toml
+# Hide torch-tpu to allow resolution of other dependencies.
+RUN cp pyproject.toml /tmp/pyproject.toml && sed -i '/torch-tpu==/d' pyproject.toml
 
 ARG VLLM_SOURCE
 # Copy vllm source (might be empty if not provided)
@@ -45,14 +49,26 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     uv pip install --system --no-config --index-url https://pypi.org/simple .
 
-# NOW pull the fresh wheel from the other project's image
-# This is the cache-busting step!
-COPY --from=artifact-source /opt/wheels/*.whl /tmp/
-
-# Install the fresh torch-tpu wheel without dependencies (they are already installed)
+# Install torch-tpu either from a fresh artifact image or the pinned registry version.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --no-deps --no-config --index-url https://pypi.org/simple /tmp/*.whl && \
-    rm -rf /tmp/*.whl
+    --mount=type=secret,id=gcloud_token \
+    --mount=from=artifact-source,source=/,target=/artifact-source,ro \
+    set -eux; \
+    if [ -z "${USE_TORCH_TPU_REGISTRY}" ]; then \
+        set -- /artifact-source/opt/wheels/*.whl; \
+        if [ ! -e "$1" ]; then echo "No torch-tpu wheels found in ARTIFACT_SOURCE" >&2; exit 1; fi; \
+        uv pip install --system --no-deps --no-config --index-url https://pypi.org/simple "$@"; \
+    else \
+        if [ -z "${TORCH_TPU_VERSION}" ]; then TORCH_TPU_VERSION="$(sed -nE 's/^[[:space:]]*"torch-tpu==([^"]+)".*/\1/p' /tmp/pyproject.toml | head -n1)"; fi; \
+        if [ -z "${TORCH_TPU_VERSION}" ]; then echo "Could not resolve torch-tpu version from pyproject.toml" >&2; exit 1; fi; \
+        TOKEN=""; \
+        if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
+        if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
+        uv pip install --system --no-deps --no-config \
+          --index-url https://pypi.org/simple \
+          --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
+          "torch-tpu==${TORCH_TPU_VERSION}"; \
+    fi
 
 # Copy the rest of the source code (restores pyproject.toml)
 COPY . .
