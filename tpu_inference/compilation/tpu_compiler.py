@@ -21,6 +21,8 @@ from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 
+from tpu_inference import envs
+
 logger = logging.getLogger(__name__)
 
 # Type alias for the compile range tuple
@@ -35,6 +37,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "tpu_inference/layers/vllm/attention.py",
     "tpu_inference/layers/common/attention_interface.py",
     "tpu_inference/kernels/ragged_paged_attention/v3",
+    "tpu_inference/kernels/experimental/batched_rpa",
 )
 
 
@@ -122,6 +125,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         hash_obj.update(
             f"torch_tpu={getattr(torch_tpu, '__version__', 'unknown')}".encode(
             ))
+        hash_obj.update(
+            f"use_batched_rpa={envs.USE_BATCHED_RPA_KERNEL}".encode())
 
         for path in _iter_runtime_cache_key_files(repo_root):
             relpath = path.relative_to(repo_root).as_posix()

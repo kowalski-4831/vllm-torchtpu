@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     RAGGED_GATED_DELTA_RULE_IMPL: str = "ragged_gated_delta_rule_chunked"
+    USE_BATCHED_RPA_KERNEL: bool = False
 
 
 def env_with_choices(
@@ -142,6 +143,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices(
         "RAGGED_GATED_DELTA_RULE_IMPL", "ragged_gated_delta_rule_chunked",
         ["ragged_gated_delta_rule_ref", "ragged_gated_delta_rule_chunked"]),
+    # Switch attention_interface from the default RPA v3 kernel to the
+    # experimental batched RPA kernel under
+    # tpu_inference/kernels/experimental/batched_rpa/. Mirrors ullm's flag.
+    "USE_BATCHED_RPA_KERNEL":
+    lambda: bool(int(os.getenv("USE_BATCHED_RPA_KERNEL") or "0")),
 }
 
 

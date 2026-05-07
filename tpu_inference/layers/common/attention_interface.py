@@ -13,12 +13,24 @@ from jax.experimental.pallas.ops.tpu.splash_attention import \
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
+from tpu_inference import envs
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_megacore
+
+logger = init_logger(__name__)
+
+# NOTE: this kernel is experimental and not fully tested.  See
+# tpu_inference/kernels/experimental/batched_rpa/wrapper.py for details.
+if envs.USE_BATCHED_RPA_KERNEL:
+    import tpu_inference.kernels.experimental.batched_rpa.wrapper as rpa
+    logger.info_once("Using experimental batched RPA kernel")
+else:
+    import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
+    logger.info_once("Using default RPA kernel")
 
 MAX_ALLOWED_PAGE_INDICES_N = (
     128 * 1024

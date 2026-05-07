@@ -116,7 +116,7 @@ class TpuPlatform(Platform):
         "PHASED_PROFILING_DIR", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
         "NEW_MODEL_DESIGN", "MOE_REQUANTIZE_BLOCK_SIZE",
-        "MOE_REQUANTIZE_WEIGHT_DTYPE"
+        "MOE_REQUANTIZE_WEIGHT_DTYPE", "USE_BATCHED_RPA_KERNEL"
     ]
 
     @classmethod
@@ -314,6 +314,9 @@ class TpuPlatform(Platform):
                 min_page_size,
             )
             cache_config.block_size = min_page_size  # type: ignore[assignment]
+        if envs.USE_BATCHED_RPA_KERNEL and cache_config.block_size < 256:
+            cache_config.block_size = 256  # type: ignore[assignment]
+        logger.info("Using KV cache block size: %s", cache_config.block_size)
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
