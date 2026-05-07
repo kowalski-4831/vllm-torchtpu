@@ -14,6 +14,19 @@
 #   qwen3-coder-480b-fp8-tp8-ep  - Nightly target (TP=8, EP, FP8)
 #   qwen3-coder-30b-tp8-ep       - Guard: Qwen3-Coder-30B-A3B-Instruct (TP=8, EP)
 #   qwen3-coder-30b-fp8-tp8-ep   - Guard: Qwen3-Coder-30B-A3B-Instruct-FP8 (TP=8, EP)
+#
+# Profiler capture (diagnostic only):
+#   CAPTURE_PROFILE=1     turn on TPU/XProf trace capture for the bench window.
+#                         Server gets --profiler-config.profiler torch +
+#                         torch_profiler_dir + ignore_frontend (the last skips
+#                         AsyncLLM's CPU profiler we don't read). Bench gets
+#                         --profile so /start_profile and /stop_profile fire
+#                         around the main run; warmup runs aren't profiled.
+#                         --profile costs roughly +11% TTFT and −4% throughput,
+#                         so don't compare profile-on numbers to a non-profile
+#                         baseline. Prefer a single ISL/OSL case for clean
+#                         attribution. Recorded as capture_profile + profile_dir
+#                         in config.json.
 
 set -euo pipefail
 
@@ -115,6 +128,13 @@ fi
 mkdir -p "$RESULTS_DIR"
 log_file="$RESULTS_DIR/benchmark.log"
 
+# Resolve profile state once so config.json and start_vllm_server agree.
+PROFILE_DIR=""
+if [ "${CAPTURE_PROFILE:-0}" = "1" ]; then
+    PROFILE_DIR="$RESULTS_DIR/profile"
+    mkdir -p "$PROFILE_DIR"
+fi
+
 start_vllm_server() {
     local max_model_len=$1
     local max_num_batched_tokens=$2
@@ -132,6 +152,16 @@ start_vllm_server() {
 
     export PYTHONUNBUFFERED=1
     export MODEL_IMPL_TYPE=vllm
+
+    if [ -n "$PROFILE_DIR" ]; then
+        # tllm's worker reads VLLM_TORCH_PROFILER_DIR; the --profiler-config
+        # flags are what gate vllm's /start_profile endpoint and satisfy its
+        # ProfilerConfig validator. ignore_frontend skips the AsyncLLM CPU
+        # profiler (we only read the TPU xplane).
+        export VLLM_TORCH_PROFILER_DIR="$PROFILE_DIR"
+        extra_args="$extra_args --profiler-config.profiler torch --profiler-config.torch_profiler_dir $VLLM_TORCH_PROFILER_DIR --profiler-config.ignore_frontend true"
+        echo "Profiler capture enabled. Traces will be written to: $VLLM_TORCH_PROFILER_DIR"
+    fi
 
     local server_cmd="vllm serve --model=${MODEL} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling --no-enable-prefix-caching --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=fp8 $extra_args"
 
@@ -210,6 +240,12 @@ run_benchmark_once() {
     local concurrency=$3
     local result_file=$4
     local bench_log=$5
+    local is_warmup=${6:-0}
+
+    local profile_arg=""
+    if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ "$is_warmup" != "1" ]; then
+        profile_arg="--profile"
+    fi
 
     set +e
     vllm bench serve \
@@ -227,6 +263,7 @@ run_benchmark_once() {
         --save-result \
         --ignore-eos \
         --result-filename "$result_file" \
+        $profile_arg \
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
     set -e
@@ -240,6 +277,14 @@ run_benchmark_once() {
 max_model_len=10240
 max_batched_tokens=8192
 max_num_seqs=512
+
+# JSON-encode capture_profile + profile_dir for config.json.
+capture_profile_json=${CAPTURE_PROFILE:-0}
+if [ -n "$PROFILE_DIR" ]; then
+    profile_dir_json="\"$PROFILE_DIR\""
+else
+    profile_dir_json=null
+fi
 
 # Save config metadata
 cat > "$RESULTS_DIR/config.json" << EOF
@@ -255,6 +300,8 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,
+    "capture_profile": $capture_profile_json,
+    "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP"
 }
 EOF
@@ -323,7 +370,7 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
             warmup_file="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.json"
             warmup_log="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.log"
             echo "    Warmup run $warmup_idx/$BENCHMARK_WARMUP_RUNS"
-            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log"; then
+            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log" 1; then
                 warmup_exit=0
             else
                 warmup_exit=$?
