@@ -24,18 +24,15 @@ EXPERIMENTS=(
 
     # --- Qwen-30B 480B-FP8 ---
     # Configs used by Google for performance evaluation
-    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 1 -- 8 1024 1024"
-    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 1 -- 8 1024 8096"
-    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 1 -- 8 8096 1024"
-    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 8 --enable-expert-parallel -- 8 1024 1024"
-    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 8 --enable-expert-parallel -- 8 1024 8096"
-    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 8 --enable-expert-parallel -- 8 8096 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 1024 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 1024 8096"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 8096 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --kv-cache-dtype fp8 -- 8 1024 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --kv-cache-dtype fp8 -- 8 1024 8096"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --kv-cache-dtype fp8 -- 8 8096 1024"
+    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 1 --no-enable-prefix-caching -- 8 1024 1024"
+    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 1 --no-enable-prefix-caching -- 8 1024 8192"
+    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 1 --no-enable-prefix-caching -- 8 8192 1024"
+    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 8 --enable-expert-parallel --no-enable-prefix-caching -- 8 1024 1024"
+    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 8 --enable-expert-parallel --no-enable-prefix-caching -- 8 1024 8192"
+    # "Qwen/Qwen3-Coder-30B-A3B-Instruct 8 --enable-expert-parallel --no-enable-prefix-caching -- 8 8192 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --no-enable-prefix-caching --kv-cache-dtype fp8 -- 8 1024 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --no-enable-prefix-caching --kv-cache-dtype fp8 -- 8 1024 8192"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel --no-enable-prefix-caching --kv-cache-dtype fp8 -- 8 8192 1024"
 
 
     # --- 480B FP8 EP ---

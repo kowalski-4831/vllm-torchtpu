@@ -180,12 +180,30 @@ def _quantize_and_format_moe_weights(
     w13 = w13.transpose(1, 2).contiguous()
     w2 = w2.transpose(1, 2).contiguous()
 
+    # Reshape scales for GMM kernel.
+    # An `unsqueeze(2)` view on a TPU tensor leaves the persistent
+    # nn.Parameter carrying ambiguous strides (stride[1] == stride[2]) that
+    # torch_tpu's per-op JIT re-emits as a per-step `tt_jit_as_strided`
+    # program at the GMM `pallas.jax_op` boundary. Allocate a fresh 4D
+    # contiguous device buffer with `torch.empty + .copy_` to break the
+    # view chain so the persistent storage is a plain 4D buffer that PJRT
+    # ships to the kernel with row-major layout.
     if w13_scale is not None:
-        w13_scale = w13_scale.transpose(1, 2).contiguous()
-        w13_scale = w13_scale.unsqueeze(2).to(torch.float32)
+        s = w13_scale.transpose(1, 2).contiguous().to(torch.float32)
+        w13_scale = torch.empty(s.shape[0],
+                                s.shape[1],
+                                1,
+                                s.shape[2],
+                                dtype=s.dtype,
+                                device=s.device).copy_(s.unsqueeze(2))
     if w2_scale is not None:
-        w2_scale = w2_scale.transpose(1, 2).contiguous()
-        w2_scale = w2_scale.unsqueeze(2).to(torch.float32)
+        s = w2_scale.transpose(1, 2).contiguous().to(torch.float32)
+        w2_scale = torch.empty(s.shape[0],
+                               s.shape[1],
+                               1,
+                               s.shape[2],
+                               dtype=s.dtype,
+                               device=s.device).copy_(s.unsqueeze(2))
 
     return w13, w13_scale, w2, w2_scale
 
@@ -505,6 +523,17 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             weight_block_size=tuple(self.weight_block_size)
             if self.weight_block_size is not None else None,
         )
+
+        # The dequant chain leaves a 4D intermediate `[out//bh, bh, in//bw,
+        # bw]` whose trailing `.reshape(out, in)` is a logical view, so the
+        # persistent nn.Parameter is still backed by a 4D PJRT buffer. The
+        # matmul boundary then needs a real `copy_bitcast_fusion` per step.
+        # Force a fresh 2D contiguous device buffer with `torch.empty + copy_`
+        # so the persistent storage is a plain row-major [out, in] buffer.
+        weight_bf16 = torch.empty(weight_bf16.shape[0],
+                                  weight_bf16.shape[1],
+                                  dtype=weight_bf16.dtype,
+                                  device=weight_bf16.device).copy_(weight_bf16)
 
         replace_parameter(layer, "weight",
                           torch.nn.Parameter(weight_bf16, requires_grad=False))

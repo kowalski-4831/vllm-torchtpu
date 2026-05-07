@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    TPU_KV_CACHE_HEADROOM_MIB: int = 5120
 
 
 def env_with_choices(
@@ -131,6 +132,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
+    # HBM reserve kept out of vLLM KV-cache sizing for TPU runtime programs and
+    # post-profiling activation allocations.
+    "TPU_KV_CACHE_HEADROOM_MIB":
+    lambda: int(os.getenv("TPU_KV_CACHE_HEADROOM_MIB") or "5120"),
 }
 
 

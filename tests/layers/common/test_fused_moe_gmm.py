@@ -108,7 +108,7 @@ def test_fused_moe_local_routing_matches_reference():
             [0.25, 0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.04],
             [0.28, 0.19, 0.15, 0.11, 0.09, 0.07, 0.06, 0.05],
         ],
-        dtype=jnp.bfloat16,
+        dtype=jnp.float32,
     )
     topk_ids = jnp.array(
         [
@@ -136,6 +136,7 @@ def test_fused_moe_local_routing_matches_reference():
         activation="silu",
     )
 
+    assert actual.dtype == hidden_states.dtype
     np.testing.assert_allclose(np.asarray(actual),
                                np.asarray(expected),
                                atol=1e-1,

@@ -1,22 +1,26 @@
 {
   "mmlu_llama": {
-    "exact_match,strict_match": 0.8503508771929824,
-    "exact_match_stderr,strict_match": 0.004559937877107495
+    "exact_match,strict_match": 0.8574277168494516,
+    "exact_match_stderr,strict_match": 0.0028321745540001164
   },
   "mmlu_llama_humanities": {
-    "exact_match,strict_match": 0.8223076923076923,
-    "exact_match_stderr,strict_match": 0.010170091311139301
+    "exact_match,strict_match": 0.7880977683315622,
+    "exact_match_stderr,strict_match": 0.00574375194526264
   },
   "mmlu_llama_other": {
-    "exact_match,strict_match": 0.8376923076923077,
-    "exact_match_stderr,strict_match": 0.009777575375130833
+    "exact_match,strict_match": 0.8741551335693595,
+    "exact_match_stderr,strict_match": 0.005725751386050041
   },
   "mmlu_llama_social_sciences": {
-    "exact_match,strict_match": 0.8858333333333334,
-    "exact_match_stderr,strict_match": 0.00892000551101278
+    "exact_match,strict_match": 0.9119272018199545,
+    "exact_match_stderr,strict_match": 0.005048812495417255
   },
   "mmlu_llama_stem": {
-    "exact_match,strict_match": 0.8557894736842105,
-    "exact_match_stderr,strict_match": 0.007888177321011375
+    "exact_match,strict_match": 0.8912147161433556,
+    "exact_match_stderr,strict_match": 0.00542975755737809
+  },
+  "mmlu_pro": {
+    "exact_match,custom-extract": 0.7687001329787234,
+    "exact_match_stderr,custom-extract": 0.003722724117728774
   }
 }

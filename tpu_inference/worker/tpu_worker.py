@@ -208,17 +208,22 @@ class TPUWorker:
             total_hbm_limit += limit_memory
 
         total_hbm_limit_cap = total_hbm_limit * gpu_memory_utilization
-        total_hbm_avail = int(total_hbm_limit_cap - total_hbm_used)
+        kv_cache_headroom_bytes = max(envs.TPU_KV_CACHE_HEADROOM_MIB,
+                                      0) * 1024 * 1024
+        total_hbm_avail = int(total_hbm_limit_cap - total_hbm_used -
+                              kv_cache_headroom_bytes)
 
         total_hbm_limit_gb = round(total_hbm_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(total_hbm_limit_cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(total_hbm_used / utils.GBYTES, 2)
+        kv_cache_headroom_gb = round(kv_cache_headroom_bytes / utils.GBYTES, 2)
         total_hbm_avail_gb = round(total_hbm_avail / utils.GBYTES, 2)
 
         logger.info(f"Memory statistics | "
                     f"{total_hbm_limit_gb=}GiB | "
                     f"{total_hbm_limit_cap_gb=}GiB | "
                     f"{total_hbm_used_gb=}GiB | "
+                    f"{kv_cache_headroom_gb=}GiB | "
                     f"{total_hbm_avail_gb=}GiB")
 
         if total_hbm_avail <= 0:
@@ -226,7 +231,10 @@ class TPUWorker:
                              f"{total_hbm_limit_cap_gb=}GiB by "
                              f"{-total_hbm_avail_gb}GiB. Please consider "
                              f"increasing --gpu-memory-utilization from "
-                             f"{gpu_memory_utilization} to a larger value.")
+                             f"{gpu_memory_utilization} to a larger value, "
+                             "or decreasing TPU_KV_CACHE_HEADROOM_MIB if "
+                             "this run has a known smaller TPU runtime "
+                             "headroom requirement.")
         return total_hbm_avail
 
     def execute_model(

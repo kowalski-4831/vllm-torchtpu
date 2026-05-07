@@ -27,7 +27,8 @@ def gmm_wrapper(lhs,
                 group_sizes,
                 group_offset,
                 zero_initialize=False,
-                fuse_act=None):
+                fuse_act=None,
+                preferred_element_type=None):
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -37,6 +38,7 @@ def gmm_wrapper(lhs,
         group_offset=group_offset[0],
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
+        preferred_element_type=preferred_element_type,
     )
 
 
@@ -48,7 +50,14 @@ def prepare_routed_gmm_inputs(
     local_num_experts: int,
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Prepare the local-only routing layout using already-local expert ids."""
+    """Prepare the local-only routing layout using already-local expert ids.
+
+    For non-EP runs `topk_indices_local` is always non-negative, so the
+    valid-mask path computed below is a no-op (jnp.where on an all-True
+    mask). For EP, mask_for_ep upstream marks non-local entries with a
+    negative id which the mask filters out. Always running the masked
+    branch keeps a single code path.
+    """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
@@ -58,19 +67,17 @@ def prepare_routed_gmm_inputs(
     valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     sorted_indices = jnp.argsort(sort_keys)
+    argsort_revert_indices = jnp.argsort(sorted_indices)
 
     token_indices_sorted = token_indices_flat[sorted_indices]
-    topk_weights_sorted = topk_weights_flat[sorted_indices]
-    valid_mask_sorted = valid_mask[sorted_indices]
-
-    x = hidden_states_local[token_indices_sorted]
-    counted_experts = jnp.where(valid_mask, topk_indices_flat, 0)
-    group_sizes_local = (
-        jax.nn.one_hot(counted_experts, local_num_experts, dtype=jnp.int32) *
-        valid_mask[:, None].astype(jnp.int32))
+    topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+    group_sizes_local = (jax.nn.one_hot(
+        topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
+                         valid_mask[:, None].astype(jnp.int32))
     group_sizes_local = group_sizes_local.sum(axis=0)
-    return (x, group_sizes_local, token_indices_sorted, topk_weights_sorted,
-            valid_mask_sorted)
+    x = hidden_states_local[token_indices_sorted]
+    return (x, group_sizes_local, argsort_revert_indices, topk_weights_flat,
+            valid_mask)
 
 
 def moe_gmm(
@@ -82,14 +89,19 @@ def moe_gmm(
     w2_scale: jax.Array | None,
     w2_bias: jax.Array | None,
     group_sizes: jax.Array,
-    token_indices_sorted: jax.Array,
-    topk_weights_sorted: jax.Array,
-    valid_mask_sorted: jax.Array,
+    argsort_revert_indices: jax.Array,
+    topk_weights_flat: jax.Array,
+    valid_mask_flat: jax.Array,
     *,
     activation: str,
     num_tokens: int,
+    topk: int,
 ) -> jax.Array:
-    """Run grouped GEMM for routed tokens and scatter-add back to tokens."""
+    """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    The valid-mask gating below is a no-op for non-EP runs (mask is all
+    True) and keeps the single code path uniform for both EP and non-EP.
+    """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
     gmm1_res = gmm_wrapper(
@@ -104,19 +116,27 @@ def moe_gmm(
     )
     gmm1_res = gmm1_res[:, :w2.shape[1]]
 
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
+
     gmm2_res = gmm_wrapper(gmm1_res,
                            w2,
                            w2_scale,
                            w2_bias,
                            group_sizes,
                            group_offset,
-                           zero_initialize=True)
+                           zero_initialize=True,
+                           preferred_element_type=x.dtype)
 
-    routed_hidden = gmm2_res * jnp.expand_dims(topk_weights_sorted, axis=-1)
-    routed_hidden = jnp.where(valid_mask_sorted[:, None], routed_hidden, 0)
-    token_hidden = jnp.zeros((num_tokens, gmm2_res.shape[-1]),
-                             dtype=gmm2_res.dtype)
-    return token_hidden.at[token_indices_sorted].add(routed_hidden)
+    token_hidden = gmm2_res[argsort_revert_indices]
+
+    token_topk_hidden = token_hidden.reshape(
+        (num_tokens, topk, gmm2_res.shape[-1]))
+    token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights,
+                                                            axis=-1)
+    token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
+    # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
+    return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
 @functools.partial(
@@ -146,14 +166,14 @@ def fused_moe_func(
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
 
-    x, group_sizes, token_indices_sorted, topk_weights_sorted, valid_mask_sorted = (
-        prepare_routed_gmm_inputs(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            local_num_experts=w1.shape[0],
-            topk=topk,
-        ))
+    (x, group_sizes, argsort_revert_indices, topk_weights_flat,
+     valid_mask) = prepare_routed_gmm_inputs(
+         hidden_states,
+         topk_ids,
+         topk_weights,
+         local_num_experts=w1.shape[0],
+         topk=topk,
+     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
@@ -164,10 +184,11 @@ def fused_moe_func(
         w2_scale,
         w2_bias,
         group_sizes,
-        token_indices_sorted,
-        topk_weights_sorted,
-        valid_mask_sorted,
+        argsort_revert_indices,
+        topk_weights_flat,
+        valid_mask,
         activation=activation,
         num_tokens=num_tokens,
+        topk=topk,
     )
     return x[:num_tokens, :hidden_size]
