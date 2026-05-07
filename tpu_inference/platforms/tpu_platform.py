@@ -130,6 +130,9 @@ class TpuPlatform(Platform):
             "tpu_inference.layers.vllm.attention.PallasAttentionBackend",
         )
 
+        from tpu_inference.layers.vllm.custom_ops import register_custom_ops
+        register_custom_ops()
+
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
         """Pick torch.distributed backend used by worker bootstrap.
@@ -246,14 +249,7 @@ class TpuPlatform(Platform):
         cls._initialize_sharding_config(vllm_config)
 
         from vllm.config import CompilationMode
-
-        cache_config = vllm_config.cache_config
-        # For v0, the default block size is 16.
-        if cache_config and cache_config.block_size is None:
-            cache_config.block_size = cast(BlockSize, 16)
-
         compilation_config = vllm_config.compilation_config
-
         if compilation_config.mode == CompilationMode.NONE:
             # --enforce-eager is set
             pass
@@ -298,9 +294,17 @@ class TpuPlatform(Platform):
             )
             model_config.dtype = torch.bfloat16
 
+        cache_config = vllm_config.cache_config
+        # For v0, the default block size is 16.
+        if cache_config and cache_config.block_size is None:
+            cache_config.block_size = cast(BlockSize, 16)
+
         from tpu_inference.layers.vllm.attention import PallasAttentionBackend
-        cache_config.block_size = PallasAttentionBackend.get_page_size(
-            vllm_config)  # type: ignore[assignment]
+        is_hybrid = getattr(vllm_config.model_config, "is_hybrid", False)
+        if not is_hybrid:
+            cache_config.block_size = PallasAttentionBackend.get_page_size(
+                vllm_config)  # type: ignore[assignment]
+
         min_page_size = PallasAttentionBackend.get_min_page_size(vllm_config)
         if min_page_size > cache_config.block_size:
             logger.warning(
@@ -429,8 +433,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
-        # TODO: Fix this
-        return False
+        return True
 
 
 def _get_token_paddings(min_token_size: int, max_token_size: int,

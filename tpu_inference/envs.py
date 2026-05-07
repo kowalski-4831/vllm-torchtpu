@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
+    RAGGED_GATED_DELTA_RULE_IMPL: str = "ragged_gated_delta_rule_chunked"
 
 
 def env_with_choices(
@@ -136,6 +137,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # post-profiling activation allocations.
     "TPU_KV_CACHE_HEADROOM_MIB":
     lambda: int(os.getenv("TPU_KV_CACHE_HEADROOM_MIB") or "5120"),
+    # Gated Delta Rule implementation
+    "RAGGED_GATED_DELTA_RULE_IMPL":
+    env_with_choices(
+        "RAGGED_GATED_DELTA_RULE_IMPL", "ragged_gated_delta_rule_chunked",
+        ["ragged_gated_delta_rule_ref", "ragged_gated_delta_rule_chunked"]),
 }
 
 

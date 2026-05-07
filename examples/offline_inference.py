@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
 
 from vllm import LLM, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from tpu_inference.core import disagg_utils
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def create_parser():
@@ -22,6 +26,16 @@ def create_parser():
     sampling_group.add_argument("--temperature", type=float, default=0.0)
     sampling_group.add_argument("--top-p", type=float)
     sampling_group.add_argument("--top-k", type=int)
+
+    # Chat params
+    chat_group = parser.add_argument_group("Chat parameters")
+    chat_group.add_argument("--use-chat-template", action="store_true")
+    # A few models (like Qwen3.5) can use this to disable thinking using,
+    # `--chat-template-kwargs='{"enable_thinking": false}'`
+    chat_group.add_argument('--chat-template-kwargs',
+                            type=json.loads,
+                            default={})
+
     return parser
 
 
@@ -31,6 +45,12 @@ def main(args: dict):
     temperature = args.pop("temperature")
     top_p = args.pop("top_p")
     top_k = args.pop("top_k")
+
+    use_chat_template = args.pop("use_chat_template")
+    chat_template_kwargs = args.pop('chat_template_kwargs')
+    # Safeguard in case the user doesn't provide use_chat_template
+    if chat_template_kwargs != {}:
+        use_chat_template = True
 
     # Create an LLM
     llm = LLM(**args)
@@ -90,7 +110,20 @@ def main(args: dict):
     torch_profiler_dir = os.getenv("VLLM_TORCH_PROFILER_DIR")
     if torch_profiler_dir is not None:
         llm.start_profile()
-    outputs = llm.generate(prompts, sampling_params)
+    if use_chat_template:
+        logger.info(
+            f"Using LLM chat API for inference with extra chat kwargs: {chat_template_kwargs}"
+        )
+        conversations = [[{
+            "role": "user",
+            "content": prompt
+        }] for prompt in prompts]
+        outputs = llm.chat(messages=conversations,
+                           sampling_params=sampling_params,
+                           chat_template_kwargs=chat_template_kwargs)
+    else:
+        logger.info("Using LLM generate API for inference")
+        outputs = llm.generate(prompts, sampling_params)
     if torch_profiler_dir is not None:
         llm.stop_profile()
 
