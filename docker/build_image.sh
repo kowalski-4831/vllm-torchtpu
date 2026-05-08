@@ -27,6 +27,7 @@ ARTIFACT_SOURCE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-c
 USE_TORCH_TPU_REGISTRY=""
 TORCH_TPU_VERSION=""
 VLLM_SOURCE=""
+TARGET="prod"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -54,6 +55,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -s|--vllm-source)
       VLLM_SOURCE="$2"
+      shift 2
+      ;;
+    --target)
+      TARGET="$2"
       shift 2
       ;;
     *)
@@ -98,10 +103,12 @@ else
   CLEANUP_VLLM=true
 fi
 
+echo "Build Target: $TARGET"
 DOCKER_ARGS=(
   --progress=plain \
   -f "${SCRIPT_DIR}/Dockerfile" \
   -t "${IMAGE_TAG}" \
+  --target "${TARGET}" \
   --build-arg ARTIFACT_SOURCE="${ARTIFACT_SOURCE}" \
   --build-arg BASE_IMAGE="${BASE_IMAGE}" \
   --build-arg USE_TORCH_TPU_REGISTRY="${USE_TORCH_TPU_REGISTRY}" \

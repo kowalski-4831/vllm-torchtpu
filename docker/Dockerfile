@@ -11,7 +11,7 @@ ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-co
 FROM $ARTIFACT_SOURCE AS artifact-source
 
 # Stage 2: The Runtime
-FROM $BASE_IMAGE
+FROM $BASE_IMAGE AS base
 
 ARG USE_TORCH_TPU_REGISTRY=""
 ARG TORCH_TPU_VERSION=""
@@ -70,14 +70,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
           "torch-tpu==${TORCH_TPU_VERSION}"; \
     fi
 
-# Copy the rest of the source code (restores pyproject.toml)
+# Stage 3: Developer Image (Editable)
+FROM base AS dev
 COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
+    uv pip install --system --no-deps --no-config -e .
+ENV PYTHONPATH="/root/tpu_inference"
+CMD ["/bin/bash"]
 
-# Final install of the project
+# Stage 4: Production/Full Image (Regular Install)
+FROM base AS prod
+COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     uv pip install --system --no-deps --no-config .
-
 ENV PYTHONPATH="/root/tpu_inference"
-
 CMD ["/bin/bash"]
