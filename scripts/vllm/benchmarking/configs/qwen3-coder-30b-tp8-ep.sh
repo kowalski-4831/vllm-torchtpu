@@ -10,3 +10,9 @@ QUANTIZATION=""
 ISL_OSL_CONFIGS="1024:1024"
 CONCURRENCY_OPTIONS="64"
 RANDOM_RANGE_RATIO="0.8"
+
+# Switch attention from default RPA v3 to the experimental batched RPA kernel
+# under tpu_inference/kernels/experimental/batched_rpa/. Set per-config so the
+# perf-gated nightly + PR-guard runs use the same kernel the baselines were
+# calibrated against. Set to 0 to ablate.
+export USE_BATCHED_RPA_KERNEL=1
