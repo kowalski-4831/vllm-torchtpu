@@ -302,6 +302,7 @@ class TpuPlatform(Platform):
 
         from tpu_inference.layers.vllm.attention import PallasAttentionBackend
         is_hybrid = getattr(vllm_config.model_config, "is_hybrid", False)
+        cls._is_hybrid = is_hybrid
         if not is_hybrid:
             cache_config.block_size = PallasAttentionBackend.get_page_size(
                 vllm_config)  # type: ignore[assignment]
@@ -437,7 +438,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
-        return True
+        return getattr(cls, "_is_hybrid", False)
 
 
 def _get_token_paddings(min_token_size: int, max_token_size: int,
