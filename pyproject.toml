@@ -26,6 +26,8 @@ dependencies = [
     "pathwaysutils",
     "vllm==0.19.0",
     "torch-tpu==0.1.1.dev20260504094009",
+    "ray[default]",
+    "ray[data]",
 ]
 
 [project.optional-dependencies]

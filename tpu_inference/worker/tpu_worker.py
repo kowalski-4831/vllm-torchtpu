@@ -133,7 +133,10 @@ class TPUWorker:
         os.environ["RANK"] = str(self.rank)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["WORLD_SIZE"] = str(self.parallel_config.world_size)
-        os.environ["LOCAL_WORLD_SIZE"] = str(self.parallel_config.world_size)
+        local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
+        if not local_world_size:
+            local_world_size = self.parallel_config.world_size
+        os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
 
         parsed = urlparse(self.distributed_init_method)
         if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:

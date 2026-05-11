@@ -1,55 +1,66 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import copy
 import os
-from array import array
-from typing import Any, Dict, List, Optional
+from collections import defaultdict
+from concurrent.futures import Future
+from typing import Dict, List, Optional
 
 import ray
 import vllm.envs as envs
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from vllm.multimodal.inputs import MultiModalKwargs
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
-from vllm.sequence import VLLM_TOKEN_ID_ARRAY_TYPE
 from vllm.utils.network_utils import (get_distributed_init_method, get_ip,
                                       get_open_port)
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.ray_distributed_executor import \
     RayDistributedExecutor as RayDistributedExecutorV1
 from vllm.v1.executor.ray_executor import RayWorkerMetaData
 from vllm.v1.executor.ray_utils import RayWorkerWrapper, _wait_until_pg_ready
-
-from tpu_inference.logger import init_logger
-
-try:
-    from ray._private.state import available_resources_per_node
-except ImportError:
-    # Ray 2.9.x doesn't expose `available_resources_per_node`
-    from ray._private.state import state as _state
-    available_resources_per_node = _state._available_resources_per_node
-
-import asyncio
-from collections import defaultdict
-
-import msgspec
-from vllm.v1.outputs import SamplerOutput
+from vllm.v1.outputs import ModelRunnerOutput
 
 from tpu_inference.distributed.utils import set_node_kv_ip_port
+from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
 
+# TODO(ranlihao): add more flexible topology map
+TPU_TOPOLOGY_MAP = {
+    16: "2,2,2,2",
+}
 
-def _encode_hook(obj: Any) -> Any:
-    """Custom msgspec enc hook that supports array types and MultiModalKwargs.
 
-    See https://jcristharif.com/msgspec/api.html#msgspec.msgpack.Encoder
-    """
-    if isinstance(obj, array):
-        assert obj.typecode == VLLM_TOKEN_ID_ARRAY_TYPE, (
-            f"vLLM array type should use '{VLLM_TOKEN_ID_ARRAY_TYPE}' type. "
-            f"Given array has a type code of {obj.typecode}.")
-        return obj.tobytes()
-    if isinstance(obj, MultiModalKwargs):
-        return dict(obj)
+# TODO(ranlihao): add async scheduling support.
+class AsyncResultFuture(Future):
+
+    def __init__(self, result_ids_ref, workers):
+        super().__init__()
+        self.result_ids_ref = result_ids_ref
+        self.workers = workers
+
+    def result(self, timeout=None):
+        result_ids = ray.get(self.result_ids_ref, timeout=timeout)
+        ret_refs = []
+        for result_id, worker in zip(result_ids, self.workers):
+            ret_refs.append(
+                worker.execute_method.remote("get_execute_model_output",
+                                             result_id))
+        return ray.get(ret_refs[0], timeout=timeout)
 
 
 class RayDistributedExecutor(RayDistributedExecutorV1):
@@ -68,6 +79,13 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
        This set TPU resources when create each worker.
        And we omit the driver worker related logic.
     """
+
+    @classmethod
+    def supports_async_scheduling(cls) -> bool:
+        """
+        Whether the executor supports async scheduling.
+        """
+        return False
 
     def _init_executor(self) -> None:
         self.forward_dag: Optional[ray.dag.CompiledDAG] = None
@@ -94,10 +112,6 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         # Create the parallel GPU workers.
         self._init_workers_ray(placement_group)
 
-        self.input_encoder = msgspec.msgpack.Encoder(enc_hook=_encode_hook)
-        self.output_decoder = msgspec.msgpack.Decoder(
-            Optional[List[SamplerOutput]])
-
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
         self.scheduler_output: SchedulerOutput | None = None
@@ -118,8 +132,20 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         it will connect to the Ray cluster and create a placement group
         for the workers, which includes the specification of the resources
         for each distributed worker.
+
+        If a placement group is already provided (e.g., by ray.serve.llm),
+        this method will reuse it instead of creating a new one.
         """
         from vllm.platforms import current_platform
+
+        # Check if placement group is already provided (e.g., by ray.serve.llm)
+        # This allows ray.serve.llm to pre-create a placement group with the correct
+        # TPU topology (e.g., 4 bundles × 4 TPUs for v6e 4x4) and have vLLM reuse it.
+        if self.parallel_config.placement_group is not None:
+            logger.info(
+                f"Using existing placement group: {self.parallel_config.placement_group}"
+            )
+            return
 
         if ray.is_initialized():
             logger.info(
@@ -140,11 +166,26 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         ray_nodes = ray.nodes()
         logger.info(f"RayDistributedExecutor | ray_nodes={ray_nodes}")
 
+        # Filter nodes that have the required TPU
+        # This is necessary when the head node doesn't have TPU resources
+        # (e.g., KubeRay deployments where head runs on a non-TPU node)
+        nodes_with_device = [
+            n for n in ray_nodes if device_str in n.get("Resources", {})
+        ]
+        logger.info(
+            f"RayDistributedExecutor | nodes_with_device={len(nodes_with_device)} "
+            f"(filtered from {len(ray_nodes)} total nodes)")
+
         if pp_size == 1:
-            placement_group_specs = [{
-                device_str: node['Resources'][device_str]
-            } for node in ray_nodes]
+            placement_group_specs = []
+            for node in nodes_with_device:
+                num_devices = int(node['Resources'][device_str])
+                for _ in range(num_devices):
+                    placement_group_specs.append({device_str: 1.0})
         else:
+            assert pp_size == len(
+                nodes_with_device
+            ), f"Cannot use PP across hosts, please set --pipeline-parallel-size to 1 or {len(nodes_with_device)}"
             num_devices_per_pp_rank = self.vllm_config.sharding_config.total_devices
             placement_group_specs = [{
                 device_str: num_devices_per_pp_rank
@@ -155,7 +196,12 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         # the current node has at least one device.
         current_ip = get_ip()
         current_node_id = ray.get_runtime_context().get_node_id()
-        current_node_resource = available_resources_per_node()[current_node_id]
+        # Get resources from ray.nodes() which is more reliable
+        # than available_resources_per_node() for TPU resource reporting
+        current_node_info = next(
+            (n for n in ray.nodes() if n["NodeID"] == current_node_id), None)
+        current_node_resource = (current_node_info.get("Resources", {})
+                                 if current_node_info else {})
         if current_node_resource.get(device_str, 0) < 1:
             raise ValueError(
                 f"Current node has no {device_str} available. "
@@ -213,8 +259,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         worker_metadata: List[RayWorkerMetaData] = []
         driver_ip = get_ip()
-        num_tpu_per_worker = placement_group.bundle_specs[0].get(
-            current_platform.ray_device_key, 0)
+        # For torchtpu-vllm, we always use 1 TPU per worker similar to Multiprocexecutor
+        num_tpu_per_worker = 1.0
         for rank, bundle_id in enumerate(bundle_indices):
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=placement_group,
@@ -229,8 +275,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 },
                 scheduling_strategy=scheduling_strategy,
                 **ray_remote_kwargs,
-            )(RayWorkerWrapper).remote(vllm_config=self.vllm_config,
-                                       rpc_rank=rank)
+            )(RayWorkerWrapper).remote(rpc_rank=rank)
             worker_metadata.append(
                 RayWorkerMetaData(worker=worker, created_rank=rank))
 
@@ -312,11 +357,60 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 "number of nodes and IPs is euqal. This setup may "
                 "lead to unexpected behaviors.")
 
+        # Construct TORCH_TPU_SLICEBUILDER_ADDRESSES for multi-host
+        host_workers = defaultdict(list)
+        for each in worker_metadata:
+            host_workers[each.ip].append(each)
+
+        sb_addresses = []
+        base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
+        for ip in sorted(host_workers.keys()):
+            for i in range(len(host_workers[ip])):
+                sb_addresses.append(f"{ip}:{base_port + i}")
+
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
+        logger.info(
+            f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {os.environ['TORCH_TPU_SLICEBUILDER_ADDRESSES']}"
+        )
+
         # Set environment variables for the driver and workers.
-        all_args_to_update_environment_variables = [{
-            current_platform.device_control_env_var:
-            ",".join(map(str, node_tpus[node_id])),
-        } for (node_id, _) in worker_node_and_tpu_ids]
+        unique_node_ids = list(node_workers.keys())
+        node_id_to_rank = {
+            node_id: i
+            for i, node_id in enumerate(unique_node_ids)
+        }
+        num_nodes = len(unique_node_ids)
+
+        rank_0_node_id = unique_node_ids[0]
+        rank_0_worker_index = node_workers[rank_0_node_id][0]
+        master_addr = sorted_worker_metadata[rank_0_worker_index].ip
+
+        all_args_to_update_environment_variables = []
+        total_chips = len(worker_node_and_tpu_ids)
+        topology = TPU_TOPOLOGY_MAP.get(total_chips, None)
+        if topology is None:
+            raise ValueError(
+                f'Cannot find topology for {total_chips} chips. The supported number of chips are {list(TPU_TOPOLOGY_MAP.keys())}'
+            )
+        master_port = get_open_port()
+        for i, (node_id, _) in enumerate(worker_node_and_tpu_ids):
+            node_rank = node_id_to_rank[node_id]
+            args = {
+                "NNODES": str(num_nodes),
+                "NODE_RANK": str(node_rank),
+                "MASTER_ADDR": master_addr,
+                "MASTER_PORT": master_port,
+                "TORCH_TPU_TOPOLOGY": topology,
+                "LOCAL_WORLD_SIZE": str(len(node_tpus[node_id])),
+            }
+            if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
+                import time
+                os.environ["TORCH_TPU_XPROF_SESSION_ID"] = str(time.time_ns())
+
+            args["TORCH_TPU_XPROF_SESSION_ID"] = os.environ[
+                "TORCH_TPU_XPROF_SESSION_ID"]
+
+            all_args_to_update_environment_variables.append(args)
 
         # Environment variables to copy from driver to workers
         env_vars_to_copy = get_env_vars_to_copy(
@@ -325,10 +419,13 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             destination="workers")
 
         # Copy existing env vars to each worker's args
-        for args in all_args_to_update_environment_variables:
+        for i, args in enumerate(all_args_to_update_environment_variables):
             for name in env_vars_to_copy:
                 if name in os.environ:
                     args[name] = os.environ[name]
+            logger.debug(
+                f"RayDistributedExecutor | Worker {i} environment variables: {args}"
+            )
 
         self._env_vars_for_all_workers = (
             all_args_to_update_environment_variables)
@@ -339,14 +436,36 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         distributed_init_method = get_distributed_init_method(
             driver_ip, get_open_port())
 
+        # Get the Driver's Node ID to identify local vs remote workers
+        driver_node_id = ray.get_runtime_context().get_node_id()
+
         # Initialize the actual workers inside worker wrapper.
         all_kwargs = []
         for rank, (node_id, _) in enumerate(worker_node_and_tpu_ids):
             local_rank = node_workers[node_id].index(rank)
             ip = sorted_worker_metadata[rank].ip
             prev_ip = sorted_worker_metadata[rank - 1].ip if rank > 0 else ""
+
+            worker_vllm_config = self.vllm_config
+
+            # When using object storage (e.g., RunAI), the Leader updates `model` to its local
+            # cache path (e.g., /root/.cache/...) during ModelConfig initialization
+            # (maybe_pull_model_tokenizer_for_runai), while `model_weights` preserves the original URI after the model is pulled.
+            # (Standard HF downloads do not overwrite `model`, allowing workers to pull normally).
+            # Since workers on remote nodes cannot access the Leader's filesystem, we create a
+            # worker-specific config copy and restore the original GCS URI from `model_weights`.
+            # This allows each worker to independently invoke `maybe_pull_model_tokenizer_for_runai`
+            # and stream the model from GCS.
+            if node_id != driver_node_id and getattr(
+                    self.vllm_config, "model_config", None) and getattr(
+                        self.vllm_config.model_config, "model_weights", None):
+                worker_vllm_config = copy.deepcopy(self.vllm_config)
+                worker_vllm_config.model_config.model = worker_vllm_config.model_config.model_weights
+                # Unset model_weights so maybe_pull_model_tokenizer_for_runai will pull the model.
+                worker_vllm_config.model_config.model_weights = None
+
             kwargs = dict(
-                vllm_config=self.vllm_config,
+                vllm_config=worker_vllm_config,
                 local_rank=local_rank,
                 rank=rank,
                 distributed_init_method=distributed_init_method,
@@ -361,13 +480,12 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         if self.parallel_config.pipeline_parallel_size > 1:
             self.collective_rpc("initialize_pp_transfer_connect")
         self.collective_rpc("load_model")
-
         if self.use_ray_spmd_worker:
             for pp_rank in range(self.parallel_config.pipeline_parallel_size):
                 self.pp_tp_workers.append([])
                 num_tp_workers = int(
-                    self.parallel_config.tensor_parallel_size //
-                    num_tpu_per_worker)
+                    len(self.workers) //
+                    self.parallel_config.pipeline_parallel_size)
                 for tp_rank in range(num_tp_workers):
                     # PP=2, TP=4, num_tpu_per_worker=2
                     # pp_tp_workers = [[0, 1], [2, 3]]
@@ -380,3 +498,26 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
     # as we pass the kv_parameters through proxy server
     def get_kv_connector_handshake_metadata(self) -> None:
         pass
+
+    # Override the execute_model method to suppprt async scheduling.
+    # Once the vLLM V1 Ray executor supports async scheduling natively,
+    # we can remove this method.
+    def _execute_dag(
+        self,
+        scheduler_output: SchedulerOutput,
+        grammar_output: "GrammarOutput | None",
+        non_block: bool = False,
+    ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        if not self.scheduler_config.async_scheduling:
+            return super()._execute_dag(scheduler_output, grammar_output,
+                                        non_block)
+
+        assert non_block
+        # Build the compiled DAG for the first time.
+        if self.forward_dag is None:  # type: ignore
+            self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
+
+        refs = self.forward_dag.execute(
+            (scheduler_output, grammar_output))  # type: ignore
+        assert not self.has_connector, "async scheduling with connector not yet supported"
+        return AsyncResultFuture(refs, self.workers)
