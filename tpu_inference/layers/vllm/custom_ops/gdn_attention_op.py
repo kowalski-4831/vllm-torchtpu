@@ -23,8 +23,10 @@ from vllm.model_executor.layers.mamba.gdn_linear_attn import \
     GatedDeltaNetAttention
 
 from tpu_inference import envs
-from tpu_inference.layers.common.gdn_attention import (
-    GdnAttentionConfig, RaggedGatedDeltaRuleImpl, run_jax_gdn_attention)
+from tpu_inference.layers.common.gdn_attention import (GdnAttentionConfig,
+                                                       run_jax_gdn_attention)
+from tpu_inference.layers.common.ragged_gated_delta_rule_wrapper import \
+    RaggedGatedDeltaRuleImpl
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
 
@@ -42,6 +44,7 @@ def gdn_attention_core_tpu(
     state_indices: jax.Array,
     query_start_loc: jax.Array,
     distribution: jax.Array,
+    seq_lens: jax.Array,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -64,6 +67,7 @@ def gdn_attention_core_tpu(
         state_indices,
         query_start_loc,
         distribution,
+        seq_lens,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -120,11 +124,12 @@ class VllmGatedDeltaNetAttention(GatedDeltaNetAttention):
                      A_log: torch.Tensor, dt_bias: torch.Tensor,
                      state_indices: torch.Tensor,
                      query_start_loc: torch.Tensor,
-                     request_distribution: torch.Tensor) -> torch.Tensor:
+                     request_distribution: torch.Tensor,
+                     seq_lens: torch.Tensor) -> torch.Tensor:
             new_conv, new_rec, outputs = gdn_jax_op(
                 mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
                 conv_bias, A_log, dt_bias, state_indices, query_start_loc,
-                request_distribution)
+                request_distribution, seq_lens)
 
             conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
@@ -202,12 +207,11 @@ class VllmGatedDeltaNetAttention(GatedDeltaNetAttention):
             state_indices = block_tables_2d[:, 0].to(torch.int32)
 
             # Execute the TorchTPU custom op
-            core_attn_out = self.gdn_op(mixed_qkv, b, a, conv_state,
-                                        recurrent_state, self.conv1d.weight,
-                                        self.conv1d.bias, self.A_log,
-                                        self.dt_bias, state_indices,
-                                        attn_metadata.query_start_loc,
-                                        attn_metadata.request_distribution)
+            core_attn_out = self.gdn_op(
+                mixed_qkv, b, a, conv_state, recurrent_state,
+                self.conv1d.weight, self.conv1d.bias, self.A_log, self.dt_bias,
+                state_indices, attn_metadata.query_start_loc,
+                attn_metadata.request_distribution, attn_metadata.seq_lens)
 
         # ============================================================
         # Part 3: Output Projection

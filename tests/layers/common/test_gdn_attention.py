@@ -31,7 +31,8 @@ class GDNAttentionTest(parameterized.TestCase):
             q_loc=[0, 8192],
             distribution=[0, 0, 3],
             test_config=GdnAttentionConfig(
-                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.CHUNKED),
+                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.
+                CHUNKED_JAX_PD),
             ref_config=GdnAttentionConfig(
                 ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF),
         ),
@@ -42,7 +43,8 @@ class GDNAttentionTest(parameterized.TestCase):
             q_loc=[0, 256, 384, 512],
             distribution=[0, 3, 3],
             test_config=GdnAttentionConfig(
-                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.CHUNKED),
+                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.
+                CHUNKED_JAX_PD),
             ref_config=GdnAttentionConfig(
                 ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF),
         ),
@@ -53,7 +55,8 @@ class GDNAttentionTest(parameterized.TestCase):
             q_loc=list(range(65)),
             distribution=[64, 64, 64],
             test_config=GdnAttentionConfig(
-                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.CHUNKED),
+                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.
+                CHUNKED_JAX_PD),
             ref_config=GdnAttentionConfig(
                 ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF),
         ),
@@ -64,7 +67,8 @@ class GDNAttentionTest(parameterized.TestCase):
             q_loc=[0, 1, 2, 3, 4, 5, 6, 7, 8, 136, 264, 520],
             distribution=[8, 11, 11],
             test_config=GdnAttentionConfig(
-                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.CHUNKED),
+                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.
+                CHUNKED_JAX_PD),
             ref_config=GdnAttentionConfig(
                 ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF),
         ),
@@ -75,7 +79,8 @@ class GDNAttentionTest(parameterized.TestCase):
             q_loc=[0, 128, 192, 224, 240, 248] + [1] * 11,
             distribution=[0, 5, 5],
             test_config=GdnAttentionConfig(
-                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.CHUNKED),
+                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.
+                CHUNKED_JAX_PD),
             ref_config=GdnAttentionConfig(
                 ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF),
         ),
@@ -86,7 +91,8 @@ class GDNAttentionTest(parameterized.TestCase):
             q_loc=list(range(65)) + [1] * 448,
             distribution=[64, 64, 64],
             test_config=GdnAttentionConfig(
-                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.CHUNKED),
+                ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.
+                CHUNKED_JAX_PD),
             ref_config=GdnAttentionConfig(
                 ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF),
         ),
@@ -148,6 +154,14 @@ class GDNAttentionTest(parameterized.TestCase):
         conv_bias = jnp.concatenate([conv_bias_q, conv_bias_k, conv_bias_v],
                                     axis=-1)
 
+        # All sequences in this test start from a fresh slot; the existing
+        # parametrizations don't exercise prefix-cache-hit / chunked-prefill
+        # continuation. ``seq_lens == query_lens`` (context_len = 0)
+        # reproduces the prior behavior (zero initial state regardless of
+        # slot contents).
+        seq_lens = jnp.asarray(q_loc[1:max_reqs + 1] - q_loc[:max_reqs],
+                               dtype=jnp.int32)
+
         run_jax_gdn_attention_local_jitted = jax.jit(
             run_jax_gdn_attention_local,
             static_argnames=[
@@ -168,6 +182,7 @@ class GDNAttentionTest(parameterized.TestCase):
             query_start_loc=q_loc,
             state_indices=state_indices,
             distribution=distribution,
+            seq_lens=seq_lens,
             n_kq=n_kq,
             n_v=n_v,
             d_k=kq_head_dim,

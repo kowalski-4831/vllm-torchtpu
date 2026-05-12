@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
-    RAGGED_GATED_DELTA_RULE_IMPL: str = "ragged_gated_delta_rule_chunked"
+    RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
     USE_BATCHED_RPA_KERNEL: bool = False
 
 
@@ -140,9 +140,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("TPU_KV_CACHE_HEADROOM_MIB") or "5120"),
     # Gated Delta Rule implementation
     "RAGGED_GATED_DELTA_RULE_IMPL":
-    env_with_choices(
-        "RAGGED_GATED_DELTA_RULE_IMPL", "ragged_gated_delta_rule_chunked",
-        ["ragged_gated_delta_rule_ref", "ragged_gated_delta_rule_chunked"]),
+    env_with_choices("RAGGED_GATED_DELTA_RULE_IMPL", "chunked_jax_pd", [
+        "ref", "chunked_jax_pd", "chunked_kernel_pd", "chunked_kernel_p_jax_d",
+        "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd"
+    ]),
     # Switch attention_interface from the default RPA v3 kernel to the
     # experimental batched RPA kernel under
     # tpu_inference/kernels/experimental/batched_rpa/. Mirrors ullm's flag.
