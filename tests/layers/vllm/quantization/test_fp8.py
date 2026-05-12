@@ -15,8 +15,8 @@
 Tests for FP8 quantization weight processing on TPU.
 
 Verifies that process_weights_after_loading correctly transforms FP8
-weights and scales for the GMM kernel, and that FP8->BF16 dequantization
-for linear layers is numerically correct.
+weights and scales for the GMM kernel, and that FP8 linear layers keep
+runtime FP8 weights with dynamically quantized activations.
 
 Run on CPU (default):
     pytest tests/layers/vllm/quantization/test_fp8.py -v
@@ -25,9 +25,11 @@ Run on TPU (when available):
     pytest tests/layers/vllm/quantization/test_fp8.py -v --use-tpu
 """
 
+import jax.numpy as jnp
 import pytest
 import torch
 
+from tpu_inference.layers.vllm.linear_common import _quantized_matmul_jax
 from tpu_inference.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
 
 
@@ -146,11 +148,11 @@ class TestFp8MoEScaleReshape:
                         f"Scale not constant within block at e={e}, ib={ib}, ob={ob}"
 
 
-class TestFp8LinearDequant:
-    """Tests for FP8 -> BF16 dequantization in linear layers."""
+class TestFp8LinearRuntimeQuant:
+    """Tests for ullm-style runtime FP8 dense linear weights."""
 
     def test_block_dequant_shape(self, device):
-        """Dequantized weight should preserve original shape."""
+        """Runtime FP8 weight should preserve original shape."""
         out_dim, in_dim = 256, 512
         block_h, block_w = 128, 128
 
@@ -173,7 +175,10 @@ class TestFp8LinearDequant:
         method.process_weights_after_loading(layer)
 
         assert layer.weight.shape == (out_dim, in_dim)
-        assert layer.weight.dtype == torch.bfloat16
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert layer.weight_scale.shape == (out_dim, )
+        assert layer.weight_scale.dtype == torch.float32
+        assert not hasattr(layer, "weight_scale_inv")
 
     def test_block_dequant_applies_scales(self, device):
         """Block scales should actually scale the weights."""
@@ -199,24 +204,28 @@ class TestFp8LinearDequant:
             FakeQuant(weight_block_size=[block_h, block_w]))
         method.process_weights_after_loading(layer)
 
-        w = layer.weight.float()
+        w = layer.weight.float() * layer.weight_scale[:, None]
         # fp8 ones = 1.0, so each block should be scaled by its scale_inv
         # Block [0,0] (top-left 128x128) should be ~1.0
         # Block [0,1] (top-right 128x128) should be ~2.0
         # Block [1,0] (bottom-left 128x128) should be ~3.0
         # Block [1,1] (bottom-right 128x128) should be ~4.0
         assert torch.allclose(w[:128, :128].mean(),
-                              torch.tensor(1.0),
-                              atol=0.1)
+                              torch.tensor(1.0, device=device),
+                              rtol=0.06,
+                              atol=0.05)
         assert torch.allclose(w[:128, 128:].mean(),
-                              torch.tensor(2.0),
-                              atol=0.1)
+                              torch.tensor(2.0, device=device),
+                              rtol=0.06,
+                              atol=0.05)
         assert torch.allclose(w[128:, :128].mean(),
-                              torch.tensor(3.0),
-                              atol=0.1)
+                              torch.tensor(3.0, device=device),
+                              rtol=0.06,
+                              atol=0.05)
         assert torch.allclose(w[128:, 128:].mean(),
-                              torch.tensor(4.0),
-                              atol=0.1)
+                              torch.tensor(4.0, device=device),
+                              rtol=0.06,
+                              atol=0.05)
 
     def test_per_tensor_dequant(self, device):
         """Per-tensor (non-block) dequant should scale entire weight."""
@@ -235,14 +244,19 @@ class TestFp8LinearDequant:
         method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=None))
         method.process_weights_after_loading(layer)
 
-        assert layer.weight.dtype == torch.bfloat16
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert layer.weight_scale.shape == (out_dim, )
         # fp8 ones * 2.5 should be ~2.5
-        assert torch.allclose(layer.weight.float().mean(),
-                              torch.tensor(2.5),
+        runtime_deq = layer.weight.float() * layer.weight_scale[:, None]
+        assert torch.allclose(runtime_deq.mean(),
+                              torch.tensor(2.5, device=device),
                               atol=0.1)
 
     def test_apply_is_linear(self, device):
-        """apply() should be a standard F.linear call."""
+        """apply() should use the runtime FP8 quantized matmul."""
+        if device.type != "tpu":
+            pytest.skip("Pallas quantized matmul bridge requires TPU.")
+
         out_dim, in_dim = 64, 128
         batch = 4
 
@@ -250,18 +264,88 @@ class TestFp8LinearDequant:
             FakeQuant(weight_block_size=[128, 128]))
 
         layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(torch.randn(out_dim,
-                                                      in_dim,
-                                                      device=device,
-                                                      dtype=torch.bfloat16),
+        layer.weight = torch.nn.Parameter(torch.ones(out_dim,
+                                                     in_dim,
+                                                     device=device,
+                                                     dtype=torch.bfloat16).to(
+                                                         torch.float8_e4m3fn),
                                           requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(torch.ones(
+            out_dim, device=device, dtype=torch.float32),
+                                                requires_grad=False)
 
-        x = torch.randn(batch, in_dim, device=device, dtype=torch.bfloat16)
+        x = torch.ones(batch, in_dim, device=device, dtype=torch.bfloat16)
         result = method.apply(layer, x)
 
         assert result.shape == (batch, out_dim)
-        expected = torch.nn.functional.linear(x, layer.weight)
-        assert torch.allclose(result, expected)
+        expected = torch.full((batch, out_dim),
+                              float(in_dim),
+                              device=device,
+                              dtype=torch.bfloat16)
+        assert torch.allclose(result, expected, rtol=0.01, atol=0.01)
+
+    def test_blockwise_runtime_scale_shape(self, device, monkeypatch):
+        """ullm blockwise env gate changes dense-linear runtime scale layout."""
+        monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+        monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "128")
+
+        out_dim, in_dim = 256, 256
+        block_h, block_w = 128, 128
+
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(torch.ones(out_dim,
+                                                     in_dim,
+                                                     device=device,
+                                                     dtype=torch.bfloat16).to(
+                                                         torch.float8_e4m3fn),
+                                          requires_grad=False)
+        layer.weight_scale_inv = torch.nn.Parameter(torch.ones(
+            out_dim // block_h,
+            in_dim // block_w,
+            device=device,
+            dtype=torch.float32),
+                                                    requires_grad=False)
+
+        method = VllmFp8LinearMethodTPU(
+            FakeQuant(weight_block_size=[block_h, block_w]))
+        method.process_weights_after_loading(layer)
+
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert layer.weight_scale.shape == (in_dim // 128, 1, out_dim)
+
+    def test_blockwise_kernel_requires_block_size(self, monkeypatch):
+        """Match ullm: enabling the blockwise kernel requires block size."""
+        monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+        monkeypatch.delenv("REQUANTIZE_BLOCK_SIZE", raising=False)
+
+        with pytest.raises(ValueError, match="REQUANTIZE_BLOCK_SIZE"):
+            VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=[128, 128]))
+
+    def test_block_size_requires_blockwise_kernel(self, monkeypatch):
+        """Match ullm: REQUANTIZE_BLOCK_SIZE only applies to the kernel path."""
+        monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "0")
+        monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "128")
+
+        with pytest.raises(ValueError, match="Blockwise quantization"):
+            VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=[128, 128]))
+
+    def test_blockwise_scale_output_dim_validated(self):
+        """Blockwise matmul should reject scales with the wrong output dim."""
+        x = jnp.ones((2, 4), dtype=jnp.bfloat16)
+        w_q = jnp.ones((3, 4), dtype=jnp.float8_e4m3fn)
+        w_scale = jnp.ones((1, 1, 2), dtype=jnp.float32)
+
+        with pytest.raises(ValueError, match="output dim"):
+            _quantized_matmul_jax(x, w_q, w_scale)
+
+    def test_blockwise_scale_block_count_validated(self):
+        """Blockwise matmul should reject ambiguous scale block counts."""
+        x = jnp.ones((2, 5), dtype=jnp.bfloat16)
+        w_q = jnp.ones((3, 5), dtype=jnp.float8_e4m3fn)
+        w_scale = jnp.ones((2, 1, 3), dtype=jnp.float32)
+
+        with pytest.raises(ValueError, match="divisible by block scale count"):
+            _quantized_matmul_jax(x, w_q, w_scale)
 
 
 class TestFp8WeightTranspose:

@@ -27,16 +27,17 @@ contracting dimension.
 
 == Linear Weights (attention projections) ==
 
-Dequantized from FP8 to BF16 at load time because the active TorchTPU-vLLM
-linear runtime path currently uses BF16 linears. The vLLM
-Fp8LinearMethod.create_weights() is reused for correct parameter allocation
-(weight_scale_inv), then process_weights dequantizes using block scales.
+The checkpoint stores FP8 weights with either block scales or tensor/channel
+scales. At load time we dequantize those weights to float32, then requantize
+them into the same runtime FP8 format used by ullm. Activations are quantized
+dynamically inside the Pallas matmul wrapper. By default this uses ullm's XLA
+per-channel quantized matmul path; setting ENABLE_QUANTIZED_MATMUL_KERNEL=1
+with REQUANTIZE_BLOCK_SIZE selects the blockwise Pallas kernel path.
 """
 
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
@@ -61,7 +62,9 @@ from tpu_inference.layers.common.quantization import (dequantize_tensor,
 from tpu_inference.layers.vllm import moe_routing
 from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
-from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
+from tpu_inference.layers.vllm.linear_common import quantized_matmul
+from tpu_inference.layers.vllm.quantization.configs import (
+    VllmQuantConfig, VllmQuantLinearConfig)
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
@@ -72,6 +75,8 @@ _MOE_REQUANT_WEIGHT_DTYPES = {
 }
 if hasattr(torch, "float8_e5m2"):
     _MOE_REQUANT_WEIGHT_DTYPES["float8_e5m2"] = torch.float8_e5m2
+
+LinearQuantConfig = tuple[str, torch.dtype, int | None, bool]
 
 
 def _get_activation_str(activation) -> str:
@@ -87,26 +92,27 @@ def _dequantize_fp8_linear(
     weight_scale_inv: torch.Tensor | None,
     block_quant: bool,
     weight_block_size: tuple[int, int] | None,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Dequantize FP8 linear weights to BF16."""
-    weight_bf16 = weight.to(torch.bfloat16)
+    """Dequantize FP8 linear weights."""
+    weight_f = weight.to(out_dtype)
 
     if block_quant:
         assert weight_scale_inv is not None
         assert weight_block_size is not None
         block_h, block_w = weight_block_size
 
-        out_dim, in_dim = weight_bf16.shape
-        weight_bf16 = weight_bf16.reshape(out_dim // block_h, block_h,
-                                          in_dim // block_w, block_w)
-        weight_bf16 = weight_bf16 * weight_scale_inv.to(
-            torch.bfloat16).unsqueeze(1).unsqueeze(3)
-        weight_bf16 = weight_bf16.reshape(out_dim, in_dim)
+        out_dim, in_dim = weight_f.shape
+        weight_f = weight_f.reshape(out_dim // block_h, block_h,
+                                    in_dim // block_w, block_w)
+        weight_f = weight_f * weight_scale_inv.to(out_dtype).unsqueeze(
+            1).unsqueeze(3)
+        weight_f = weight_f.reshape(out_dim, in_dim)
     else:
         assert weight_scale is not None
-        weight_bf16 = weight_bf16 * weight_scale.to(torch.bfloat16)
+        weight_f = weight_f * weight_scale.to(out_dtype)
 
-    return weight_bf16
+    return weight_f
 
 
 def _get_moe_quant_config(
@@ -135,6 +141,96 @@ def _get_moe_quant_config(
     logger.info_once(msg)
 
     return desired_quant_dtype, requant_dtype, requant_block_size
+
+
+def _get_linear_quant_config(
+    linear_config: VllmQuantLinearConfig | None, ) -> LinearQuantConfig:
+    """Parse dense-linear quantization settings using ullm's env gates."""
+    enable_quantized_matmul_kernel = (
+        linear_config.enable_quantized_matmul_kernel
+        if linear_config is not None else envs.ENABLE_QUANTIZED_MATMUL_KERNEL)
+    requant_block_size = (linear_config.requant_block_size if linear_config
+                          is not None else envs.REQUANTIZE_BLOCK_SIZE)
+    desired_quant_dtype = (linear_config.requant_weight_dtype if linear_config
+                           is not None else envs.REQUANTIZE_WEIGHT_DTYPE)
+
+    if enable_quantized_matmul_kernel and not requant_block_size:
+        raise ValueError(
+            "You should set REQUANTIZE_BLOCK_SIZE to enable quantized matmul "
+            "kernel. Please set the value or disable the quantized matmul "
+            "kernel.")
+    if not enable_quantized_matmul_kernel and requant_block_size:
+        raise ValueError(
+            "Blockwise quantization is supported by quantized matmul kernel. "
+            "Please enable quantized_matmul_kernel or unset the quantize "
+            "block size to trigger XLA per-channel quantization.")
+
+    requant_dtype = _MOE_REQUANT_WEIGHT_DTYPES.get(desired_quant_dtype)
+    if requant_dtype is None:
+        supported = ", ".join(sorted(_MOE_REQUANT_WEIGHT_DTYPES))
+        raise ValueError(
+            "Unsupported REQUANTIZE_WEIGHT_DTYPE="
+            f"{desired_quant_dtype!r}. Supported values: {supported}.")
+
+    return (desired_quant_dtype, requant_dtype, requant_block_size,
+            enable_quantized_matmul_kernel)
+
+
+def _format_linear_scale_for_runtime(
+    weight_scale: torch.Tensor,
+    *,
+    blockwise_kernel: bool,
+) -> torch.Tensor:
+    """Match ullm's runtime scale layout for dense quantized matmul."""
+    weight_scale = weight_scale.to(torch.float32).contiguous()
+    if blockwise_kernel:
+        # quantize_tensor returns [n_out, n_blocks]. The blockwise kernel
+        # expects [n_blocks, 1, n_out].
+        weight_scale = weight_scale.transpose(0, 1).contiguous().unsqueeze(1)
+    elif weight_scale.ndim == 2 and weight_scale.shape[-1] == 1:
+        weight_scale = weight_scale.squeeze(-1).contiguous()
+    return weight_scale
+
+
+def _process_fp8_linear_weights(
+    layer: torch.nn.Module,
+    *,
+    block_quant: bool,
+    weight_block_size: tuple[int, int] | None,
+    linear_config: VllmQuantLinearConfig | None,
+    linear_quant_config: LinearQuantConfig | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, str, int | None]:
+    """Convert checkpoint FP8 dense linear weights to ullm runtime FP8."""
+    if linear_quant_config is None:
+        linear_quant_config = _get_linear_quant_config(linear_config)
+    desired_quant_dtype, requant_dtype, requant_block_size, blockwise_kernel = (
+        linear_quant_config)
+
+    weight_scale = (layer.weight_scale.data
+                    if hasattr(layer, "weight_scale") else None)
+    weight_scale_inv = (layer.weight_scale_inv.data if hasattr(
+        layer, "weight_scale_inv") else None)
+
+    weight_f = _dequantize_fp8_linear(
+        layer.weight.data,
+        weight_scale=weight_scale,
+        weight_scale_inv=weight_scale_inv,
+        block_quant=block_quant,
+        weight_block_size=weight_block_size,
+        out_dtype=torch.float32,
+    )
+    weight, weight_scale = quantize_tensor(
+        weight_f,
+        quant_dtype=requant_dtype,
+        axis=-1,
+        block_size=requant_block_size,
+    )
+    weight_scale = _format_linear_scale_for_runtime(
+        weight_scale,
+        blockwise_kernel=blockwise_kernel,
+    )
+    return weight.contiguous(
+    ), weight_scale, desired_quant_dtype, requant_block_size
 
 
 def _quantize_and_format_moe_weights(
@@ -320,13 +416,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                     fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            if self.is_checkpoint_fp8_serialized:
-                return VllmFp8LinearMethodTPU(self)
-            logger.info_once(
-                "BF16 checkpoint with --quantization fp8: linear layers "
-                "will run in BF16 (online FP8 linear quantization not "
-                "yet implemented on TPU).")
-            return UnquantizedLinearMethod()
+            return VllmFp8LinearMethodTPU(self, self.get_linear_config(layer))
 
         if isinstance(layer, Attention):
             return None
@@ -488,18 +578,20 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
 class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
-    TPU FP8 linear method that dequantizes FP8 weights to BF16 at load time.
+    TPU FP8 linear method matching ullm's runtime quantized matmul path.
 
     Reuses vLLM's Fp8LinearMethod.create_weights() for correct FP8 weight and
-    scale parameter allocation (needed by the weight loader), but dequantizes
-    to BF16 after loading because this runtime path currently uses BF16
-    linears.
+    scale parameter allocation (needed by the weight loader). After loading,
+    checkpoint FP8 weights are converted to the runtime FP8 format and applied
+    with dynamically quantized activations.
 
     Inherits from Fp8LinearMethod but skips GPU-specific __init__. Only
     sets attributes needed by create_weights().
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(self,
+                 quant_config: Fp8Config,
+                 linear_config: VllmQuantLinearConfig | None = None):
         # Skip Fp8LinearMethod.__init__ which has GPU-specific code
         # (CUDA capability, Marlin, cutlass, W8A8BlockFp8LinearOp).
         # Set only the attributes that create_weights() reads.
@@ -511,39 +603,58 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # Set safe defaults so the parent's create_weights doesn't crash.
         self.use_marlin = False
         self.cutlass_block_fp8_supported = False
+        self.linear_config = linear_config
+        self._linear_quant_config = _get_linear_quant_config(
+            self.linear_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Dequantize FP8 block-quantized weights to BF16."""
-        weight_bf16 = _dequantize_fp8_linear(
-            layer.weight.data,
-            weight_scale=getattr(layer, "weight_scale", None).data if hasattr(
-                layer, "weight_scale") else None,
-            weight_scale_inv=getattr(layer, "weight_scale_inv", None).data
-            if hasattr(layer, "weight_scale_inv") else None,
-            block_quant=self.block_quant,
-            weight_block_size=tuple(self.weight_block_size)
-            if self.weight_block_size is not None else None,
-        )
+        """Convert dense linear checkpoint weights to runtime FP8."""
+        weight, weight_scale, requant_dtype_name, requant_block_size = (
+            _process_fp8_linear_weights(
+                layer,
+                block_quant=self.block_quant,
+                weight_block_size=tuple(self.weight_block_size)
+                if self.weight_block_size is not None else None,
+                linear_config=self.linear_config,
+                linear_quant_config=self._linear_quant_config,
+            ))
 
-        # The dequant chain leaves a 4D intermediate `[out//bh, bh, in//bw,
-        # bw]` whose trailing `.reshape(out, in)` is a logical view, so the
-        # persistent nn.Parameter is still backed by a 4D PJRT buffer. The
-        # matmul boundary then needs a real `copy_bitcast_fusion` per step.
-        # Force a fresh 2D contiguous device buffer with `torch.empty + copy_`
-        # so the persistent storage is a plain row-major [out, in] buffer.
-        weight_bf16 = torch.empty(weight_bf16.shape[0],
-                                  weight_bf16.shape[1],
-                                  dtype=weight_bf16.dtype,
-                                  device=weight_bf16.device).copy_(weight_bf16)
+        # The dequant/requant chain may leave views backed by higher-rank PJRT
+        # buffers. Allocate fresh contiguous persistent parameters so the
+        # matmul boundary sees plain row-major buffers.
+        weight = torch.empty(weight.shape[0],
+                             weight.shape[1],
+                             dtype=weight.dtype,
+                             device=weight.device).copy_(weight)
+        weight_scale = torch.empty(
+            *weight_scale.shape,
+            dtype=weight_scale.dtype,
+            device=weight_scale.device,
+        ).copy_(weight_scale)
 
         replace_parameter(layer, "weight",
-                          torch.nn.Parameter(weight_bf16, requires_grad=False))
+                          torch.nn.Parameter(weight, requires_grad=False))
+        if hasattr(layer, "weight_scale_inv"):
+            delattr(layer, "weight_scale_inv")
+        replace_parameter(layer, "weight_scale", weight_scale)
 
-        logger.info_once("FP8 linear weights dequantized to BF16: "
-                         f"shape={list(weight_bf16.shape)}")
+        if layer.weight.device.type == "tpu":
+            sync.synchronize(layer.weight, wait=True)
+            sync.synchronize(layer.weight_scale, wait=True)
+
+        scale_desc = ("per-channel" if requant_block_size is None else
+                      str(requant_block_size))
+        logger.info_once("FP8 linear weights requantized for runtime: "
+                         f"shape={list(layer.weight.shape)}, "
+                         f"weight_dtype={requant_dtype_name}, "
+                         f"scale={list(layer.weight_scale.shape)}, "
+                         f"requant_block_size={scale_desc}")
 
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
+        out = quantized_matmul(x, layer.weight, layer.weight_scale)
+        if bias is not None:
+            out = out + bias
+        return out

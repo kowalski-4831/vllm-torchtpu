@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     NUM_SLICES: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
+    ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
+    REQUANTIZE_BLOCK_SIZE: int | None = None
+    REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
@@ -71,6 +74,29 @@ def env_with_choices(
         return value
 
     return _get_validated_env
+
+
+def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
+    """
+    Accepts both numeric strings ("0", "1") and boolean strings
+    ("true", "false", "True", "False").
+    """
+
+    def _get_bool_env() -> bool:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return default
+
+        value_lower = value.lower()
+        if value_lower in ("true", "1"):
+            return True
+        if value_lower in ("false", "0"):
+            return False
+        raise ValueError(
+            f"Invalid boolean value '{value}' for {env_name}. "
+            f"Valid options: '0', '1', 'true', 'false', 'True', 'False'.")
+
+    return _get_bool_env
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -126,6 +152,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Ray compiled DAG channel type for TPU
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE":
     env_with_choices("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm", ["shm"]),
+    # Enable the blockwise Pallas quantized matmul kernel for dense linears.
+    "ENABLE_QUANTIZED_MATMUL_KERNEL":
+    env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
+    # Runtime block size for dense linear weight requantization.
+    "REQUANTIZE_BLOCK_SIZE":
+    lambda: int(block_size) if
+    (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None else None,
+    # Runtime dtype for dense linear weight requantization.
+    "REQUANTIZE_WEIGHT_DTYPE":
+    lambda: os.getenv("REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),

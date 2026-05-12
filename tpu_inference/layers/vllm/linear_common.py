@@ -1,11 +1,102 @@
+from threading import Lock
+from typing import Callable
+
 import jax
 import jax.numpy as jnp
+import torch
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from torch_tpu._internal import pallas
 
-from tpu_inference.kernels.quantized_matmul.kernel import \
-    quantized_matmul_kernel
+from tpu_inference.kernels.quantized_matmul.blockwise_kernel import \
+    quantized_matmul_kernel as blockwise_quantized_matmul_kernel
+from tpu_inference.kernels.quantized_matmul.util import xla_quantized_matmul
+
+
+def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
+    """Return the activation quant dtype used by ullm for a weight dtype."""
+    if jnp.issubdtype(w_q_dtype, jnp.integer):
+        return jnp.int8
+    if jnp.issubdtype(w_q_dtype, jnp.floating):
+        return jnp.float8_e4m3fn
+    raise ValueError(f"Unsupported quantized dtype: {w_q_dtype}")
+
+
+def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array,
+                          w_s: jax.Array) -> jax.Array:
+    if x.shape[1] != w_q.shape[1]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[1]} must match weight hidden dim "
+            f"{w_q.shape[1]}.")
+    x_q_dtype = _get_x_q_dtype(w_q.dtype)
+    if len(w_s.shape) == 3:
+        k_dim = x.shape[1]
+        sharded_num_blocks, _, _ = w_s.shape
+        if w_s.shape[1] != 1:
+            raise ValueError(
+                f"Blockwise weight scale middle dim must be 1, got {w_s.shape=}"
+            )
+        if w_s.shape[2] != w_q.shape[0]:
+            raise ValueError(
+                f"Blockwise weight scale output dim {w_s.shape[2]} must match "
+                f"weight output dim {w_q.shape[0]}.")
+        if sharded_num_blocks <= 0 or k_dim % sharded_num_blocks != 0:
+            raise ValueError(
+                f"Input hidden dim {k_dim} must be divisible by block scale "
+                f"count {sharded_num_blocks}.")
+        block_size = k_dim // sharded_num_blocks
+        return blockwise_quantized_matmul_kernel(
+            x,
+            w_q,
+            w_s,
+            x_q_dtype=x_q_dtype,
+            block_size=block_size,
+        )
+    return xla_quantized_matmul(x, w_q, w_s)
+
+
+_quantized_matmul_kernel_op: Callable | None = None
+_quantized_matmul_kernel_op_lock = Lock()
+
+
+def _get_quantized_matmul_op() -> Callable:
+    global _quantized_matmul_kernel_op
+    if _quantized_matmul_kernel_op is not None:
+        return _quantized_matmul_kernel_op
+
+    with _quantized_matmul_kernel_op_lock:
+        if _quantized_matmul_kernel_op is not None:
+            return _quantized_matmul_kernel_op
+
+        op = pallas.jax_op("pallas::quantized_matmul_kernel",
+                           _quantized_matmul_jax)
+
+        def _fake_quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
+                                   w_s: torch.Tensor):
+            del w_s
+            return torch.empty(x.shape[0],
+                               w_q.shape[0],
+                               dtype=x.dtype,
+                               device=x.device)
+
+        op.register_fake(_fake_quantized_matmul)
+        _quantized_matmul_kernel_op = op
+        return op
+
+
+def quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
+                     w_s: torch.Tensor) -> torch.Tensor:
+    """Torch bridge for ullm-style FP8 runtime dense linears."""
+    if x.shape[-1] != w_q.shape[-1]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[-1]}.")
+
+    orig_out_shape = (*x.shape[:-1], w_q.shape[0])
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
+    return out_2d.reshape(orig_out_shape)
 
 
 def sharded_quantized_matmul(x: jax.Array, w_q: jax.Array, w_s: jax.Array,
@@ -18,7 +109,7 @@ def sharded_quantized_matmul(x: jax.Array, w_q: jax.Array, w_s: jax.Array,
     x = jax.lax.with_sharding_constraint(x, NamedSharding(mesh, x_sharding))
 
     def wrapper(x, w_q, w_s):
-        output = quantized_matmul_kernel(x, w_q, w_s, x_q_dtype=w_q.dtype)
+        output = _quantized_matmul_jax(x, w_q, w_s)
         if in_axis:
             output = jax.lax.psum(output, axis_name=in_axis)
         return output

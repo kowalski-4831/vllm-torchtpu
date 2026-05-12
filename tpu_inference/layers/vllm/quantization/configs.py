@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 
+from tpu_inference import envs
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
@@ -42,6 +43,10 @@ class VllmQuantLinearConfig:
         assert isinstance(layer, LinearBase)
         self.vllm_config = vllm_config
         self.output_sizes = [layer.output_size]
+        self.enable_quantized_matmul_kernel = (
+            envs.ENABLE_QUANTIZED_MATMUL_KERNEL)
+        self.requant_block_size = envs.REQUANTIZE_BLOCK_SIZE
+        self.requant_weight_dtype = envs.REQUANTIZE_WEIGHT_DTYPE
 
         # TODO: Implement proper sharding configuration for TPU
         # This should determine weight/bias sharding based on layer type
