@@ -16,8 +16,18 @@ FROM $BASE_IMAGE AS base
 ARG USE_TORCH_TPU_REGISTRY=""
 ARG TORCH_TPU_VERSION=""
 
-# Install curl for health checks
+# Install curl for health checks (minimal for base)
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# Stage 2.5: The CI Environment (with tools)
+FROM base AS ci
+
+# Install tools needed for CI (git, gcloud)
+RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg git && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    apt-get update && apt-get install -y google-cloud-cli && \
+    rm -rf /var/lib/apt/lists/*
 
 # Clear PYTHONPATH inherited from base image if any
 ENV PYTHONPATH=""
@@ -71,7 +81,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi
 
 # Stage 3: Developer Image (Editable)
-FROM base AS dev
+FROM ci AS dev
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
