@@ -29,10 +29,12 @@ contracting dimension.
 
 The checkpoint stores FP8 weights with either block scales or tensor/channel
 scales. At load time we dequantize those weights to float32, then requantize
-them into the same runtime FP8 format used by ullm. Activations are quantized
-dynamically inside the Pallas matmul wrapper. By default this uses ullm's XLA
-per-channel quantized matmul path; setting ENABLE_QUANTIZED_MATMUL_KERNEL=1
-with REQUANTIZE_BLOCK_SIZE selects the blockwise Pallas kernel path.
+them into the runtime FP8 layout consumed by the Pallas matmul bridge in
+`tpu_inference/layers/vllm/linear_common.py`. Activations are quantized
+dynamically inside the bridge. By default the bridge dispatches to a pure-JAX
+`dot_general`-based per-channel FP8 matmul (`xla_quantized_matmul`); setting
+ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
+the blockwise Pallas kernel path instead.
 """
 
 from typing import Optional
@@ -145,7 +147,12 @@ def _get_moe_quant_config(
 
 def _get_linear_quant_config(
     linear_config: VllmQuantLinearConfig | None, ) -> LinearQuantConfig:
-    """Parse dense-linear quantization settings using ullm's env gates."""
+    """Parse dense-linear quantization settings from env-gated overrides.
+
+    Reads ENABLE_QUANTIZED_MATMUL_KERNEL, REQUANTIZE_BLOCK_SIZE, and
+    REQUANTIZE_WEIGHT_DTYPE (either from `linear_config` or `envs`) and
+    validates that the kernel-gate / block-size combination is coherent.
+    """
     enable_quantized_matmul_kernel = (
         linear_config.enable_quantized_matmul_kernel
         if linear_config is not None else envs.ENABLE_QUANTIZED_MATMUL_KERNEL)
@@ -181,7 +188,14 @@ def _format_linear_scale_for_runtime(
     *,
     blockwise_kernel: bool,
 ) -> torch.Tensor:
-    """Match ullm's runtime scale layout for dense quantized matmul."""
+    """Reshape `weight_scale` to the layout expected by the matmul bridge.
+
+    - Blockwise kernel path: kernel expects `[n_in_blocks, 1, n_out]`. The
+      requantizer produces `[n_out, n_in_blocks]`, so transpose and add the
+      singleton middle axis.
+    - XLA per-channel path: kernel expects a 1-D `[n_out]` scale, so drop
+      a trailing singleton dim if present.
+    """
     weight_scale = weight_scale.to(torch.float32).contiguous()
     if blockwise_kernel:
         # quantize_tensor returns [n_out, n_blocks]. The blockwise kernel
@@ -200,7 +214,13 @@ def _process_fp8_linear_weights(
     linear_config: VllmQuantLinearConfig | None,
     linear_quant_config: LinearQuantConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, str, int | None]:
-    """Convert checkpoint FP8 dense linear weights to ullm runtime FP8."""
+    """Convert checkpoint FP8 dense linear weights to the runtime FP8 layout.
+
+    Dequantizes the checkpoint weight to float32 (collapsing per-block or
+    per-tensor scales), then requantizes to the runtime dtype/block-size
+    chosen by the env gates, and formats the scale tensor to the shape the
+    matmul bridge expects.
+    """
     if linear_quant_config is None:
         linear_quant_config = _get_linear_quant_config(linear_config)
     desired_quant_dtype, requant_dtype, requant_block_size, blockwise_kernel = (
@@ -578,12 +598,13 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
 class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
-    TPU FP8 linear method matching ullm's runtime quantized matmul path.
+    TPU FP8 linear method that keeps weights in FP8 at runtime and quantizes
+    activations dynamically inside a Pallas matmul bridge.
 
     Reuses vLLM's Fp8LinearMethod.create_weights() for correct FP8 weight and
     scale parameter allocation (needed by the weight loader). After loading,
-    checkpoint FP8 weights are converted to the runtime FP8 format and applied
-    with dynamically quantized activations.
+    checkpoint FP8 weights are converted to the runtime FP8 layout and applied
+    with dynamically quantized activations through `quantized_matmul`.
 
     Inherits from Fp8LinearMethod but skips GPU-specific __init__. Only
     sets attributes needed by create_weights().

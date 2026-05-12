@@ -15,7 +15,11 @@ from tpu_inference.kernels.quantized_matmul.util import xla_quantized_matmul
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
-    """Return the activation quant dtype used by ullm for a weight dtype."""
+    """Return the activation quant dtype paired with a given weight dtype.
+
+    Integer weights pair with int8 activations; floating-point (FP8) weights
+    pair with float8_e4m3fn activations.
+    """
     if jnp.issubdtype(w_q_dtype, jnp.integer):
         return jnp.int8
     if jnp.issubdtype(w_q_dtype, jnp.floating):
@@ -87,7 +91,13 @@ def _get_quantized_matmul_op() -> Callable:
 
 def quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
                      w_s: torch.Tensor) -> torch.Tensor:
-    """Torch bridge for ullm-style FP8 runtime dense linears."""
+    """Torch entry point for the runtime FP8 dense-linear matmul.
+
+    Reshapes `x` to 2-D, dispatches through a cached `pallas.jax_op`, and
+    reshapes the output back. The underlying JAX function picks the blockwise
+    Pallas kernel when `w_s` is rank-3 `[n_in_blocks, 1, n_out]`, and the
+    per-channel `xla_quantized_matmul` path when `w_s` is 1-D `[n_out]`.
+    """
     if x.shape[-1] != w_q.shape[-1]:
         raise ValueError(
             f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
