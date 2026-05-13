@@ -296,6 +296,7 @@ class TpuPlatform(Platform):
             model_config.dtype = torch.bfloat16
 
         cache_config = vllm_config.cache_config
+        block_size_was_unspecified = cache_config.block_size is None
         # For v0, the default block size is 16.
         if cache_config and cache_config.block_size is None:
             cache_config.block_size = cast(BlockSize, 16)
@@ -316,7 +317,8 @@ class TpuPlatform(Platform):
                 min_page_size,
             )
             cache_config.block_size = min_page_size  # type: ignore[assignment]
-        if envs.USE_BATCHED_RPA_KERNEL and cache_config.block_size < 256:
+        if (envs.USE_BATCHED_RPA_KERNEL and block_size_was_unspecified
+                and cache_config.block_size < 256):
             cache_config.block_size = 256  # type: ignore[assignment]
         logger.info("Using KV cache block size: %s", cache_config.block_size)
 

@@ -149,6 +149,9 @@ start_vllm_server() {
     if [ -n "$QUANTIZATION" ]; then
         extra_args="$extra_args --quantization $QUANTIZATION"
     fi
+    if [ "${USE_BATCHED_RPA_KERNEL:-0}" = "1" ]; then
+        extra_args="$extra_args --block-size 256"
+    fi
 
     export PYTHONUNBUFFERED=1
     export MODEL_IMPL_TYPE=vllm
