@@ -53,10 +53,10 @@ _dynamic_compile_unwrapped = False
 
 def _configure_torchtpu_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
-    previous_mode = execution_mode.get_eager_mode()
-    execution_mode.set_eager_mode(execution_mode.EagerMode.DEFER_AND_FUSE)
+    previous_mode = execution_mode.eager_mode
+    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
     logger.info("TorchTPU eager mode configured: %s (previous=%s)",
-                execution_mode.get_eager_mode().name, previous_mode.name)
+                execution_mode.eager_mode.name, previous_mode.name)
 
 
 def _unwrap_dynamic_compile_fns() -> None:

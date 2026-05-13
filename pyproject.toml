@@ -25,7 +25,7 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     "vllm==0.19.0",
-    "torch-tpu==0.1.1.dev20260504094009",
+    "torch-tpu==0.1.1.dev20260512095200",
     "ray[default]",
     "ray[data]",
 ]
