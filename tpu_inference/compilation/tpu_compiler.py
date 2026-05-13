@@ -113,7 +113,6 @@ class TpuCompilerAdaptor(CompilerInterface):
 
     def compute_hash(self, vllm_config: VllmConfig) -> str:
         """Hash TPU runtime sources that sit behind custom-op boundaries."""
-        del vllm_config
         import torch_tpu
 
         repo_root = Path(__file__).resolve().parents[2]
@@ -127,6 +126,24 @@ class TpuCompilerAdaptor(CompilerInterface):
         # cache key — each Impl registers under a distinct op name
         # (`pallas::rpa_kernel_*` vs `pallas::rpa_kernel_batched_*`), so the
         # FX graph already discriminates.
+
+        # KV-cache budget inputs. The compiled FX graphs embed the resolved
+        # num_gpu_blocks as a literal, but num_gpu_blocks isn't known until
+        # after profile_run computes the KV-cache budget from these env+config
+        # values. Hashing them catches changes that would otherwise produce a
+        # stale-cache "tensor X vs Y expanded size" error on first execution
+        # instead of a clean recompile.
+        hash_obj.update(
+            f"kv_headroom_mib={envs.TPU_KV_CACHE_HEADROOM_MIB}".encode())
+        hash_obj.update(
+            f"gpu_mem_util={vllm_config.cache_config.gpu_memory_utilization}".
+            encode())
+        hash_obj.update(
+            f"max_num_batched_tokens="
+            f"{vllm_config.scheduler_config.max_num_batched_tokens}".encode())
+        hash_obj.update(
+            f"num_gpu_blocks_override="
+            f"{vllm_config.cache_config.num_gpu_blocks_override}".encode())
 
         for path in _iter_runtime_cache_key_files(repo_root):
             relpath = path.relative_to(repo_root).as_posix()
