@@ -1991,7 +1991,8 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_logits(
             self, hidden_states: torch.Tensor,
             indices_do_sample: torch.Tensor) -> torch.Tensor:
-        return self.model.compute_logits(hidden_states[indices_do_sample])
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self.model.compute_logits(selected)
 
     def _apply_temperature(self, logits: torch.Tensor,
                            temperatures: torch.Tensor) -> torch.Tensor:
