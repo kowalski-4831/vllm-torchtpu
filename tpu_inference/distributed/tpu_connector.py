@@ -46,6 +46,9 @@ from uuid import uuid4
 
 import torch
 import zmq
+from torch_tpu._internal.batch_transfer import (batch_transfer_d2h,
+                                                batch_transfer_d2h_sync,
+                                                batch_transfer_h2d_sync)
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
@@ -154,6 +157,23 @@ class _CoordRecvEntry:
     # Have we already surfaced this req in get_finished()? Prevents duplicate
     # reporting across scheduler ticks while we wait for per-rank copies.
     reported_done: bool = False
+
+
+@dataclass
+class _StageInFlight:
+    """A pending async D2H batch waiting on its PjRt future.
+
+    Tensors are retained here so that the source device buffer and the
+    destination shm view stay alive until the DMA completes. The waiter
+    thread blocks on `future.wait()` and then signals STAGE_DONE for this
+    rank."""
+    uuid: int
+    slot_idx: int
+    num_blocks: int
+    future: Any  # TransferFuture
+    tpu_tensors: list
+    cpu_tensors: list
+    enqueue_t0: float
 
 
 class _LatencyTracker:
@@ -495,8 +515,12 @@ class TPUConnectorWorker:
         # queue each iteration, so send_multipart() is only ever called from
         # one thread (ZMQ sockets are not thread-safe).
         self._coord_ipc_out: queue.Queue = queue.Queue()
-        # Reusable executor for both producer staging and consumer pulling.
-        self._coord_executor = ThreadPoolExecutor(max_workers=128)
+        # Request-level pulls run asynchronously so the worker main thread can
+        # keep servicing vLLM RPCs. Each request then fans out to N channel
+        # pulls on a separate executor; sharing one pool for both levels can
+        # self-starve when many requests are in flight.
+        self._coord_executor = ThreadPoolExecutor(max_workers=64)
+        self._coord_channel_executor = ThreadPoolExecutor(max_workers=128)
 
         # Rank-0 authoritative state. Non-zero ranks leave these empty and
         # return empty sets from get_finished; the scheduler unions across
@@ -544,6 +568,13 @@ class TPUConnectorWorker:
 
         # Lock around the rank-0 bookkeeping dicts above.
         self._coord_lock = threading.Lock()
+
+        # Async-D2H staging: producer enqueues _StageInFlight entries here;
+        # a single waiter thread per rank blocks on `future.wait()` and
+        # then signals STAGE_DONE. Decouples the worker's main RPC thread
+        # from the DMA so we can overlap with the next model_forward and
+        # the STAGE_NOTIFY/scheduler/PULL-setup round-trip.
+        self._stage_pending_q: queue.Queue = queue.Queue()
 
     def __del__(self):
         self._stop_event.set()
@@ -627,12 +658,15 @@ class TPUConnectorWorker:
                                device=self.device)
         slot_idx = 0
         if self.is_producer:
+            tpu_tensors = []
+            cpu_tensors = []
             for layer_idx, cache in enumerate(kv_caches):
                 src_shard = torch.index_select(cache, 0, indices)
-                cpu_shard = src_shard.detach().to("cpu")
                 dest_view = self._coord_pool.layer_view(
                     slot_idx, self.tp_rank, layer_idx, num_blocks)
-                dest_view.copy_(cpu_shard)
+                tpu_tensors.append(src_shard)
+                cpu_tensors.append(dest_view)
+            batch_transfer_d2h_sync(tpu_tensors, cpu_tensors)
         else:
             use_kv_scatter = self._kv_scatter_enabled
             if use_kv_scatter:
@@ -770,6 +804,14 @@ class TPUConnectorWorker:
         t_ipc.start()
         self._coord_threads.append(t_ipc)
 
+        # Stage waiter: drains the async-D2H queue and signals STAGE_DONE
+        # once each future completes.
+        t_stage_wait = threading.Thread(target=self._coord_stage_waiter_loop,
+                                        name="tpu_conn_stage_wait",
+                                        daemon=True)
+        t_stage_wait.start()
+        self._coord_threads.append(t_stage_wait)
+
         # Expiration sweeper for pending sends.
         t_exp = threading.Thread(target=self._coord_rank0_expire_loop,
                                  name="tpu_conn_expire",
@@ -824,6 +866,15 @@ class TPUConnectorWorker:
         t.start()
         self._coord_threads.append(t)
 
+        # Stage waiter: same role as on rank 0; sends STAGE_DONE via IPC
+        # once the per-rank D2H future completes.
+        t_stage_wait = threading.Thread(
+            target=self._coord_stage_waiter_loop,
+            name=f"tpu_conn_stage_wait_{self.tp_rank}",
+            daemon=True)
+        t_stage_wait.start()
+        self._coord_threads.append(t_stage_wait)
+
     # ---- IPC envelope helpers ------------------------------------------
     # All IPC send paths enqueue; the IPC loop thread is the only one that
     # actually calls send_multipart. This keeps the single ZMQ socket off
@@ -869,8 +920,16 @@ class TPUConnectorWorker:
     # ---- Coord teardown -------------------------------------------------
     def _coord_teardown(self) -> None:
         self._stop_event.set()
+        # Wake the stage waiter so it can observe _stop_event and exit.
+        if hasattr(self, "_stage_pending_q"):
+            try:
+                self._stage_pending_q.put_nowait(None)
+            except Exception:
+                pass
         if hasattr(self, "_coord_executor"):
             self._coord_executor.shutdown(wait=False)
+        if hasattr(self, "_coord_channel_executor"):
+            self._coord_channel_executor.shutdown(wait=False)
         for t in getattr(self, "_coord_threads", []):
             t.join(timeout=2)
         if getattr(self, "_coord_pool", None) is not None:
@@ -980,19 +1039,14 @@ class TPUConnectorWorker:
             "slot=%d to %d non-zero ranks", req_meta.uuid, slot_idx,
             len(self._coord_rank_to_identity))
 
-        # Rank 0 stages its own shard inline on the main thread. The XLA
-        # queue is empty at this point (scheduler just handed us work; no
-        # model_forward yet), so .to("cpu") materializes quickly.
+        # Rank 0 enqueues its own async D2H on the main thread; the waiter
+        # thread emits STAGE_DONE once the future completes. Returning here
+        # before the DMA finishes lets vLLM advance and the
+        # STAGE_NOTIFY/scheduler/PULL-setup round-trip overlap with the
+        # transfer.
         try:
-            self._coord_stage_shard(slot_idx, num_blocks,
+            self._coord_stage_shard(req_meta.uuid, slot_idx, num_blocks,
                                     req_meta.local_block_ids)
-            with self._coord_lock:
-                e2 = self._coord_send.get(req_meta.uuid)
-                if e2 is None:
-                    return
-                e2.staged.add(0)
-                if len(e2.staged) == self.tp_size:
-                    e2.stage_complete.set()
         except Exception as ex:
             logger.exception(
                 "TPUConnectorWorker rank0 --> stage_self uuid=%s failed: %s",
@@ -1025,13 +1079,16 @@ class TPUConnectorWorker:
             info = self._worker_pending_stage.pop(uuid)
         slot_idx, num_blocks, block_ids = info
         try:
-            self._coord_stage_shard(slot_idx, num_blocks, block_ids)
+            self._coord_stage_shard(uuid, slot_idx, num_blocks, block_ids)
         except Exception as e:
             logger.exception(
                 "TPUConnectorWorker rank%d --> stage_inline uuid=%s failed: %s",
                 self.tp_rank, uuid, e)
-        # ACK regardless so rank 0's stage_complete can fire.
-        self._coord_send_ipc(_IPC_STAGE_DONE, (uuid, self.tp_rank))
+            # Enqueue path didn't run, so the waiter won't fire STAGE_DONE
+            # for us. Send it directly so rank 0's stage_complete can still
+            # fire (the producer will serve a partially-zero shm slice, but
+            # that's strictly better than hanging the request out forever).
+            self._coord_send_ipc(_IPC_STAGE_DONE, (uuid, self.tp_rank))
 
     def _maybe_enable_kv_scatter(self) -> None:
         """Run the startup smoke test for the multi-layer scatter kernel
@@ -1067,50 +1124,114 @@ class TPUConnectorWorker:
                 "smoke test failed; falling back to index_put_", self.node_id,
                 self.tp_rank)
 
-    def _coord_stage_shard(self, slot_idx: int, num_blocks: int,
+    def _coord_stage_shard(self, uuid: int, slot_idx: int, num_blocks: int,
                            block_ids: list[int]) -> None:
-        """D2H this rank's shard of the selected blocks into the shm slot.
+        """Issue an async D2H batch for this rank's shard and enqueue the
+        future for the waiter thread.
 
-        We use `.to("cpu")` per layer rather than a raw
-        `dest_view.copy_(lazy_src)` onto shm: the latter has been observed
-        to accumulate all N layers into one monolithic XLA graph
-        (synchronize on a CPU tensor is a no-op), which either takes
-        >30s to compile or never flushes -- producing a PULL timeout.
-        `.to("cpu")` is the canonical torch_tpu materialization path and
-        flushes each layer's lazy gather+copy independently."""
+        Returns immediately after the enqueue: the DMA proceeds in
+        background, and the per-rank STAGE_DONE is emitted by the waiter
+        once `future.wait()` returns. This frees the worker's main RPC
+        thread to advance vLLM, and lets the D2H overlap with the
+        STAGE_NOTIFY -> scheduler -> PULL-setup round-trip and any
+        subsequent model_forward.
+
+        `tpu_tensors` (the lazy `index_select` results) and `cpu_tensors`
+        (shm views) are retained on the in-flight entry until the future
+        completes, so the source device buffer and destination shm
+        backing stay alive across the DMA."""
         logger.info(
-            "TPUConnectorWorker %s rank%d --> stage_shard entering "
-            "slot=%d blocks=%d layers=%d", self.node_id, self.tp_rank,
-            slot_idx, num_blocks, len(self.runner.kv_caches))
+            "TPUConnectorWorker %s rank%d --> stage_shard enqueue "
+            "uuid=%s slot=%d blocks=%d layers=%d", self.node_id, self.tp_rank,
+            uuid, slot_idx, num_blocks, len(self.runner.kv_caches))
         indices = torch.tensor(block_ids,
                                dtype=torch.int64,
                                device=self.device)
         kv_caches = self.runner.kv_caches
-        stage_t0 = time.perf_counter()
-        first_layer_ms = 0.0
+        enqueue_t0 = time.perf_counter()
+
+        tpu_tensors = []
+        cpu_tensors = []
         for layer_idx, cache in enumerate(kv_caches):
-            layer_t0 = time.perf_counter()
             src_shard = torch.index_select(cache, 0, indices)
-            # Force materialization to CPU (blocking in torch_tpu),
-            # then memcpy into shm via plain CPU->CPU copy_.
-            cpu_shard = src_shard.detach().to("cpu")
             dest_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
                                                     layer_idx, num_blocks)
-            dest_view.copy_(cpu_shard)
-            if layer_idx == 0:
-                first_layer_ms = (time.perf_counter() - layer_t0) * 1000.0
-                logger.info(
-                    "TPUConnectorWorker %s rank%d --> stage_shard layer 0 "
-                    "done in %.2fms (slot=%d blocks=%d)", self.node_id,
-                    self.tp_rank, first_layer_ms, slot_idx, num_blocks)
-        total_ms = (time.perf_counter() - stage_t0) * 1000.0
-        self._lat.record(_LAT_D2H, total_ms)
-        self._lat.record(_LAT_STAGE, total_ms)
+            tpu_tensors.append(src_shard)
+            cpu_tensors.append(dest_view)
+
+        future = batch_transfer_d2h(tpu_tensors, cpu_tensors)
+        enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
+
+        self._stage_pending_q.put(
+            _StageInFlight(uuid=uuid,
+                           slot_idx=slot_idx,
+                           num_blocks=num_blocks,
+                           future=future,
+                           tpu_tensors=tpu_tensors,
+                           cpu_tensors=cpu_tensors,
+                           enqueue_t0=enqueue_t0))
         logger.info(
-            "TPUConnectorWorker %s rank%d --> stage slot=%d blocks=%d "
-            "layers=%d d2h=%.2fms (first-layer=%.2fms)", self.node_id,
-            self.tp_rank, slot_idx, num_blocks, len(kv_caches), total_ms,
-            first_layer_ms)
+            "TPUConnectorWorker %s rank%d --> stage_shard enqueued "
+            "uuid=%s slot=%d enqueue=%.2fms", self.node_id, self.tp_rank, uuid,
+            slot_idx, enqueue_ms)
+
+    def _coord_stage_waiter_loop(self) -> None:
+        """Drain the per-rank async-D2H queue: wait on each future, then
+        signal STAGE_DONE for that uuid. Source/destination tensors are
+        retained on the in-flight entry, so dropping the entry after wait
+        completes is the natural moment to release the device buffer."""
+        while not self._stop_event.is_set():
+            try:
+                entry = self._stage_pending_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if entry is None:
+                return
+            try:
+                wait_t0 = time.perf_counter()
+                entry.future.wait()
+                wait_ms = (time.perf_counter() - wait_t0) * 1000.0
+                total_ms = (time.perf_counter() - entry.enqueue_t0) * 1000.0
+                self._lat.record(_LAT_D2H, total_ms)
+                self._lat.record(_LAT_STAGE, total_ms)
+                logger.info(
+                    "TPUConnectorWorker %s rank%d --> stage_done "
+                    "uuid=%s slot=%d wait=%.2fms total=%.2fms", self.node_id,
+                    self.tp_rank, entry.uuid, entry.slot_idx, wait_ms,
+                    total_ms)
+            except Exception as e:
+                logger.exception(
+                    "TPUConnectorWorker %s rank%d --> stage_waiter uuid=%s "
+                    "future.wait() failed: %s", self.node_id, self.tp_rank,
+                    entry.uuid, e)
+            # Drop tensor refs even on failure so the slot can be expired
+            # without a leaked device buffer reference.
+            entry.tpu_tensors.clear()
+            entry.cpu_tensors.clear()
+            self._signal_stage_done(entry.uuid)
+
+    def _signal_stage_done(self, uuid: int) -> None:
+        """Mark this rank's STAGE_DONE on the rank-0 send entry. On rank 0
+        this is a direct local update; on other ranks it goes through IPC
+        to rank 0's listener, which performs the same update."""
+        if self.tp_rank == 0:
+            fired_complete = False
+            staged_count = 0
+            with self._coord_lock:
+                entry = self._coord_send.get(uuid)
+                if entry is None:
+                    return
+                entry.staged.add(0)
+                staged_count = len(entry.staged)
+                if staged_count == self.tp_size:
+                    entry.stage_complete.set()
+                    fired_complete = True
+            if fired_complete:
+                logger.info(
+                    "TPUConnectorWorker rank0 --> stage_complete uuid=%s "
+                    "(all %d ranks staged, self-fire)", uuid, self.tp_size)
+        else:
+            self._coord_send_ipc(_IPC_STAGE_DONE, (uuid, self.tp_rank))
 
     # =========================================================
     # Rank 0 consumer path: pull, write shm, broadcast LOAD_NOTIFY
@@ -1248,7 +1369,11 @@ class TPUConnectorWorker:
             sock = make_zmq_socket(ctx=self.zmq_cxt,
                                    path=sock_path,
                                    socket_type=zmq.DEALER,
-                                   bind=False)
+                                   bind=False,
+                                   linger=0)
+            timeout_ms = max(1, int(timeout_s * 1000))
+            sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
             try:
                 t0 = time.perf_counter()
                 sock.send_multipart([_MSG_PULL, uuid_bytes, req_blocks_pickle])
@@ -1310,13 +1435,24 @@ class TPUConnectorWorker:
         t_total0 = time.perf_counter()
         try:
             futures = [
-                self._coord_executor.submit(_pull_channel, ch)
+                self._coord_channel_executor.submit(_pull_channel, ch)
                 for ch in range(n_channels)
             ]
             results: list[tuple[int, float, float, list[int],
                                 Optional[zmq.Frame]]] = []
+            first_error: Optional[BaseException] = None
             for fut in futures:
-                results.append(fut.result())
+                try:
+                    results.append(fut.result())
+                except BaseException as e:
+                    if first_error is None:
+                        first_error = e
+            # All channel futures have returned or timed out before we mark
+            # the request failed and release its shm slot. Otherwise a late
+            # successful channel from a failed pull can unpack into a slot
+            # already reused by a later request.
+            if first_error is not None:
+                raise first_error
             t_done = time.perf_counter()
 
             # Sanity-check all ranks were delivered exactly once.
@@ -1445,6 +1581,7 @@ class TPUConnectorWorker:
         use_kv_scatter = self._kv_scatter_enabled
         h2d_ms_total = 0.0
         insert_ms_total = 0.0
+        alloc_ms_total = 0.0
         if use_kv_scatter:
             # One bridge crossing for all N layers. We still issue N
             # .to(device) calls sequentially (the only way to get shm
@@ -1456,12 +1593,21 @@ class TPUConnectorWorker:
                                            device=self.device)
             prebuilt = kv_scatter.prepare_scatter_args(dest_blocks_dev,
                                                        self.device)
-            h2d_t0 = time.perf_counter()
+            alloc_t0 = time.perf_counter()
+            src_views = []
             device_shards = []
             for layer_idx in range(len(kv_caches)):
                 src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
                                                        layer_idx, num_blocks)
-                device_shards.append(src_view.to(self.device))
+                src_views.append(src_view)
+                device_shards.append(
+                    torch.empty(src_view.shape,
+                                dtype=src_view.dtype,
+                                device=self.device))
+            alloc_t1 = time.perf_counter()
+
+            h2d_t0 = time.perf_counter()
+            batch_transfer_h2d_sync(src_views, device_shards)
             h2d_t1 = time.perf_counter()
             new_caches = kv_scatter.multi_layer_scatter_into(
                 device_shards,
@@ -1478,31 +1624,47 @@ class TPUConnectorWorker:
                 kv_caches[i] = c
             h2d_ms_total = (h2d_t1 - h2d_t0) * 1000.0
             insert_ms_total = (k_wait_t - h2d_t1) * 1000.0
+            alloc_ms_total = (alloc_t1 - alloc_t0) * 1000.0
             path = "kv_scatter"
         else:
             indices = torch.tensor(local_blocks,
                                    dtype=torch.int64,
                                    device=self.device)
-            for layer_idx, cache in enumerate(kv_caches):
+            alloc_t0 = time.perf_counter()
+            src_views = []
+            device_shards = []
+            for layer_idx in range(len(kv_caches)):
                 src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
                                                        layer_idx, num_blocks)
-                h_t0 = time.perf_counter()
-                device_shard = src_view.to(self.device)
-                h_t1 = time.perf_counter()
-                cache.index_put_((indices, ), device_shard)
+                src_views.append(src_view)
+                device_shards.append(
+                    torch.empty(src_view.shape,
+                                dtype=src_view.dtype,
+                                device=self.device))
+            alloc_t1 = time.perf_counter()
+
+            h_t0 = time.perf_counter()
+            batch_transfer_h2d_sync(src_views, device_shards)
+            h_t1 = time.perf_counter()
+
+            h2d_ms_total = (h_t1 - h_t0) * 1000.0
+            insert_ms_total = 0.0
+            alloc_ms_total = (alloc_t1 - alloc_t0) * 1000.0
+
+            for layer_idx, cache in enumerate(kv_caches):
+                ins_t0 = time.perf_counter()
+                cache.index_put_((indices, ), device_shards[layer_idx])
                 tpu_sync.synchronize(cache)
-                h_t2 = time.perf_counter()
-                h2d_ms_total += (h_t1 - h_t0) * 1000.0
-                insert_ms_total += (h_t2 - h_t1) * 1000.0
+                insert_ms_total += (time.perf_counter() - ins_t0) * 1000.0
             path = "naive"
         self._lat.record(_LAT_H2D, h2d_ms_total)
         self._lat.record(_LAT_INSERT, insert_ms_total)
         self._lat.record(_LAT_SCATTER, h2d_ms_total + insert_ms_total)
         logger.info(
             "TPUConnectorWorker %s rank%d --> scatter slot=%d blocks=%d "
-            "layers=%d h2d=%.2fms insert=%.2fms path=%s", self.node_id,
-            self.tp_rank, slot_idx, num_blocks, len(kv_caches), h2d_ms_total,
-            insert_ms_total, path)
+            "layers=%d alloc=%.2fms h2d=%.2fms insert=%.2fms path=%s",
+            self.node_id, self.tp_rank, slot_idx, num_blocks, len(kv_caches),
+            alloc_ms_total, h2d_ms_total, insert_ms_total, path)
 
     def _coord_rank0_register_copy(self, uuid: int,
                                    req_meta: LoadMeta) -> None:
@@ -1749,7 +1911,11 @@ class TPUConnectorWorker:
                                path=sock_path,
                                socket_type=zmq.ROUTER,
                                bind=True)
+        sock.setsockopt(zmq.LINGER, 0)
         sock.setsockopt(zmq.ROUTER_MANDATORY, 0)
+        sock.setsockopt(zmq.SNDTIMEO,
+                        max(1,
+                            dist_utils.get_p2p_wait_pull_timeout() * 1000))
         ranks_on_channel = [
             r for r in range(self.tp_size)
             if r % self._n_channels == channel_idx
@@ -1758,9 +1924,45 @@ class TPUConnectorWorker:
             "TPUConnectorWorker rank0 --> data server ch=%d listening on "
             "tcp://%s:%s serving ranks=%s", channel_idx, self.host_ip, port,
             ranks_on_channel)
+
+        ready_responses: queue.Queue = queue.Queue()
+
+        def _prepare_response(client_id: bytes, uuid: int,
+                              uuid_bytes: bytes) -> None:
+            response = self._coord_rank0_build_pull_response(
+                uuid, uuid_bytes, channel_idx, ranks_on_channel)
+            ready_responses.put((client_id, uuid, uuid_bytes, response))
+
+        def _send_ready_responses() -> None:
+            while True:
+                try:
+                    client_id, uuid, uuid_bytes, response = (
+                        ready_responses.get_nowait())
+                except queue.Empty:
+                    return
+                if response is None:
+                    try:
+                        sock.send_multipart([client_id, _MSG_ERR, uuid_bytes])
+                    except zmq.ZMQError as e:
+                        logger.warning(
+                            "TPUConnectorWorker rank0 --> data send ERR "
+                            "ch=%d uuid=%s failed: %s", channel_idx, uuid, e)
+                    continue
+                # copy=False lets ZMQ send the big per-layer memoryviews
+                # directly from shm via scatter-gather sendmsg, no userland
+                # copy. Small framing frames pay a tiny per-frame overhead;
+                # net win is ~256MB of memcpy avoided per rank.
+                try:
+                    sock.send_multipart([client_id, *response], copy=False)
+                except zmq.ZMQError as e:
+                    logger.warning(
+                        "TPUConnectorWorker rank0 --> data send ch=%d "
+                        "uuid=%s failed: %s", channel_idx, uuid, e)
+
         while not self._stop_event.is_set():
+            _send_ready_responses()
             try:
-                if sock.poll(timeout=500) == 0:
+                if sock.poll(timeout=50) == 0:
                     continue
                 frames = sock.recv_multipart()
             except zmq.ContextTerminated:
@@ -1781,21 +1983,18 @@ class TPUConnectorWorker:
             try:
                 uuid = int(uuid_bytes.decode("utf-8"))
             except ValueError:
-                sock.send_multipart([client_id, _MSG_ERR, b"bad-uuid"])
+                try:
+                    sock.send_multipart([client_id, _MSG_ERR, b"bad-uuid"])
+                except zmq.ZMQError as e:
+                    logger.warning(
+                        "TPUConnectorWorker rank0 --> data send bad-uuid "
+                        "ch=%d failed: %s", channel_idx, e)
                 continue
             logger.info(
                 "TPUConnectorWorker rank0 --> PULL received ch=%d uuid=%s",
                 channel_idx, uuid)
-            response = self._coord_rank0_build_pull_response(
-                uuid, uuid_bytes, channel_idx, ranks_on_channel)
-            if response is None:
-                sock.send_multipart([client_id, _MSG_ERR, uuid_bytes])
-                continue
-            # copy=False lets ZMQ send the big per-layer memoryviews
-            # directly from shm via scatter-gather sendmsg, no userland
-            # copy. Small framing frames pay a tiny per-frame overhead;
-            # net win is ~256MB of memcpy avoided per rank.
-            sock.send_multipart([client_id, *response], copy=False)
+            self._coord_channel_executor.submit(_prepare_response, client_id,
+                                                uuid, uuid_bytes)
 
     def _coord_rank0_build_pull_response(
             self, uuid: int, uuid_bytes: bytes, channel_idx: int,
@@ -1813,6 +2012,12 @@ class TPUConnectorWorker:
         while time.perf_counter() < deadline:
             with self._coord_lock:
                 entry = self._coord_send.get(uuid)
+                if entry is not None:
+                    # A live PULL means the slot is actively being served.
+                    # Do not let the expiration sweeper release it while this
+                    # channel is waiting for staging or queued to send.
+                    entry.expiration_time = max(entry.expiration_time,
+                                                time.perf_counter() + timeout)
             if entry is not None:
                 break
             time.sleep(0.05)
@@ -1828,6 +2033,9 @@ class TPUConnectorWorker:
                 "waiting for staging (have %d of %d)", channel_idx, uuid,
                 len(entry.staged), self.tp_size)
             return None
+        with self._coord_lock:
+            entry.expiration_time = max(entry.expiration_time,
+                                        time.perf_counter() + timeout)
         # Wire format (per channel, after the ROUTER envelope):
         #   ch 0:  [OK, uuid, n_ranks, header,
         #            (rank_idx, layer_mv_0, ..., layer_mv_{L-1})*]
