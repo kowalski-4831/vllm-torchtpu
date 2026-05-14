@@ -13,11 +13,11 @@ import jax
 import numpy as np
 import torch
 import torch.nn as nn
+import torch_tpu  # noqa: F401
 import vllm.envs as envs
 # TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from packaging import version
-from torch_tpu import api
 from torch_tpu._internal import sync
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import (ParallelConfig, VllmConfig,
@@ -1922,7 +1922,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             setattr(self, config_name, new_config)
 
     def load_model(self) -> None:
-        self.device_config.device = api.tpu_device()
+        self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
 

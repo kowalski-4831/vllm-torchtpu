@@ -166,8 +166,7 @@ _TRAILING = (16, 2, 128)
 
 
 def _body_single_layer_scatter_correctness():
-    from torch_tpu import api
-    device = api.tpu_device()
+    device = torch.device("tpu")
 
     num_src_blocks = 3
     num_dst_blocks = 8
@@ -194,8 +193,7 @@ def _body_single_layer_scatter_correctness():
 
 
 def _body_multi_layer_scatter_all_layers_updated():
-    from torch_tpu import api
-    device = api.tpu_device()
+    device = torch.device("tpu")
 
     num_layers = 4
     num_src_blocks = 2
@@ -254,8 +252,7 @@ class TestMultiLayerScatterIntoKernel:
 
 
 def _body_smoke_test_passes_on_tpu():
-    from torch_tpu import api
-    device = api.tpu_device()
+    device = torch.device("tpu")
     result = smoke_test_multi_layer_scatter(device)
     assert result is True
 

@@ -25,7 +25,7 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     "vllm==0.19.0",
-    "torch-tpu==0.1.1.dev20260512095200",
+    "torch-tpu==0.1.1.dev20260513183524",
     # Keep the PJRT runtime pinned with the torch-tpu wheel. libtpu 0.0.41
     # regresses GDN compilation with scoped VMEM OOMs in CI.
     "libtpu==0.0.40",

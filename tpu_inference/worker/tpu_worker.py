@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import torch
-from torch_tpu import api
+import torch_tpu  # noqa: F401
 from torch_tpu._internal.profiler import profiler_api
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
@@ -125,8 +125,8 @@ class TPUWorker:
     def init_device(self):
         # vLLM's MultiprocExecutor passes rank/local_rank as constructor
         # args, but torch_tpu's C++ layer (discovery.cc) reads torchrun-style
-        # env vars. Bridge the gap by setting them here before
-        # api.tpu_device() triggers PJRT initialization.
+        # env vars. Bridge the gap by setting them here before any TPU
+        # device usage in this worker.
         # TORCH_TPU_SLICEBUILDER_ADDRESSES and TORCH_TPU_TOPOLOGY are
         # already inherited from the parent process (set by
         # prepare_tpu_environment() in tpu_platform.py).
@@ -147,7 +147,7 @@ class TPUWorker:
         os.environ.setdefault("MASTER_PORT", str(parsed.port))
 
         if not self.devices:
-            self.devices = [api.tpu_device()]
+            self.devices = [torch.device("tpu")]
 
         # Initialize vLLM distributed state using true rank/world-size so TP
         # uses native vLLM model-parallel groups.

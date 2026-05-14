@@ -43,8 +43,8 @@ def device(request):
     use_tpu = request.config.getoption("--use-tpu")
     if use_tpu:
         try:
-            from torch_tpu import api
-            return api.tpu_device()
+            import torch_tpu  # noqa: F401
+            return torch.device("tpu")
         except ImportError:
             pytest.skip("torch_tpu not available")
         except Exception as e:
