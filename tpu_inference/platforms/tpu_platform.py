@@ -304,7 +304,7 @@ class TpuPlatform(Platform):
         from tpu_inference.layers.vllm.attention import PallasAttentionBackend
         is_hybrid = getattr(vllm_config.model_config, "is_hybrid", False)
         cls._is_hybrid = is_hybrid
-        if not is_hybrid:
+        if not is_hybrid and block_size_was_unspecified:
             cache_config.block_size = PallasAttentionBackend.get_page_size(
                 vllm_config)  # type: ignore[assignment]
 
