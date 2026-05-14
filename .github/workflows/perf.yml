@@ -94,6 +94,9 @@ jobs:
           rm -rf /tmp/vllm
           rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
 
+      - name: Save installed packages list
+        run: uv pip list > /tmp/perf_eval_pip_list.txt
+
       - name: Wait For Connection
         uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
         with:
