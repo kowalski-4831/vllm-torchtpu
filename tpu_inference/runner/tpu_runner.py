@@ -1742,17 +1742,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         cur_start_idx = 0
         req_ids = cast(list[str],
                        self.input_batch.req_ids[:self.input_batch.num_reqs])
-        self.input_batch.temperature.copy_(
-            self.input_batch.temperature_cpu_tensor)
+        all_greedy = self.input_batch.all_greedy
+        if not all_greedy:
+            self.input_batch.temperature.copy_(
+                self.input_batch.temperature_cpu_tensor)
         for logits, num_reqs in zip(state.logits_list, state.num_reqs_list):
             cur_end_idx = cur_start_idx + num_reqs
-            temperatures_tpu = torch.ones((logits.shape[0], 1),
-                                          dtype=logits.dtype,
-                                          device=logits.device)
-            num_active_reqs = cur_end_idx - cur_start_idx
-            temperatures_tpu[:num_active_reqs,
-                             0] = self.input_batch.temperature[
-                                 cur_start_idx:cur_end_idx]
             if grammar_output is not None:
                 require_struct_decoding, grammar_bitmask_padded, arange = (
                     self.prepare_structured_decoding_input(
@@ -1760,9 +1755,26 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits = self.structured_decode(require_struct_decoding,
                                                 grammar_bitmask_padded, logits,
                                                 arange)
-            u = torch.rand_like(logits)
-            selected_token_ids = self.sample_from_logits_func(
-                logits, temperatures_tpu, u)
+            if all_greedy:
+                dummy_placeholder = torch.empty((1, 1),
+                                                dtype=logits.dtype,
+                                                device=logits.device)
+                selected_token_ids = self.sample_from_logits_func(
+                    logits,
+                    dummy_placeholder,
+                    dummy_placeholder,
+                    all_greedy=True)
+            else:
+                temperatures_tpu = torch.ones((logits.shape[0], 1),
+                                              dtype=logits.dtype,
+                                              device=logits.device)
+                num_active_reqs = cur_end_idx - cur_start_idx
+                temperatures_tpu[:num_active_reqs,
+                                 0] = self.input_batch.temperature[
+                                     cur_start_idx:cur_end_idx]
+                u = torch.rand_like(logits)
+                selected_token_ids = self.sample_from_logits_func(
+                    logits, temperatures_tpu, u, all_greedy=all_greedy)
             # NOTE (NickLucche) Use the original logits (before any penalties or
             # temperature scaling) for the top-k logprobs. We can't enforce it
             # due to recompilations outside torch.compiled code, so just make
@@ -2123,9 +2135,12 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                             device=self.device,
                                             dtype=self._hidden_states_dtype)
             dummy_u = torch.rand_like(dummy_logits)
-            out = self.sample_from_logits_func(dummy_logits,
-                                               dummy_temperatures, dummy_u)
-            sync.synchronize(out, wait=True)
+            for all_greedy in [False, True]:
+                out = self.sample_from_logits_func(dummy_logits,
+                                                   dummy_temperatures,
+                                                   dummy_u,
+                                                   all_greedy=all_greedy)
+                sync.synchronize(out, wait=True)
             logger.info("  -- num_seqs: %d", num_reqs)
         end = time.perf_counter()
         logger.info("Compilation finished in %.2f [secs].", end - start)
@@ -2396,16 +2411,23 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def sample_from_logits(self, logits: torch.Tensor,
+    def sample_from_logits(self,
+                           logits: torch.Tensor,
                            temperatures: torch.Tensor,
-                           u: torch.Tensor) -> torch.Tensor:
+                           u: torch.Tensor,
+                           all_greedy: bool = False) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
         """
+        if all_greedy:
+            return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
-        gumbel_noise = -torch.log(-torch.log(u))
+        u_clamped = torch.clamp(u,
+                                min=torch.finfo(u.dtype).tiny,
+                                max=1.0 - torch.finfo(u.dtype).eps)
+        gumbel_noise = -torch.log(-torch.log(u_clamped))
         noisy_logits = scaled_logits + gumbel_noise
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
