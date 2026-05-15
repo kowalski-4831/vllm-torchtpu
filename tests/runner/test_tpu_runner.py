@@ -143,7 +143,7 @@ class TestTPURunner:
     @patch('tpu_inference.runner.tpu_runner.bind_kv_cache')
     @patch('tpu_inference.runner.tpu_runner.has_kv_transfer_group',
            return_value=False)
-    @patch('tpu_inference.runner.tpu_runner.InputBatch')
+    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
     def test_initialize_kv_cache_hybrid_duplication(self, mock_input_batch,
                                                     mock_has_kv_transfer,
                                                     mock_bind_kv_cache,

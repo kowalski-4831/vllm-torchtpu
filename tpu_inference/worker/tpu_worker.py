@@ -2,7 +2,7 @@
 
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 from urllib.parse import urlparse
 
 import torch
@@ -12,12 +12,9 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
-from vllm.lora.request import LoRARequest
-from vllm.tasks import SupportedTask
 from vllm.v1 import utils as vllm_utils
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.worker_base import WorkerBase
 
 from tpu_inference import envs, utils
 from tpu_inference.distributed import jax_parallel_state
@@ -29,7 +26,7 @@ from tpu_inference.runner.tpu_runner import TPUModelRunner
 logger = init_logger(__name__)
 
 
-class TPUWorker:
+class TPUWorker(WorkerBase):
 
     def __init__(
         self,
@@ -48,73 +45,64 @@ class TPUWorker:
         from tpu_inference.platforms.tpu_platform import apply_tpu_patches
         apply_tpu_patches()
 
-        # If we use vLLM's model implementation in PyTorch, we should set it
-        # with torch version of the dtype.
-        impl = envs.MODEL_IMPL_TYPE
-        if impl != "vllm":
+        if envs.MODEL_IMPL_TYPE != "vllm":
             raise ValueError("Only vLLM models are supported")
 
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.parallel_config = vllm_config.parallel_config
-        self.parallel_config.rank = rank
-        self.cache_config = vllm_config.cache_config
-        self.compilation_config = vllm_config.compilation_config
+        super().__init__(vllm_config=vllm_config,
+                         local_rank=local_rank,
+                         rank=rank,
+                         distributed_init_method=distributed_init_method,
+                         is_driver_worker=is_driver_worker)
+        # WorkerBase initializes self.device=None which makes vLLM's
+        # MultiprocExecutor.async_output_busy_loop call
+        # current_platform.set_device(None) → TPU has no torch device-switching
+        # API (pinning is via TPU_VISIBLE_CHIPS env var). Drop the attribute
+        # so hasattr(self.worker, "device") returns False and the call skips.
+        if hasattr(self, "device"):
+            del self.device
 
-        # TPU compilation requires static shapes, so we clear any dynamic
-        # compile ranges that vLLM might have added.
+        # TPU compilation requires static shapes, so clear dynamic compile
+        # ranges vLLM might have added.
         self.compilation_config.compile_ranges_endpoints = []
 
-        self.local_rank = local_rank
-        self.rank = rank
-        self.distributed_init_method = distributed_init_method
-        self.is_driver_worker = is_driver_worker
+        # TPU-specific extras not in WorkerBase.
         self.devices = devices if devices is not None else []
         self.device_ranks = set(device.id for device in self.devices)
         self.prev_worker_ip = prev_worker_ip
 
         if self.cache_config.cache_dtype == "auto":
             model_dtype = self.model_config.dtype
-            if isinstance(model_dtype, str):
-                self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
-            else:
-                self.kv_cache_dtype = model_dtype
+            self.kv_cache_dtype = (TPU_STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
+                                   if isinstance(model_dtype, str) else
+                                   model_dtype)
         else:
             self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype]
 
         if self.model_config.trust_remote_code:
-            # note: lazy import to avoid importing torch before initializing
+            # Lazy import to avoid importing torch before initializing.
             from vllm.utils.import_utils import init_cached_hf_modules
-
             init_cached_hf_modules()
 
-        # Delay profiler initialization to the start of the profiling.
-        # This is because in vLLM V1, MP runtime is initialized before the
-        # TPU Worker is initialized. The profiler server needs to start after
-        # MP runtime is initialized.
-        self.profile_dir = None
+        # TPU profiler: only on rank 0 single-host, or every PP worker.
+        self.profile_dir: str | None = None
         self.profile_context = None
         torch_profiler_dir = os.getenv("VLLM_TORCH_PROFILER_DIR")
-        if (torch_profiler_dir and self.rank < 1
-                and self.parallel_config.pipeline_parallel_size == 1):
-            if not self.devices or 0 in self.device_ranks:
-                # For TPU, we can only have 1 active profiler session for 1 profiler
-                # server. So we only profile on rank0.
-                self.profile_dir = torch_profiler_dir
-                logger.info("Profiling enabled. Traces will be saved to: %s",
-                            self.profile_dir)
-
-        # For PP, we use MPMD so we want to profile every worker.
         pp_size = self.parallel_config.pipeline_parallel_size
-        if pp_size > 1 and torch_profiler_dir:
+        if torch_profiler_dir and pp_size == 1 and self.rank < 1 and (
+                not self.devices or 0 in self.device_ranks):
+            # Only 1 active profiler session per server is allowed.
+            self.profile_dir = torch_profiler_dir
+            logger.info("Profiling enabled. Traces will be saved to: %s",
+                        self.profile_dir)
+        elif pp_size > 1 and torch_profiler_dir:
+            # PP uses MPMD: profile every worker.
             self.profile_dir = os.path.join(
                 torch_profiler_dir,
-                f"pprank_{self.rank}_ppworldsize_{pp_size}",
-            )
+                f"pprank_{self.rank}_ppworldsize_{pp_size}")
             os.makedirs(self.profile_dir, exist_ok=True)
 
-        # step_counter is used to calculate uuid to transfer intermediate tensors.
+        # step_counter is used to calc uuid for intermediate tensor transfer.
         self.step_counter = 0
 
     def initialize_cache(self, num_gpu_blocks: int,
@@ -240,24 +228,14 @@ class TPUWorker:
                              "headroom requirement.")
         return total_hbm_avail
 
-    def execute_model(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> Optional[ModelRunnerOutput]:
+    def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)
 
-    def sample_tokens(self,
-                      grammar_output: GrammarOutput) -> ModelRunnerOutput:
+    def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
 
-    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+    def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
-
-    def add_lora(
-        self,
-        lora_request: LoRARequest,
-    ) -> bool:
-        raise NotImplementedError("TODO")
 
     def profile(self,
                 is_start: bool = True,
@@ -290,7 +268,7 @@ class TPUWorker:
                 logger.warning(
                     "Profiler context is not set. Cannot stop profiler.")
 
-    def load_model(self) -> None:
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> float:
@@ -298,46 +276,29 @@ class TPUWorker:
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
-        # Reset the seed to ensure that the random state is not affected by
-        # the model initialization and profiling.
-        # self.model_runner._init_random()
         return compilation_time
-
-    def reset_mm_cache(self) -> None:
-        pass
 
     def get_model(self):
         return self.model_runner.get_model()
 
-    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+    def get_supported_tasks(self):
         return self.model_runner.get_supported_tasks()
 
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+    def get_kv_cache_spec(self):
         return self.model_runner.get_kv_cache_spec()
 
-    def initialize_from_config(
-        self,
-        kv_cache_config: KVCacheConfig,
-    ) -> None:
-        """Allocate GPU KV cache with the specified kv_cache_config."""
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
         pass
 
-    def check_health(self) -> None:
-        # worker will always be healthy as long as it's running.
-        return
-
-    def sync_weights(
-        self,
-        updated_weights,
-        mappings: Dict[str, Tuple[str, Tuple[str]]],
-        transpose_keys: Dict[str, Tuple[int]],
-        reshard_fn=None,
-    ) -> None:
-        """Sync the updated weights to the model runner."""
+    def sync_weights(self,
+                     updated_weights,
+                     mappings: Dict[str, Tuple[str, Tuple[str]]],
+                     transpose_keys: Dict[str, Tuple[int]],
+                     reshard_fn=None) -> None:
         return self.model_runner._sync_weights(
             updated_weights=updated_weights,
             mappings=mappings,
@@ -345,10 +306,7 @@ class TPUWorker:
             reshard_fn=reshard_fn,
         )
 
-    def shutdown(self) -> None:
-        return
-
-    # Ray executor do not need handshake metadata
-    # as we pass the kv_parameters through proxy server
+    # Ray executor doesn't need handshake metadata — kv_parameters go
+    # through the proxy server.
     def get_kv_connector_handshake_metadata(self) -> None:
         pass
