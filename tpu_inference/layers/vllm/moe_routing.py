@@ -45,15 +45,30 @@ def select_experts(
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
-def mask_for_ep(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    expert_map: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map global expert IDs to local and zero non-local experts."""
-    local_ids = expert_map[topk_ids.to(torch.long)].to(torch.int32)
-    valid = local_ids >= 0
-    topk_weights = torch.where(valid, topk_weights,
-                               torch.zeros_like(topk_weights))
-    topk_ids = torch.where(valid, local_ids, torch.full_like(local_ids, -1))
-    return topk_weights, topk_ids
+def get_experts_start(layer) -> int | None:
+    """Return the first global expert id owned by this shard, or None for non-EP.
+
+    Mirrors the formula vLLM's ``determine_expert_map`` uses for linear
+    placement (``vllm/model_executor/layers/fused_moe/layer.py``), so this is
+    a pure function of ``ep_rank``, ``ep_size``, and ``global_num_experts`` --
+    known at layer construction time. ``validate_linear_ep_placement`` enforces
+    that the placement is linear before this value is used.
+    """
+    if not layer.moe_config.moe_parallel_config.use_ep:
+        return None
+    base = layer.global_num_experts // layer.ep_size
+    remainder = layer.global_num_experts % layer.ep_size
+    return layer.ep_rank * base + min(layer.ep_rank, remainder)
+
+
+def validate_linear_ep_placement(layer) -> None:
+    """Validate that this layer uses linear EP placement.
+
+    The kernel relies on a contiguous-block ``expert_map``, which vLLM only
+    produces when ``expert_placement_strategy == "linear"``.
+    """
+    strategy = getattr(layer, "expert_placement_strategy", "linear")
+    if strategy != "linear":
+        raise NotImplementedError(
+            "fused MoE kernel currently requires linear EP placement; got "
+            f"expert_placement_strategy={strategy!r}.")

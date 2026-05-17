@@ -22,7 +22,7 @@ from torch_tpu._internal import pallas
 from tpu_inference.layers.common.fused_moe_gmm import fused_moe_func
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str, Optional[int]], Callable] = {}
 
 
 def _allocate_kernel_instance_id() -> int:
@@ -36,11 +36,13 @@ def _build_fused_moe_custom_op(
     *,
     topk: int,
     activation: str,
+    experts_start: Optional[int],
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
 
     wrapped_fn = functools.partial(fused_moe_func,
+                                   experts_start=experts_start,
                                    topk=topk,
                                    activation=activation)
 
@@ -53,7 +55,7 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation)
+    cache_key = (topk, activation, experts_start)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -62,14 +64,16 @@ def _get_fused_moe_custom_op(
     *,
     topk: int,
     activation: str,
+    experts_start: Optional[int],
 ):
-    cache_key = (topk, activation)
+    cache_key = (topk, activation, experts_start)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
     return _build_fused_moe_custom_op(
         topk=topk,
         activation=activation,
+        experts_start=experts_start,
     )
 
 
@@ -77,11 +81,13 @@ def prebuild_fused_moe_kernel(
     *,
     topk: int,
     activation: str,
+    experts_start: Optional[int],
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
+        experts_start=experts_start,
     )
 
 
@@ -95,13 +101,22 @@ def fused_moe_gmm(
     w2_bias: Optional[torch.Tensor],
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    experts_start: Optional[int],
     topk: int,
     activation: str,
 ) -> torch.Tensor:
-    """Fused MoE forward pass with precomputed routing."""
+    """Fused MoE forward pass with precomputed routing.
+
+    ``experts_start`` is the first global expert id owned by this shard under
+    linear EP placement (or ``None`` for non-EP). It is a Python int derived at
+    load time from ``ep_rank``, ``ep_size``, and ``global_num_experts``, baked
+    into the JAX kernel closure as a compile-time constant -- so the global->
+    local remap is a literal subtract fused into the routing loop.
+    """
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
+        experts_start=experts_start,
     )
     return fused_moe(
         hidden_states,

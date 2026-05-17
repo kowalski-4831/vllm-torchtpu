@@ -70,9 +70,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 from tpu_inference.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from tpu_inference.layers.common.quantization import dequantize_mxfp4_packed
+from tpu_inference.layers.vllm import moe_routing
 from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
-from tpu_inference.layers.vllm.moe_routing import mask_for_ep, select_experts
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -234,9 +234,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         logger.info_once(
             "MXFP4 weights dequantized to bfloat16 and transposed for GMM kernel."
         )
+        if layer.moe_config.moe_parallel_config.use_ep:
+            moe_routing.validate_linear_ep_placement(layer)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
+            experts_start=moe_routing.get_experts_start(layer),
         )
 
     def get_fused_moe_quant_config(
@@ -269,7 +272,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 renormalize=layer.renormalize,
             )
         else:
-            topk_weights, topk_ids = select_experts(
+            topk_weights, topk_ids = moe_routing.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
@@ -277,11 +280,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
             )
 
-        # Step 2: EP masking (map global expert IDs to local, zero non-local)
-        if layer.moe_config.moe_parallel_config.use_ep:
-            topk_weights, topk_ids = mask_for_ep(topk_weights, topk_ids,
-                                                 layer.expert_map)
-
+        # Step 2: EP global->local remap happens inside fused_moe_gmm via an
+        # elementwise subtract from `experts_start` (scalar).
         return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -292,6 +292,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_bias=layer.w2_bias,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            experts_start=moe_routing.get_experts_start(layer),
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )

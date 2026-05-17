@@ -58,9 +58,9 @@ from tpu_inference import envs
 from tpu_inference.layers.common.quant_methods import FP8, get_tpu_quant_method
 from tpu_inference.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
+from tpu_inference.layers.vllm import moe_routing
 from tpu_inference.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
-from tpu_inference.layers.vllm.moe_routing import mask_for_ep, select_experts
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 
@@ -434,9 +434,12 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             f"w13_scale={list(layer.w13_weight_scale_inv.shape)}, "
             f"w2_scale={list(layer.w2_weight_scale_inv.shape)}, "
             f"requant_block_size={scale_desc}")
+        if layer.moe_config.moe_parallel_config.use_ep:
+            moe_routing.validate_linear_ep_placement(layer)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
+            experts_start=moe_routing.get_experts_start(layer),
         )
 
     def apply_monolithic(
@@ -457,7 +460,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 renormalize=layer.renormalize,
             )
         else:
-            topk_weights, topk_ids = select_experts(
+            topk_weights, topk_ids = moe_routing.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
@@ -465,11 +468,8 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
             )
 
-        # Step 2: EP masking (map global expert IDs to local, zero non-local)
-        if layer.moe_config.moe_parallel_config.use_ep:
-            topk_weights, topk_ids = mask_for_ep(topk_weights, topk_ids,
-                                                 layer.expert_map)
-
+        # Step 2: EP global->local remap happens inside fused_moe_gmm via an
+        # elementwise subtract from `experts_start` (scalar).
         return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -480,6 +480,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             w2_bias=getattr(layer, 'w2_bias', None),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            experts_start=moe_routing.get_experts_start(layer),
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )

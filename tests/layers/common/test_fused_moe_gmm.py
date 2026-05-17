@@ -141,3 +141,138 @@ def test_fused_moe_local_routing_matches_reference():
                                np.asarray(expected),
                                atol=1e-1,
                                rtol=1e-1)
+
+
+def _make_ep_inputs(num_local_experts, seed=0):
+    """Synthesize one local shard's weights + per-token local topk_ids.
+
+    Matches the megablox-friendly shapes used by
+    test_fused_moe_local_routing_matches_reference so the kernel does not
+    return NaN on tile-misaligned inputs.
+    """
+    num_tokens = 4
+    hidden_size = 2048
+    intermediate_size = 768
+    topk = 8
+    key = jax.random.key(seed)
+    hk, w1k, w2k, b1k, b2k = jax.random.split(key, 5)
+    hidden_states = (
+        jax.random.normal(hk, (num_tokens, hidden_size), dtype=jnp.float32) /
+        10).astype(jnp.bfloat16)
+    w1 = (jax.random.normal(
+        w1k, (num_local_experts, hidden_size, intermediate_size * 2),
+        dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    w2 = (
+        jax.random.normal(w2k,
+                          (num_local_experts, intermediate_size, hidden_size),
+                          dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    w1_bias = (jax.random.normal(b1k,
+                                 (num_local_experts, 1, intermediate_size * 2),
+                                 dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    w2_bias = (jax.random.normal(b2k, (num_local_experts, 1, hidden_size),
+                                 dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    topk_weights = jnp.array(
+        [
+            [0.30, 0.18, 0.14, 0.12, 0.10, 0.07, 0.05, 0.04],
+            [0.22, 0.18, 0.16, 0.14, 0.11, 0.08, 0.06, 0.05],
+            [0.25, 0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.04],
+            [0.28, 0.19, 0.15, 0.11, 0.09, 0.07, 0.06, 0.05],
+        ],
+        dtype=jnp.float32,
+    )
+    # Local ids stay in [0, num_local_experts); distinct per slot to exercise
+    # the full local shard.
+    base = jnp.array([0, 2, 4, 6, 8, 10, 12, 14], dtype=jnp.int32)
+    local_ids = jnp.stack([
+        base,
+        base + 1,
+        (base + 1)[::-1],
+        base[::-1],
+    ]) % num_local_experts
+    return (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids,
+            topk)
+
+
+@pytest.mark.parametrize(
+    "num_local_experts,experts_start",
+    [
+        (16, 0),  # rank 0: experts_start == 0 must behave like the legacy path
+        (16, 32),  # rank 2 of 8-way EP (Qwen3-30B shape: 128 / 8 = 16 local)
+        (20,
+         60),  # rank 3 of 8-way EP (Qwen3-480B-FP8 shape: 160 / 8 = 20 local)
+    ])
+def test_fused_moe_global_id_remap_matches_local(num_local_experts,
+                                                 experts_start):
+    """Global ids + experts_start must produce the same output as local ids."""
+    _require_tpu()
+    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids,
+     topk) = _make_ep_inputs(num_local_experts)
+    global_ids = local_ids + experts_start
+    expected = fused_moe_func(hidden_states=hidden_states,
+                              w1=w1,
+                              w2=w2,
+                              w1_scale=None,
+                              w2_scale=None,
+                              w1_bias=w1_bias,
+                              w2_bias=w2_bias,
+                              topk_weights=topk_weights,
+                              topk_ids=local_ids,
+                              topk=topk,
+                              activation="silu")
+    actual = fused_moe_func(hidden_states=hidden_states,
+                            w1=w1,
+                            w2=w2,
+                            w1_scale=None,
+                            w2_scale=None,
+                            w1_bias=w1_bias,
+                            w2_bias=w2_bias,
+                            topk_weights=topk_weights,
+                            topk_ids=global_ids,
+                            experts_start=experts_start,
+                            topk=topk,
+                            activation="silu")
+    np.testing.assert_allclose(np.asarray(actual),
+                               np.asarray(expected),
+                               atol=1e-1,
+                               rtol=1e-1)
+
+
+def test_fused_moe_global_id_remap_masks_out_of_range():
+    """Non-local global ids must contribute zero (range check + jnp.where)."""
+    _require_tpu()
+    num_local_experts, experts_start = 16, 32
+    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids,
+     topk) = _make_ep_inputs(num_local_experts)
+    global_ids = local_ids + experts_start
+    # Token 0 slot 0: below shard (-> masked). Token 1 slot 1: above shard.
+    global_ids = global_ids.at[0, 0].set(experts_start - 1)
+    global_ids = global_ids.at[1, 1].set(experts_start + num_local_experts)
+    # Reference: same call but with the offending weights pre-zeroed.
+    masked_weights = topk_weights.at[0, 0].set(0.0).at[1, 1].set(0.0)
+    expected = fused_moe_func(hidden_states=hidden_states,
+                              w1=w1,
+                              w2=w2,
+                              w1_scale=None,
+                              w2_scale=None,
+                              w1_bias=w1_bias,
+                              w2_bias=w2_bias,
+                              topk_weights=masked_weights,
+                              topk_ids=local_ids,
+                              topk=topk,
+                              activation="silu")
+    actual = fused_moe_func(hidden_states=hidden_states,
+                            w1=w1,
+                            w2=w2,
+                            w1_scale=None,
+                            w2_scale=None,
+                            w1_bias=w1_bias,
+                            w2_bias=w2_bias,
+                            topk_weights=topk_weights,
+                            topk_ids=global_ids,
+                            experts_start=experts_start,
+                            topk=topk,
+                            activation="silu")
+    np.testing.assert_allclose(np.asarray(actual),
+                               np.asarray(expected),
+                               atol=1e-1,
+                               rtol=1e-1)

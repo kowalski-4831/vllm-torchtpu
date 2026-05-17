@@ -54,9 +54,10 @@ def prepare_routed_gmm_inputs(
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
-    mask). For EP, mask_for_ep upstream marks non-local entries with a
-    negative id which the mask filters out. Always running the masked
-    branch keeps a single code path.
+    mask). For EP, the caller applies the expert-map remap upstream
+    (inside this JIT) and marks non-local entries with a negative id which
+    the mask filters out. Always running the masked branch keeps a single
+    code path.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
@@ -156,15 +157,29 @@ def fused_moe_func(
     w2_bias: jax.Array | None,
     topk_weights: jax.Array,
     topk_ids: jax.Array,
-    topk: int,
-    activation: str,
+    experts_start: int | None = None,
+    topk: int = 1,
+    activation: str = "silu",
 ) -> jax.Array:
-    """Run MoE with precomputed expert ids and weights."""
+    """Run MoE with precomputed expert ids and weights.
+
+    For linear EP placement, ``experts_start`` is the first global expert id
+    owned by this shard, bound as a Python int (compile-time constant) by the
+    torch bridge. The kernel remaps global ids to local ids with an elementwise
+    subtract and masks non-local experts.
+    """
     num_tokens, hidden_size = hidden_states.shape
     _, padded_hidden_size, _ = w1.shape
 
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
+
+    if experts_start is not None:
+        local_ids = topk_ids - experts_start
+        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        topk_weights = jnp.where(valid, topk_weights,
+                                 jnp.zeros_like(topk_weights))
+        topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat,
      valid_mask) = prepare_routed_gmm_inputs(
