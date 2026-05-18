@@ -3,16 +3,17 @@
 import bisect
 import contextlib
 import dataclasses
+import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
 import numpy as np
 import torch
-import torch.nn as nn
 import torch_tpu  # noqa: F401
 import vllm.envs as envs
 # TODO: Remove this after jax dependency is removed
@@ -167,28 +168,6 @@ def _torch_tpu_wrapper():
                     delattr(torch.cuda, k)
             else:
                 setattr(torch.cuda, k, v)
-
-
-@contextlib.contextmanager
-def _bypass_torch_compile(model: nn.Module):
-    """HACK: vLLM wraps the model backbone with
-    `TorchCompileWithNoGuardsWrapper` which overrides `__call__` to route
-    through `torch.compile`, making neither
-    `torch.compiler.set_stance("force_eager")` nor
-    `torch._dynamo.config.patch(disable=True)` work here.
-    """
-    if hasattr(model, "get_language_model"):
-        compiled_model = model.get_language_model().model
-    else:
-        compiled_model = model.model
-
-    compiled_model_cls = compiled_model.__class__
-    original_call = compiled_model_cls.__call__
-    compiled_model_cls.__call__ = compiled_model_cls.forward
-    try:
-        yield
-    finally:
-        compiled_model_cls.__call__ = original_call
 
 
 # Recompilation-avoidance contract:
@@ -1746,27 +1725,67 @@ class TPUModelRunner(GPUModelRunner):
 
             self._precompile_sampling_subgraphs()
 
+    @contextmanager
+    def _profile_no_cache_writes(self) -> Iterator[None]:
+        # Keep the kv=0-specialized profile compile out of the persistent
+        # serving cache. Flips only the disable flag; does not touch
+        # compile_sizes / compile_ranges_split_points / cache_dir, so
+        # capture_model sees its normal compile config.
+        saved_env = os.environ.get("VLLM_DISABLE_COMPILE_CACHE")
+        clear_envs = getattr(envs.__getattr__, "cache_clear", None)
+        os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+        if clear_envs:
+            clear_envs()
+        try:
+            yield
+        finally:
+            if saved_env is None:
+                os.environ.pop("VLLM_DISABLE_COMPILE_CACHE", None)
+            else:
+                os.environ["VLLM_DISABLE_COMPILE_CACHE"] = saved_env
+            if clear_envs:
+                clear_envs()
+
     def profile_run(
         self,
         num_tokens: int,
     ) -> None:
-        self._initialize_attention_kernels()
+        from vllm.compilation.wrapper import reset_compile_wrapper
 
-        # KV cache isn't allocated yet; torch.compile would specialize on
-        # the kv_cache.numel() == 0 early-return in attention. Compile the
-        # backbone later in capture_model() after KV alloc.
-        with _bypass_torch_compile(self.model):
-            self._dummy_run(num_tokens,
-                            self.num_reqs_max_model_len,
-                            self.max_num_blocks_per_req,
-                            use_max_model_len=True)
+        from tpu_inference.layers.vllm.linear_common import \
+            _get_quantized_matmul_op
 
-        # Sampling-path subgraphs don't depend on kv_cache; compile them
-        # now so their bottom-HBM reservations are visible to vLLM's
-        # available-memory probe and counted in the KV-cache budget.
-        if not self.enforce_eager:
-            with self.maybe_setup_dummy_loras(self.lora_config):
-                self._precompile_sampling_subgraphs()
+        # set_current_vllm_config is required for the post-reset compile
+        # path: reset_compile_wrapper restores the wrapper's original
+        # forward code, so the next trace re-instantiates CustomOps that
+        # call get_current_vllm_config().
+        cc = self.vllm_config.compilation_config
+        saved_cache = (cc.cache_dir, cc.local_cache_dir)
+        with set_current_vllm_config(self.vllm_config):
+            self._initialize_attention_kernels()
+            # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
+            _get_quantized_matmul_op()
+
+            # Compile backbone here so XLA materializes the FP8 activation
+            # slab; vLLM's post-probe sees the real HBM. Cache writes are
+            # disabled so the kv=0-specialized graph never lands in the
+            # persistent serving cache.
+            with self._profile_no_cache_writes():
+                self._dummy_run(num_tokens, self.num_reqs_max_model_len,
+                                self.max_num_blocks_per_req)
+            compiled = (self.model.get_language_model().model if hasattr(
+                self.model, "get_language_model") else self.model.model)
+            reset_compile_wrapper(compiled)
+            # reset_compile_wrapper wipes cache_dir; restore so
+            # capture_model can read/write the persistent cache.
+            cc.cache_dir, cc.local_cache_dir = saved_cache
+            torch._dynamo.reset()
+            sync.synchronize()
+
+            # Sampling subgraphs (Phase A) — uses the restored cache_dir.
+            if not self.enforce_eager:
+                with self.maybe_setup_dummy_loras(self.lora_config):
+                    self._precompile_sampling_subgraphs()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
