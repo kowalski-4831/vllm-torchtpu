@@ -22,11 +22,12 @@ RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 # Stage 2.5: The CI Environment (with tools)
 FROM base AS ci
 
-# Install tools needed for CI (git, gcloud)
-RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg git && \
+# Install tools needed for CI (git, gcloud, lsof, fuser)
+RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg git lsof psmisc lsb-release && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
-    apt-get update && apt-get install -y google-cloud-cli && \
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt gcsfuse-$(lsb_release -c -s) main" | tee -a /etc/apt/sources.list.d/gcsfuse.list && \
+    apt-get update && apt-get install -y google-cloud-cli gcsfuse && \
     rm -rf /var/lib/apt/lists/*
 
 # Clear PYTHONPATH inherited from base image if any
@@ -63,7 +64,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     --mount=from=artifact-source,source=/,target=/artifact-source,ro \
-    set -eux; \
+    set -eu; \
     if [ -z "${USE_TORCH_TPU_REGISTRY}" ]; then \
         set -- /artifact-source/opt/wheels/*.whl; \
         if [ ! -e "$1" ]; then echo "No torch-tpu wheels found in ARTIFACT_SOURCE" >&2; exit 1; fi; \
@@ -79,6 +80,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
           --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
           "torch-tpu==${TORCH_TPU_VERSION}"; \
     fi
+
 
 # Stage 3: Developer Image (Editable)
 FROM ci AS dev

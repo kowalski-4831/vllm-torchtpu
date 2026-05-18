@@ -30,6 +30,18 @@ on:
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'docker/**'
+      - '.gitignore'
+      - '.dockerignore'
+      - '.pre-commit-config.yaml'
+      - '.readthedocs.yaml'
+      - 'mkdocs.yml'
+      - 'LICENSE'
+      - 'DCO'
+      - 'MANIFEST.in'
 
 permissions:
   contents: read
