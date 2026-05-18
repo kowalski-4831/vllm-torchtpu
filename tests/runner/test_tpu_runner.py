@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, VllmConfig)
@@ -23,7 +25,12 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheTensor,
                                         MambaSpec)
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.utils import AttentionGroup
 
+from tpu_inference.layers.common.attention_metadata import (
+    AttentionMetadata, AttentionMetadataBuilder,
+    AttentionMetadataBuilderContext)
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
@@ -93,6 +100,12 @@ class TestTPURunner:
         self.runner.vllm_config = vllm_config
         self.runner.cache_config = vllm_config.cache_config
         self.runner._hybrid_uniform_page_size_bytes = None
+        self.runner.max_num_reqs = 16
+        self.runner.max_model_len = 1024
+        self.runner.max_num_tokens = 2048
+        self.runner.pin_memory = False
+        self.runner.model_config = vllm_config.model_config
+        self.runner.shared_kv_cache_layers = None
 
         # Bind the actual methods to our mock
         self.runner._update_mamba_page_size_padded = TPUModelRunner._update_mamba_page_size_padded.__get__(
@@ -185,10 +198,16 @@ class TestTPURunner:
         self.runner.vllm_config.compilation_config.static_forward_context = {}
         self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
 
-        mock_bt = MagicMock()
-        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1),
-                                                          dtype=torch.int32)
-        mock_input_batch.return_value.block_table = [mock_bt]
+        # One block table per kv_cache_group (the per-group dtype check
+        # introduced with multi-group support iterates over every group).
+        mock_block_tables = []
+        for _ in kv_cache_groups:
+            mock_bt = MagicMock()
+            mock_bt.max_num_blocks_per_req = 1
+            mock_bt.get_cpu_tensor.return_value = torch.zeros(
+                (1, 1), dtype=torch.int32)
+            mock_block_tables.append(mock_bt)
+        mock_input_batch.return_value.block_table = mock_block_tables
 
         self.runner.input_batch = mock_input_batch.return_value
         self.runner.kv_caches = []
@@ -272,3 +291,255 @@ class TestTPURunner:
                           '_update_mamba_page_size_padded') as mock_update:
             self.runner.get_kv_cache_spec()
             mock_update.assert_not_called()
+
+    def test_mrope_positions_buffer_is_int32(self):
+        """Run the real TPUModelRunner.__init__ (with parent's __init__ and
+        a few heavy TPU-only helpers patched out) on the setup_method mock
+        and verify the uses_mrope override block produces an int32 buffer
+        — not just that _make_buffer respects an int32 dtype on its own."""
+        self.runner.dtype = torch.bfloat16
+        self.runner.parallel_config = self.runner.vllm_config.parallel_config
+        self.runner.uses_mrope = True
+        self.runner.supports_mm_inputs = False
+        self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
+        self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(
+            self.runner)
+
+        with patch.object(GPUModelRunner, '__init__', return_value=None), \
+             patch('tpu_inference.runner.tpu_runner._torch_tpu_wrapper',
+                   side_effect=lambda: contextlib.nullcontext()), \
+             patch('tpu_inference.runner.tpu_runner._validate_libtpu_version'
+                   ), \
+             patch.object(TPUModelRunner,
+                          '_create_mesh_for_parallelism',
+                          return_value=MagicMock()):
+            TPUModelRunner.__init__(self.runner, self.runner.vllm_config,
+                                    self.mock_device)
+
+        assert self.runner.mrope_positions.cpu.dtype == torch.int32
+        assert self.runner.mrope_positions.cpu.shape == (
+            3, self.runner.max_num_tokens + 1)
+        assert self.runner.mrope_positions.np.dtype == np.int32
+
+    def test_initialize_kv_cache_multi_group(self):
+        """Multi-group initialize_kv_cache: verify the three new behaviors
+        added with the builder migration: (1) attn_groups gets one shared
+        TPU builder per kv_cache_group, (2) may_reinitialize_input_batch is
+        called with per-group block_sizes, (3) empty_slot_mappings has one
+        entry per group (consumed by upstream _build_attention_metadata)."""
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=16384)
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
+            KVCacheGroupSpec(layer_names=["attn.1"], kv_cache_spec=attn_spec),
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[
+                KVCacheTensor(size=16384, shared_by=["attn.0"]),
+                KVCacheTensor(size=16384, shared_by=["attn.1"]),
+            ],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.kv_caches = []
+
+        mock_input_batch = MagicMock()
+        mock_block_tables = []
+        for _ in kv_cache_groups:
+            mock_bt = MagicMock()
+            mock_bt.max_num_blocks_per_req = 4
+            mock_bt.get_cpu_tensor.return_value = torch.zeros(
+                (1, 1), dtype=torch.int32)
+            mock_block_tables.append(mock_bt)
+        mock_input_batch.block_table = mock_block_tables
+        self.runner.input_batch = mock_input_batch
+
+        with patch(
+                'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                return_value=(1, 16, 2, 1, 128)
+        ), patch('tpu_inference.runner.tpu_runner.bind_kv_cache'), patch(
+                'tpu_inference.runner.tpu_runner.has_kv_transfer_group',
+                return_value=False):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+        # (1) One shared TPU builder per group, in the parent's
+        # list-of-list-of-AttentionGroup layout.
+        assert len(self.runner.attn_groups) == len(kv_cache_groups)
+        for gid, group_list in enumerate(self.runner.attn_groups):
+            assert len(group_list) == 1
+            grp = group_list[0]
+            assert isinstance(grp, AttentionGroup)
+            assert grp.backend is None
+            assert grp.kv_cache_group_id == gid
+            assert len(grp.metadata_builders) == 1
+            assert isinstance(grp.metadata_builders[0],
+                              AttentionMetadataBuilder)
+            assert grp.metadata_builders[0].kv_cache_group_id == gid
+
+        # (2) may_reinitialize_input_batch saw the per-group block_sizes
+        # list (replacing the old explicit single-group InputBatch reinit).
+        self.runner.may_reinitialize_input_batch.assert_called_once_with(
+            kv_cache_config, [16, 16])
+
+        # (3) empty_slot_mappings: one zero-element tensor per kv_cache_group.
+        assert set(self.runner.empty_slot_mappings.keys()) == {0, 1}
+        for tensor in self.runner.empty_slot_mappings.values():
+            assert tensor.numel() == 0
+
+
+class TestAttentionMetadataBuilder:
+    """Direct tests for AttentionMetadataBuilder.build, exercising the
+    runner-state path used in _prepare_inputs and the position_ids_override
+    path used in _dummy_run."""
+
+    def _make_runner_mock(self,
+                          most_model_len=None,
+                          num_groups=1,
+                          max_num_blocks_per_req=4,
+                          max_num_reqs=4):
+        runner = MagicMock()
+        runner.device = torch.device("cpu")
+        runner.block_size = 16
+        runner.max_num_reqs = max_num_reqs
+        runner.most_model_len = most_model_len
+        runner.position_ids = torch.full((8, ), 42, dtype=torch.int32)
+
+        block_tables = []
+        for gid in range(num_groups):
+            bt = MagicMock()
+            bt.max_num_blocks_per_req = max_num_blocks_per_req
+            bt.get_cpu_tensor.return_value = (
+                torch.arange(max_num_reqs * max_num_blocks_per_req,
+                             dtype=torch.int32).reshape(
+                                 max_num_reqs, max_num_blocks_per_req) +
+                gid * 100)
+            block_tables.append(bt)
+        runner.input_batch.block_table = block_tables
+        return runner
+
+    def _make_builder(self, runner, kv_cache_group_id=0):
+        spec = FullAttentionSpec(block_size=16,
+                                 num_kv_heads=2,
+                                 head_size=128,
+                                 dtype=torch.bfloat16,
+                                 page_size_padded=16384)
+        return AttentionMetadataBuilder(
+            kv_cache_spec=spec,
+            layer_names=["attn.0"],
+            vllm_config=MagicMock(),
+            device=runner.device,
+            runner=runner,
+            kv_cache_group_id=kv_cache_group_id,
+        )
+
+    def _make_cm(self, num_reqs):
+        """Minimal CommonAttentionMetadata stand-in — build() only reads
+        num_reqs off it (everything else still comes from ctx because TPU
+        bypasses parent's CpuGpuBuffers)."""
+        cm = MagicMock()
+        cm.num_reqs = num_reqs
+        return cm
+
+    def test_build_runner_state_path(self):
+        """Normal _prepare_inputs path: copy from the right per-group block
+        table at the right start_index, pad remaining rows, and reuse
+        runner.position_ids. target_num_reqs is sourced from cm.num_reqs
+        (the only field we currently read from common_attn_metadata)."""
+        runner = self._make_runner_mock(num_groups=2)
+        # Build for group 1 to cover the per-group block_table lookup too.
+        builder = self._make_builder(runner, kv_cache_group_id=1)
+
+        target_num_reqs, num_reqs, start_index = 4, 2, 1
+        seq_lens = torch.tensor([10, 12, 0, 0], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32)
+        request_distribution = torch.tensor([2, 2, 2], dtype=torch.int32)
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=num_reqs,
+            start_index=start_index,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            request_distribution=request_distribution,
+        )
+
+        meta = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=self._make_cm(target_num_reqs))
+
+        assert isinstance(meta, AttentionMetadata)
+        assert meta.input_positions is runner.position_ids
+        assert meta.seq_lens is seq_lens
+        assert meta.query_start_loc is query_start_loc
+        assert meta.request_distribution is request_distribution
+
+        # Group 1 (not 0) should have been read; group 0 untouched.
+        runner.input_batch.block_table[0].get_cpu_tensor.assert_not_called()
+        runner.input_batch.block_table[1].get_cpu_tensor.assert_called_once()
+
+        # Flattened (target_num_reqs * max_num_blocks_per_req,); first
+        # num_reqs rows from the source slice, rest zero-padded.
+        max_num_blocks = runner.input_batch.block_table[
+            1].max_num_blocks_per_req
+        block_tables_2d = meta.block_tables.reshape(target_num_reqs,
+                                                    max_num_blocks)
+        src = runner.input_batch.block_table[1].get_cpu_tensor.return_value
+        assert torch.equal(block_tables_2d[:num_reqs],
+                           src[start_index:start_index + num_reqs])
+        assert torch.equal(
+            block_tables_2d[num_reqs:],
+            torch.zeros((target_num_reqs - num_reqs, max_num_blocks),
+                        dtype=torch.int32))
+
+    def test_build_position_ids_override(self):
+        """_dummy_run path: position_ids_override is forwarded as-is and the
+        block-table copy is skipped (no read from input_batch)."""
+        runner = self._make_runner_mock()
+        builder = self._make_builder(runner)
+
+        override = torch.zeros((3, 8), dtype=torch.int32)
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+            position_ids_override=override,
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert meta.input_positions is override
+        runner.input_batch.block_table[0].get_cpu_tensor.assert_not_called()
+        assert torch.equal(meta.block_tables,
+                           torch.zeros((4 * 4, ), dtype=torch.int32))
+
+    def test_build_most_model_len_shrinks_block_table(self):
+        """When use_max_model_len is False, target_num_blocks =
+        cdiv(most_model_len, block_size) — smaller than the per-group
+        max_num_blocks_per_req, so the H2D copy is shorter."""
+        runner = self._make_runner_mock(most_model_len=32,
+                                        max_num_blocks_per_req=8)
+        builder = self._make_builder(runner)
+
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=False,
+            seq_lens=torch.tensor([8, 16, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        # cdiv(32, 16) = 2; flattened length = target_num_reqs * 2 = 8.
+        assert meta.block_tables.shape == (4 * 2, )

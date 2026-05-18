@@ -39,12 +39,13 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
                              LogprobsTensors, ModelRunnerOutput)
-from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
-from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
 
-from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.attention_metadata import (
+    AttentionMetadata, AttentionMetadataBuilder,
+    AttentionMetadataBuilderContext)
 from tpu_inference.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend)
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
@@ -266,7 +267,6 @@ class TPUModelRunner(GPUModelRunner):
             self.parallel_config)
         self.head_size = self.model_config.get_head_size()
         self.vocab_size = self.model_config.get_vocab_size()
-        assert not self.uses_mrope, "TPU does not support M-RoPE yet."
 
         # Pallas attention bookkeeping.
         self._attention_kernels_initialized = False
@@ -283,6 +283,13 @@ class TPUModelRunner(GPUModelRunner):
             (self.max_num_reqs, self.max_num_blocks_per_req),
             dtype=torch.int32,
             device="cpu")
+        if self.uses_mrope:
+            # Override parent's int64 mrope buffer with int32 so the H2D copy is
+            # dtype-identical to what the TPU model expects. Parent's
+            # _calc_mrope_positions writes via .cpu and .np — both route here.
+            self.mrope_positions = self._make_buffer(3,
+                                                     self.max_num_tokens + 1,
+                                                     dtype=torch.int32)
         self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
                                                dtype=torch.int32,
                                                device="cpu",
@@ -964,6 +971,9 @@ class TPUModelRunner(GPUModelRunner):
 
         num_reqs = len(num_scheduled_tokens_per_req)
 
+        if self.uses_mrope:
+            self._calc_mrope_positions(scheduler_output)
+
         # Fast path for decode-only: all requests have exactly 1 token.
         if max_num_scheduled_tokens_all_reqs == 1:
             # Pure decode: each request schedules exactly 1 token.
@@ -1039,35 +1049,27 @@ class TPUModelRunner(GPUModelRunner):
         self.input_ids = self.input_ids_cpu[:
                                             padded_total_num_scheduled_tokens].to(
                                                 self.device, non_blocking=True)
-        self.position_ids = self.positions_cpu[:
-                                               padded_total_num_scheduled_tokens].to(
-                                                   self.device,
-                                                   non_blocking=True)
+        if self.uses_mrope:
+            self.mrope_positions.cpu[:, total_num_scheduled_tokens:
+                                     padded_total_num_scheduled_tokens] = 0
+            self.position_ids = self.mrope_positions.cpu[:, :
+                                                         padded_total_num_scheduled_tokens].to(
+                                                             self.device,
+                                                             non_blocking=True)
+        else:
+            self.position_ids = self.positions_cpu[:
+                                                   padded_total_num_scheduled_tokens].to(
+                                                       self.device,
+                                                       non_blocking=True)
         if use_max_model_len:
-            block_tables = self.block_table_cpu[:self.num_reqs_max_model_len, :
-                                                self.max_num_blocks_per_req]
-            block_tables.zero_()
-            block_tables[:num_reqs, :self.max_num_blocks_per_req] = (
-                self.input_batch.block_table[0].get_cpu_tensor()
-                [start_index:start_index + num_reqs])
             seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
                 self.device, non_blocking=True)
+            target_num_reqs = self.num_reqs_max_model_len
         else:
             assert self.num_reqs_most_model_len is not None
-            block_tables = self.block_table_cpu[:self.
-                                                num_reqs_most_model_len, :self.
-                                                num_blocks_per_most_len_req]
-            block_tables.zero_()
-            block_tables[:num_reqs, :self.num_blocks_per_most_len_req] = (
-                self.input_batch.block_table[0].get_cpu_tensor()[
-                    start_index:start_index +
-                    num_reqs, :self.num_blocks_per_most_len_req])
             seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
                 self.device, non_blocking=True)
-        # Flatten on CPU before H2D to avoid device-side as_strided/reshape
-        # materialization on every decode step.
-        block_tables = block_tables.reshape(-1).to(self.device,
-                                                   non_blocking=True)
+            target_num_reqs = self.num_reqs_most_model_len
 
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
@@ -1122,12 +1124,22 @@ class TPUModelRunner(GPUModelRunner):
                 self._cached_logits_indices = logits_indices
                 self._cached_request_distribution = request_distribution
 
-        attn_metadata = AttentionMetadata(
-            input_positions=self.position_ids,
-            block_tables=block_tables,
+        self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=num_reqs,
+            start_index=start_index,
+            use_max_model_len=use_max_model_len,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+        )
+        slot_mappings = self.empty_slot_mappings
+        per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
+            num_tokens=total_num_scheduled_tokens,
+            num_reqs=target_num_reqs,
+            max_query_len=max_num_scheduled_tokens_all_reqs,
+            num_tokens_padded=padded_total_num_scheduled_tokens,
+            num_reqs_padded=target_num_reqs,
+            slot_mappings=slot_mappings,
         )
 
         if self.lora_config is not None:
@@ -1140,17 +1152,6 @@ class TPUModelRunner(GPUModelRunner):
 
             self.set_active_loras(self.input_batch,
                                   padded_num_scheduled_tokens_per_req)
-
-        # Cache attention layer names on first call to avoid iterating
-        # all model layers every step.
-        if self._attn_layer_names is None:
-            self._attn_layer_names = list(
-                get_layers_from_vllm_config(self.vllm_config,
-                                            (Attention, MambaBase)).keys())
-        per_layer_attn_metadata = {
-            layer_name: attn_metadata
-            for layer_name in self._attn_layer_names
-        }
 
         # Prepare token substitution indices
         cur_input_indices, pre_next_tokens_indices = self._prepare_async_token_substitution_indices(
@@ -1516,8 +1517,11 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
-    def _dummy_run(self, num_tokens: int, num_reqs: int,
-                   num_blocks: int) -> None:
+    def _dummy_run(self,
+                   num_tokens: int,
+                   num_reqs: int,
+                   num_blocks: int,
+                   use_max_model_len: bool = True) -> None:
         if self.supports_mm_inputs:
             input_ids = None
             inputs_embeds = torch.zeros(
@@ -1530,10 +1534,12 @@ class TPUModelRunner(GPUModelRunner):
                                     dtype=torch.int32).to(self.device)
             inputs_embeds = None
         actual_num_reqs = min(num_tokens, num_reqs)
-        position_ids = torch.zeros(num_tokens,
-                                   dtype=torch.int32).to(self.device)
-        block_tables = torch.zeros((num_reqs * num_blocks, ),
-                                   dtype=torch.int32).to(self.device)
+        if self.uses_mrope:
+            position_ids = torch.zeros((3, num_tokens),
+                                       dtype=torch.int32).to(self.device)
+        else:
+            position_ids = torch.zeros(num_tokens,
+                                       dtype=torch.int32).to(self.device)
         query_lens = [1] * num_reqs
         query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
                                                     dtype=torch.int32),
@@ -1546,20 +1552,47 @@ class TPUModelRunner(GPUModelRunner):
         request_distribution = torch.tensor(
             [actual_num_reqs, actual_num_reqs, actual_num_reqs],
             dtype=torch.int32).to(self.device)
-        attn_metadata = AttentionMetadata(
-            input_positions=position_ids,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            query_start_loc=query_start_loc,
-            request_distribution=request_distribution,
-        )
 
-        layer_names = get_layers_from_vllm_config(
-            self.vllm_config, (Attention, MambaBase)).keys()
-        per_layer_attn_metadata = {
-            layer_name: attn_metadata
-            for layer_name in layer_names
-        }
+        if getattr(self, "kv_cache_config", None) is not None:
+            self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=0,
+                use_max_model_len=use_max_model_len,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                request_distribution=request_distribution,
+                position_ids_override=position_ids,
+            )
+            slot_mappings = self.empty_slot_mappings
+            per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                max_query_len=1,
+                num_tokens_padded=num_tokens,
+                num_reqs_padded=num_reqs,
+                slot_mappings=slot_mappings,
+            )
+        else:
+            # Pre-init path (called before initialize_kv_cache): use the
+            # caller-supplied num_blocks and a single shared metadata.
+            if self._attn_layer_names is None:
+                self._attn_layer_names = list(
+                    get_layers_from_vllm_config(self.vllm_config,
+                                                (Attention, MambaBase)).keys())
+            block_tables = torch.zeros((num_reqs * num_blocks, ),
+                                       dtype=torch.int32).to(self.device)
+            attn_metadata = AttentionMetadata(
+                input_positions=position_ids,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                request_distribution=request_distribution,
+            )
+
+            per_layer_attn_metadata = {
+                layer_name: attn_metadata
+                for layer_name in self._attn_layer_names
+            }
 
         with (
                 self.maybe_select_dummy_loras(
@@ -1597,12 +1630,15 @@ class TPUModelRunner(GPUModelRunner):
             with self._precompile_timed("model backbone"):
                 for num_tokens in self.num_tokens_paddings:
                     logger.info("  -- num_tokens: %d", num_tokens)
-                    self._dummy_run(num_tokens, self.num_reqs_max_model_len,
-                                    self.max_num_blocks_per_req)
+                    self._dummy_run(num_tokens,
+                                    self.num_reqs_max_model_len,
+                                    self.max_num_blocks_per_req,
+                                    use_max_model_len=True)
                     if self.most_model_len is not None:
                         self._dummy_run(num_tokens,
                                         self.num_reqs_most_model_len,
-                                        self.num_blocks_per_most_len_req)
+                                        self.num_blocks_per_most_len_req,
+                                        use_max_model_len=False)
 
             hsize = self.model_config.get_hidden_size()
             with self._precompile_timed("compute_selected_logits"):
@@ -1676,8 +1712,10 @@ class TPUModelRunner(GPUModelRunner):
         # So we will not compile here and instead let the compilation happen in
         # the `precompile_backbone` step.
         with _bypass_torch_compile(self.model):
-            self._dummy_run(num_tokens, self.num_reqs_max_model_len,
-                            self.max_num_blocks_per_req)
+            self._dummy_run(num_tokens,
+                            self.num_reqs_max_model_len,
+                            self.max_num_blocks_per_req,
+                            use_max_model_len=True)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -1689,51 +1727,71 @@ class TPUModelRunner(GPUModelRunner):
         # Mirror GPUModelRunner.initialize_kv_cache: needed by inherited
         # _update_states -> _may_reorder_batch which reads kv_cache_config.
         self.kv_cache_config = kv_cache_config
+
+        # Dummy slot mapping, not used anywhere in the TPU code flow. But needed
+        #  for upstream `_build_attention_metadata` call.
+        self.empty_slot_mappings = {
+            gid: torch.empty(0, device=self.device)
+            for gid in range(len(self.kv_cache_config.kv_cache_groups))
+        }
+
         attn_block_size = None
         has_attention = False
         has_mamba = False
-        if len(kv_cache_config.kv_cache_groups) > 1:
-            for group in kv_cache_config.kv_cache_groups:
-                if isinstance(group.kv_cache_spec, MambaSpec):
-                    has_mamba = True
-                    # We can safely ignore block size for Mamba layers since they only use a single cache state per sequence.
-                    continue
-                elif (isinstance(group.kv_cache_spec, AttentionSpec)):
-                    has_attention = True
-                    if attn_block_size is None:
-                        attn_block_size = group.kv_cache_spec.block_size
-                    assert attn_block_size == group.kv_cache_spec.block_size, "Block size across attention groups must be the same."
-                else:
-                    raise NotImplementedError(
-                        "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
-                    )
-        else:
-            attn_block_size = kv_cache_config.kv_cache_groups[
-                0].kv_cache_spec.block_size
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                has_mamba = True
+                # We can safely ignore block size for Mamba layers since they only use a single cache state per sequence.
+                continue
+            if isinstance(spec, AttentionSpec):
+                has_attention = True
+            elif len(kv_cache_config.kv_cache_groups) > 1:
+                raise NotImplementedError(
+                    "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
+                )
 
-        # TODO(angelayi): try replacing this single-group InputBatch reinit
-        # with self.may_reinitialize_input_batch(kv_cache_config,
-        # [attn_block_size]) once a Qwen3.5 / hybrid mamba+attn smoke is
-        # in the validation matrix. The helper derives block_sizes from
-        # kv_cache_config.kv_cache_groups -> for hybrid models that yields
-        # [attn_block_size, mamba_block_size] (len 2), which mismatches our
-        # single-element kernel_block_sizes and would assert at InputBatch
-        # construction; the explicit single-group call below preserves main's
-        # behavior for pure-attention and hybrid alike.
-        if attn_block_size != self.block_size:
-            self.input_batch = InputBatch(
-                max_num_reqs=self.max_num_reqs,
-                max_model_len=self.max_model_len,
-                max_num_batched_tokens=self.max_num_tokens,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                vocab_size=self.model_config.get_vocab_size(),
-                block_sizes=[attn_block_size],
-                kernel_block_sizes=[attn_block_size],
-            )
-        # Verify dtype compatibility between block_table_cpu and input_batch
-        assert self.block_table_cpu.dtype == self.input_batch.block_table[
-            0].get_cpu_tensor().dtype
+            block_size = getattr(spec, "block_size", None)
+            if block_size is not None:
+                if attn_block_size is None:
+                    attn_block_size = block_size
+                assert attn_block_size == block_size, "Block size across attention groups must be the same."
+
+        block_sizes = []
+        for group in kv_cache_config.kv_cache_groups:
+            block_sizes.append(
+                getattr(group.kv_cache_spec, "block_size", attn_block_size)
+                or self.block_size)
+
+        self.may_reinitialize_input_batch(kv_cache_config, block_sizes)
+
+        # Populate self.attn_groups directly with a single shared TPU builder
+        # per group; bypasses parent's initialize_attn_backend (per-backend
+        # get_builder_cls dispatch, cudagraph-mode resolution, cp compat
+        # checks) — all GPU-relevant and unused on TPU.
+        self.attn_groups = []
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            builder = AttentionMetadataBuilder(group.kv_cache_spec,
+                                               group.layer_names,
+                                               self.vllm_config,
+                                               self.device,
+                                               runner=self,
+                                               kv_cache_group_id=gid)
+            self.attn_groups.append([
+                AttentionGroup(
+                    backend=None,
+                    layer_names=list(group.layer_names),
+                    kv_cache_spec=group.kv_cache_spec,
+                    kv_cache_group_id=gid,
+                    metadata_builders=[builder],
+                )
+            ])
+
+        # Verify dtype compatibility between block_table_cpu and every
+        # per-group block table that downstream code may index.
+        for group_id in range(len(kv_cache_config.kv_cache_groups)):
+            assert (self.block_table_cpu.dtype == self.input_batch.
+                    block_table[group_id].get_cpu_tensor().dtype)
 
         layer_name_to_spec = {}
         for group in kv_cache_config.kv_cache_groups:
