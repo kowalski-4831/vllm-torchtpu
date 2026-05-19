@@ -38,6 +38,22 @@ def test_quantize_tensor_keeps_zero_rows_finite(device):
     assert scale[0].item() == 0.0
 
 
+def test_quantize_tensor_uses_reciprocal_multiply_scale_rounding():
+    tensor = torch.tensor([[0.0010000200709328055]],
+                          device="cpu",
+                          dtype=torch.float32)
+    dtype_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    expected_scale = tensor.abs().amax(dim=-1, keepdim=True) * torch.tensor(
+        1.0 / dtype_max, dtype=torch.float32)
+
+    _, scale = quantize_tensor(tensor,
+                               quant_dtype=torch.float8_e4m3fn,
+                               axis=-1,
+                               block_size=None)
+
+    torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
+
+
 def test_quantize_tensor_to_fp4_keeps_zero_blocks_finite(device):
     tensor = torch.tensor(
         [[0.0, 0.0, 1.0, -1.0], [2.0, -2.0, 0.0, 0.0]],

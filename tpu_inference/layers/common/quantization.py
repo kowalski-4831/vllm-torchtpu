@@ -234,7 +234,12 @@ def quantize_tensor(
     blocked = moved.reshape(*moved.shape[:-1], num_blocks, block_size)
 
     abs_max = blocked.abs().amax(dim=-1, keepdim=True)
-    scale = abs_max / float(dtype_info.max)
+    # Use explicit fp32 reciprocal multiply for stable FP8 scale rounding.
+    # Plain division can land one ULP lower and change tie-point buckets.
+    dtype_max_recip = torch.tensor(1.0 / float(dtype_info.max),
+                                   dtype=torch.float32,
+                                   device=tensor.device)
+    scale = abs_max * dtype_max_recip
     # Keep all-zero blocks quantized as exact zeros instead of producing
     # 0 * inf -> NaN during requantization.
     scale_inv = _safe_inverse_scale(scale)
