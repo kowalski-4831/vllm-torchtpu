@@ -169,6 +169,17 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w13_weight = w13_weight.transpose(1, 2).contiguous()
         w2_weight = w2_weight.transpose(1, 2).contiguous()
 
+        # Pad each w13 half (gate, up) to a multiple of 128 so the fused GMM
+        # kernel's sub-view of the up half lands on a tile boundary.
+        half = w13_weight.shape[-1] // 2
+        aligned_half = (half + 127) // 128 * 128
+        if aligned_half != half:
+            pad = w13_weight.new_zeros(
+                (*w13_weight.shape[:-1], aligned_half - half))
+            w13_weight = torch.cat(
+                [w13_weight[..., :half], pad, w13_weight[..., half:], pad],
+                dim=-1).contiguous()
+
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -180,6 +191,13 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_bias = w13_bias[:, ::2]
                 w3_bias = w13_bias[:, 1::2]
                 w13_bias = torch.cat([w1_bias, w3_bias], dim=1)
+
+            if aligned_half != half:
+                bpad = w13_bias.new_zeros(
+                    (*w13_bias.shape[:-1], aligned_half - half))
+                w13_bias = torch.cat(
+                    [w13_bias[..., :half], bpad, w13_bias[..., half:], bpad],
+                    dim=-1).contiguous()
 
             layer.w13_bias = torch.nn.Parameter(
                 w13_bias.unsqueeze(1).to(torch.float32),
