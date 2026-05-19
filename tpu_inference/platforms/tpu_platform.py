@@ -93,6 +93,8 @@ def apply_tpu_patches() -> None:
     All patches are idempotent.
     """
     from tpu_inference import _patch_vllm_tpu_group_custom_ops
+    from tpu_inference.layers.vllm.custom_ops import _register_custom_ops
+    _register_custom_ops()
     _patch_vllm_tpu_group_custom_ops()
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
@@ -130,9 +132,6 @@ class TpuPlatform(Platform):
             AttentionBackendEnum.FLASH_ATTN,
             "tpu_inference.layers.vllm.attention.PallasAttentionBackend",
         )
-
-        from tpu_inference.layers.vllm.custom_ops import register_custom_ops
-        register_custom_ops()
 
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:

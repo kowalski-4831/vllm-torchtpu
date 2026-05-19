@@ -16,6 +16,6 @@ from tpu_inference.layers.vllm.custom_ops import \
     gdn_attention_op as gdn_attention_op
 
 
-def register_custom_ops() -> None:
+def _register_custom_ops() -> None:
     """Explicitly imported to trigger custom operation registration decorators."""
     pass
