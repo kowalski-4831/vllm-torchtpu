@@ -301,42 +301,14 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
             index_map.rhs_scale_index_map,
         )
 
-    up_spec = None
-    if cfgs.fuse_act is not None:
-        offset = pl.cdiv(cfgs.dims.size_n, cfgs.tiles.tile_n)
-        rhs_weight_up_spec = pl.BlockSpec(
-            (None, cfgs.tiles.tile_k // cfgs.rhs_cfgs.packing,
-             cfgs.tiles.tile_n),
-            functools.partial(index_map.rhs_weight_index_map, offset=offset),
-            pipeline_mode=pl.Buffered(buffer_count=3),
-        )
-
-        rhs_scale_up_spec = rhs_bias_up_spec = None
-        if cfgs.rhs_cfgs.has_bias:
-            rhs_bias_up_spec = pl.BlockSpec(
-                (None, 1, cfgs.tiles.tile_n),
-                functools.partial(index_map.rhs_bias_index_map, offset=offset),
-            )
-        if cfgs.rhs_cfgs.has_scale:
-            rhs_scale_up_spec = pl.BlockSpec(
-                (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
-                functools.partial(index_map.rhs_scale_index_map,
-                                  offset=offset),
-            )
-        up_spec = WeightsRef(
-            weight=rhs_weight_up_spec,
-            scale=rhs_scale_up_spec,
-            bias=rhs_bias_up_spec,
-        )
-    if up_spec is None:
-        return WeightsRef(weight=rhs_weight_spec,
-                          scale=rhs_scale_spec,
-                          bias=rhs_bias_spec)
-
-    return FusedWeightsRef(gate=WeightsRef(weight=rhs_weight_spec,
-                                           scale=rhs_scale_spec,
-                                           bias=rhs_bias_spec),
-                           up=up_spec)
+    rhs_block_spec = WeightsRef(weight=rhs_weight_spec,
+                                scale=rhs_scale_spec,
+                                bias=rhs_bias_spec)
+    if cfgs.fuse_act is None:
+        return rhs_block_spec
+    # Up half's column offset comes from a sub-view in kernel_main; both
+    # halves share this BlockSpec.
+    return FusedWeightsRef(gate=rhs_block_spec, up=rhs_block_spec)
 
 
 def generate_block_specs(
@@ -891,7 +863,10 @@ def kernel_main(
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     if cfgs.fuse_act is not None:
-        rhs_inner_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_ref)
+        # Up half = sub-view of rhs_ref at column size_n.
+        rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.dims.size_n:],
+                                  rhs_ref)
+        rhs_inner_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
     else:
         rhs_inner_ref = rhs_ref
     pipeline_fn(lhs_in, rhs_inner_ref, out_in, scratches=scratches)
