@@ -44,9 +44,36 @@ jobs:
   # PR-time guard: runs two configs in series on every PR. Each config
   # serves vllm + runs vllm bench serve + compares output JSON to a frozen
   # baseline. Then it runs lm_eval against the live server.
+  check_changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
+        id: filter
+        with:
+          filters: |
+            src:
+              - '!**.md'
+              - '!docs/**'
+              - '!docker/**'
+              - '!.gitignore'
+              - '!.dockerignore'
+              - '!.pre-commit-config.yaml'
+              - '!.readthedocs.yaml'
+              - '!mkdocs.yml'
+              - '!LICENSE'
+              - '!DCO'
+              - '!MANIFEST.in'
+
   perf-eval-guard:
     name: "Perf and Eval Guard (PR)"
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: check_changes
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && needs.check_changes.outputs.should_run == 'true')
     runs-on: linux-x86-tpu7x-224-4tpu
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest

@@ -30,18 +30,6 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'docker/**'
-      - '.gitignore'
-      - '.dockerignore'
-      - '.pre-commit-config.yaml'
-      - '.readthedocs.yaml'
-      - 'mkdocs.yml'
-      - 'LICENSE'
-      - 'DCO'
-      - 'MANIFEST.in'
 
 permissions:
   contents: read
@@ -55,8 +43,33 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'main' }}
 
 jobs:
-  run_tests:
+  check_changes:
     if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
+        id: filter
+        with:
+          filters: |
+            src:
+              - '!**.md'
+              - '!docs/**'
+              - '!docker/**'
+              - '!.gitignore'
+              - '!.dockerignore'
+              - '!.pre-commit-config.yaml'
+              - '!.readthedocs.yaml'
+              - '!mkdocs.yml'
+              - '!LICENSE'
+              - '!DCO'
+              - '!MANIFEST.in'
+
+  run_tests:
+    needs: check_changes
+    if: github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
     uses: ./.github/workflows/tests.yml
     name: "Run Tests"
     with:
