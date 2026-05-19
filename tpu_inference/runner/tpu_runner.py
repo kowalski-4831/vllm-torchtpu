@@ -70,31 +70,34 @@ class ExecuteModelState:
 def _substitute_placeholder_token(
         input_ids: torch.Tensor, token_in_tpu_cur_input_indices: torch.Tensor,
         token_in_tpu_pre_next_tokens_indices: torch.Tensor,
-        next_tokens: torch.Tensor, placeholder_num: int):
-    """Substitute placeholder tokens from TPU for async scheduler
+        next_tokens: torch.Tensor):
+    """Substitute placeholder tokens from TPU for async scheduler.
 
-    Padding for parallelisation of the substitute_placeholder_token_fn
-    [1, 3] => [1, 3, 0, 2, 4, 5, 6, 7, 8]
-    The reason for such a special padding instead of padding with -1 is:
-    An edge case when the end index needs to be updated and padding is required.
-    If we pad the array with -1, the _substitute_placeholder_token_fn will repeatedly update the end element with the original value
-    Although such a scenario is unlikely to happen in vLLM, it is best to eliminate any potential risks.
+    Padding scheme (set up by `_apply_async_token_substitution`):
+      - `token_in_tpu_cur_input_indices`: real-slot indices followed by all
+        other indices in ascending order; the tail entries re-target slots
+        that should keep their current values.
+      - `token_in_tpu_pre_next_tokens_indices`: real `next_tokens` indices
+        followed by `-1` sentinels at the padded positions.
+    The `-1` sentinel is the mask source; the program is shape-only so it
+    does not recompile when the active count changes.
 
     Args:
-        input_ids: possible input_ids size
-        token_in_tpu_cur_input_indices: replace holder idx in input_ids. Length the same to input_ids.
-        token_in_tpu_pre_next_tokens_indices: value idx in next_tokens. Length the same to input_ids.
-        next_tokens: next tokens on the TPU from previous step.
-        placeholder_num: number of placeholders. placeholder_num <= len(token_in_tpu_cur_input_indices)
+        input_ids: device tensor [N] where N is the bucketed input size.
+        token_in_tpu_cur_input_indices: int tensor [N], destination slots.
+        token_in_tpu_pre_next_tokens_indices: int tensor [N], source slots
+            in `next_tokens`; -1 marks a padding slot to leave unchanged.
+        next_tokens: int tensor of tokens from the previous async step.
     Return:
-        input_ids after replace placeholder tokens
+        input_ids with real placeholders replaced; padding slots untouched.
     """
     assert input_ids.shape[0] == token_in_tpu_cur_input_indices.shape[
         0] == token_in_tpu_pre_next_tokens_indices.shape[0]
-    device = input_ids.device
-    mask = torch.arange(input_ids.shape[0], device=device) < placeholder_num
-    new_token_values = next_tokens[token_in_tpu_pre_next_tokens_indices].to(
-        input_ids.dtype)
+    mask = token_in_tpu_pre_next_tokens_indices >= 0
+    # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
+    # slots; their gathered values are discarded by `mask` in `where`.
+    safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
+    new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
     original_values = input_ids[token_in_tpu_cur_input_indices]
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
@@ -852,8 +855,7 @@ class TPUModelRunner(GPUModelRunner):
 
         return _substitute_placeholder_token(
             input_ids, cur_input_indices, pre_next_tokens_indices,
-            self._pre_async_results.next_tokens_tpu,
-            len(token_in_tpu_cur_input_indices))
+            self._pre_async_results.next_tokens_tpu)
 
     def _modify_prev_results(self):
         if self._pre_async_results is None:
@@ -1292,9 +1294,6 @@ class TPUModelRunner(GPUModelRunner):
         req_ids = cast(list[str],
                        self.input_batch.req_ids[:self.input_batch.num_reqs])
         all_greedy = self.input_batch.all_greedy
-        if not all_greedy:
-            self.input_batch.temperature.copy_(
-                self.input_batch.temperature_cpu_tensor)
         for logits, num_reqs in zip(state.logits_list, state.num_reqs_list):
             cur_end_idx = cur_start_idx + num_reqs
             if grammar_output is not None:
@@ -1314,13 +1313,8 @@ class TPUModelRunner(GPUModelRunner):
                     dummy_placeholder,
                     all_greedy=True)
             else:
-                temperatures_tpu = torch.ones((logits.shape[0], 1),
-                                              dtype=logits.dtype,
-                                              device=logits.device)
-                num_active_reqs = cur_end_idx - cur_start_idx
-                temperatures_tpu[:num_active_reqs,
-                                 0] = self.input_batch.temperature[
-                                     cur_start_idx:cur_end_idx]
+                temperatures_tpu = self._build_padded_temperatures(
+                    cur_start_idx, cur_end_idx, logits)
                 u = torch.rand_like(logits)
                 selected_token_ids = self.sample_from_logits_func(
                     logits, temperatures_tpu, u, all_greedy=all_greedy)
@@ -1622,6 +1616,73 @@ class TPUModelRunner(GPUModelRunner):
                            device=self.device,
                            dtype=self._hidden_states_dtype)
 
+    def _precompile_compute_selected_logits(self) -> None:
+        hsize = self.model_config.get_hidden_size()
+        with self._precompile_timed("compute_selected_logits"):
+            for num_tokens in self.num_tokens_paddings:
+                dummy_hidden = torch.zeros((num_tokens, hsize),
+                                           device=self.device,
+                                           dtype=self._hidden_states_dtype)
+                for num_reqs in self.num_reqs_paddings:
+                    indices = torch.zeros(num_reqs,
+                                          dtype=torch.int32,
+                                          device=self.device)
+                    out = self.compute_selected_logits(dummy_hidden, indices)
+                    sync.synchronize(out, wait=True)
+                    logger.info("  -- num_tokens: %d, num_seqs: %d",
+                                num_tokens, num_reqs)
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
+
+    def _precompile_structured_decoding(self) -> None:
+        with self._precompile_timed("structured_decoding"):
+            arange = self.structured_decode_arange.to(self.device)
+            for num_reqs in self.num_reqs_paddings:
+                out = self.structured_decode(
+                    self.require_structured_out_cpu[:num_reqs].to(self.device),
+                    self.grammar_bitmask_cpu[:num_reqs].to(self.device),
+                    self._dummy_logits(num_reqs),
+                    arange,
+                )
+                sync.synchronize(out, wait=True)
+                logger.info("  -- num_seqs: %d", num_reqs)
+
+    def _precompile_sample_from_logits(self) -> None:
+        with self._precompile_timed("sample_from_logits"):
+            for num_reqs in self.num_reqs_paddings:
+                dummy_logits = self._dummy_logits(num_reqs)
+                dummy_temperatures = torch.ones(
+                    (num_reqs, 1),
+                    dtype=self._hidden_states_dtype,
+                    device=self.device)
+                dummy_u = torch.rand_like(dummy_logits)
+                for all_greedy in [False, True]:
+                    out = self.sample_from_logits_func(dummy_logits,
+                                                       dummy_temperatures,
+                                                       dummy_u,
+                                                       all_greedy=all_greedy)
+                    sync.synchronize(out, wait=True)
+                logger.info("  -- num_seqs: %d", num_reqs)
+
+    def _precompile_gather_logprobs(self) -> None:
+        with self._precompile_timed("gather_logprobs"):
+            for num_reqs in self.num_reqs_paddings:
+                out = self.gather_logprobs(
+                    self._dummy_logits(num_reqs),
+                    torch.zeros((num_reqs, 1),
+                                dtype=torch.int64).to(self.device),
+                )
+                sync.synchronize(out.logprobs, wait=True)
+                logger.info("  -- num_seqs: %d", num_reqs)
+
+    def _precompile_sampling_subgraphs(self) -> None:
+        """Compile sampling-path subgraphs so their bottom-HBM reservations
+        are visible to vLLM's available-memory probe in profile_run."""
+        self._precompile_compute_selected_logits()
+        self._precompile_structured_decoding()
+        self._precompile_sample_from_logits()
+        self._precompile_gather_logprobs()
+
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         if self.enforce_eager:
@@ -1640,63 +1701,7 @@ class TPUModelRunner(GPUModelRunner):
                                         self.num_blocks_per_most_len_req,
                                         use_max_model_len=False)
 
-            hsize = self.model_config.get_hidden_size()
-            with self._precompile_timed("compute_selected_logits"):
-                for num_tokens in self.num_tokens_paddings:
-                    dummy_hidden = torch.zeros((num_tokens, hsize),
-                                               device=self.device,
-                                               dtype=self._hidden_states_dtype)
-                    for num_reqs in self.num_reqs_paddings:
-                        indices = torch.zeros(num_reqs,
-                                              dtype=torch.int32,
-                                              device=self.device)
-                        out = self.compute_selected_logits(
-                            dummy_hidden, indices)
-                        sync.synchronize(out, wait=True)
-                        logger.info("  -- num_tokens: %d, num_seqs: %d",
-                                    num_tokens, num_reqs)
-                        if num_reqs >= min(num_tokens, self.max_num_reqs):
-                            break
-
-            with self._precompile_timed("structured_decoding"):
-                arange = self.structured_decode_arange.to(self.device)
-                for num_reqs in self.num_reqs_paddings:
-                    out = self.structured_decode(
-                        self.require_structured_out_cpu[:num_reqs].to(
-                            self.device),
-                        self.grammar_bitmask_cpu[:num_reqs].to(self.device),
-                        self._dummy_logits(num_reqs),
-                        arange,
-                    )
-                    sync.synchronize(out, wait=True)
-                    logger.info("  -- num_seqs: %d", num_reqs)
-
-            with self._precompile_timed("sample_from_logits"):
-                for num_reqs in self.num_reqs_paddings:
-                    dummy_logits = self._dummy_logits(num_reqs)
-                    dummy_temperatures = torch.ones(
-                        (num_reqs, 1),
-                        device=self.device,
-                        dtype=self._hidden_states_dtype)
-                    dummy_u = torch.rand_like(dummy_logits)
-                    for all_greedy in [False, True]:
-                        out = self.sample_from_logits_func(
-                            dummy_logits,
-                            dummy_temperatures,
-                            dummy_u,
-                            all_greedy=all_greedy)
-                        sync.synchronize(out, wait=True)
-                    logger.info("  -- num_seqs: %d", num_reqs)
-
-            with self._precompile_timed("gather_logprobs"):
-                for num_reqs in self.num_reqs_paddings:
-                    out = self.gather_logprobs(
-                        self._dummy_logits(num_reqs),
-                        torch.zeros((num_reqs, 1),
-                                    dtype=torch.int64).to(self.device),
-                    )
-                    sync.synchronize(out.logprobs, wait=True)
-                    logger.info("  -- num_seqs: %d", num_reqs)
+            self._precompile_sampling_subgraphs()
 
     def profile_run(
         self,
@@ -1704,18 +1709,21 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         self._initialize_attention_kernels()
 
-        # TODO: figure out if this can be fixed
-        # Run eagerly (without torch.compile) during profiling.
-        # The profiling run executes before KV cache is allocated, so
-        # kv_cache.numel() == 0. If torch.compile traces this path, it
-        # specializes the graph with the early-return branch in attention.
-        # So we will not compile here and instead let the compilation happen in
-        # the `precompile_backbone` step.
+        # KV cache isn't allocated yet; torch.compile would specialize on
+        # the kv_cache.numel() == 0 early-return in attention. Compile the
+        # backbone later in capture_model() after KV alloc.
         with _bypass_torch_compile(self.model):
             self._dummy_run(num_tokens,
                             self.num_reqs_max_model_len,
                             self.max_num_blocks_per_req,
                             use_max_model_len=True)
+
+        # Sampling-path subgraphs don't depend on kv_cache; compile them
+        # now so their bottom-HBM reservations are visible to vLLM's
+        # available-memory probe and counted in the KV-cache budget.
+        if not self.enforce_eager:
+            with self.maybe_setup_dummy_loras(self.lora_config):
+                self._precompile_sampling_subgraphs()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -1925,6 +1933,16 @@ class TPUModelRunner(GPUModelRunner):
         if isinstance(out, (list, tuple)):
             out = out[0]
         return out
+
+    def _build_padded_temperatures(self, cur_start_idx: int, cur_end_idx: int,
+                                   logits: torch.Tensor) -> torch.Tensor:
+        # Stage [padded_num_reqs] on CPU (neutral 1.0 for padding slots),
+        # then one fixed-shape H2D copy to keep decode shape-stable.
+        padded_num_reqs = logits.shape[0]
+        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
+        temps_cpu[:cur_end_idx - cur_start_idx].copy_(
+            self.input_batch.temperature_cpu_tensor[cur_start_idx:cur_end_idx])
+        return temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
