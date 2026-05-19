@@ -21,6 +21,8 @@ from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 
+from tpu_inference import envs
+
 logger = logging.getLogger(__name__)
 
 # Type alias for the compile range tuple
