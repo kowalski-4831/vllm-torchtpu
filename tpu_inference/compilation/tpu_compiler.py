@@ -21,8 +21,6 @@ from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 
-from tpu_inference import envs
-
 logger = logging.getLogger(__name__)
 
 # Type alias for the compile range tuple
@@ -125,8 +123,10 @@ class TpuCompilerAdaptor(CompilerInterface):
         hash_obj.update(
             f"torch_tpu={getattr(torch_tpu, '__version__', 'unknown')}".encode(
             ))
-        hash_obj.update(
-            f"use_batched_rpa={envs.USE_BATCHED_RPA_KERNEL}".encode())
+        # Kernel choice (default vs batched RPA) no longer needs to be in the
+        # cache key — each Impl registers under a distinct op name
+        # (`pallas::rpa_kernel_*` vs `pallas::rpa_kernel_batched_*`), so the
+        # FX graph already discriminates.
 
         for path in _iter_runtime_cache_key_files(repo_root):
             relpath = path.relative_to(repo_root).as_posix()

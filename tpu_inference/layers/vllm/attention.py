@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+from typing import ClassVar
 
 import jax
 import torch
@@ -11,7 +12,8 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType)
 
-from tpu_inference.layers.common.attention_interface import attention
+from tpu_inference.layers.common.attention_interface import (
+    attention, ragged_paged_attention, ragged_paged_attention_batched)
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import (is_floating_dtype,
                                                       quantize_kv)
@@ -67,7 +69,7 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
     return packing_bits // bits
 
 
-def _pallas_rpa_kernel(
+def _pallas_rpa_kernel_impl(
     kv_cache: jax.Array,
     query: jax.Array,
     key: jax.Array,
@@ -83,6 +85,7 @@ def _pallas_rpa_kernel(
     *,
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
+    rpa_func,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -104,8 +107,87 @@ def _pallas_rpa_kernel(
         v_scale=v_scale,
         sinks=sinks,
         attention_chunk_size=sliding_window,
+        rpa_func=rpa_func,
     )
     return new_kv_cache, outputs
+
+
+def _pallas_rpa_kernel_default(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+) -> tuple[jax.Array, jax.Array]:
+    """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
+
+    Full signature (not `*args, **kwargs`) is required so `pallas.jax_op` can
+    introspect argument types via `_verify_signature`.
+    """
+    return _pallas_rpa_kernel_impl(
+        kv_cache,
+        query,
+        key,
+        value,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sinks,
+        q_scale,
+        k_scale,
+        v_scale,
+        mesh=mesh,
+        sliding_window=sliding_window,
+        rpa_func=ragged_paged_attention,
+    )
+
+
+def _pallas_rpa_kernel_batched(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+) -> tuple[jax.Array, jax.Array]:
+    """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
+    return _pallas_rpa_kernel_impl(
+        kv_cache,
+        query,
+        key,
+        value,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sinks,
+        q_scale,
+        k_scale,
+        v_scale,
+        mesh=mesh,
+        sliding_window=sliding_window,
+        rpa_func=ragged_paged_attention_batched,
+    )
 
 
 # =========================================================================================
@@ -228,12 +310,43 @@ class PallasAttentionBackend(AttentionBackend):
         return page_size
 
 
+class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
+    """Pallas attention backend wired to the batched-RPA kernel.
+
+    Registered under `AttentionBackendEnum.CUSTOM` by
+    `TpuPlatform.pre_register_and_update`; user opts in via
+    `--attention-backend CUSTOM`. The Impl subclass sets `use_batched_rpa=True`,
+    which plumbs through `_pallas_rpa_kernel` → `attention()` →
+    `sharded_ragged_paged_attention()` to pick the batched kernel function.
+    Declares `get_supported_kernel_block_sizes() -> [256]` so vLLM's standard
+    `get_preferred_block_size` flow picks the right block size automatically.
+    """
+
+    @staticmethod
+    def get_name() -> str:
+        return "CUSTOM"
+
+    @staticmethod
+    def get_impl_cls() -> type["PallasBatchedRPAAttentionBackendImpl"]:
+        return PallasBatchedRPAAttentionBackendImpl
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [256]
+
+
 class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_instance_counter = 0
     # Registry of shared custom ops keyed to avoid registering duplicate Pallas
     # kernels for layers with identical configs.
     # Mapping of (sliding_window, mesh, q_scale, k_scale, v_scale) -> custom op
     _kernel_registry: dict = {}
+
+    # Each Impl subclass points at its own RPA kernel entry function. Wrapped
+    # with `staticmethod` so attribute access through `self` doesn't bind it
+    # as a method. Subclasses override this to select a different kernel.
+    _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
+    _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
 
     def __init__(
         self,
@@ -293,20 +406,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
         v_scale: float | None,
     ):
         # Reuse an existing custom op if one with the same config already exists.
+        # `_kernel_op_prefix` is included so subclasses (e.g. the batched RPA
+        # variant) don't collide with the base impl in the shared registry.
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
-        registry_key = (self.sliding_window, id(mesh), q_scale, k_scale,
-                        v_scale)
+        registry_key = (self._kernel_op_prefix, self.sliding_window, id(mesh),
+                        q_scale, k_scale, v_scale)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             return existing
 
         kernel_instance_id = self._allocate_kernel_instance_id()
-        op_name = f"pallas::rpa_kernel_{kernel_instance_id}"
+        op_name = f"{self._kernel_op_prefix}_{kernel_instance_id}"
 
         # Prepare wrapper function with static arguments
         wrapped_fn = functools.partial(
-            _pallas_rpa_kernel,
+            self._kernel_entry,
             mesh=mesh,
             sliding_window=self.sliding_window,
             q_scale=q_scale,
@@ -444,3 +559,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             sync.synchronize(kv_cache)
 
         return outputs.reshape(q_len, self.num_heads * self.head_size)
+
+
+class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
+    """Impl variant that dispatches to the batched RPA Pallas kernel."""
+    _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
+    _kernel_op_prefix = "pallas::rpa_kernel_batched"

@@ -149,8 +149,8 @@ start_vllm_server() {
     if [ -n "$QUANTIZATION" ]; then
         extra_args="$extra_args --quantization $QUANTIZATION"
     fi
-    if [ "${USE_BATCHED_RPA_KERNEL:-0}" = "1" ]; then
-        extra_args="$extra_args --block-size 256"
+    if [ -n "${ATTENTION_BACKEND:-}" ]; then
+        extra_args="$extra_args --attention-backend $ATTENTION_BACKEND"
     fi
 
     export PYTHONUNBUFFERED=1

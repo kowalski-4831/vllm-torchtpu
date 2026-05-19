@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
-    USE_BATCHED_RPA_KERNEL: bool = False
 
 
 def env_with_choices(
@@ -144,11 +143,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ref", "chunked_jax_pd", "chunked_kernel_pd", "chunked_kernel_p_jax_d",
         "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd"
     ]),
-    # Switch attention_interface from the default RPA v3 kernel to the
-    # experimental batched RPA kernel under
-    # tpu_inference/kernels/experimental/batched_rpa/. Mirrors ullm's flag.
-    "USE_BATCHED_RPA_KERNEL":
-    lambda: bool(int(os.getenv("USE_BATCHED_RPA_KERNEL") or "0")),
 }
 
 

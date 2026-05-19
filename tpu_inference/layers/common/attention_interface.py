@@ -13,8 +13,9 @@ from jax.experimental.pallas.ops.tpu.splash_attention import \
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+import tpu_inference.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
-from tpu_inference import envs
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -23,21 +24,16 @@ from tpu_inference.utils import get_megacore
 
 logger = init_logger(__name__)
 
-# NOTE: this kernel is experimental and not fully tested.  See
-# tpu_inference/kernels/experimental/batched_rpa/wrapper.py for details.
-if envs.USE_BATCHED_RPA_KERNEL:
-    import tpu_inference.kernels.experimental.batched_rpa.wrapper as rpa
-    logger.info_once("Using experimental batched RPA kernel")
-else:
-    import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
-    logger.info_once("Using default RPA kernel")
-
 MAX_ALLOWED_PAGE_INDICES_N = (
     128 * 1024
 )  # Based on experiments on v5e, 256x1024 results in smem oom but 128x1024 not. TODO: Adjust this based on TPU version.
 
-ragged_paged_attention = rpa.ragged_paged_attention
-get_kv_cache_shape = rpa.get_kv_cache_shape
+# Default and experimental batched RPA kernels are loaded unconditionally.
+# Selection happens per attention layer via the `use_batched_rpa` flag plumbed
+# from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
+ragged_paged_attention = rpa_default.ragged_paged_attention
+ragged_paged_attention_batched = rpa_batched.ragged_paged_attention
+get_kv_cache_shape = rpa_default.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
@@ -299,6 +295,7 @@ def sharded_ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    rpa_func: Callable = ragged_paged_attention,
 ):
     """Shards along KV heads."""
 
@@ -321,12 +318,12 @@ def sharded_ragged_paged_attention(
 
     use_hd64 = q.shape[-1] == 64
 
-    func = ragged_paged_attention
     if use_hd64:
+        # Batched RPA has no hd64 variant; head_dim==64 always uses default.
         func = functools.partial(ragged_paged_attention_hd64,
                                  strict_sliding_window=True)
     else:
-        func = ragged_paged_attention
+        func = rpa_func
 
     if attention_sink is not None:
         if not use_hd64:
@@ -368,6 +365,7 @@ def attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
+    rpa_func: Callable = ragged_paged_attention,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -403,6 +401,7 @@ def attention(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        rpa_func=rpa_func,
     )
 
     return kv_cache, output

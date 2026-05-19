@@ -2,7 +2,7 @@
 
 import os
 import time
-from typing import TYPE_CHECKING, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import portpicker
 import torch
@@ -18,14 +18,13 @@ from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.config import BlockSize, ModelConfig, VllmConfig
+    from vllm.config import ModelConfig, VllmConfig
     from vllm.inputs import ProcessorInputs
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams, SamplingType
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
-    BlockSize = None
     ModelConfig = None
     VllmConfig = None
     ProcessorInputs = None
@@ -118,8 +117,8 @@ class TpuPlatform(Platform):
         "PHASED_PROFILING_DIR", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
         "NEW_MODEL_DESIGN", "MOE_REQUANTIZE_BLOCK_SIZE",
-        "MOE_REQUANTIZE_WEIGHT_DTYPE", "USE_BATCHED_RPA_KERNEL",
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES", "TORCH_TPU_TOPOLOGY"
+        "MOE_REQUANTIZE_WEIGHT_DTYPE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY"
     ]
 
     @classmethod
@@ -131,6 +130,12 @@ class TpuPlatform(Platform):
         register_backend(
             AttentionBackendEnum.FLASH_ATTN,
             "tpu_inference.layers.vllm.attention.PallasAttentionBackend",
+        )
+        # Experimental batched RPA — opt in via `--attention-backend CUSTOM`.
+        register_backend(
+            AttentionBackendEnum.CUSTOM,
+            "tpu_inference.layers.vllm.attention."
+            "PallasBatchedRPAAttentionBackend",
         )
 
     @classmethod
@@ -181,6 +186,12 @@ class TpuPlatform(Platform):
                              attn_selector_config: "AttentionSelectorConfig",
                              **kwargs) -> str:
         backend_name = getattr(selected_backend, "name", None)
+        if backend_name == "CUSTOM":
+            logger.info("Using TPU Pallas attention backend (batched-RPA "
+                        "variant via CUSTOM; requires block_size=256).")
+            return ("tpu_inference.layers.vllm.attention."
+                    "PallasBatchedRPAAttentionBackend")
+
         if backend_name not in (None, "FLASH_ATTN"):
             logger.info("Cannot use %s backend on TPU.", selected_backend)
 
@@ -295,19 +306,29 @@ class TpuPlatform(Platform):
             model_config.dtype = torch.bfloat16
 
         cache_config = vllm_config.cache_config
-        block_size_was_unspecified = cache_config.block_size is None
-        # For v0, the default block size is 16.
-        if cache_config and cache_config.block_size is None:
-            cache_config.block_size = cast(BlockSize, 16)
+        # vLLM's CacheConfig._apply_block_size_default has already populated
+        # block_size with DEFAULT_BLOCK_SIZE if the user didn't pass one, so
+        # `block_size is None` is never true by this point. The authoritative
+        # signal is the `user_specified_block_size` flag pydantic sets.
+        block_size_was_unspecified = not getattr(
+            cache_config, "user_specified_block_size", cache_config.block_size
+            is None)
 
-        from tpu_inference.layers.vllm.attention import PallasAttentionBackend
+        from tpu_inference.layers.vllm.attention import (
+            PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
+        attn_backend = getattr(getattr(vllm_config, "attention_config", None),
+                               "backend", None)
+        selected_name = getattr(attn_backend, "name", None)
+        backend_cls = (PallasBatchedRPAAttentionBackend if selected_name
+                       == "CUSTOM" else PallasAttentionBackend)
         is_hybrid = getattr(vllm_config.model_config, "is_hybrid", False)
         cls._is_hybrid = is_hybrid
         if not is_hybrid and block_size_was_unspecified:
-            cache_config.block_size = PallasAttentionBackend.get_page_size(
-                vllm_config)  # type: ignore[assignment]
+            default = backend_cls.get_page_size(vllm_config)
+            cache_config.block_size = (  # type: ignore[assignment]
+                backend_cls.get_preferred_block_size(default))
 
-        min_page_size = PallasAttentionBackend.get_min_page_size(vllm_config)
+        min_page_size = backend_cls.get_min_page_size(vllm_config)
         if min_page_size > cache_config.block_size:
             logger.warning(
                 "Increase the page size from %s to %s to make sure there's"
@@ -316,9 +337,6 @@ class TpuPlatform(Platform):
                 min_page_size,
             )
             cache_config.block_size = min_page_size  # type: ignore[assignment]
-        if (envs.USE_BATCHED_RPA_KERNEL and block_size_was_unspecified
-                and cache_config.block_size < 256):
-            cache_config.block_size = 256  # type: ignore[assignment]
         logger.info("Using KV cache block size: %s", cache_config.block_size)
 
         parallel_config = vllm_config.parallel_config
