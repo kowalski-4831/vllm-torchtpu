@@ -15,7 +15,7 @@ from vllm.distributed import cleanup_dist_env_and_memory
 MOE_MODEL_NAME = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 
 MOE_PROMPTS = [
-    "MoE tensor parallel test prompt.",
+    "The capital of France is",
     "Write one sentence about compilers.",
     "List two uses of sparse experts.",
     "Explain TPU execution briefly.",
@@ -86,6 +86,10 @@ def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     assert len(outputs) == len(MOE_PROMPTS)
     assert all(len(output.outputs) == 1 for output in outputs)
     assert all(output.outputs[0].text.strip() for output in outputs)
+    # Greedy decoding of "The capital of France is" must produce "Paris";
+    # catches MoE channel-misalignment bugs that yield non-empty token salad.
+    assert "paris" in outputs[0].outputs[0].text.lower(), \
+        f"incoherent MoE output: {outputs[0].outputs[0].text!r}"
 
 
 @pytest.mark.timeout(1800)
@@ -105,3 +109,5 @@ def test_moe_generate_with_ep_equal_local_tpu_count(async_scheduling: bool):
     assert len(outputs) == len(MOE_PROMPTS)
     assert all(len(output.outputs) == 1 for output in outputs)
     assert all(output.outputs[0].text.strip() for output in outputs)
+    assert "paris" in outputs[0].outputs[0].text.lower(), \
+        f"incoherent MoE output: {outputs[0].outputs[0].text!r}"
