@@ -87,7 +87,9 @@ FROM ci AS dev
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-deps --no-config -e .
+    uv pip install --system --no-config --index-url https://pypi.org/simple -e ".[test,benchmarking]"
+
+
 ENV PYTHONPATH="/root/tpu_inference"
 CMD ["/bin/bash"]
 
@@ -95,7 +97,15 @@ CMD ["/bin/bash"]
 FROM base AS prod
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gcloud_token \
+    set -eu; \
+    TOKEN=""; \
+    if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-deps --no-config .
+    uv pip install --system --no-config \
+      --index-url https://pypi.org/simple \
+      --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
+      .
+
 ENV PYTHONPATH="/root/tpu_inference"
 CMD ["/bin/bash"]
