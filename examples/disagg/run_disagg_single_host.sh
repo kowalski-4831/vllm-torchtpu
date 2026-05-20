@@ -15,6 +15,9 @@ PREFILL_PORTS=()
 DECODE_HOSTS=()
 DECODE_PORTS=()
 
+# Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
+TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
+
 wait_for_server() {
   local port=$1
   timeout 1200 bash -c "
@@ -38,10 +41,11 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     PORT=$((8400 + i))
     KV_PORT=$((7100 + i))
     SIDE_PORT=$((6100 + i))
+    CHIP_IDX=$i
 
     TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
     TPU_PROCESS_BOUNDS=1,1,1 \
-    TPU_VISIBLE_CHIPS=0 \
+    TPU_VISIBLE_DEVICE_PATHS=${TPU_DEVICE_PATHS[$CHIP_IDX]} \
     \
     TPU_KV_TRANSFER_PORT=$KV_PORT \
     TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
@@ -65,10 +69,11 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     KV_PORT=$((7200 + i))
     # Same as prefill SIDE_PORT
     SIDE_PORT=$((6100 + i))
+    CHIP_IDX=$((NUM_PREFILL_INSTANCES + i))
 
     TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
     TPU_PROCESS_BOUNDS=1,1,1 \
-    TPU_VISIBLE_CHIPS=1 \
+    TPU_VISIBLE_DEVICE_PATHS=${TPU_DEVICE_PATHS[$CHIP_IDX]} \
     \
     TPU_KV_TRANSFER_PORT=$KV_PORT \
     TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
