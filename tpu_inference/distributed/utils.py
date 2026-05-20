@@ -71,10 +71,67 @@ def get_transfer_channel_number() -> int:
     return int(n)
 
 
+def _get_nonnegative_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, value, default)
+        return default
+    if parsed < 0:
+        logger.warning("Invalid %s=%d; using %d", name, parsed, default)
+        return default
+    return parsed
+
+
+def get_kv_coord_executor_max_workers() -> int:
+    """Request-level pull executor size.
+
+    0 means auto. This executor owns one task per active pull request; each
+    task fans out channel work to the bounded channel executor.
+    """
+    return _get_nonnegative_int_env("TPU_KV_COORD_EXECUTOR_MAX_WORKERS", 0)
+
+
+def get_kv_channel_executor_max_workers() -> int:
+    """Channel-level pull executor size.
+
+    0 means auto. This bounds simultaneous channel recv/unpack tasks across
+    all active pull requests.
+    """
+    return _get_nonnegative_int_env("TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS", 0)
+
+
 def get_p2p_wait_pull_timeout() -> int:
     """KV-cache transfer timeout in seconds."""
     timeout_str = os.getenv("TPU_P2P_WAIT_PULL_TIMEOUT", "120")
     return int(timeout_str)
+
+
+def get_kv_stage_wait_timeout_secs() -> float:
+    """Per-entry deadline for the async-D2H ``future.wait()`` in the stage
+    waiter. ``TransferFuture.wait()`` is unbounded; this caps how long a
+    single hung DMA can hold up subsequent uuids on the same rank. On
+    timeout the entry is marked stage_failed and STAGE_DONE is signaled so
+    the rest of the pipeline keeps moving.
+    """
+    val_str = os.getenv("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", "30")
+    try:
+        val = float(val_str)
+    except ValueError:
+        return 30.0
+    return val if val > 0 else 30.0
+
+
+def get_kv_stage_waiter_pool_size() -> int:
+    """Worker count for the stage waiter pool. 0 = auto (4).
+
+    Sized above 1 so a single hung ``future.wait()`` does not serialize
+    every subsequently-enqueued uuid behind it.
+    """
+    return _get_nonnegative_int_env("TPU_KV_STAGE_WAITER_POOL_SIZE", 0)
 
 
 def get_kv_shm_pool_gb() -> float:
@@ -120,3 +177,14 @@ def get_kv_latency_log_interval() -> float:
         return float(val_str)
     except ValueError:
         return 30.0
+
+
+def get_kv_pin_shm() -> bool:
+    """Whether to mlock(2) the KV shm pool at startup.
+
+    Off by default. Requires RLIMIT_MEMLOCK >= TPU_KV_SHM_POOL_GB or
+    CAP_IPC_LOCK; failure is logged and the pool stays pageable. The
+    primary motivation is to make `transfer_h2d_batch` from shm closer
+    to the D2H direction's latency by keeping pages resident in RAM."""
+    enable_str = os.getenv("TPU_KV_PIN_SHM", "false").lower()
+    return enable_str in ("true", "1", "yes")

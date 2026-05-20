@@ -48,6 +48,7 @@ import torch
 import zmq
 from torch_tpu._internal.batch_transfer import (batch_transfer_d2h,
                                                 batch_transfer_d2h_sync,
+                                                batch_transfer_h2d,
                                                 batch_transfer_h2d_sync)
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -92,7 +93,7 @@ _LAT_SCATTER = "scatter"  # consumer: total scatter (H2D+insert across layers)
 # Intra-host IPC op tags (rank-0 coordinator <-> other ranks).
 _IPC_HELLO = b"HELLO"  # worker -> coord: (rank,)
 _IPC_STAGE_NOTIFY = b"STAGE_N"  # coord -> worker: (uuid, slot_idx, num_blocks)
-_IPC_STAGE_DONE = b"STAGE_D"  # worker -> coord: (uuid, rank)
+_IPC_STAGE_DONE = b"STAGE_D"  # worker -> coord: (uuid, rank, failed)
 _IPC_LOAD_NOTIFY = b"LOAD_N"  # coord -> worker: (uuid, slot_idx, num_blocks, local_blocks)
 _IPC_LOAD_SKIP = b"LOAD_S"  # coord -> worker: (uuid,) -- drain w/ no scatter (cache hit)
 _IPC_COPY_DONE = b"COPY_D"  # worker -> coord: (uuid, rank)
@@ -128,13 +129,34 @@ class _CoordSendEntry:
     slot_idx: int
     num_blocks: int
     expiration_time: float
+    # tp_size at construction; sizes the per-rank readiness vector below.
+    # Default is for backward-compat with any test that instantiates the
+    # dataclass without it; production callers always pass it.
+    tp_size: int = 1
     # Ranks that have sent STAGE_DONE. Once |staged| == tp_size the slot is
-    # ready to serve external PULL requests.
+    # ready to serve external PULL requests for any subset of ranks.
     staged: set[int] = field(default_factory=set)
+    # Per-rank staged event. PULL serving (`_coord_rank0_build_pull_response`)
+    # waits only on the ranks that ride its channel, instead of blocking on
+    # global stage_complete -- a slow rank no longer holds back channels
+    # whose ranks already finished staging. Sized in __post_init__.
+    staged_events: list[threading.Event] = field(default_factory=list)
+    # Set when ALL tp_size ranks have staged. Kept around for the existing
+    # PERF P stage_complete log line; no longer gates PULL serving.
     stage_complete: threading.Event = field(default_factory=threading.Event)
     # Flipped True when the remote side has acked the pull via NOTIFY, so
     # get_finished() can return this req as done_sending.
     pull_acked: bool = False
+    # Set when any rank's stage waiter aborted on timeout (or its
+    # `future.wait()` raised). PULL serving must surface this so a doomed
+    # request errors out cleanly instead of shipping incomplete shm data.
+    stage_failed: bool = False
+
+    def __post_init__(self):
+        if not self.staged_events:
+            self.staged_events = [
+                threading.Event() for _ in range(self.tp_size)
+            ]
 
 
 @dataclass
@@ -164,9 +186,11 @@ class _StageInFlight:
     """A pending async D2H batch waiting on its PjRt future.
 
     Tensors are retained here so that the source device buffer and the
-    destination shm view stay alive until the DMA completes. The waiter
-    thread blocks on `future.wait()` and then signals STAGE_DONE for this
-    rank."""
+    destination shm view stay alive until the DMA completes. A pool worker
+    blocks on `future.wait()` and then signals STAGE_DONE for this rank;
+    the dispatcher loop may also signal STAGE_DONE early on a deadline
+    timeout, in which case the worker's eventual call is deduplicated by
+    `_signal_lock` / `_signaled`."""
     uuid: int
     slot_idx: int
     num_blocks: int
@@ -174,6 +198,10 @@ class _StageInFlight:
     tpu_tensors: list
     cpu_tensors: list
     enqueue_t0: float
+    issue_t1: float = 0.0
+    total_bytes: int = 0
+    _signal_lock: threading.Lock = field(default_factory=threading.Lock)
+    _signaled: bool = False
 
 
 class _LatencyTracker:
@@ -516,11 +544,24 @@ class TPUConnectorWorker:
         # one thread (ZMQ sockets are not thread-safe).
         self._coord_ipc_out: queue.Queue = queue.Queue()
         # Request-level pulls run asynchronously so the worker main thread can
-        # keep servicing vLLM RPCs. Each request then fans out to N channel
-        # pulls on a separate executor; sharing one pool for both levels can
-        # self-starve when many requests are in flight.
-        self._coord_executor = ThreadPoolExecutor(max_workers=64)
-        self._coord_channel_executor = ThreadPoolExecutor(max_workers=128)
+        # keep servicing vLLM RPCs. Each request then fans out to channel pulls
+        # on a separate bounded executor. Keeping these pools close to the
+        # actual channel count avoids dozens of Python unpack tasks contending
+        # for the GIL while the network is already saturated.
+        channel_workers = dist_utils.get_kv_channel_executor_max_workers()
+        if channel_workers == 0:
+            channel_workers = max(1, self._n_channels * 2)
+        coord_workers = dist_utils.get_kv_coord_executor_max_workers()
+        if coord_workers == 0:
+            coord_workers = max(1, min(2, channel_workers))
+        self._coord_executor = ThreadPoolExecutor(
+            max_workers=coord_workers, thread_name_prefix="tpu-kv-coord")
+        self._coord_channel_executor = ThreadPoolExecutor(
+            max_workers=channel_workers, thread_name_prefix="tpu-kv-channel")
+        logger.info(
+            "TPUConnectorWorker --> coord executors | request_workers=%d | "
+            "channel_workers=%d | n_channels=%d", coord_workers,
+            channel_workers, self._n_channels)
 
         # Rank-0 authoritative state. Non-zero ranks leave these empty and
         # return empty sets from get_finished; the scheduler unions across
@@ -563,18 +604,27 @@ class TPUConnectorWorker:
         self._worker_pending_stage_cv = threading.Condition()
         # uuid -> (slot_idx, num_blocks, local_blocks) -- consumer: after
         # coord has filled the slot, ranks scatter from shm on next step.
-        self._worker_pending_load: dict[int, tuple[int, int, list[int]]] = {}
+        self._worker_pending_load: dict[int, Optional[tuple[int, int,
+                                                            list[int]]]] = {}
         self._worker_pending_load_cv = threading.Condition()
 
         # Lock around the rank-0 bookkeeping dicts above.
         self._coord_lock = threading.Lock()
 
         # Async-D2H staging: producer enqueues _StageInFlight entries here;
-        # a single waiter thread per rank blocks on `future.wait()` and
-        # then signals STAGE_DONE. Decouples the worker's main RPC thread
-        # from the DMA so we can overlap with the next model_forward and
-        # the STAGE_NOTIFY/scheduler/PULL-setup round-trip.
+        # a dispatcher thread per rank submits each entry to a small pool
+        # whose workers block on `future.wait()` and then signal STAGE_DONE.
+        # Pooling (vs. a single serial waiter) means one hung DMA cannot
+        # back up every subsequently-enqueued uuid on the same rank; the
+        # dispatcher also enforces a per-entry deadline so even pool-wide
+        # hangs eventually fail forward.
         self._stage_pending_q: queue.Queue = queue.Queue()
+        _stage_pool_size = dist_utils.get_kv_stage_waiter_pool_size() or 4
+        self._coord_stage_waiter_pool = ThreadPoolExecutor(
+            max_workers=_stage_pool_size,
+            thread_name_prefix=f"tpu_conn_stage_wait_r{self.tp_rank}")
+        self._coord_stage_wait_timeout_s = (
+            dist_utils.get_kv_stage_wait_timeout_secs())
 
     def __del__(self):
         self._stop_event.set()
@@ -668,28 +718,42 @@ class TPUConnectorWorker:
                 cpu_tensors.append(dest_view)
             batch_transfer_d2h_sync(tpu_tensors, cpu_tensors)
         else:
+            # Mirror _coord_scatter_shard exactly: torch.empty + async H2D
+            # batch + prepare_scatter_args + multi_layer_scatter_into. The
+            # earlier `.to(device)` warmup compiled a different HLO than the
+            # hot path (batch_transfer_h2d into a pre-allocated
+            # torch.empty), so the first real request paid a 3-8s recompile.
             use_kv_scatter = self._kv_scatter_enabled
+            dest_blocks_dev = torch.tensor(list(range(num_blocks)),
+                                           dtype=torch.int32,
+                                           device=self.device)
+            src_views = []
+            device_shards = []
+            for layer_idx in range(len(kv_caches)):
+                src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
+                                                       layer_idx, num_blocks)
+                src_views.append(src_view)
+                device_shards.append(
+                    torch.empty(src_view.shape,
+                                dtype=src_view.dtype,
+                                device=self.device))
+            h2d_future = batch_transfer_h2d(src_views, device_shards)
+            h2d_future.wait()
             if use_kv_scatter:
-                dest_blocks_dev = torch.tensor(list(range(num_blocks)),
-                                               dtype=torch.int32,
-                                               device=self.device)
-                device_shards = []
-                for layer_idx in range(len(kv_caches)):
-                    src_view = self._coord_pool.layer_view(
-                        slot_idx, self.tp_rank, layer_idx, num_blocks)
-                    device_shards.append(src_view.to(self.device))
+                prebuilt = kv_scatter.prepare_scatter_args(
+                    dest_blocks_dev, self.device)
                 new_caches = kv_scatter.multi_layer_scatter_into(
-                    device_shards, list(kv_caches), dest_blocks_dev)
+                    device_shards,
+                    list(kv_caches),
+                    dest_blocks_dev,
+                    prebuilt_args=prebuilt)
                 for c in new_caches:
                     tpu_sync.synchronize(c)
                 for i, c in enumerate(new_caches):
                     kv_caches[i] = c
             else:
                 for layer_idx, cache in enumerate(kv_caches):
-                    src_view = self._coord_pool.layer_view(
-                        slot_idx, self.tp_rank, layer_idx, num_blocks)
-                    device_shard = src_view.to(self.device)
-                    cache.index_put_((indices, ), device_shard)
+                    cache.index_put_((indices, ), device_shards[layer_idx])
                     tpu_sync.synchronize(cache)
 
     # ---- Main dispatch driven by start_load_kv --------------------------
@@ -769,6 +833,15 @@ class TPUConnectorWorker:
             self._coord_pool = self._coord_attach_shm_with_retry(
                 self._coord_pool_spec, shm_name)
             self._coord_setup_worker(ipc_path)
+
+        # Pin the shm pool into RAM if requested. Each rank's process must
+        # mlock independently (mlock is per-VMA, not per physical page).
+        # Run on a daemon thread so init isn't blocked: a 128 GB lock at
+        # ~1 us/page takes 30+s and trips vLLM's engine-core heartbeat.
+        # Lock only this rank's slice -- each rank only reads its own
+        # shard for transfer_h2d_batch.
+        if dist_utils.get_kv_pin_shm():
+            self._coord_pool.mlock_async(my_rank=self.tp_rank)
 
     def _coord_attach_shm_with_retry(self, spec: PoolSpec,
                                      name: str) -> HostKVShmPool:
@@ -930,6 +1003,8 @@ class TPUConnectorWorker:
             self._coord_executor.shutdown(wait=False)
         if hasattr(self, "_coord_channel_executor"):
             self._coord_channel_executor.shutdown(wait=False)
+        if hasattr(self, "_coord_stage_waiter_pool"):
+            self._coord_stage_waiter_pool.shutdown(wait=False)
         for t in getattr(self, "_coord_threads", []):
             t.join(timeout=2)
         if getattr(self, "_coord_pool", None) is not None:
@@ -998,6 +1073,8 @@ class TPUConnectorWorker:
         logger.info(
             "TPUConnectorWorker rank0 --> handle_new_send req_id=%s uuid=%s "
             "blocks=%d", req_id, req_meta.uuid, num_blocks)
+        logger.info("PERF P handle_new_send req_id=%s uuid=%s ts=%.6f", req_id,
+                    req_meta.uuid, time.time())
         try:
             slot_idx = self._coord_pool.acquire_slot(timeout=0.0)
         except Exception:
@@ -1025,6 +1102,7 @@ class TPUConnectorWorker:
             slot_idx=slot_idx,
             num_blocks=num_blocks,
             expiration_time=req_meta.expiration_time,
+            tp_size=self.tp_size,
         )
         with self._coord_lock:
             self._coord_send[req_meta.uuid] = entry
@@ -1085,10 +1163,10 @@ class TPUConnectorWorker:
                 "TPUConnectorWorker rank%d --> stage_inline uuid=%s failed: %s",
                 self.tp_rank, uuid, e)
             # Enqueue path didn't run, so the waiter won't fire STAGE_DONE
-            # for us. Send it directly so rank 0's stage_complete can still
-            # fire (the producer will serve a partially-zero shm slice, but
-            # that's strictly better than hanging the request out forever).
-            self._coord_send_ipc(_IPC_STAGE_DONE, (uuid, self.tp_rank))
+            # for us. Signal it directly with failed=True so rank 0 marks
+            # the entry stage_failed and PULL serving will _MSG_ERR rather
+            # than ship a partially-zero shm slice.
+            self._signal_stage_done(uuid, failed=True)
 
     def _maybe_enable_kv_scatter(self) -> None:
         """Run the startup smoke test for the multi-layer scatter kernel
@@ -1152,14 +1230,17 @@ class TPUConnectorWorker:
 
         tpu_tensors = []
         cpu_tensors = []
+        d2h_total_bytes = 0
         for layer_idx, cache in enumerate(kv_caches):
             src_shard = torch.index_select(cache, 0, indices)
             dest_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
                                                     layer_idx, num_blocks)
             tpu_tensors.append(src_shard)
             cpu_tensors.append(dest_view)
+            d2h_total_bytes += dest_view.numel() * dest_view.element_size()
 
         future = batch_transfer_d2h(tpu_tensors, cpu_tensors)
+        issue_t1 = time.perf_counter()
         enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
 
         self._stage_pending_q.put(
@@ -1169,69 +1250,148 @@ class TPUConnectorWorker:
                            future=future,
                            tpu_tensors=tpu_tensors,
                            cpu_tensors=cpu_tensors,
-                           enqueue_t0=enqueue_t0))
+                           enqueue_t0=enqueue_t0,
+                           issue_t1=issue_t1,
+                           total_bytes=d2h_total_bytes))
         logger.info(
             "TPUConnectorWorker %s rank%d --> stage_shard enqueued "
             "uuid=%s slot=%d enqueue=%.2fms", self.node_id, self.tp_rank, uuid,
             slot_idx, enqueue_ms)
 
     def _coord_stage_waiter_loop(self) -> None:
-        """Drain the per-rank async-D2H queue: wait on each future, then
-        signal STAGE_DONE for that uuid. Source/destination tensors are
-        retained on the in-flight entry, so dropping the entry after wait
-        completes is the natural moment to release the device buffer."""
-        while not self._stop_event.is_set():
-            try:
-                entry = self._stage_pending_q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if entry is None:
-                return
-            try:
-                wait_t0 = time.perf_counter()
-                entry.future.wait()
-                wait_ms = (time.perf_counter() - wait_t0) * 1000.0
-                total_ms = (time.perf_counter() - entry.enqueue_t0) * 1000.0
-                self._lat.record(_LAT_D2H, total_ms)
-                self._lat.record(_LAT_STAGE, total_ms)
-                logger.info(
-                    "TPUConnectorWorker %s rank%d --> stage_done "
-                    "uuid=%s slot=%d wait=%.2fms total=%.2fms", self.node_id,
-                    self.tp_rank, entry.uuid, entry.slot_idx, wait_ms,
-                    total_ms)
-            except Exception as e:
-                logger.exception(
-                    "TPUConnectorWorker %s rank%d --> stage_waiter uuid=%s "
-                    "future.wait() failed: %s", self.node_id, self.tp_rank,
-                    entry.uuid, e)
-            # Drop tensor refs even on failure so the slot can be expired
-            # without a leaked device buffer reference.
-            entry.tpu_tensors.clear()
-            entry.cpu_tensors.clear()
-            self._signal_stage_done(entry.uuid)
+        """Dispatch each pending stage entry to the waiter pool and enforce
+        a per-entry deadline. Pool workers do the blocking `future.wait()`
+        and signal STAGE_DONE on success; the dispatcher signals a failed
+        STAGE_DONE if an entry exceeds `_coord_stage_wait_timeout_s`, so a
+        wedged DMA cannot starve later uuids on the same rank.
 
-    def _signal_stage_done(self, uuid: int) -> None:
+        TransferFuture.wait() is unbounded (see xla::Future::Await), so
+        leaking the worker thread is the only way to break out of a hung
+        wait from Python. The leaked thread is harmless: PjRt owns the
+        underlying buffers via its own holds, and `_complete_stage_entry`
+        is idempotent so the eventual return is a no-op.
+        """
+        timeout_s = self._coord_stage_wait_timeout_s
+        # (deadline, entry, py_future); list ordering is not load-bearing.
+        in_flight: list[tuple[float, _StageInFlight, Any]] = []
+        while not self._stop_event.is_set():
+            got_entry = True
+            try:
+                entry = self._stage_pending_q.get(timeout=0.05)
+            except queue.Empty:
+                got_entry = False
+                entry = None
+            if got_entry:
+                if entry is None:
+                    # Shutdown sentinel from _coord_teardown.
+                    return
+                py_fut = self._coord_stage_waiter_pool.submit(
+                    self._coord_stage_wait_worker, entry)
+                in_flight.append((time.monotonic() + timeout_s, entry, py_fut))
+            if in_flight:
+                now = time.monotonic()
+                kept: list[tuple[float, _StageInFlight, Any]] = []
+                for deadline, ent, fut in in_flight:
+                    if fut.done():
+                        # Worker already signaled (success path or caught
+                        # exception path); nothing more to do here.
+                        continue
+                    if now >= deadline:
+                        logger.warning(
+                            "TPUConnectorWorker %s rank%d --> stage_waiter "
+                            "uuid=%s slot=%d future.wait() exceeded "
+                            "%.1fs; signaling failed STAGE_DONE (worker "
+                            "thread leaks until wait returns)", self.node_id,
+                            self.tp_rank, ent.uuid, ent.slot_idx, timeout_s)
+                        self._complete_stage_entry(ent, failed=True)
+                        # Stop tracking; the eventual worker callback
+                        # dedups via the entry's signal lock.
+                        continue
+                    kept.append((deadline, ent, fut))
+                in_flight = kept
+
+    def _coord_stage_wait_worker(self, entry: "_StageInFlight") -> None:
+        """Pool worker: block on the entry's TransferFuture and complete.
+
+        Runs in `_coord_stage_waiter_pool`. Several can run in parallel
+        across distinct entries; a single hung wait only consumes one slot
+        until the dispatcher's deadline marks the entry failed."""
+        failed = False
+        try:
+            wait_t0 = time.perf_counter()
+            entry.future.wait()
+            wait_ms = (time.perf_counter() - wait_t0) * 1000.0
+            total_ms = (time.perf_counter() - entry.enqueue_t0) * 1000.0
+            issue_ms = ((entry.issue_t1 - entry.enqueue_t0) *
+                        1000.0 if entry.issue_t1 else 0.0)
+            mb = entry.total_bytes / (1024 * 1024)
+            mbps = mb / max(1e-3, total_ms / 1000.0)
+            self._lat.record(_LAT_D2H, total_ms)
+            self._lat.record(_LAT_STAGE, total_ms)
+            logger.info(
+                "TPUConnectorWorker %s rank%d --> stage_done "
+                "uuid=%s slot=%d issue=%.2fms wait=%.2fms total=%.2fms "
+                "throughput=%.2fMiB/s", self.node_id, self.tp_rank, entry.uuid,
+                entry.slot_idx, issue_ms, wait_ms, total_ms, mbps)
+        except Exception as e:
+            failed = True
+            logger.exception(
+                "TPUConnectorWorker %s rank%d --> stage_waiter uuid=%s "
+                "future.wait() raised: %s", self.node_id, self.tp_rank,
+                entry.uuid, e)
+        self._complete_stage_entry(entry, failed=failed)
+
+    def _complete_stage_entry(self, entry: "_StageInFlight",
+                              failed: bool) -> None:
+        """Run completion side-effects exactly once per entry.
+
+        Both the worker and the dispatcher's deadline path may call this;
+        whichever wins clears the tensor refs and emits STAGE_DONE. The
+        loser short-circuits at the lock guard."""
+        with entry._signal_lock:
+            if entry._signaled:
+                return
+            entry._signaled = True
+        entry.tpu_tensors.clear()
+        entry.cpu_tensors.clear()
+        self._signal_stage_done(entry.uuid, failed=failed)
+
+    def _signal_stage_done(self, uuid: int, failed: bool = False) -> None:
         """Mark this rank's STAGE_DONE on the rank-0 send entry. On rank 0
         this is a direct local update; on other ranks it goes through IPC
-        to rank 0's listener, which performs the same update."""
+        to rank 0's listener, which performs the same update. If `failed`
+        is True the entry is tagged stage_failed so PULL serving aborts
+        cleanly with _MSG_ERR rather than shipping stale shm data."""
         if self.tp_rank == 0:
             fired_complete = False
             staged_count = 0
+            per_rank_event: Optional[threading.Event] = None
             with self._coord_lock:
                 entry = self._coord_send.get(uuid)
                 if entry is None:
                     return
+                if failed:
+                    entry.stage_failed = True
                 entry.staged.add(0)
                 staged_count = len(entry.staged)
                 if staged_count == self.tp_size:
                     entry.stage_complete.set()
                     fired_complete = True
+                if 0 < len(entry.staged_events):
+                    per_rank_event = entry.staged_events[0]
+            # Set the per-rank event outside the lock; the wait side is
+            # _coord_rank0_build_pull_response, which only takes the lock
+            # briefly to look up the entry, then waits on the event.
+            if per_rank_event is not None:
+                per_rank_event.set()
             if fired_complete:
                 logger.info(
                     "TPUConnectorWorker rank0 --> stage_complete uuid=%s "
                     "(all %d ranks staged, self-fire)", uuid, self.tp_size)
+                logger.info("PERF P stage_complete uuid=%s ts=%.6f", uuid,
+                            time.time())
         else:
-            self._coord_send_ipc(_IPC_STAGE_DONE, (uuid, self.tp_rank))
+            self._coord_send_ipc(_IPC_STAGE_DONE, (uuid, self.tp_rank, failed))
 
     # =========================================================
     # Rank 0 consumer path: pull, write shm, broadcast LOAD_NOTIFY
@@ -1239,6 +1399,10 @@ class TPUConnectorWorker:
     def _coord_rank0_handle_new_load(self, req_id: ReqId,
                                      req_meta: LoadMeta) -> None:
         assert not self.is_producer
+        logger.info(
+            "PERF D handle_new_load req_id=%s uuid=%s ts=%.6f drain=%s",
+            req_id, req_meta.uuid, time.time(), req_meta.remote_block_ids
+            is None)
         if req_meta.remote_block_ids is None:
             # Either a full cache hit or a drain-for-completed-pull. Only
             # the former requires telling other ranks to skip; the drain
@@ -1338,7 +1502,7 @@ class TPUConnectorWorker:
 
     def _coord_rank0_pull(self, entry: _CoordRecvEntry) -> None:
         """Pull the full KV blob (all ranks' shards) from remote coord and
-        scatter it into shm. Then broadcast LOAD_NOTIFY and set the
+        unpack it into shm. Then broadcast LOAD_NOTIFY and set the
         load_complete event so get_finished() returns done_recving.
 
         Uses ``self._n_channels`` parallel DEALER sockets (one per thread)
@@ -1376,6 +1540,8 @@ class TPUConnectorWorker:
             sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
             try:
                 t0 = time.perf_counter()
+                logger.info("PERF D pull_send ch=%d uuid=%s ts=%.6f", ch,
+                            entry.uuid, time.time())
                 sock.send_multipart([_MSG_PULL, uuid_bytes, req_blocks_pickle])
                 deadline = t0 + timeout_s
                 frames = None
@@ -1400,6 +1566,8 @@ class TPUConnectorWorker:
                         f"PULL ch={ch} failed for req_id={entry.req_id}: "
                         f"[{tag!r}, {payload_hint!r}]")
                 t_wire_done = time.perf_counter()
+                logger.info("PERF D wire_done ch=%d uuid=%s ts=%.6f", ch,
+                            entry.uuid, time.time())
 
                 # Wire format after OK:
                 #   frames[1]=uuid echo, frames[2]=n_ranks ascii
@@ -1515,17 +1683,41 @@ class TPUConnectorWorker:
                     self._coord_done_recving.add(entry.req_id)
                 self._coord_pool.release_slot(entry.slot_idx)
             entry.load_complete.set()
+            logger.info(
+                "PERF D pull_complete req_id=%s uuid=%s ts=%.6f pull_ok=%s",
+                entry.req_id, entry.uuid, time.time(), entry.pull_ok)
 
     # =========================================================
     # Drain pass: every rank (including 0) scatters its shard
     # =========================================================
+    def _coord_scatter_and_ack(self, req_id: ReqId, uuid: int, slot_idx: int,
+                               num_blocks: int,
+                               local_blocks: list[int]) -> None:
+        logger.info("PERF D drain_start rank=%d req_id=%s uuid=%s ts=%.6f",
+                    self.tp_rank, req_id, uuid, time.time())
+        try:
+            self._coord_scatter_shard(slot_idx, num_blocks, local_blocks)
+        except Exception as e:
+            logger.exception(
+                "TPUConnectorWorker %s rank%d --> scatter req_id=%s failed: %s",
+                self.node_id, self.tp_rank, req_id, e)
+        finally:
+            if self.tp_rank == 0:
+                self._coord_rank0_register_copy(uuid)
+            else:
+                self._coord_send_ipc(_IPC_COPY_DONE, (uuid, self.tp_rank))
+            logger.info("PERF D drain_done rank=%d req_id=%s uuid=%s ts=%.6f",
+                        self.tp_rank, req_id, uuid, time.time())
+
     def _coord_drain_scatter(self, req_id: ReqId, req_meta: LoadMeta) -> None:
         uuid = req_meta.uuid
         if self.tp_rank == 0:
             # Rank 0's state is in _coord_recv; grab slot info from there.
             with self._coord_lock:
                 entry = self._coord_recv.get(uuid)
-            if entry is None or not entry.pull_ok:
+            if entry is None:
+                return
+            if not entry.pull_ok:
                 # Unknown or failed; scheduler will treat this as a cache hit
                 # and we notify upstream so P can free its buffer.
                 self._coord_rank0_send_notify(req_meta, uuid)
@@ -1540,27 +1732,8 @@ class TPUConnectorWorker:
                 return
             slot_idx, num_blocks, local_blocks = info
 
-        # Scatter our own shard.
-        try:
-            self._coord_scatter_shard(slot_idx, num_blocks, local_blocks)
-        except Exception as e:
-            logger.exception(
-                "TPUConnectorWorker %s rank%d --> scatter req_id=%s failed: %s",
-                self.node_id, self.tp_rank, req_id, e)
-            if self.tp_rank != 0:
-                # Still ack so coord can free the slot.
-                self._coord_send_ipc(_IPC_COPY_DONE, (uuid, self.tp_rank))
-            else:
-                # Rank 0 must still ack its own scatter, otherwise the
-                # all-ranks-copied check in register_copy never fires
-                # and the slot leaks even after every other rank succeeds.
-                self._coord_rank0_register_copy(uuid, req_meta)
-            return
-
-        if self.tp_rank == 0:
-            self._coord_rank0_register_copy(uuid, req_meta)
-        else:
-            self._coord_send_ipc(_IPC_COPY_DONE, (uuid, self.tp_rank))
+        self._coord_scatter_and_ack(req_id, uuid, slot_idx, num_blocks,
+                                    local_blocks)
 
     def _coord_scatter_shard(self, slot_idx: int, num_blocks: int,
                              local_blocks: list[int]) -> None:
@@ -1580,6 +1753,8 @@ class TPUConnectorWorker:
         from torch_tpu._internal.sync import sync as tpu_sync
         use_kv_scatter = self._kv_scatter_enabled
         h2d_ms_total = 0.0
+        h2d_issue_ms = 0.0
+        h2d_wait_ms = 0.0
         insert_ms_total = 0.0
         alloc_ms_total = 0.0
         if use_kv_scatter:
@@ -1596,10 +1771,12 @@ class TPUConnectorWorker:
             alloc_t0 = time.perf_counter()
             src_views = []
             device_shards = []
+            h2d_total_bytes = 0
             for layer_idx in range(len(kv_caches)):
                 src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
                                                        layer_idx, num_blocks)
                 src_views.append(src_view)
+                h2d_total_bytes += src_view.numel() * src_view.element_size()
                 device_shards.append(
                     torch.empty(src_view.shape,
                                 dtype=src_view.dtype,
@@ -1623,6 +1800,9 @@ class TPUConnectorWorker:
             for i, c in enumerate(new_caches):
                 kv_caches[i] = c
             h2d_ms_total = (h2d_t1 - h2d_t0) * 1000.0
+            # The sync H2D helper blocks until completion, so there is no
+            # separately observable issue/wait split.
+            h2d_issue_ms = h2d_ms_total
             insert_ms_total = (k_wait_t - h2d_t1) * 1000.0
             alloc_ms_total = (alloc_t1 - alloc_t0) * 1000.0
             path = "kv_scatter"
@@ -1633,10 +1813,12 @@ class TPUConnectorWorker:
             alloc_t0 = time.perf_counter()
             src_views = []
             device_shards = []
+            h2d_total_bytes = 0
             for layer_idx in range(len(kv_caches)):
                 src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
                                                        layer_idx, num_blocks)
                 src_views.append(src_view)
+                h2d_total_bytes += src_view.numel() * src_view.element_size()
                 device_shards.append(
                     torch.empty(src_view.shape,
                                 dtype=src_view.dtype,
@@ -1644,10 +1826,14 @@ class TPUConnectorWorker:
             alloc_t1 = time.perf_counter()
 
             h_t0 = time.perf_counter()
-            batch_transfer_h2d_sync(src_views, device_shards)
+            h2d_future = batch_transfer_h2d(src_views, device_shards)
+            h2d_t_issued = time.perf_counter()
+            h2d_future.wait()
             h_t1 = time.perf_counter()
 
             h2d_ms_total = (h_t1 - h_t0) * 1000.0
+            h2d_issue_ms = (h2d_t_issued - h_t0) * 1000.0
+            h2d_wait_ms = (h_t1 - h2d_t_issued) * 1000.0
             insert_ms_total = 0.0
             alloc_ms_total = (alloc_t1 - alloc_t0) * 1000.0
 
@@ -1660,29 +1846,41 @@ class TPUConnectorWorker:
         self._lat.record(_LAT_H2D, h2d_ms_total)
         self._lat.record(_LAT_INSERT, insert_ms_total)
         self._lat.record(_LAT_SCATTER, h2d_ms_total + insert_ms_total)
+        h2d_mb = h2d_total_bytes / (1024 * 1024)
+        h2d_mbps = h2d_mb / max(1e-3, h2d_ms_total / 1000.0)
         logger.info(
             "TPUConnectorWorker %s rank%d --> scatter slot=%d blocks=%d "
-            "layers=%d alloc=%.2fms h2d=%.2fms insert=%.2fms path=%s",
+            "layers=%d alloc=%.2fms h2d=%.2fms h2d_issue=%.2fms "
+            "h2d_wait=%.2fms insert=%.2fms h2d_throughput=%.2fMiB/s path=%s",
             self.node_id, self.tp_rank, slot_idx, num_blocks, len(kv_caches),
-            alloc_ms_total, h2d_ms_total, insert_ms_total, path)
+            alloc_ms_total, h2d_ms_total, h2d_issue_ms, h2d_wait_ms,
+            insert_ms_total, h2d_mbps, path)
 
-    def _coord_rank0_register_copy(self, uuid: int,
-                                   req_meta: LoadMeta) -> None:
-        all_copied = False
+    def _coord_rank0_register_copy(self, uuid: int) -> None:
+        entry_for_notify = None
         with self._coord_lock:
             entry = self._coord_recv.get(uuid)
             if entry is None:
                 return
             entry.copied.add(0)
             if len(entry.copied) == self.tp_size:
-                all_copied = True
-        if all_copied:
+                entry_for_notify = self._coord_recv.pop(uuid, None)
+        if entry_for_notify is not None:
             # Notify remote P and release slot.
-            self._coord_rank0_send_notify(req_meta, uuid)
-            with self._coord_lock:
-                entry = self._coord_recv.pop(uuid, None)
-            if entry is not None:
-                self._coord_pool.release_slot(entry.slot_idx)
+            dummy = LoadMeta(
+                uuid=entry_for_notify.uuid,
+                local_block_ids=entry_for_notify.local_blocks,
+                remote_block_ids=entry_for_notify.remote_blocks,
+                remote_host=entry_for_notify.remote_host,
+                remote_port=entry_for_notify.remote_port,
+            )
+            try:
+                self._coord_rank0_send_notify(dummy, uuid)
+            finally:
+                self._coord_pool.release_slot(entry_for_notify.slot_idx)
+                logger.info(
+                    "PERF D scatter_complete req_id=%s uuid=%s ts=%.6f",
+                    entry_for_notify.req_id, uuid, time.time())
 
     def _coord_rank0_send_notify(self, req_meta: LoadMeta, uuid: int) -> None:
         remote_host = req_meta.remote_host
@@ -1692,18 +1890,19 @@ class TPUConnectorWorker:
         # DEALER is not thread-safe; serialize create+send under the lock.
         with self._coord_sockets_lock:
             sock = self._coord_notif_sockets.get(sock_path)
-            if sock is None:
+            new_sock = sock is None
+            if new_sock:
                 sock = make_zmq_socket(ctx=self.zmq_cxt,
                                        path=sock_path,
                                        socket_type=zmq.DEALER,
                                        bind=False)
                 self._coord_notif_sockets[sock_path] = sock
-                logger.info(
-                    "TPUConnectorWorker rank0 --> notify channel to %s",
-                    sock_path)
-            logger.info(
-                "TPUConnectorWorker rank0 --> notify pull-done uuid=%s", uuid)
             sock.send_string(str(uuid))
+        if new_sock:
+            logger.info("TPUConnectorWorker rank0 --> notify channel to %s",
+                        sock_path)
+        logger.info("TPUConnectorWorker rank0 --> notify pull-done uuid=%s",
+                    uuid)
 
     # =========================================================
     # Non-zero rank: wait for coord messages then act
@@ -1775,22 +1974,36 @@ class TPUConnectorWorker:
                     "(%d/%d registered)", rank,
                     len(self._coord_rank_to_identity), self.tp_size - 1)
             elif tag == _IPC_STAGE_DONE:
-                uuid, rank = obj
+                # Payload is (uuid, rank, failed). All workers run from
+                # the same code so we don't need a length-tolerant unpack.
+                uuid, rank, failed = obj
                 fired_complete = False
                 staged_count = 0
+                per_rank_event: Optional[threading.Event] = None
                 with self._coord_lock:
                     entry = self._coord_send.get(uuid)
                     if entry is None:
                         continue
+                    if failed:
+                        entry.stage_failed = True
                     entry.staged.add(rank)
                     staged_count = len(entry.staged)
                     if staged_count == self.tp_size:
                         entry.stage_complete.set()
                         fired_complete = True
+                    if 0 <= rank < len(entry.staged_events):
+                        per_rank_event = entry.staged_events[rank]
+                # Fire the per-rank readiness so any PULL channel waiting
+                # only on this rank's shard can proceed without waiting on
+                # the slowest rank in the request.
+                if per_rank_event is not None:
+                    per_rank_event.set()
                 if fired_complete:
                     logger.info(
                         "TPUConnectorWorker rank0 --> stage_complete uuid=%s "
                         "(all %d ranks staged)", uuid, self.tp_size)
+                    logger.info("PERF P stage_complete uuid=%s ts=%.6f", uuid,
+                                time.time())
                 else:
                     logger.info(
                         "TPUConnectorWorker rank0 --> STAGE_DONE uuid=%s "
@@ -1798,7 +2011,6 @@ class TPUConnectorWorker:
                         self.tp_size)
             elif tag == _IPC_COPY_DONE:
                 uuid, rank = obj
-                all_copied = False
                 entry_for_notify = None
                 with self._coord_lock:
                     entry = self._coord_recv.get(uuid)
@@ -1806,9 +2018,8 @@ class TPUConnectorWorker:
                         continue
                     entry.copied.add(rank)
                     if len(entry.copied) == self.tp_size:
-                        all_copied = True
-                        entry_for_notify = entry
-                if all_copied and entry_for_notify is not None:
+                        entry_for_notify = self._coord_recv.pop(uuid, None)
+                if entry_for_notify is not None:
                     # Synthesize a LoadMeta-like object for the notify path.
                     dummy = LoadMeta(
                         uuid=entry_for_notify.uuid,
@@ -1817,10 +2028,15 @@ class TPUConnectorWorker:
                         remote_host=entry_for_notify.remote_host,
                         remote_port=entry_for_notify.remote_port,
                     )
-                    self._coord_rank0_send_notify(dummy, entry_for_notify.uuid)
-                    with self._coord_lock:
-                        self._coord_recv.pop(uuid, None)
-                    self._coord_pool.release_slot(entry_for_notify.slot_idx)
+                    try:
+                        self._coord_rank0_send_notify(dummy,
+                                                      entry_for_notify.uuid)
+                    finally:
+                        self._coord_pool.release_slot(
+                            entry_for_notify.slot_idx)
+                        logger.info(
+                            "PERF D scatter_complete req_id=%s uuid=%s ts=%.6f",
+                            entry_for_notify.req_id, uuid, time.time())
             else:
                 logger.warning(
                     "TPUConnectorWorker rank0 --> unknown IPC tag=%s", tag)
@@ -1868,7 +2084,12 @@ class TPUConnectorWorker:
                                                         block_ids)
                     self._worker_pending_stage_cv.notify_all()
             elif tag == _IPC_LOAD_NOTIFY:
-                uuid, slot_idx, num_blocks, local_blocks = obj
+                if len(obj) == 5:
+                    uuid, _req_id, slot_idx, num_blocks, local_blocks = obj
+                else:
+                    # Backward-compatible decode for any in-flight old control
+                    # messages during rolling restarts.
+                    uuid, slot_idx, num_blocks, local_blocks = obj
                 with self._worker_pending_load_cv:
                     self._worker_pending_load[uuid] = (slot_idx, num_blocks,
                                                        local_blocks)
@@ -1929,8 +2150,14 @@ class TPUConnectorWorker:
 
         def _prepare_response(client_id: bytes, uuid: int,
                               uuid_bytes: bytes) -> None:
-            response = self._coord_rank0_build_pull_response(
-                uuid, uuid_bytes, channel_idx, ranks_on_channel)
+            try:
+                response = self._coord_rank0_build_pull_response(
+                    uuid, uuid_bytes, channel_idx, ranks_on_channel)
+            except Exception:
+                logger.exception(
+                    "TPUConnectorWorker rank0 --> build_pull_response "
+                    "ch=%d uuid=%s failed", channel_idx, uuid)
+                response = None
             ready_responses.put((client_id, uuid, uuid_bytes, response))
 
         def _send_ready_responses() -> None:
@@ -1952,12 +2179,19 @@ class TPUConnectorWorker:
                 # directly from shm via scatter-gather sendmsg, no userland
                 # copy. Small framing frames pay a tiny per-frame overhead;
                 # net win is ~256MB of memcpy avoided per rank.
+                _t_send_start = time.time()
+                logger.info("PERF P send_start ch=%d uuid=%s ts=%.6f",
+                            channel_idx, uuid, _t_send_start)
                 try:
                     sock.send_multipart([client_id, *response], copy=False)
                 except zmq.ZMQError as e:
                     logger.warning(
                         "TPUConnectorWorker rank0 --> data send ch=%d "
                         "uuid=%s failed: %s", channel_idx, uuid, e)
+                logger.info(
+                    "PERF P send_done ch=%d uuid=%s ts=%.6f dur_ms=%.2f",
+                    channel_idx, uuid, time.time(),
+                    (time.time() - _t_send_start) * 1000.0)
 
         while not self._stop_event.is_set():
             _send_ready_responses()
@@ -1993,6 +2227,8 @@ class TPUConnectorWorker:
             logger.info(
                 "TPUConnectorWorker rank0 --> PULL received ch=%d uuid=%s",
                 channel_idx, uuid)
+            logger.info("PERF P pull_recv ch=%d uuid=%s ts=%.6f", channel_idx,
+                        uuid, time.time())
             self._coord_channel_executor.submit(_prepare_response, client_id,
                                                 uuid, uuid_bytes)
 
@@ -2026,16 +2262,43 @@ class TPUConnectorWorker:
                 "TPUConnectorWorker rank0 --> PULL ch=%d unknown uuid=%s "
                 "(timed out waiting for register-send)", channel_idx, uuid)
             return None
-        remaining = max(0.0, deadline - time.perf_counter())
-        if not entry.stage_complete.wait(timeout=remaining):
-            logger.warning(
-                "TPUConnectorWorker rank0 --> PULL ch=%d uuid=%s timed out "
-                "waiting for staging (have %d of %d)", channel_idx, uuid,
-                len(entry.staged), self.tp_size)
-            return None
+        # Wait only for the ranks this channel actually serves. Each
+        # channel ch carries shards for ranks where r % n_channels == ch,
+        # so a slow rank only delays its own channel rather than blocking
+        # all `n_channels` PULLs on the global stage_complete event. With
+        # n_channels=tp_size (the default) this means each channel waits
+        # for exactly one rank.
+        for r in ranks_on_channel:
+            rem = max(0.0, deadline - time.perf_counter())
+            if r >= len(entry.staged_events):
+                # Defensive: should never happen because tp_size sizes the
+                # vector at construction. Fall back to global wait.
+                if not entry.stage_complete.wait(timeout=rem):
+                    logger.warning(
+                        "TPUConnectorWorker rank0 --> PULL ch=%d uuid=%s "
+                        "timed out waiting for staging (have %d of %d)",
+                        channel_idx, uuid, len(entry.staged), self.tp_size)
+                    return None
+                break
+            if not entry.staged_events[r].wait(timeout=rem):
+                logger.warning(
+                    "TPUConnectorWorker rank0 --> PULL ch=%d uuid=%s timed "
+                    "out waiting for rank %d to stage (have %d of %d)",
+                    channel_idx, uuid, r, len(entry.staged), self.tp_size)
+                return None
         with self._coord_lock:
             entry.expiration_time = max(entry.expiration_time,
                                         time.perf_counter() + timeout)
+            stage_failed = entry.stage_failed
+        if stage_failed:
+            # Some rank's stage waiter aborted (timeout or wait() raised).
+            # Returning None routes _send_ready_responses to _MSG_ERR so
+            # the consumer drops the request instead of receiving stale
+            # shm bytes.
+            logger.warning(
+                "TPUConnectorWorker rank0 --> PULL ch=%d uuid=%s "
+                "stage_failed; sending ERR", channel_idx, uuid)
+            return None
         # Wire format (per channel, after the ROUTER envelope):
         #   ch 0:  [OK, uuid, n_ranks, header,
         #            (rank_idx, layer_mv_0, ..., layer_mv_{L-1})*]
@@ -2107,12 +2370,14 @@ class TPUConnectorWorker:
             # Mark the send entry as acked; get_finished() sweeps it.
             with self._coord_lock:
                 entry = self._coord_send.get(uuid)
-                if entry is None:
-                    logger.warning(
-                        "TPUConnectorWorker rank0 --> stray pull-done "
-                        "uuid=%s", uuid)
-                    continue
-                entry.pull_acked = True
+                stray = entry is None
+                if not stray:
+                    entry.pull_acked = True
+            if stray:
+                logger.warning(
+                    "TPUConnectorWorker rank0 --> stray pull-done uuid=%s",
+                    uuid)
+                continue
             logger.info("TPUConnectorWorker rank0 --> pull-done uuid=%s", uuid)
 
     # =========================================================
@@ -2164,15 +2429,17 @@ class TPUConnectorWorker:
             if self._coord_done_sending:
                 done_sending |= self._coord_done_sending
                 self._coord_done_sending.clear()
-            # Consumer: pull_ok + load_complete → done_recving. Mark
+            # Consumer: pull_ok + load_complete -> done_recving. Mark
             # `reported_done` so repeated get_finished() calls don't emit
             # the same req id twice; the entry stays in _coord_recv until
             # all ranks have acknowledged their scatter via COPY_DONE.
+            newly_done_recving: list[tuple[str, int]] = []
             for uuid, entry in list(self._coord_recv.items()):
                 if (entry.load_complete.is_set() and entry.pull_ok
                         and not entry.reported_done):
                     done_recving.add(entry.req_id)
                     entry.reported_done = True
+                    newly_done_recving.append((entry.req_id, uuid))
             # Merge in failure-surfacing reqs (pull failed, shm pool
             # exhausted on admit). The scheduler advances these as if
             # the KV were ready; the output will be wrong for that req,
@@ -2183,6 +2450,9 @@ class TPUConnectorWorker:
         # Free slots outside the lock to avoid nesting lock waits.
         for sidx in released_slots:
             self._coord_pool.release_slot(sidx)
+        for req_id, uuid in newly_done_recving:
+            logger.info("PERF D done_recving req_id=%s uuid=%s ts=%.6f",
+                        req_id, uuid, time.time())
         if done_sending:
             logger.info("TPUConnectorWorker rank0 --> done_sending=%s",
                         done_sending)

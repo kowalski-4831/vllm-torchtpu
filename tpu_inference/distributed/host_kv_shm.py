@@ -16,17 +16,54 @@ Free-list is held on rank-0 only. Other ranks compute offsets from
 (slot_idx, tp_rank, layer_idx) and never touch the free-list state.
 """
 
+import ctypes
+import os
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Optional
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy is present in normal installs.
+    np = None
 import torch
 
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
+
+try:
+    _memmove = ctypes.CDLL(None).memmove
+    _memmove.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
+    _memmove.restype = ctypes.c_void_p
+except (AttributeError, OSError):  # pragma: no cover - libc is present on TPU.
+    _memmove = None
+
+# mlock(2) / munlock(2) bindings. Used to keep the shm pool resident in RAM
+# so PJRT's H2D path does not re-fault pages mid-DMA. mlock alone does not
+# tell PJRT the pages are pinned for DMA, but in practice keeping them
+# resident is the cheapest first step toward "transfer_h2d_batch from shm
+# at line rate" parity with the D2H direction.
+try:
+    _libc_for_mlock = ctypes.CDLL("libc.so.6", use_errno=True)
+    _libc_for_mlock.mlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+    _libc_for_mlock.mlock.restype = ctypes.c_int
+    _libc_for_mlock.munlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+    _libc_for_mlock.munlock.restype = ctypes.c_int
+except OSError:  # pragma: no cover - libc is present on TPU.
+    _libc_for_mlock = None
+
+
+def _shm_base_addr(shm: shared_memory.SharedMemory) -> int:
+    """Return the raw mmap base address of a SharedMemory block.
+
+    `shm.buf` is a memoryview over the mmapped region; `c_char.from_buffer`
+    on it produces a ctypes object aliasing the same memory, whose address
+    is the mmap base."""
+    return ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
 
 
 def _dtype_bytes(dtype: torch.dtype) -> int:
@@ -73,6 +110,12 @@ class HostKVShmPool:
         self.spec = spec
         self._shm = shm
         self._owner = owner
+        # Regions locked by mlock_async(); used by close() for clean
+        # munlock without re-deriving the (possibly already-closed) shm
+        # base address. Each entry is (addr, size).
+        self._mlocked_regions: list[tuple[int, int]] = []
+        self._mlock_thread: Optional[threading.Thread] = None
+        self._mlock_done = threading.Event()
         # Only rank 0 uses the free list.
         self._free: Optional[queue.Queue] = None
         self._lock: Optional[threading.Lock] = None
@@ -81,6 +124,96 @@ class HostKVShmPool:
             for i in range(spec.num_slots):
                 self._free.put(i)
             self._lock = threading.Lock()
+
+    # ---- mlock / munlock ----------------------------------------------
+    def mlock_async(self, my_rank: Optional[int] = None) -> threading.Thread:
+        """Run mlock(2) on a daemon thread so init isn't blocked.
+
+        With pool=128 GB and ~1 µs/page, locking on the calling thread
+        takes 30+ seconds and trips vLLM's engine-core <-> worker
+        heartbeat. Async + per-rank slicing avoids both.
+
+        If `my_rank` is given, locks only this rank's slice across all
+        slots (per_rank_bytes * num_slots); since each rank only reads
+        its own shard for H2D, locking the other 7/8 is wasted work. If
+        `my_rank` is None, locks the whole pool (use only when the caller
+        truly reads across all ranks' regions).
+        """
+        if self._mlock_thread is not None and self._mlock_thread.is_alive():
+            return self._mlock_thread
+        target = self._mlock_blocking
+        name = (f"shm-mlock-r{my_rank}"
+                if my_rank is not None else "shm-mlock-all")
+        self._mlock_done.clear()
+        t = threading.Thread(target=target,
+                             args=(my_rank, ),
+                             name=name,
+                             daemon=True)
+        t.start()
+        self._mlock_thread = t
+        return t
+
+    def wait_mlock(self, timeout: Optional[float] = None) -> bool:
+        """Block until the async mlock completes (or until timeout). Mainly
+        useful for tests / benchmarks that need pages pinned before the
+        first request hits."""
+        return self._mlock_done.wait(timeout=timeout)
+
+    def _mlock_blocking(self, my_rank: Optional[int]) -> None:
+        if _libc_for_mlock is None:
+            logger.warning("HostKVShmPool: libc.mlock unavailable")
+            self._mlock_done.set()
+            return
+        try:
+            base = _shm_base_addr(self._shm)
+        except Exception as e:
+            logger.warning("HostKVShmPool: cannot derive shm base addr: %s", e)
+            self._mlock_done.set()
+            return
+        spec = self.spec
+        regions: list[tuple[int, int]] = []
+        if my_rank is None:
+            regions.append((base, self._shm.size))
+        else:
+            # Per-rank slice: one (per_rank_bytes) region per slot, since
+            # ranks are interleaved within a slot. Doing num_slots small
+            # mlocks costs the same as one big mlock (kernel paginates
+            # internally), so we don't try to coalesce.
+            rank_off_in_slot = my_rank * spec.per_rank_bytes
+            for s in range(spec.num_slots):
+                addr = base + s * spec.per_slot_bytes + rank_off_in_slot
+                regions.append((addr, spec.per_rank_bytes))
+        t0 = time.perf_counter()
+        locked_bytes = 0
+        for addr, size in regions:
+            rc = _libc_for_mlock.mlock(ctypes.c_void_p(addr),
+                                       ctypes.c_size_t(size))
+            if rc != 0:
+                err = ctypes.get_errno()
+                logger.warning(
+                    "HostKVShmPool: mlock(addr=0x%x size=%d) failed "
+                    "errno=%d (%s); raise RLIMIT_MEMLOCK or grant "
+                    "CAP_IPC_LOCK to use", addr, size, err, os.strerror(err))
+                # Don't bail: keep the regions we did manage to lock so
+                # munlock() balances. Just stop trying further regions.
+                break
+            self._mlocked_regions.append((addr, size))
+            locked_bytes += size
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "HostKVShmPool: mlock done | rank=%s | locked=%.2fGB across "
+            "%d regions | elapsed=%.2fs",
+            "all" if my_rank is None else str(my_rank),
+            locked_bytes / (1024**3), len(self._mlocked_regions), elapsed)
+        self._mlock_done.set()
+
+    def _munlock_pool(self) -> None:
+        if _libc_for_mlock is None or not self._mlocked_regions:
+            return
+        for addr, size in self._mlocked_regions:
+            _libc_for_mlock.munlock(ctypes.c_void_p(addr),
+                                    ctypes.c_size_t(size))
+        self._mlocked_regions.clear()
 
     @classmethod
     def create(cls, spec: PoolSpec, name: str) -> "HostKVShmPool":
@@ -207,12 +340,35 @@ class HostKVShmPool:
                       rank * spec.per_rank_bytes)
         used = self._used_per_layer(num_blocks)
         for li, buf in enumerate(layer_buffers):
-            if len(buf) != used:
+            src = memoryview(buf)
+            if src.nbytes != used:
                 raise RuntimeError(
-                    f"unpack_rank_layers: layer {li} size {len(buf)} != "
+                    f"unpack_rank_layers: layer {li} size {src.nbytes} != "
                     f"expected {used} (num_blocks={num_blocks})")
             layer_off = rank_start + li * spec.per_layer_bytes
-            self._shm.buf[layer_off:layer_off + used] = buf
+            self._copy_into_shm(layer_off, src, used)
+
+    def _copy_into_shm(self, offset: int, src: memoryview,
+                       nbytes: int) -> None:
+        """Copy a contiguous source buffer into shm.
+
+        ctypes CDLL calls release the GIL around the native call, so the large
+        memcpy does not block rank-0 progress while channel workers unpack.
+        Keep fallbacks for unusual environments without NumPy/libc memmove.
+        """
+        if np is None:
+            self._shm.buf[offset:offset + nbytes] = src
+            return
+
+        dst = np.ndarray((nbytes, ),
+                         dtype=np.uint8,
+                         buffer=self._shm.buf,
+                         offset=offset)
+        src_arr = np.frombuffer(src, dtype=np.uint8, count=nbytes)
+        if _memmove is not None:
+            _memmove(dst.ctypes.data, src_arr.ctypes.data, nbytes)
+        else:
+            np.copyto(dst, src_arr, casting="no")
 
     def unpack_rank(self, slot_idx: int, rank: int, num_blocks: int,
                     payload) -> None:
@@ -235,6 +391,9 @@ class HostKVShmPool:
 
     # ---- Lifecycle ------------------------------------------------------
     def close(self) -> None:
+        # munlock before closing the mmap; otherwise the kernel still holds
+        # the locked pages until munmap, which is a slower path.
+        self._munlock_pool()
         try:
             self._shm.close()
         except Exception:

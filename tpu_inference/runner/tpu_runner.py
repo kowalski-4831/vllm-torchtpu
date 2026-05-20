@@ -1518,12 +1518,14 @@ class TPUModelRunner(GPUModelRunner):
             PallasAttentionBackendImpl
 
         layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        initialized_count = 0
         with set_vllm_model_wrapper_context(mesh=self.mesh):
-            for layer_name, attn_layer in layers.items():
+            for attn_layer in layers.values():
                 if isinstance(attn_layer.impl, PallasAttentionBackendImpl):
                     attn_layer.impl.initialize_kernel(attn_layer)
-                    logger.info("Pre-built RPA kernel for layer: %s",
-                                layer_name)
+                    initialized_count += 1
+        logger.info("Pre-built RPA kernels for %d attention layers.",
+                    initialized_count)
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
