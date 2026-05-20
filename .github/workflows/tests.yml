@@ -78,9 +78,10 @@ jobs:
           echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
-          # UV uses these to auth into the torch-tpu index defined in pyproject.toml
+          # Bootstrap keyring auth for private registry
+          uv pip install --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
+
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
-          echo UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(gcloud auth print-access-token)" >> "$GITHUB_ENV"
 
       - name: Install torchtpu-vllm from source
         if: ${{ inputs.wheel-gcs-path == '' }}

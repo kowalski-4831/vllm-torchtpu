@@ -97,7 +97,17 @@ fi
 if [ "$RUN_IN_BUILDKITE" = "false" ]; then
     echo "Running in local mode, building image."
     docker image prune -f
-    pip download --pre --index-url "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch_tpu -d /tmp/wheels_for_docker_build
+
+    # Install keyring for auth
+    pip install keyring keyrings.google-artifactregistry-auth
+    export UV_INDEX_TORCH_REGISTRY_USERNAME="oauth2accesstoken"
+
+    # Download the wheel and its dependencies
+    pip download --pre \
+      --index-url "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
+      torch_tpu \
+      -d /tmp/wheels_for_docker_build
+
     docker build -f docker/Dockerfile -t ${DOCKER_IMAGE} --build-arg TORCH_TPU_WHEEL_DIR=/tmp/wheels_for_docker_build/ .
 fi
 
