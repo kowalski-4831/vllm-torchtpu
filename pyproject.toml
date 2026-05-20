@@ -60,6 +60,12 @@ benchmarking = [
     "evalplus",
 ]
 
+[project.entry-points."vllm.platform_plugins"]
+# Standard vLLM out-of-tree platform plugin discovery. The function returns
+# the dotted class path when this platform should activate, else None. See
+# https://docs.vllm.ai/en/latest/design/plugin_system/
+torchtpu = "tpu_inference.platforms:register_tpu_platform"
+
 [tool.pytest.ini_options]
 markers = [
     "nightly: tests that only run in the nightly CI workflow",

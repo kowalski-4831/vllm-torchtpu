@@ -21,7 +21,6 @@ def _patch_vllm_tpu_group_custom_ops() -> None:
     """
 
     from vllm.distributed.parallel_state import GroupCoordinator
-    from vllm.platforms import current_platform
 
     if getattr(GroupCoordinator, "_tpu_no_custom_collective_patch", False):
         return
@@ -30,12 +29,34 @@ def _patch_vllm_tpu_group_custom_ops() -> None:
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        if current_platform.is_tpu():
-            self.use_custom_op_call = False
+        self.use_custom_op_call = False
 
     GroupCoordinator.__init__ = patched_init
     GroupCoordinator._tpu_no_custom_collective_patch = True
     logger.info("Applied TPU patch: disable vLLM custom collective ops.")
+
+
+def _patch_default_moe_runner_select_forward() -> None:
+    """Keep DefaultMoERunner on the direct ``_moe_forward`` path under OOT.
+
+    Upstream gates this on ``is_tpu()``; under our OOT plugin that's False
+    and we'd take ``torch.ops.vllm.moe_forward``, which captures weight
+    tensors as closures and trips torch_tpu's MLIR builder.
+    """
+    from vllm.model_executor.layers.fused_moe.runner import \
+        default_moe_runner as _dmr
+
+    if getattr(_dmr.DefaultMoERunner, "_tpu_select_forward_patch", False):
+        return
+
+    def patched_select(self, layer):
+        return (_dmr._moe_forward
+                if self.shared_experts is None else _dmr._moe_forward_shared)
+
+    _dmr.DefaultMoERunner._select_forward = patched_select
+    _dmr.DefaultMoERunner._tpu_select_forward_patch = True
+    logger.info(
+        "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
 if "proxy" in envs.JAX_PLATFORMS:

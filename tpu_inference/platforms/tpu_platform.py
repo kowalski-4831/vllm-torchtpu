@@ -91,16 +91,19 @@ def apply_tpu_patches() -> None:
     module-level state is re-initialized on import in spawned processes.
     All patches are idempotent.
     """
-    from tpu_inference import _patch_vllm_tpu_group_custom_ops
+    from tpu_inference import (_patch_default_moe_runner_select_forward,
+                               _patch_vllm_tpu_group_custom_ops)
     from tpu_inference.layers.vllm.custom_ops import _register_custom_ops
     _register_custom_ops()
     _patch_vllm_tpu_group_custom_ops()
+    _patch_default_moe_runner_select_forward()
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
 
 
 class TpuPlatform(Platform):
-    _enum = PlatformEnum.TPU
+    # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
+    _enum = PlatformEnum.OOT
     device_name: str = "tpu"
     device_type: str = "tpu"
     dispatch_key: str = "PrivateUse1"
