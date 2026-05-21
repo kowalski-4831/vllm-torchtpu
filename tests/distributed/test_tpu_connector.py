@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.request import RequestStatus
 
-from tpu_inference.distributed.tpu_connector import (  # isort: skip
+from tpu_inference.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, _CoordRecvEntry, _CoordSendEntry)
 
@@ -22,7 +22,8 @@ from tpu_inference.distributed.tpu_connector import (  # isort: skip
 # Shared test helpers
 # ---------------------------------------------------------------------------
 
-_MOD = "tpu_inference.distributed.tpu_connector"
+_MOD = "tpu_inference.distributed.kv_transfer.tpu_connector"
+_BASE = "tpu_inference.distributed.kv_transfer.zmq_shm_base"
 
 
 def _make_vllm_config(*, is_producer: bool = True, block_size: int = 16):
@@ -52,15 +53,15 @@ def _make_worker(*,
     should mock _coord_setup and call it separately.
     """
     cfg = _make_vllm_config(is_producer=is_producer)
-    with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=tp_rank), \
-         patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=tp_size), \
-         patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
-         patch(f"{_MOD}.dist_utils.get_host_ip", return_value="127.0.0.1"), \
-         patch(f"{_MOD}.dist_utils.get_kv_transfer_port", return_value="9100"), \
-         patch(f"{_MOD}.dist_utils.get_side_channel_port", return_value="9600"), \
-         patch(f"{_MOD}.dist_utils.get_transfer_channel_number", return_value=0), \
-         patch(f"{_MOD}.dist_utils.get_kv_latency_log_interval", return_value=0.0), \
-         patch(f"{_MOD}.zmq.Context"):
+    with patch(f"{_BASE}.get_tensor_model_parallel_rank", return_value=tp_rank), \
+         patch(f"{_BASE}.get_tensor_model_parallel_world_size", return_value=tp_size), \
+         patch(f"{_BASE}.dist_utils.get_node_id", return_value=0), \
+         patch(f"{_BASE}.dist_utils.get_host_ip", return_value="127.0.0.1"), \
+         patch(f"{_BASE}.dist_utils.get_kv_transfer_port", return_value="9100"), \
+         patch(f"{_BASE}.dist_utils.get_side_channel_port", return_value="9600"), \
+         patch(f"{_BASE}.dist_utils.get_transfer_channel_number", return_value=0), \
+         patch(f"{_BASE}.dist_utils.get_kv_latency_log_interval", return_value=0.0), \
+         patch(f"{_BASE}.zmq.Context"):
         return TPUConnectorWorker(cfg)
 
 
@@ -350,15 +351,15 @@ class TestTPUConnectorWorkerInit:
 
     def test_n_channels_override_clamped_to_tp_size(self):
         # Requesting 16 channels on a TP=4 worker is clamped to 4.
-        with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=0), \
-             patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=4), \
-             patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
-             patch(f"{_MOD}.dist_utils.get_host_ip", return_value="127.0.0.1"), \
-             patch(f"{_MOD}.dist_utils.get_kv_transfer_port", return_value="9100"), \
-             patch(f"{_MOD}.dist_utils.get_side_channel_port", return_value="9600"), \
-             patch(f"{_MOD}.dist_utils.get_transfer_channel_number", return_value=16), \
-             patch(f"{_MOD}.dist_utils.get_kv_latency_log_interval", return_value=0.0), \
-             patch(f"{_MOD}.zmq.Context"):
+        with patch(f"{_BASE}.get_tensor_model_parallel_rank", return_value=0), \
+             patch(f"{_BASE}.get_tensor_model_parallel_world_size", return_value=4), \
+             patch(f"{_BASE}.dist_utils.get_node_id", return_value=0), \
+             patch(f"{_BASE}.dist_utils.get_host_ip", return_value="127.0.0.1"), \
+             patch(f"{_BASE}.dist_utils.get_kv_transfer_port", return_value="9100"), \
+             patch(f"{_BASE}.dist_utils.get_side_channel_port", return_value="9600"), \
+             patch(f"{_BASE}.dist_utils.get_transfer_channel_number", return_value=16), \
+             patch(f"{_BASE}.dist_utils.get_kv_latency_log_interval", return_value=0.0), \
+             patch(f"{_BASE}.zmq.Context"):
             worker = TPUConnectorWorker(_make_vllm_config())
         assert worker._n_channels == 4
 

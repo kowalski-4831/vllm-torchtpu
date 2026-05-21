@@ -1,16 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-TPUConnector: KV-cache connector for P/D disaggregated serving on TPU.
-
-Ported from tpu_inference/distributed/tpu_connector.py in the tpu-inference
-(JAX) project, with the JAX transfer-server data plane replaced by a ZMQ-based
-pull-on-demand transport that moves torch tensors over the TPU host network.
-
-vLLM's multiproc_executor forks one process per TP rank, so we can't let
-every rank bind the same TCP port. Rank 0 acts as a per-host coordinator
-that owns both external ZMQ endpoints and a SharedMemory pool of KV
-staging slots; other ranks talk to rank 0 over an ipc:// ROUTER/DEALER
-side channel. See _coord_* methods and host_kv_shm.HostKVShmPool.
+ZmqShmKvConnectorBase: P/D disaggregated serving over a per-host SharedMemory
+pool plus ZMQ ROUTER/DEALER coordination.
 
   P workflow:
     P receives the request (max_output_tokens=1). P prefills; when the
@@ -41,35 +32,22 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
-from uuid import uuid4
+from typing import Any, Optional
 
 import torch
 import zmq
-from torch_tpu._internal.batch_transfer import (batch_transfer_d2h,
-                                                batch_transfer_d2h_sync,
-                                                batch_transfer_h2d,
-                                                batch_transfer_h2d_sync)
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import \
+    KVConnectorMetadata
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
-from vllm.utils.math_utils import round_down
 from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.request import RequestStatus
-
-if TYPE_CHECKING:
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.request import Request
 
 import tpu_inference.distributed.utils as dist_utils
 from tpu_inference import envs
-from tpu_inference.distributed import kv_scatter
-from tpu_inference.distributed.host_kv_shm import HostKVShmPool, PoolSpec
+from tpu_inference.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
+                                                               PoolSpec)
 from tpu_inference.logger import init_logger
-from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 ReqId = str
 
@@ -248,240 +226,19 @@ class _LatencyTracker:
         logger.info("%s latency summary | %s", self._who, " | ".join(parts))
 
 
-class TPUConnector(KVConnectorBase_V1):
+class ZmqShmKvConnectorBase:
+    """Generic shm-staged, ZMQ-coordinated KV connector worker.
 
-    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
-        assert vllm_config.kv_transfer_config is not None
-        self._connector_metadata: Optional[TPUConnectorMetadata] = None
-
-        if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = TPUConnectorScheduler(vllm_config)
-            self.connector_worker = None
-        elif role == KVConnectorRole.WORKER:
-            self.connector_scheduler = None
-            self.connector_worker = TPUConnectorWorker(vllm_config)
-
-    # ---- Scheduler-side methods -----------------------------------------
-    def get_num_new_matched_tokens(
-            self, request: "Request",
-            num_computed_tokens: int) -> tuple[int, bool]:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.get_num_new_matched_tokens(
-            request, num_computed_tokens)
-
-    def update_state_after_alloc(self, request: "Request",
-                                 blocks: "KVCacheBlocks",
-                                 num_external_tokens: int):
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.update_state_after_alloc(
-            request, blocks, num_external_tokens)
-
-    def build_connector_meta(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> TPUConnectorMetadata:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.build_connector_meta()
-
-    def request_finished(
-        self,
-        request: "Request",
-        block_ids: list[int],
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.request_finished(request, block_ids)
-
-    def get_finished_count(self) -> int:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.get_finished_count()
-
-    # ---- Worker-side methods --------------------------------------------
-    def register_kv_caches(self, kv_caches: list[torch.Tensor]):
-        """No-op: we call register_runner() from the runner after
-        bind_kv_cache, and read runner.kv_caches lazily in the worker."""
-        pass
-
-    def register_runner(self, runner: TPUModelRunner) -> None:
-        assert self.connector_worker is not None
-        self.connector_worker.register_runner(runner)
-
-    def start_load_kv(self, _, **kwargs) -> None:
-        assert self.connector_worker is not None
-        assert isinstance(self._connector_metadata, TPUConnectorMetadata)
-        self.connector_worker.process_send_load(self._connector_metadata)
-
-    def wait_for_layer_load(self, layer_name: str) -> None:
-        """Layer-wise load is not supported on TPU."""
-        pass
-
-    def save_kv_layer(self, *args, **kwargs) -> None:
-        """Layer-wise save is not supported on TPU."""
-        pass
-
-    def wait_for_save(self):
-        """No-op. See comment in tpu_inference's TPUConnector: reqs_to_send is
-        only populated after the request finishes prefill, at which point
-        total_num_scheduled_tokens may be 0 and wait_for_save is not called
-        by the KVConnectorModelRunnerMixin. We run the send from
-        start_load_kv -> process_send_load instead."""
-        pass
-
-    def get_finished(self,
-                     finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        assert self.connector_worker is not None
-        return self.connector_worker.get_finished()
-
-
-class TPUConnectorScheduler:
-
-    def __init__(self, vllm_config: "VllmConfig"):
-        self.vllm_config = vllm_config
-        self.config = vllm_config.kv_transfer_config
-        self.is_producer = self.config.is_kv_producer
-
-        self.block_size = vllm_config.cache_config.block_size
-
-        # Populated by request_finished() on P.
-        self.reqs_to_send: dict[ReqId, SendMeta] = {}
-        # Populated by update_state_after_alloc() on D.
-        self.reqs_to_load: dict[ReqId, LoadMeta] = {}
-
-        self.kv_ip = dist_utils.get_kv_ips()
-        self.kv_port = dist_utils.get_kv_ports()
-        logger.info("TPUConnectorScheduler --> kv_ip=%s | kv_port=%s",
-                    self.kv_ip, self.kv_port)
-
-    def get_num_new_matched_tokens(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-    ) -> tuple[int, bool]:
-        """
-        D workers use this to get the number of new tokens
-        that can be loaded from remote P workers.
-        No-op for P workers.
-
-        Args:
-            request (Request): the request object.
-            num_computed_tokens (int): the number of locally
-                computed tokens for this request
-
-        Returns:
-            A tuple with the following elements:
-                - The number of tokens that will be loaded from the
-                  external KV cache.
-                - If async loading. Must be 'False' for TPU connector
-                  because TPU pulls KV cache in a blocking way.
-
-        """
-        if self.is_producer or not request.kv_transfer_params:
-            return 0, False
-
-        assert num_computed_tokens % self.block_size == 0
-        # Rounding must match request_finished()'s remote_block_ids computation.
-        rounded_num_prompt_tokens = round_down(len(request.prompt_token_ids),
-                                               self.block_size)
-        count = max(rounded_num_prompt_tokens - num_computed_tokens, 0)
-        # The pull is blocking at the ZMQ layer, but we wrap it in a thread
-        # pool so from the scheduler's perspective it's async.
-        if count > 0:
-            return count, True
-        return 0, False
-
-    def update_state_after_alloc(self, request: "Request",
-                                 blocks: "KVCacheBlocks",
-                                 num_external_tokens: int):
-        if self.is_producer or not request.kv_transfer_params:
-            return
-
-        params = request.kv_transfer_params
-        if num_external_tokens > 0:
-            local_block_ids = blocks.get_block_ids()[0]
-            # D must pull the whole prefill blocks regardless of partial
-            # prefix-cache hits, because the transport has no RDMA-style
-            # partial-pull and P publishes the full payload under a uuid.
-            self.reqs_to_load[request.request_id] = LoadMeta(
-                uuid=params["uuid"],
-                local_block_ids=local_block_ids,
-                remote_block_ids=params["remote_block_ids"],
-                remote_host=params["remote_host"],
-                remote_port=params["remote_port"],
-            )
-        else:
-            # Full prefix-cache hit or async pull done -- we still need to
-            # notify P so it can free the pending buffer.
-            self.reqs_to_load[request.request_id] = LoadMeta(
-                uuid=params["uuid"],
-                local_block_ids=None,
-                remote_block_ids=None,
-                remote_host=params["remote_host"],
-                remote_port=params["remote_port"],
-            )
-        logger.info(
-            "TPUConnectorScheduler update_state_after_alloc --> reqs_to_load=%s",
-            self.reqs_to_load)
-
-    def build_connector_meta(self) -> TPUConnectorMetadata:
-        meta = TPUConnectorMetadata()
-        if self.is_producer:
-            meta.reqs_to_send = self.reqs_to_send
-            self.reqs_to_send = {}
-        else:
-            meta.reqs_to_load = self.reqs_to_load
-            self.reqs_to_load = {}
-        return meta
-
-    def get_finished_count(self) -> int:
-        return len(self.kv_ip) if isinstance(self.kv_ip, list) else 1
-
-    def request_finished(
-        self,
-        request: "Request",
-        block_ids: list[int],
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
-        if not self.is_producer:
-            return False, None
-
-        # max_tokens is forced to 1 by the proxy on P, so the only way the
-        # prefill finishes cleanly is length cap.
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
-            return False, None
-
-        # Only transfer full blocks; let D re-prefill the trailing partial
-        # block locally.
-        all_full = request.num_computed_tokens % self.block_size == 0
-        computed_block_ids = block_ids if all_full else block_ids[:-1]
-
-        delay_free_blocks = len(computed_block_ids) > 0
-        if delay_free_blocks:
-            uuid = get_uuid()
-            expiration_time = (time.perf_counter() +
-                               dist_utils.get_p2p_wait_pull_timeout())
-            self.reqs_to_send[request.request_id] = SendMeta(
-                uuid=uuid,
-                local_block_ids=computed_block_ids,
-                expiration_time=expiration_time)
-            kv_transfer_params = dict(uuid=uuid,
-                                      remote_block_ids=computed_block_ids,
-                                      remote_host=self.kv_ip,
-                                      remote_port=self.kv_port)
-            logger.info(
-                "TPUConnectorScheduler --> reqs_to_send=%s | kv_transfer_params=%s",
-                self.reqs_to_send, kv_transfer_params)
-        else:
-            kv_transfer_params = {}
-
-        return delay_free_blocks, kv_transfer_params
-
-
-class TPUConnectorWorker:
+    Subclasses implement the transport hooks at the bottom of this
+    class.
+    """
 
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
 
-        self.runner: Optional[TPUModelRunner] = None
+        self.runner: Optional[Any] = None
         self.device: Optional[torch.device] = None
         self.multi_host = envs.TPU_MULTIHOST_BACKEND == "ray"
         self.node_id: int = dist_utils.get_node_id()
@@ -633,7 +390,7 @@ class TPUConnectorWorker:
             self.zmq_cxt.destroy(linger=0)
 
     # ---- Bring-up -------------------------------------------------------
-    def register_runner(self, runner: TPUModelRunner):
+    def register_runner(self, runner: Any):
         self.runner = runner
         self.device = runner.device
 
@@ -700,61 +457,41 @@ class TPUConnectorWorker:
         exists yet at register_runner time, so touching slot 0 is safe.
 
         Mirrors _coord_stage_shard / _coord_scatter_shard exactly so the
-        compiled executable cache hits on first real request."""
-        from torch_tpu._internal.sync import sync as tpu_sync
+        compiled executable cache hits on first real request. Inlined
+        rather than calling the hot path so warmup samples don't leak into
+        the latency tracker or emit a stray scatter log line."""
         kv_caches = self.runner.kv_caches
         indices = torch.arange(num_blocks,
                                dtype=torch.int64,
                                device=self.device)
         slot_idx = 0
         if self.is_producer:
-            tpu_tensors = []
-            cpu_tensors = []
-            for layer_idx, cache in enumerate(kv_caches):
-                src_shard = torch.index_select(cache, 0, indices)
-                dest_view = self._coord_pool.layer_view(
-                    slot_idx, self.tp_rank, layer_idx, num_blocks)
-                tpu_tensors.append(src_shard)
-                cpu_tensors.append(dest_view)
-            batch_transfer_d2h_sync(tpu_tensors, cpu_tensors)
+            self._stage_d2h_sync(slot_idx, num_blocks, list(range(num_blocks)))
         else:
-            # Mirror _coord_scatter_shard exactly: torch.empty + async H2D
-            # batch + prepare_scatter_args + multi_layer_scatter_into. The
-            # earlier `.to(device)` warmup compiled a different HLO than the
-            # hot path (batch_transfer_h2d into a pre-allocated
-            # torch.empty), so the first real request paid a 3-8s recompile.
+            # Mirror _coord_scatter_shard exactly. An earlier
+            # `.to(device)` warmup compiled a different HLO than the hot
+            # path (batch_transfer_h2d into a pre-allocated torch.empty),
+            # so the first real request paid a 3-8s recompile.
             use_kv_scatter = self._kv_scatter_enabled
-            dest_blocks_dev = torch.tensor(list(range(num_blocks)),
-                                           dtype=torch.int32,
-                                           device=self.device)
-            src_views = []
-            device_shards = []
-            for layer_idx in range(len(kv_caches)):
-                src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
-                                                       layer_idx, num_blocks)
-                src_views.append(src_view)
-                device_shards.append(
-                    torch.empty(src_view.shape,
-                                dtype=src_view.dtype,
-                                device=self.device))
-            h2d_future = batch_transfer_h2d(src_views, device_shards)
-            h2d_future.wait()
+            src_views = [
+                self._coord_pool.layer_view(slot_idx, self.tp_rank, layer_idx,
+                                            num_blocks)
+                for layer_idx in range(len(kv_caches))
+            ]
+            h2d_future, device_shards = self._h2d_into_device_async(src_views)
+            self._wait_stage(h2d_future)
             if use_kv_scatter:
-                prebuilt = kv_scatter.prepare_scatter_args(
-                    dest_blocks_dev, self.device)
-                new_caches = kv_scatter.multi_layer_scatter_into(
-                    device_shards,
-                    list(kv_caches),
-                    dest_blocks_dev,
-                    prebuilt_args=prebuilt)
+                new_caches = self._try_fast_scatter(device_shards,
+                                                    list(kv_caches),
+                                                    list(range(num_blocks)))
                 for c in new_caches:
-                    tpu_sync.synchronize(c)
+                    self._synchronize_device(c)
                 for i, c in enumerate(new_caches):
                     kv_caches[i] = c
             else:
                 for layer_idx, cache in enumerate(kv_caches):
                     cache.index_put_((indices, ), device_shards[layer_idx])
-                    tpu_sync.synchronize(cache)
+                    self._synchronize_device(cache)
 
     # ---- Main dispatch driven by start_load_kv --------------------------
     def process_send_load(self, metadata: TPUConnectorMetadata):
@@ -1169,38 +906,11 @@ class TPUConnectorWorker:
             self._signal_stage_done(uuid, failed=True)
 
     def _maybe_enable_kv_scatter(self) -> None:
-        """Run the startup smoke test for the multi-layer scatter kernel
-        (``kv_scatter``) and flip it on if it passes. Consumer-only. On
-        by default; any failure falls back permanently to ``index_put_``
-        with a warning. Smoke-tests with a small num_layers; compile for
-        the real per-worker num_layers happens on first invocation
-        (typically during warmup)."""
-        if self.is_producer:
-            return
-        if not kv_scatter.scatter_available():
-            logger.warning(
-                "TPUConnectorWorker %s rank%d --> kv_scatter kernel "
-                "unavailable; staying on index_put_", self.node_id,
-                self.tp_rank)
-            return
-        trailing = tuple(self.shape[1:]) if len(self.shape) > 1 else (128, )
-        ok = kv_scatter.smoke_test_multi_layer_scatter(
-            device=self.device,
-            num_layers=2,
-            num_blocks=4,
-            trailing_shape=trailing,
-            dtype=self.dtype,
-        )
-        if ok:
-            self._kv_scatter_enabled = True
-            logger.info(
-                "TPUConnectorWorker %s rank%d --> multi-layer scatter "
-                "enabled for insert path", self.node_id, self.tp_rank)
-        else:
-            logger.warning(
-                "TPUConnectorWorker %s rank%d --> multi-layer scatter "
-                "smoke test failed; falling back to index_put_", self.node_id,
-                self.tp_rank)
+        """Subclass hook: optionally enable the multi-layer fused scatter
+        on startup. Default is a no-op (leaves ``_kv_scatter_enabled`` as
+        False, falling back to per-layer ``index_put_`` in the drain pass).
+        Subclasses override to run a device-specific smoke test."""
+        return
 
     def _coord_stage_shard(self, uuid: int, slot_idx: int, num_blocks: int,
                            block_ids: list[int]) -> None:
@@ -1214,32 +924,17 @@ class TPUConnectorWorker:
         STAGE_NOTIFY -> scheduler -> PULL-setup round-trip and any
         subsequent model_forward.
 
-        `tpu_tensors` (the lazy `index_select` results) and `cpu_tensors`
-        (shm views) are retained on the in-flight entry until the future
-        completes, so the source device buffer and destination shm
-        backing stay alive across the DMA."""
+        Source device tensors and destination shm views are retained on
+        the in-flight entry until the future completes, so the source
+        device buffer and destination shm backing stay alive across the
+        DMA."""
         logger.info(
             "TPUConnectorWorker %s rank%d --> stage_shard enqueue "
             "uuid=%s slot=%d blocks=%d layers=%d", self.node_id, self.tp_rank,
             uuid, slot_idx, num_blocks, len(self.runner.kv_caches))
-        indices = torch.tensor(block_ids,
-                               dtype=torch.int64,
-                               device=self.device)
-        kv_caches = self.runner.kv_caches
         enqueue_t0 = time.perf_counter()
-
-        tpu_tensors = []
-        cpu_tensors = []
-        d2h_total_bytes = 0
-        for layer_idx, cache in enumerate(kv_caches):
-            src_shard = torch.index_select(cache, 0, indices)
-            dest_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
-                                                    layer_idx, num_blocks)
-            tpu_tensors.append(src_shard)
-            cpu_tensors.append(dest_view)
-            d2h_total_bytes += dest_view.numel() * dest_view.element_size()
-
-        future = batch_transfer_d2h(tpu_tensors, cpu_tensors)
+        future, src_refs, dst_refs, d2h_total_bytes = self._stage_d2h(
+            slot_idx, num_blocks, block_ids)
         issue_t1 = time.perf_counter()
         enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
 
@@ -1248,8 +943,8 @@ class TPUConnectorWorker:
                            slot_idx=slot_idx,
                            num_blocks=num_blocks,
                            future=future,
-                           tpu_tensors=tpu_tensors,
-                           cpu_tensors=cpu_tensors,
+                           tpu_tensors=src_refs,
+                           cpu_tensors=dst_refs,
                            enqueue_t0=enqueue_t0,
                            issue_t1=issue_t1,
                            total_bytes=d2h_total_bytes))
@@ -1260,16 +955,17 @@ class TPUConnectorWorker:
 
     def _coord_stage_waiter_loop(self) -> None:
         """Dispatch each pending stage entry to the waiter pool and enforce
-        a per-entry deadline. Pool workers do the blocking `future.wait()`
+        a per-entry deadline. Pool workers do the blocking ``_wait_stage``
         and signal STAGE_DONE on success; the dispatcher signals a failed
         STAGE_DONE if an entry exceeds `_coord_stage_wait_timeout_s`, so a
         wedged DMA cannot starve later uuids on the same rank.
 
-        TransferFuture.wait() is unbounded (see xla::Future::Await), so
-        leaking the worker thread is the only way to break out of a hung
-        wait from Python. The leaked thread is harmless: PjRt owns the
-        underlying buffers via its own holds, and `_complete_stage_entry`
-        is idempotent so the eventual return is a no-op.
+        ``_wait_stage`` is unbounded under most device backends (e.g.
+        xla::Future::Await), so leaking the worker thread is the only way
+        to break out of a hung wait from Python. The leaked thread is
+        harmless: the device runtime owns the underlying buffers via its
+        own holds, and `_complete_stage_entry` is idempotent so the
+        eventual return is a no-op.
         """
         timeout_s = self._coord_stage_wait_timeout_s
         # (deadline, entry, py_future); list ordering is not load-bearing.
@@ -1311,7 +1007,7 @@ class TPUConnectorWorker:
                 in_flight = kept
 
     def _coord_stage_wait_worker(self, entry: "_StageInFlight") -> None:
-        """Pool worker: block on the entry's TransferFuture and complete.
+        """Pool worker: block on the entry's stage future and complete.
 
         Runs in `_coord_stage_waiter_pool`. Several can run in parallel
         across distinct entries; a single hung wait only consumes one slot
@@ -1319,7 +1015,7 @@ class TPUConnectorWorker:
         failed = False
         try:
             wait_t0 = time.perf_counter()
-            entry.future.wait()
+            self._wait_stage(entry.future)
             wait_ms = (time.perf_counter() - wait_t0) * 1000.0
             total_ms = (time.perf_counter() - entry.enqueue_t0) * 1000.0
             issue_ms = ((entry.issue_t1 - entry.enqueue_t0) *
@@ -1740,62 +1436,43 @@ class TPUConnectorWorker:
         """H2D + scatter this rank's shard from shm into the kv cache.
 
         Two paths:
-          * Multi-layer kv_scatter (default when its startup smoke test
-            passes): ``src_view.to(device)`` per layer (queued lazily),
-            then one bridge call that scatters all N layers in a single
-            fused kernel with each destination donated+aliased to its
-            output.
-          * Naive fallback (kv_scatter smoke test failed):
-            ``src_view.to(device)`` + ``index_put_`` per layer."""
+          * Multi-layer fused scatter (default when ``_kv_scatter_enabled``):
+            sync H2D into freshly allocated device buffers, then one fused
+            ``_try_fast_scatter`` call writes all layers at once with each
+            destination donated+aliased to its output.
+          * Naive fallback (smoke test failed): async H2D + explicit wait
+            so issue/wait timings are observable, then per-layer
+            ``index_put_`` followed by ``_synchronize_device``."""
         if not local_blocks:
             return
         kv_caches = self.runner.kv_caches
-        from torch_tpu._internal.sync import sync as tpu_sync
-        use_kv_scatter = self._kv_scatter_enabled
+        use_fast_scatter = self._kv_scatter_enabled
         h2d_ms_total = 0.0
         h2d_issue_ms = 0.0
         h2d_wait_ms = 0.0
         insert_ms_total = 0.0
         alloc_ms_total = 0.0
-        if use_kv_scatter:
-            # One bridge crossing for all N layers. We still issue N
-            # .to(device) calls sequentially (the only way to get shm
-            # bytes to HBM under the current torch_tpu bridge), but let
-            # torch_tpu queue them up lazily before firing the one
-            # kernel call that does all N scatters.
-            dest_blocks_dev = torch.tensor(local_blocks,
-                                           dtype=torch.int32,
-                                           device=self.device)
-            prebuilt = kv_scatter.prepare_scatter_args(dest_blocks_dev,
-                                                       self.device)
+        if use_fast_scatter:
             alloc_t0 = time.perf_counter()
             src_views = []
-            device_shards = []
             h2d_total_bytes = 0
             for layer_idx in range(len(kv_caches)):
                 src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
                                                        layer_idx, num_blocks)
                 src_views.append(src_view)
                 h2d_total_bytes += src_view.numel() * src_view.element_size()
-                device_shards.append(
-                    torch.empty(src_view.shape,
-                                dtype=src_view.dtype,
-                                device=self.device))
             alloc_t1 = time.perf_counter()
 
             h2d_t0 = time.perf_counter()
-            batch_transfer_h2d_sync(src_views, device_shards)
+            device_shards = self._h2d_into_device(src_views)
             h2d_t1 = time.perf_counter()
-            new_caches = kv_scatter.multi_layer_scatter_into(
-                device_shards,
-                list(kv_caches),
-                dest_blocks_dev,
-                prebuilt_args=prebuilt)
-            # Sync every returned cache -- they're independent outputs
-            # of the fused kernel and XLA may schedule them in parallel,
-            # so syncing only the last would race.
+            new_caches = self._try_fast_scatter(device_shards, list(kv_caches),
+                                                local_blocks)
+            # Sync every returned cache -- they're independent outputs of the
+            # fused kernel and the device may schedule them in parallel, so
+            # syncing only the last would race.
             for c in new_caches:
-                tpu_sync.synchronize(c)
+                self._synchronize_device(c)
             k_wait_t = time.perf_counter()
             for i, c in enumerate(new_caches):
                 kv_caches[i] = c
@@ -1812,23 +1489,18 @@ class TPUConnectorWorker:
                                    device=self.device)
             alloc_t0 = time.perf_counter()
             src_views = []
-            device_shards = []
             h2d_total_bytes = 0
             for layer_idx in range(len(kv_caches)):
                 src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
                                                        layer_idx, num_blocks)
                 src_views.append(src_view)
                 h2d_total_bytes += src_view.numel() * src_view.element_size()
-                device_shards.append(
-                    torch.empty(src_view.shape,
-                                dtype=src_view.dtype,
-                                device=self.device))
             alloc_t1 = time.perf_counter()
 
             h_t0 = time.perf_counter()
-            h2d_future = batch_transfer_h2d(src_views, device_shards)
+            h2d_future, device_shards = self._h2d_into_device_async(src_views)
             h2d_t_issued = time.perf_counter()
-            h2d_future.wait()
+            self._wait_stage(h2d_future)
             h_t1 = time.perf_counter()
 
             h2d_ms_total = (h_t1 - h_t0) * 1000.0
@@ -1840,7 +1512,7 @@ class TPUConnectorWorker:
             for layer_idx, cache in enumerate(kv_caches):
                 ins_t0 = time.perf_counter()
                 cache.index_put_((indices, ), device_shards[layer_idx])
-                tpu_sync.synchronize(cache)
+                self._synchronize_device(cache)
                 insert_ms_total += (time.perf_counter() - ins_t0) * 1000.0
             path = "naive"
         self._lat.record(_LAT_H2D, h2d_ms_total)
@@ -2461,11 +2133,40 @@ class TPUConnectorWorker:
                         done_recving)
         return done_sending, done_recving
 
+    # ====================================================================
+    # Abstract transport hooks (subclass implements)
+    # ====================================================================
+    def _stage_d2h(self, slot_idx: int, num_blocks: int,
+                   block_ids: list[int]) -> tuple[Any, list, list, int]:
+        """Issue an async device->host transfer of this rank's shard. """
+        raise NotImplementedError
 
-def get_uuid() -> int:
-    int128 = uuid4().int
-    # Stay under 64-bit so JSON-encoded responses through the proxy are safe.
-    return int128 >> 78
+    def _stage_d2h_sync(self, slot_idx: int, num_blocks: int,
+                        block_ids: list[int]) -> None:
+        """Synchronous variant of ``_stage_d2h``."""
+        raise NotImplementedError
+
+    def _wait_stage(self, future: Any) -> None:
+        """Block on a future returned by ``_stage_d2h``."""
+        raise NotImplementedError
+
+    def _h2d_into_device(self, src_views: list) -> list[torch.Tensor]:
+        """Copy the shm data into HBM synchronously."""
+        raise NotImplementedError
+
+    def _h2d_into_device_async(
+            self, src_views: list) -> tuple[Any, list[torch.Tensor]]:
+        """Async _h2d_into_device. """
+        raise NotImplementedError
+
+    def _synchronize_device(self, tensor: torch.Tensor) -> None:
+        raise NotImplementedError
+
+    def _try_fast_scatter(
+            self, device_shards: list[torch.Tensor],
+            kv_caches: list[torch.Tensor],
+            local_blocks: list[int]) -> Optional[list[torch.Tensor]]:
+        raise NotImplementedError
 
 
 def _try_remove_ipc_endpoint(ipc_path: str) -> None:

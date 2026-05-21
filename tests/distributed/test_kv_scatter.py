@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests for tpu_inference.distributed.kv_scatter.
+Unit tests for tpu_inference.distributed.kv_transfer.kv_scatter.
 
 Split into two groups:
   - CPU tests: prepare_scatter_args and zero/empty edge cases for
@@ -20,7 +20,7 @@ import traceback
 import pytest
 import torch
 
-from tpu_inference.distributed.kv_scatter import (
+from tpu_inference.distributed.kv_transfer.kv_scatter import (
     multi_layer_scatter_into, prepare_scatter_args, scatter_available,
     smoke_test_multi_layer_scatter)
 
