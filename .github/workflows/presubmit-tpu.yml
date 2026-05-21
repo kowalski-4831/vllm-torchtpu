@@ -70,8 +70,9 @@ jobs:
 
   run_tests:
     needs: check_changes
-    if: github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
+    if: always() && !cancelled() && contains(fromJSON('["success", "skipped"]'), needs.check_changes.result)
     uses: ./.github/workflows/tests.yml
     name: "Run Tests"
     with:
       halt-for-connection: ${{ inputs.halt-for-connection }}
+      should-run: ${{ github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true' }}
