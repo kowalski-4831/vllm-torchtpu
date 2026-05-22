@@ -29,15 +29,10 @@ on:
         description: 'Whether this is a nightly run (runs all tests including nightly-only).'
         type: string
         default: 'false'
-      should-run:
-        description: 'Whether to actually run the tests. If false, the job is skipped.'
-        type: boolean
-        default: true
 
 jobs:
   run_tests:
     name: "Tests on ${{ matrix.job_info.runner }}"
-    if: ${{ inputs.should-run }}
     strategy:
       matrix:
         job_info: [

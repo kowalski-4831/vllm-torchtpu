@@ -70,9 +70,54 @@ jobs:
 
   run_tests:
     needs: check_changes
-    if: always() && !cancelled() && contains(fromJSON('["success", "skipped"]'), needs.check_changes.result)
+    if: github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
     uses: ./.github/workflows/tests.yml
     name: "Run Tests"
     with:
       halt-for-connection: ${{ inputs.halt-for-connection }}
-      should-run: ${{ github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true' }}
+
+  # This check exists as a target for branch protection. The tests on TPU are
+  # not always run, but if they *are* run we want to make sure they pass before
+  # the PR is merged, and it turns out to be a little difficult to represent
+  # that situation as a pure status check based on names because:
+  #
+  # 1. If a job never appears because a workflow is skipped, the required status
+  #    neither passes nor fails and it hangs indefinitely
+  # 2. If we skip the specific job (Run tests on ${{ matrix.job_info.runner}}),
+  #    the job_info struct never gets populated or something and the job name
+  #    doesn't match what we are expecteing.
+  #
+  # As a result, it's easier to just have this job with a static name that
+  # always runs and have it check whether the other jobs we ran were successful.
+  presubmit_tpu_gate:
+    needs: [check_changes, run_tests]
+    # always() = always run whether or not previous jobs succeeded
+    # !cancelled() = only run if the job wasn't explicitly cancelled
+    if: always() && !cancelled()
+    name: "TPU Presubmit Gate"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          CHECK_CHANGES_RESULT="${{ needs.check_changes.result }}"
+          RUN_TESTS_RESULT="${{ needs.run_tests.result }}"
+
+          echo "check_changes result: $CHECK_CHANGES_RESULT"
+          echo "run_tests result: $RUN_TESTS_RESULT"
+
+          if [ "$CHECK_CHANGES_RESULT" = "failure" ]; then
+            echo "check_changes failed"
+            exit 1
+          fi
+
+          if [ "$RUN_TESTS_RESULT" = "failure" ]; then
+            echo "run_tests failed"
+            exit 1
+          fi
+
+          if [ "$RUN_TESTS_RESULT" = "cancelled" ]; then
+            echo "run_tests was cancelled"
+            exit 1
+          fi
+
+          echo "Gate passed"
