@@ -11,6 +11,7 @@ TPU.
 import threading
 from unittest.mock import MagicMock, patch
 
+import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.request import RequestStatus
 
@@ -372,6 +373,46 @@ class TestTPUConnectorWorkerInit:
         worker = _make_worker(tp_rank=0, tp_size=3)
         base = int(worker.kv_transfer_port)
         assert worker._kv_transfer_ports == [base, base + 1, base + 2]
+
+
+# ---------------------------------------------------------------------------
+# TestKVCacheReplacement — runner / forward-context consistency
+# ---------------------------------------------------------------------------
+
+
+class TestKVCacheReplacement:
+
+    def test_replace_runner_kv_cache_updates_bound_attention_layers(self):
+        worker = _make_worker(tp_rank=0, tp_size=1, is_producer=False)
+
+        old_cache0 = torch.empty(1)
+        old_cache1 = torch.empty(1)
+        new_cache0 = torch.ones(1)
+
+        runner = MagicMock()
+        runner.kv_caches = [old_cache0, old_cache1]
+        worker.runner = runner
+
+        layer0 = MagicMock()
+        layer0.kv_cache = old_cache0
+        shared_layer0 = MagicMock()
+        shared_layer0.kv_cache = old_cache0
+        layer1 = MagicMock()
+        layer1.kv_cache = old_cache1
+        worker.vllm_config.compilation_config.static_forward_context = {
+            "layer.0": layer0,
+            "layer.0.shared": shared_layer0,
+            "layer.1": layer1,
+            "non_attention": object(),
+        }
+
+        worker._replace_runner_kv_cache(0, new_cache0)
+
+        assert runner.kv_caches[0] is new_cache0
+        assert layer0.kv_cache is new_cache0
+        assert shared_layer0.kv_cache is new_cache0
+        assert runner.kv_caches[1] is old_cache1
+        assert layer1.kv_cache is old_cache1
 
 
 # ---------------------------------------------------------------------------

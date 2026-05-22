@@ -417,6 +417,30 @@ class ZmqShmKvConnectorBase:
                     "(continuing; first real request will pay the compile "
                     "cost): %s", self.node_id, self.tp_rank, e)
 
+    def _replace_runner_kv_cache(self, layer_idx: int,
+                                 new_cache: torch.Tensor) -> None:
+        """Replace a runner KV cache and keep attention layers bound to it.
+
+        vLLM's bind_kv_cache() stores each cache tensor in both
+        runner.kv_caches and the static forward context. The fast scatter path
+        returns donated destination tensors, so replacing only
+        runner.kv_caches leaves Attention.forward() reading a stale tensor.
+        """
+        assert self.runner is not None
+        kv_caches = self.runner.kv_caches
+        old_cache = kv_caches[layer_idx]
+        kv_caches[layer_idx] = new_cache
+
+        compilation_config = getattr(self.vllm_config, "compilation_config",
+                                     None)
+        static_forward_context = getattr(compilation_config,
+                                         "static_forward_context", None)
+        if not isinstance(static_forward_context, dict):
+            return
+        for layer in static_forward_context.values():
+            if getattr(layer, "kv_cache", None) is old_cache:
+                layer.kv_cache = new_cache
+
     def _warmup_block_sizes(self) -> list[int]:
         """Block count to pre-compile: the worst-case max_blocks only."""
         block_size = self.vllm_config.cache_config.block_size
@@ -487,7 +511,7 @@ class ZmqShmKvConnectorBase:
                 for c in new_caches:
                     self._synchronize_device(c)
                 for i, c in enumerate(new_caches):
-                    kv_caches[i] = c
+                    self._replace_runner_kv_cache(i, c)
             else:
                 for layer_idx, cache in enumerate(kv_caches):
                     cache.index_put_((indices, ), device_shards[layer_idx])
@@ -1475,7 +1499,7 @@ class ZmqShmKvConnectorBase:
                 self._synchronize_device(c)
             k_wait_t = time.perf_counter()
             for i, c in enumerate(new_caches):
-                kv_caches[i] = c
+                self._replace_runner_kv_cache(i, c)
             h2d_ms_total = (h2d_t1 - h2d_t0) * 1000.0
             # The sync H2D helper blocks until completion, so there is no
             # separately observable issue/wait split.
