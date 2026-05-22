@@ -18,6 +18,15 @@ alias tpu-vm-ssh="ssh <user_name>@tpu_ip_addr"
 
 To simulate the CI environment as closely as possible, run the tests inside the designated CI Docker container on the TPU VM.
 
+> [!NOTE]
+> **Dubious Ownership Error**: If you encounter `fatal: detected dubious ownership` error when running `uv pip install` or git commands inside the container, you may need to run the following command inside the container:
+>
+> ```bash
+> git config --global --add safe.directory /root/tpu_inference
+> ```
+>
+> TODO: Move this to Dockerfile to avoid this manual step.
+
 First, make sure you have the latest CI Docker image on your TPU VM. You can pull it by running:
 
 ```bash
@@ -102,7 +111,20 @@ tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileg
   bash -c 'cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep --run-lm-eval --run-evalplus'"
 ```
 
-**4. Unit Tests**
+**4. Nightly: Qwen 3.5-397B**
+
+```bash
+tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g \\
+  -v /mnt/pd/projects/torchtpu-vllm:/root/tpu_inference \\
+  -v /mnt/pd/.cache/huggingface:/root/.cache/huggingface \\
+  -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \\
+  -e UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=\"\$TOKEN\" \\
+  -e SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \\
+  us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest \\
+  bash -c 'cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-tp8 --run-lm-eval --run-evalplus'"
+```
+
+**5. Unit Tests**
 
 ```bash
 tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g \\

@@ -352,15 +352,6 @@ jobs:
           EVALPLUS_PARALLEL: "8"
         run: |
           set +e
-          cfg=qwen3-coder-480b-fp8-tp8-ep
-          results_dir=/tmp/perf_eval_480b
-          baseline=scripts/vllm/benchmarking/baselines/perf/qwen3-coder-480b-fp8-tp8-ep.baseline.json
-          check_log="$results_dir/regression_check.md"
-          eval_baseline=scripts/vllm/benchmarking/baselines/eval/qwen3-coder-480b-fp8-tp8-ep.baseline.json
-          eval_log="$results_dir/eval_check.md"
-          evalplus_baseline=scripts/vllm/benchmarking/baselines/evalplus/qwen3-coder-480b-fp8-tp8-ep.baseline.json
-          evalplus_log="$results_dir/evalplus_check.md"
-          mkdir -p "$results_dir"
 
           cleanup_server() {
             echo ""
@@ -415,6 +406,11 @@ jobs:
             local eval_check_rc="$4"
             local evalplus_rc="$5"
             local evalplus_check_rc="$6"
+            local cfg="$7"
+            local results_dir="$8"
+            local check_log="$9"
+            local eval_log="${10}"
+            local evalplus_log="${11}"
 
             if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
               return 0
@@ -448,100 +444,111 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
-          echo "::group::Dry-run benchmark: $cfg"
-          ./scripts/vllm/benchmarking/run_benchmarks.sh \
-            --config "$cfg" \
-            --results-dir "$results_dir" \
-            --dry-run 2>&1 | tee "$results_dir/dry_run.log"
-          dry_rc=${PIPESTATUS[0]}
-          echo "::endgroup::"
+          fail=0
+          for cfg in qwen3-coder-480b-fp8-tp8-ep qwen3.5-397b-tp8; do
+            results_dir="/tmp/perf_eval_$cfg"
+            baseline="scripts/vllm/benchmarking/baselines/perf/$cfg.baseline.json"
+            check_log="$results_dir/regression_check.md"
+            eval_baseline="scripts/vllm/benchmarking/baselines/eval/$cfg.baseline.json"
+            eval_log="$results_dir/eval_check.md"
+            evalplus_baseline="scripts/vllm/benchmarking/baselines/evalplus/$cfg.baseline.json"
+            evalplus_log="$results_dir/evalplus_check.md"
+            mkdir -p "$results_dir"
 
-          if [ "$dry_rc" -ne 0 ]; then
-            echo "::error::benchmark dry run failed for $cfg (exit $dry_rc)"
-            append_summary "skipped" "skipped" "skipped" "skipped" "skipped" "skipped"
-            exit "$dry_rc"
-          fi
-
-          echo "::group::Run benchmark: $cfg"
-          ./scripts/vllm/benchmarking/run_benchmarks.sh \
-            --config "$cfg" \
-            --results-dir "$results_dir" \
-            --keep-alive
-          run_rc=$?
-          echo "::endgroup::"
-
-          eval_rc="skipped"
-          eval_check_rc="skipped"
-          evalplus_rc="skipped"
-          evalplus_check_rc="skipped"
-
-          if [ "$run_rc" -eq 0 ]; then
-            MODEL=$(read_model_from_config "$results_dir/config.json")
-
-            if [ -f "$eval_baseline" ]; then
-              echo "::group::Run eval: $cfg"
-              lm_eval \
-                --model local-chat-completions \
-                --model_args model="$MODEL",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=128 \
-                --tasks mmlu_llama,mmlu_pro \
-                --apply_chat_template \
-                --fewshot_as_multiturn true \
-                --seed "0,1234,None,1234" \
-                --gen_kwargs continue_final_message=True add_generation_prompt=False 'chat_template_kwargs={"enable_thinking": False}' \
-                --output_path "$results_dir" 2>&1 | tee "$results_dir/eval.log"
-              eval_rc=${PIPESTATUS[0]}
-              echo "::endgroup::"
-
-              echo "::group::Check eval regression: $cfg"
-              python3 scripts/vllm/benchmarking/check_regression.py \
-                --mode eval \
-                --results-dir "$results_dir" \
-                --baseline "$eval_baseline" 2>&1 | tee "$eval_log"
-              eval_check_rc=${PIPESTATUS[0]}
-              echo "::endgroup::"
-            fi
-
-            echo "::group::Run EvalPlus: $cfg"
-            run_evalplus "$MODEL" "$results_dir"
-            evalplus_rc=$?
+            echo "::group::Dry-run benchmark: $cfg"
+            ./scripts/vllm/benchmarking/run_benchmarks.sh \
+              --config "$cfg" \
+              --results-dir "$results_dir" \
+              --dry-run 2>&1 | tee "$results_dir/dry_run.log"
+            dry_rc=${PIPESTATUS[0]}
             echo "::endgroup::"
 
-            if [ -f "$evalplus_baseline" ]; then
-              echo "::group::Check EvalPlus regression: $cfg"
-              python3 scripts/vllm/benchmarking/check_regression.py \
-                --mode evalplus \
-                --results-dir "$results_dir" \
-                --baseline "$evalplus_baseline" 2>&1 | tee "$evalplus_log"
-              evalplus_check_rc=${PIPESTATUS[0]}
-              echo "::endgroup::"
+            if [ "$dry_rc" -ne 0 ]; then
+              echo "::error::benchmark dry run failed for $cfg (exit $dry_rc)"
+              append_summary "skipped" "skipped" "skipped" "skipped" "skipped" "skipped" "$cfg" "$results_dir" "$check_log" "$eval_log" "$evalplus_log"
+              fail=1
+              continue
             fi
-          fi
 
-          cleanup_server
+            echo "::group::Run benchmark: $cfg"
+            ./scripts/vllm/benchmarking/run_benchmarks.sh \
+              --config "$cfg" \
+              --results-dir "$results_dir" \
+              --keep-alive
+            run_rc=$?
+            echo "::endgroup::"
 
-          echo "::group::Check perf regression: $cfg"
-          python3 scripts/vllm/benchmarking/check_regression.py \
-            --mode perf \
-            --results-dir "$results_dir" \
-            --baseline "$baseline" 2>&1 | tee "$check_log"
-          check_rc=${PIPESTATUS[0]}
-          echo "::endgroup::"
+            eval_rc="skipped"
+            eval_check_rc="skipped"
+            evalplus_rc="skipped"
+            evalplus_check_rc="skipped"
 
-          append_summary "$run_rc" "$check_rc" "$eval_rc" "$eval_check_rc" "$evalplus_rc" "$evalplus_check_rc"
+            if [ "$run_rc" -eq 0 ]; then
+              MODEL=$(read_model_from_config "$results_dir/config.json")
 
-          if [ "$run_rc" -ne 0 ]; then exit "$run_rc"; fi
-          if [ "$check_rc" -ne 0 ]; then exit "$check_rc"; fi
-          if [ "$eval_rc" != "skipped" ] && [ "$eval_rc" -ne 0 ]; then exit "$eval_rc"; fi
-          if [ "$eval_check_rc" != "skipped" ] && [ "$eval_check_rc" -ne 0 ]; then exit "$eval_check_rc"; fi
-          if [ "$evalplus_rc" != "skipped" ] && [ "$evalplus_rc" -ne 0 ]; then exit "$evalplus_rc"; fi
-          if [ "$evalplus_check_rc" != "skipped" ] && [ "$evalplus_check_rc" -ne 0 ]; then exit "$evalplus_check_rc"; fi
-          exit 0
+              if [ -f "$eval_baseline" ]; then
+                echo "::group::Run eval: $cfg"
+                lm_eval \
+                  --model local-chat-completions \
+                  --model_args model="$MODEL",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=128 \
+                  --tasks mmlu_llama,mmlu_pro \
+                  --apply_chat_template \
+                  --fewshot_as_multiturn true \
+                  --seed "0,1234,None,1234" \
+                  --gen_kwargs continue_final_message=True add_generation_prompt=False 'chat_template_kwargs={"enable_thinking": False}' \
+                  --output_path "$results_dir" 2>&1 | tee "$results_dir/eval.log"
+                eval_rc=${PIPESTATUS[0]}
+                echo "::endgroup::"
+
+                echo "::group::Check eval regression: $cfg"
+                python3 scripts/vllm/benchmarking/check_regression.py \
+                  --mode eval \
+                  --results-dir "$results_dir" \
+                  --baseline "$eval_baseline" 2>&1 | tee "$eval_log"
+                eval_check_rc=${PIPESTATUS[0]}
+                echo "::endgroup::"
+                if [ "$eval_check_rc" -ne 0 ]; then fail=1; fi
+              fi
+
+              echo "::group::Run EvalPlus: $cfg"
+              run_evalplus "$MODEL" "$results_dir"
+              evalplus_rc=$?
+              echo "::endgroup::"
+
+              if [ -f "$evalplus_baseline" ]; then
+                echo "::group::Check EvalPlus regression: $cfg"
+                python3 scripts/vllm/benchmarking/check_regression.py \
+                  --mode evalplus \
+                  --results-dir "$results_dir" \
+                  --baseline "$evalplus_baseline" 2>&1 | tee "$evalplus_log"
+                evalplus_check_rc=${PIPESTATUS[0]}
+                echo "::endgroup::"
+                if [ "$evalplus_check_rc" -ne 0 ]; then fail=1; fi
+              fi
+            else
+              fail=1
+            fi
+
+            cleanup_server
+
+            echo "::group::Check perf regression: $cfg"
+            python3 scripts/vllm/benchmarking/check_regression.py \
+              --mode perf \
+              --results-dir "$results_dir" \
+              --baseline "$baseline" 2>&1 | tee "$check_log"
+            check_rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            if [ "$check_rc" -ne 0 ]; then fail=1; fi
+
+            append_summary "$run_rc" "$check_rc" "$eval_rc" "$eval_check_rc" "$evalplus_rc" "$evalplus_check_rc" "$cfg" "$results_dir" "$check_log" "$eval_log" "$evalplus_log"
+          done
+          exit "$fail"
 
       - name: Upload nightly JSON results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: perf-eval-nightly-results
-          path: /tmp/perf_eval_480b
+          path: /tmp/perf_eval_*
           retention-days: 30
           if-no-files-found: warn

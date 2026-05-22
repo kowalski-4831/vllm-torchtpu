@@ -35,6 +35,9 @@ ENV PYTHONPATH=""
 
 WORKDIR /root/tpu_inference
 
+# Mark mounted directory as safe for git
+RUN git config --global --add safe.directory /root/tpu_inference
+
 RUN pip install uv
 
 # Copy pyproject.toml to install dependencies

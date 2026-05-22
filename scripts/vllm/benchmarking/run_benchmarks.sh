@@ -139,7 +139,7 @@ start_vllm_server() {
     local max_model_len=$1
     local max_num_batched_tokens=$2
     local max_num_seqs=$3
-    local gpu_mem_util=0.95
+    local gpu_mem_util="${GPU_MEMORY_UTILIZATION:-0.95}"
 
     # Build extra args
     local extra_args=""
@@ -151,6 +151,9 @@ start_vllm_server() {
     fi
     if [ -n "${ATTENTION_BACKEND:-}" ]; then
         extra_args="$extra_args --attention-backend $ATTENTION_BACKEND"
+    fi
+    if [ -n "${EXTRA_SERVE_ARGS:-}" ]; then
+        extra_args="$extra_args $EXTRA_SERVE_ARGS"
     fi
 
     export PYTHONUNBUFFERED=1
