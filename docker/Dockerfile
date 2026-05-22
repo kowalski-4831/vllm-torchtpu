@@ -48,9 +48,15 @@ ARG VLLM_SOURCE
 COPY vllm /root/tpu_inference/vllm
 
 # Install vllm from source if requested
-RUN if [ -n "$VLLM_SOURCE" ]; then \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gcloud_token \
+    if [ -n "$VLLM_SOURCE" ]; then \
+      TOKEN=""; \
+      if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
       sed -i 's/vllm==[^"]*/vllm/' pyproject.toml && \
-      VLLM_TARGET_DEVICE="tpu" uv pip install --system -e /root/tpu_inference/vllm ; \
+      VLLM_TARGET_DEVICE="tpu" uv pip install --system \
+        --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
+        -e /root/tpu_inference/vllm ; \
     fi
 
 # Install dependencies directly from pyproject.toml
