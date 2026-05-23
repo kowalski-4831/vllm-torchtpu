@@ -117,10 +117,11 @@ class TestTPURunner:
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
             self.runner)
 
+    @patch('tpu_inference.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
     @patch(
         'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
-    @patch('tpu_inference.runner.tpu_runner.torch.accelerator.get_memory_info',
+    @patch('tpu_inference.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
     def test_update_mamba_page_size_padded(self, mock_mem_info,
                                            mock_get_page_size):
@@ -144,7 +145,8 @@ class TestTPURunner:
 
         # Check that num blocks override calculation was called
         mock_mem_info.assert_called_once()
-        # avail (10GB * 0.9 = 9,663,676,416) // 4096 * 4096 // 203776 = 47423
+        # Headroom pinned to 0, so avail is the full gpu_memory_utilization
+        # cap: (10GB * 0.9 = 9,663,676,416) // 4096 * 4096 // 203776 = 47423
         assert self.runner.cache_config.num_gpu_blocks_override == 47423
 
     @patch(
@@ -231,7 +233,7 @@ class TestTPURunner:
     @patch(
         'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
-    @patch('tpu_inference.runner.tpu_runner.torch.accelerator.get_memory_info',
+    @patch('tpu_inference.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
     def test_get_kv_cache_spec_hybrid_padded_size(self, mock_mem_info,
                                                   mock_get_page_size,

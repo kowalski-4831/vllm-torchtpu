@@ -187,29 +187,16 @@ class TPUWorker(WorkerBase):
 
     def determine_available_memory(self) -> int:
         # VLLM directive of the percentage of HBM memory the model executor can use
-        gpu_memory_utilization = self.cache_config.gpu_memory_utilization
-
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
-        total_hbm_limit = total_hbm_used = 0
-        for device in self.devices:
-            free_memory, limit_memory = torch.accelerator.get_memory_info(
-                device)
-            total_hbm_used += (limit_memory - free_memory)
-            total_hbm_limit += limit_memory
+        gpu_memory_utilization = self.cache_config.gpu_memory_utilization
+        budget = utils.compute_hbm_budget(self.devices, gpu_memory_utilization)
 
-        total_hbm_limit_cap = total_hbm_limit * gpu_memory_utilization
-        kv_cache_headroom_bytes = max(envs.TPU_KV_CACHE_HEADROOM_MIB,
-                                      0) * 1024 * 1024
-        total_hbm_avail = int(total_hbm_limit_cap - total_hbm_used -
-                              kv_cache_headroom_bytes)
-
-        total_hbm_limit_gb = round(total_hbm_limit / utils.GBYTES, 2)
-        total_hbm_limit_cap_gb = round(total_hbm_limit_cap / utils.GBYTES, 2)
-        total_hbm_used_gb = round(total_hbm_used / utils.GBYTES, 2)
-        kv_cache_headroom_gb = round(kv_cache_headroom_bytes / utils.GBYTES, 2)
-        total_hbm_avail_gb = round(total_hbm_avail / utils.GBYTES, 2)
-
+        total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
+        total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
+        total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
+        kv_cache_headroom_gb = round(budget.headroom / utils.GBYTES, 2)
+        total_hbm_avail_gb = round(budget.available / utils.GBYTES, 2)
         logger.info(f"Memory statistics | "
                     f"{total_hbm_limit_gb=}GiB | "
                     f"{total_hbm_limit_cap_gb=}GiB | "
@@ -217,7 +204,7 @@ class TPUWorker(WorkerBase):
                     f"{kv_cache_headroom_gb=}GiB | "
                     f"{total_hbm_avail_gb=}GiB")
 
-        if total_hbm_avail <= 0:
+        if budget.available <= 0:
             raise ValueError(f"{total_hbm_used_gb=}GiB exceeds "
                              f"{total_hbm_limit_cap_gb=}GiB by "
                              f"{-total_hbm_avail_gb}GiB. Please consider "
@@ -226,7 +213,7 @@ class TPUWorker(WorkerBase):
                              "or decreasing TPU_KV_CACHE_HEADROOM_MIB if "
                              "this run has a known smaller TPU runtime "
                              "headroom requirement.")
-        return total_hbm_avail
+        return budget.available
 
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)

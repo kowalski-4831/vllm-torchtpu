@@ -43,6 +43,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
 
+from tpu_inference import utils
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
@@ -737,14 +738,14 @@ class TPUModelRunner(GPUModelRunner):
         OOM. Pinning to `num_blocks_tpu` preserves the headroom the
         single-step formula silently removes.
 
-        No internal safety margin is applied — `gpu_memory_utilization` is
-        the knob users already have for reserving headroom. Adding a
-        silent reduction here would conflict with their explicit budget.
+        `avail` comes from `utils.compute_hbm_budget`, the same helper
+        `TPUWorker.determine_available_memory()` uses, so it reserves both the
+        `gpu_memory_utilization` cap and the `TPU_KV_CACHE_HEADROOM_MIB`
+        headroom, and the block count pinned here matches the KV-cache budget
+        the worker hands vLLM. No safety margin is applied beyond those two
+        knobs.
 
-        Skipped if the user has explicitly set `num_gpu_blocks_override` or
-        if HBM usage isn't readable (e.g. in tests without real devices).
-        Spec padding alone still fixes the OOB bug in that case; only the
-        ~1-block-per-tensor flooring-boundary precision is lost.
+        Skipped only if the user has explicitly set `num_gpu_blocks_override`.
 
         Args:
             attn_page_size_bytes: TPU-actual bytes per block for one
@@ -764,19 +765,11 @@ class TPUModelRunner(GPUModelRunner):
         if cache_config.num_gpu_blocks_override is not None:
             return
 
-        try:
-            free_memory, limit_memory = torch.accelerator.get_memory_info(
-                self.device)
-            total_used = limit_memory - free_memory
-            total_limit = limit_memory
-        except Exception as exc:
-            logger.debug(
-                "Skipping num_gpu_blocks_override: hbm_usage_bytes failed "
-                "(%s).", exc)
-            return
-
         gpu_mem_util = cache_config.gpu_memory_utilization
-        avail = int(total_limit * gpu_mem_util - total_used)
+        # Shares utils.compute_hbm_budget() with
+        # TPUWorker.determine_available_memory(), so the pinned block count
+        # matches the KV-cache budget vLLM is given.
+        avail = utils.compute_hbm_budget([self.device], gpu_mem_util).available
         if avail <= 0:
             return
 

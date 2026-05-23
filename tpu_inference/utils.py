@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
 from functools import wraps
-from typing import Any, Callable, List, Tuple, Union
+from typing import Any, Callable, List, NamedTuple, Tuple, Union
 
 import jax
+import torch
 from jax._src import dtypes
 from jax.sharding import Mesh
 from vllm import utils
@@ -128,6 +129,43 @@ def hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
     usage = [(round(used / GBYTES, 2), round(limit / GBYTES, 2))
              for used, limit in usage]
     return usage
+
+
+class HbmBudget(NamedTuple):
+    """HBM accounting for the KV-cache budget, summed across devices.
+
+    All fields are bytes:
+      total_limit: HBM the device(s) expose.
+      total_used:  HBM already resident (weights, compiled graphs, ...).
+      cap:         total_limit * gpu_memory_utilization.
+      headroom:    TPU_KV_CACHE_HEADROOM_MIB reserved for non-KV memory
+                   (activations, compilation scratch).
+      available:   cap - total_used - headroom; the budget for the KV cache.
+    """
+    total_limit: int
+    total_used: int
+    cap: int
+    headroom: int
+    available: int
+
+
+def compute_hbm_budget(devices: Any,
+                       gpu_memory_utilization: float) -> HbmBudget:
+    """Compute the HBM budget available for the KV cache."""
+    total_limit = total_used = 0
+    for device in devices:
+        free_memory, limit_memory = torch.accelerator.get_memory_info(device)
+        total_used += limit_memory - free_memory
+        total_limit += limit_memory
+    cap = int(total_limit * gpu_memory_utilization)
+    headroom = max(envs.TPU_KV_CACHE_HEADROOM_MIB, 0) * 1024 * 1024
+    available = cap - total_used - headroom
+
+    return HbmBudget(total_limit=total_limit,
+                     total_used=total_used,
+                     cap=cap,
+                     headroom=headroom,
+                     available=available)
 
 
 def get_padded_head_dim(head_dim: int) -> int:
