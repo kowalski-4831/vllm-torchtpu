@@ -69,6 +69,7 @@ class ExecuteModelState:
     num_reqs_list: list[int]
 
 
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
         input_ids: torch.Tensor, token_in_tpu_cur_input_indices: torch.Tensor,
         token_in_tpu_pre_next_tokens_indices: torch.Tensor,
@@ -879,7 +880,8 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
 
     def _update_placeholder(self, discard_sampled_tokens_req_indices,
-                            request_seq_lens):
+                            request_seq_lens, next_token_indices: dict[int,
+                                                                       int]):
         placeholder_req_id_to_index: dict[str, int] = {}
         discard_set = set(discard_sampled_tokens_req_indices)
         for req_idx, req_state, seq_len, req_id in request_seq_lens:
@@ -891,7 +893,8 @@ class TPUModelRunner(GPUModelRunner):
 
             req_state.output_token_ids.append(0)
 
-            placeholder_req_id_to_index[req_state.req_id] = req_idx
+            next_token_index = next_token_indices[req_idx]
+            placeholder_req_id_to_index[req_state.req_id] = next_token_index
 
         return placeholder_req_id_to_index
 
@@ -1260,6 +1263,9 @@ class TPUModelRunner(GPUModelRunner):
         needs_logprobs = max_num_logprobs is not None
 
         combined_selected_tokens: list[torch.Tensor] = []
+        next_tokens_tpu_chunks: list[torch.Tensor] = []
+        next_token_indices: dict[int, int] = {}
+        next_tokens_tpu_offset = 0
         combined_logprobs: list[Any] = []
 
         cur_start_idx = 0
@@ -1298,6 +1304,12 @@ class TPUModelRunner(GPUModelRunner):
                         if needs_logprobs else None)
 
             combined_selected_tokens.append(selected_token_ids[:num_reqs])
+            if self.scheduler_config.async_scheduling:
+                next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
+                for req_idx in range(cur_start_idx, cur_end_idx):
+                    next_token_indices[req_idx] = (next_tokens_tpu_offset +
+                                                   req_idx - cur_start_idx)
+                next_tokens_tpu_offset += selected_token_ids.shape[0]
             if needs_logprobs:
                 sliced_logprobs = LogprobsTensors(
                     logprobs.logprob_token_ids[:num_reqs],
@@ -1382,9 +1394,13 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
             req_id_to_index_copy = self._update_placeholder(
-                discard_sampled_tokens_req_indices, request_seq_lens)
+                discard_sampled_tokens_req_indices, request_seq_lens,
+                next_token_indices)
             if next_tokens is not None:
-                next_tokens_tpu = next_tokens.view(-1)
+                if len(next_tokens_tpu_chunks) == 1:
+                    next_tokens_tpu = next_tokens_tpu_chunks[0]
+                else:
+                    next_tokens_tpu = torch.cat(next_tokens_tpu_chunks, dim=0)
                 self._pre_async_results = AsyncPreResults(
                     req_ids=req_ids,
                     next_tokens_tpu=next_tokens_tpu,
