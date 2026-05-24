@@ -1665,6 +1665,34 @@ class TPUModelRunner(GPUModelRunner):
                 sync.synchronize(out.logprobs, wait=True)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
+    def _precompile_substitute_placeholder_token(self) -> None:
+        if not self.scheduler_config.async_scheduling:
+            return
+        with self._precompile_timed("substitute_placeholder_token"):
+            for num_tokens in self.num_tokens_paddings:
+                input_ids = torch.zeros(num_tokens,
+                                        dtype=torch.int32,
+                                        device=self.device)
+                cur_input_indices = torch.zeros(num_tokens,
+                                                dtype=torch.int32,
+                                                device=self.device)
+                # -1 sentinel marks every slot as padding so the precompiled
+                # program is byte-identical to the runtime JIT call.
+                pre_next_tokens_indices = torch.full((num_tokens, ),
+                                                     -1,
+                                                     dtype=torch.int32,
+                                                     device=self.device)
+                for num_reqs in self.num_reqs_paddings:
+                    next_tokens = torch.zeros(num_reqs,
+                                              dtype=torch.int64,
+                                              device=self.device)
+                    out = _substitute_placeholder_token(
+                        input_ids, cur_input_indices, pre_next_tokens_indices,
+                        next_tokens)
+                    sync.synchronize(out, wait=True)
+                    logger.info("  -- num_tokens: %d, num_seqs: %d",
+                                num_tokens, num_reqs)
+
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
         are visible to vLLM's available-memory probe in profile_run."""
@@ -1952,6 +1980,11 @@ class TPUModelRunner(GPUModelRunner):
                 kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self)
+
+        # Precompile after KV cache allocation so XLA's buffer assignment sees
+        # the same HBM pressure as runtime.
+        if not self.enforce_eager:
+            self._precompile_substitute_placeholder_token()
 
     def forward_model(self, input_ids, positions, inputs_embeds=None):
         # @support_torch_compile annotations will be put on the vLLM model if it
