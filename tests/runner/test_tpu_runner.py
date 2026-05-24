@@ -106,6 +106,7 @@ class TestTPURunner:
         self.runner.pin_memory = False
         self.runner.model_config = vllm_config.model_config
         self.runner.shared_kv_cache_layers = None
+        self.runner.enforce_eager = False
 
         # Bind the actual methods to our mock
         self.runner._update_mamba_page_size_padded = TPUModelRunner._update_mamba_page_size_padded.__get__(
