@@ -174,6 +174,11 @@ def fused_moe_func(
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
 
+    # Pin topk_weights to hidden_states.dtype so the EP mask, GMM
+    # reduce, and `where` propagate in BF16 — some custom_routing_fn
+    # callers return FP32 weights and would otherwise promote downstream.
+    topk_weights = topk_weights.astype(hidden_states.dtype)
+
     if experts_start is not None:
         local_ids = topk_ids - experts_start
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
