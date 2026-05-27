@@ -54,7 +54,7 @@ jobs:
       run:
         shell: bash
 
-    runs-on: linux-x86-n2-16
+    runs-on: linux-x86-n4-16
     container: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
     outputs:
       gcs_path: ${{ steps.upload-to-gcs.outputs.gcs_path }}
