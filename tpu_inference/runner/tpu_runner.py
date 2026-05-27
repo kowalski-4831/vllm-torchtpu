@@ -274,16 +274,12 @@ class TPUModelRunner(GPUModelRunner):
             self.mrope_positions = self._make_buffer(3,
                                                      self.max_num_tokens + 1,
                                                      dtype=torch.int32)
-        self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
-                                               dtype=torch.int32,
-                                               device="cpu",
-                                               pin_memory=self.pin_memory)
-        self.query_start_loc_np = self.query_start_loc_cpu.numpy()
-        self.seq_lens_cpu = torch.zeros(self.max_num_tokens,
-                                        dtype=torch.int32,
-                                        device="cpu",
-                                        pin_memory=self.pin_memory)
-        self.seq_lens_np = self.seq_lens_cpu.numpy()
+        # Reuse parent's CpuGpuBuffer (query_start_loc) and CPU staging tensor
+        # (optimistic_seq_lens_cpu) so cm.query_start_loc / cm.seq_lens are
+        # populated correctly when our builder runs. Keep numpy aliases for
+        # fast in-place arithmetic in _prepare_inputs.
+        self.query_start_loc_np = self.query_start_loc.np
+        self.seq_lens_np = self.optimistic_seq_lens_cpu.numpy()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(self.max_num_tokens,
                                                dtype=torch.bool,
@@ -1039,14 +1035,12 @@ class TPUModelRunner(GPUModelRunner):
                                                        self.device,
                                                        non_blocking=True)
         if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
-                self.device, non_blocking=True)
             target_num_reqs = self.num_reqs_max_model_len
         else:
             assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
-                self.device, non_blocking=True)
             target_num_reqs = self.num_reqs_most_model_len
+        self.seq_lens = self.optimistic_seq_lens_cpu[:target_num_reqs].to(
+            self.device, non_blocking=True)
 
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
@@ -1058,29 +1052,23 @@ class TPUModelRunner(GPUModelRunner):
 
         if is_decode_only and decode_cache_key == self._decode_device_cache_key:
             # Reuse cached device tensors — skip 3 H2D copies.
-            query_start_loc = self._cached_query_start_loc
+            self.query_start_loc.gpu = self._cached_query_start_loc
             logits_indices = self._cached_logits_indices
             request_distribution = self._cached_request_distribution
         else:
-            # Compute and copy to device (first call or shape changed).
-            if use_max_model_len:
-                query_start_loc = self.query_start_loc_cpu[:self.
-                                                           num_reqs_max_model_len
-                                                           + 1].to(
-                                                               self.device,
-                                                               non_blocking=True
-                                                           )
-            else:
-                query_start_loc = self.query_start_loc_cpu[:self.
-                                                           num_reqs_most_model_len
-                                                           + 1].to(
-                                                               self.device,
-                                                               non_blocking=True
-                                                           )
+            # Re-assign self.query_start_loc.gpu to a new device tensor to avoid
+            # in-place modification of pending XLA graphs.
+            self.query_start_loc.gpu = self.query_start_loc.cpu[:
+                                                                target_num_reqs
+                                                                + 1].to(
+                                                                    self.
+                                                                    device,
+                                                                    non_blocking
+                                                                    =True)
 
             # Indices at which we sample (positions of last token in the
             # sequence). Padded to avoid recompiling when `num_reqs` varies.
-            logits_indices = (self.query_start_loc_cpu[1:padded_num_reqs + 1] -
+            logits_indices = (self.query_start_loc.cpu[1:padded_num_reqs + 1] -
                               1).to(self.device, non_blocking=True)
 
             # For the V3 kernel, request_distribution is
@@ -1097,7 +1085,7 @@ class TPUModelRunner(GPUModelRunner):
             if is_decode_only:
                 # Cache for future decode steps.
                 self._decode_device_cache_key = decode_cache_key
-                self._cached_query_start_loc = query_start_loc
+                self._cached_query_start_loc = self.query_start_loc.gpu
                 self._cached_logits_indices = logits_indices
                 self._cached_request_distribution = request_distribution
 
@@ -1105,8 +1093,6 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             start_index=start_index,
             use_max_model_len=use_max_model_len,
-            seq_lens=seq_lens,
-            query_start_loc=query_start_loc,
             request_distribution=request_distribution,
         )
         slot_mappings = self.empty_slot_mappings
@@ -1526,12 +1512,6 @@ class TPUModelRunner(GPUModelRunner):
         else:
             position_ids = torch.zeros(num_tokens,
                                        dtype=torch.int32).to(self.device)
-        query_lens = [1] * num_reqs
-        query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
-                                                    dtype=torch.int32),
-                                       dim=0,
-                                       dtype=torch.int32).to(self.device)
-        seq_lens = torch.ones((num_reqs, ), dtype=torch.int32).to(self.device)
         # V3: request_distribution = [decode_end, prefill_end, mixed_end].
         # Dummy runs use one scheduled token per active request, so model
         # them as pure decode to match the real single-chip path.
@@ -1540,12 +1520,16 @@ class TPUModelRunner(GPUModelRunner):
             dtype=torch.int32).to(self.device)
 
         if getattr(self, "kv_cache_config", None) is not None:
+            self.query_start_loc.gpu = torch.arange(num_reqs + 1,
+                                                    device=self.device,
+                                                    dtype=torch.int32)
+            self.seq_lens = torch.ones(num_reqs,
+                                       device=self.device,
+                                       dtype=torch.int32)
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
                 use_max_model_len=use_max_model_len,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
             )
@@ -1565,6 +1549,13 @@ class TPUModelRunner(GPUModelRunner):
                 self._attn_layer_names = list(
                     get_layers_from_vllm_config(self.vllm_config,
                                                 (Attention, MambaBase)).keys())
+            query_lens = [1] * num_reqs
+            query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
+                                                        dtype=torch.int32),
+                                           dim=0,
+                                           dtype=torch.int32).to(self.device)
+            seq_lens = torch.ones((num_reqs, ),
+                                  dtype=torch.int32).to(self.device)
             block_tables = torch.zeros((num_reqs * num_blocks, ),
                                        dtype=torch.int32).to(self.device)
             attn_metadata = AttentionMetadata(
