@@ -39,7 +39,7 @@ EXPERIMENTS=(
     # Matching fbcode benchmark_configs.json settings as closely as possible.
     # Benchmark defaults: prefill input_lens=1024,8192 batch_sizes=1,2,4,8
     #                     decode context_lens=1024,8192 batch_sizes=1,8,16,32,64,128,256
-    #                     max_model_len=ceil(1.25*8192)=10240
+    #                     max_model_len=16384 (covers 8192*1.8 + 1024*1.8 = 16590 worst case)
     #
     # Constraint: --max-num-batched-tokens 1024 required to limit compile buckets to [16..1024].
     # Without this, XLA compilation of 8 workers in parallel OOMs the 944GB host RAM container.
@@ -47,24 +47,24 @@ EXPERIMENTS=(
     # Compile cache (symlinked to /mnt/hyperdisk/_cache_vllm) must be warm for cold-start to survive.
 
     # Prefill profiles — full benchmark matrix: input_lens={1024,8192} x batch_sizes={1,2,4,8}
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 1 1024 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 2 1024 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 4 1024 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 1024 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 1 8192 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 2 8192 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 4 8192 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 8192 1 10240 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 1 1024 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 2 1024 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 4 1024 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 1024 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 1 8192 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 2 8192 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 4 8192 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 8192 1 16384 1024"
 
     # Decode profiles — full benchmark matrix: context_lens={1024,8192} x batch_sizes={1,8,16,32,64,128,256}
     # context_len is simulated by input_len (prefills that many tokens, then decodes 1)
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 1 1 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 1 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 16 1 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 32 1 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 64 1 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 128 1 1 10240 1024"
-    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 256 1 1 10240 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 1 1 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 8 1 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 16 1 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 32 1 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 64 1 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 128 1 1 16384 1024"
+    # "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 8 --enable-expert-parallel -- 256 1 1 16384 1024"
 )
 
 # 2. Execution Loop

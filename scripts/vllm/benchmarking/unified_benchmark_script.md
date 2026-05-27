@@ -11,7 +11,7 @@ export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
 
 vllm serve --model=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
   --tensor-parallel-size=8 --data-parallel-size=1 \
-  --max-model-len=10240 --max-num-batched-tokens=8192 --max-num-seqs=512 \
+  --max-model-len=16384 --max-num-batched-tokens=8192 --max-num-seqs=512 \
   --port 8000 --async-scheduling --no-enable-prefix-caching \
   --gpu-memory-utilization=0.95 --kv-cache-dtype=fp8 \
   --enable-expert-parallel --quantization fp8

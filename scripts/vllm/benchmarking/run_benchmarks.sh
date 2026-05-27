@@ -280,7 +280,9 @@ run_benchmark_once() {
 # =============================================================================
 # Compute server parameters from config
 # =============================================================================
-max_model_len=10240
+# Covers the worst-case sampled length for ISL/OSL=8192 with --random-range-ratio=0.8
+# (max ≈ 1.8*8192 + 1.8*1024 = 16590); pre-16384 runs silently dropped ~40% of these.
+max_model_len=16384
 max_batched_tokens=8192
 max_num_seqs=512
 
