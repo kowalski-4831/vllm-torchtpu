@@ -900,20 +900,13 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
     tile_m = min(tile_m, dims.size_m)
 
-    # Subtract non-rhs VMEM overhead (LHS tiles, acc buffers, spill headroom)
-    # before computing per-buffer budget. Matches msl-tpu-kernel's approach.
+    # Per-buffer VMEM target for triple-buffered RHS. Matches ullm reference;
+    # the pre-#157 overhead subtraction + 5MiB spill + scale-bytes inflation
+    # shrank rhs_vmem_target unnecessarily.
     num_rhs_buffers = 3
-    lhs_bits_item = jax.dtypes.itemsize_bits(lhs_cfgs.dtype)
-    _overhead = (2 * tile_m * dims.size_k * lhs_bits_item // 8 +
-                 5 * 1024 * 1024)
-    rhs_vmem_budget = max(vmem_limit_bytes - _overhead, vmem_limit_bytes // 2)
-    rhs_vmem_target = rhs_vmem_budget // num_rhs_buffers
+    rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
     base_rhs_size_bytes = (dims.size_k * dims.size_n * rhs_bits // 8 *
                            base_rhs_bytes_multiplier)
-    if rhs_cfgs.has_scale:
-        num_quant_blocks = pl.cdiv(dims.size_k, rhs_cfgs.quant_block_size)
-        base_rhs_size_bytes += (num_quant_blocks * dims.size_n * 4 *
-                                base_rhs_bytes_multiplier)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
