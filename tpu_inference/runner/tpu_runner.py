@@ -1262,7 +1262,11 @@ class TPUModelRunner(GPUModelRunner):
                 "with the merged vLLM v1 sampler path yet.")
         needs_logprobs = max_num_logprobs is not None
 
+        # Per-chunk bucketed (padded) tensors plus their real (unpadded)
+        # request counts; kept at bucketed shapes so the async D2H copy hits
+        # a precompiled program. Host-side trim happens in AsyncTPUCopyState.
         combined_selected_tokens: list[torch.Tensor] = []
+        combined_selected_tokens_real_lens: list[int] = []
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
@@ -1303,7 +1307,10 @@ class TPUModelRunner(GPUModelRunner):
             logprobs = (self.gather_logprobs(logits, selected_token_ids)
                         if needs_logprobs else None)
 
-            combined_selected_tokens.append(selected_token_ids[:num_reqs])
+            # Keep the bucketed (padded) tensor; trim happens on the host
+            # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
+            combined_selected_tokens.append(selected_token_ids)
+            combined_selected_tokens_real_lens.append(num_reqs)
             if self.scheduler_config.async_scheduling:
                 next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
                 for req_idx in range(cur_start_idx, cur_end_idx):
@@ -1380,23 +1387,18 @@ class TPUModelRunner(GPUModelRunner):
                                    finished_recving=finished_recving,
                                ))
 
-        next_tokens = None
-        if len(combined_selected_tokens) > 1:
-            next_tokens = torch.cat(combined_selected_tokens, dim=0)
-        elif len(combined_selected_tokens) == 1:
-            next_tokens = combined_selected_tokens[0]
-
         next_tokens_tpu = None
         copy_state = None
-        if next_tokens is not None:
-            copy_state = AsyncTPUCopyState.from_device(next_tokens)
+        if combined_selected_tokens:
+            copy_state = AsyncTPUCopyState.from_device_chunks(
+                combined_selected_tokens, combined_selected_tokens_real_lens)
 
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
             req_id_to_index_copy = self._update_placeholder(
                 discard_sampled_tokens_req_indices, request_seq_lens,
                 next_token_indices)
-            if next_tokens is not None:
+            if next_tokens_tpu_chunks:
                 if len(next_tokens_tpu_chunks) == 1:
                     next_tokens_tpu = next_tokens_tpu_chunks[0]
                 else:

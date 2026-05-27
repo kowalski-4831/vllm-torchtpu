@@ -10,29 +10,57 @@ INVALID_TOKEN_ID = -1
 
 @dataclass
 class AsyncTPUCopyState:
-    sampled_token_ids_cpu: torch.Tensor
+    """Async D2H copy state for sampled tokens.
+
+    Per-chunk device tensors are kept at their bucketed (padded) shapes so
+    each D2H copy hits a precompiled program. Host-side trim and concat
+    happen lazily on `wait()` and produce a single contiguous CPU tensor
+    matching the real (unpadded) request count.
+    """
+    chunks_cpu: list[torch.Tensor]
+    chunk_real_lens: list[int]
     copy_ready_event: Any
-    sampled_token_ids_tpu: torch.Tensor | None = None
+    chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
+    _sampled_token_ids_cpu: torch.Tensor | None = None
 
     @classmethod
-    def from_device(cls,
-                    sampled_token_ids: torch.Tensor) -> "AsyncTPUCopyState":
-        sampled_token_ids_cpu = sampled_token_ids.to("cpu", non_blocking=True)
+    def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
+                           chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
+        assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
+        chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
         return cls(
-            sampled_token_ids_cpu=sampled_token_ids_cpu,
+            chunks_cpu=chunks_cpu,
+            chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
-            sampled_token_ids_tpu=sampled_token_ids,
+            chunks_tpu=chunks_tpu,
         )
 
     def wait(self) -> None:
         if self.completed:
             return
         self.copy_ready_event.synchronize()
-        self.sampled_token_ids_tpu = None
+        self.chunks_tpu = None
         self.completed = True
+
+    @property
+    def sampled_token_ids_cpu(self) -> torch.Tensor:
+        """Return the unpadded concatenated CPU tensor.
+
+        Performed lazily after `wait()`; trims each bucketed chunk to its real
+        length on the host (no device recompile).
+        """
+        if self._sampled_token_ids_cpu is None:
+            trimmed = [
+                t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
+            ]
+            if len(trimmed) == 1:
+                self._sampled_token_ids_cpu = trimmed[0]
+            else:
+                self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
+        return self._sampled_token_ids_cpu
 
 
 @dataclass
