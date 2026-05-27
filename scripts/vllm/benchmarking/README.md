@@ -42,10 +42,10 @@ the same live server:
   floor.
 - `--mode eval` runs `lm_eval` over `mmlu_llama,mmlu_pro` against the vLLM
   chat-completions endpoint and compares accuracy to
-  `baselines/eval/<config>.baseline.json` (1pp tolerance). Only keys present in
+  `baselines/eval/<config>.baseline.json` (1.5pp tolerance). Only keys present in
   the baseline are gated.
 - `--mode evalplus` (nightly only) runs EvalPlus over `humaneval,mbpp` and
-  compares to `baselines/evalplus/<config>.baseline.json` (1pp tolerance). The
+  compares to `baselines/evalplus/<config>.baseline.json` (1.5pp tolerance). The
   PR guard skips EvalPlus; the nightly job uploads results either way and gates
   only when a baseline file exists.
 

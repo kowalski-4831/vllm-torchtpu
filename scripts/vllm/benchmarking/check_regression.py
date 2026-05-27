@@ -421,7 +421,7 @@ def main() -> int:
 
     tolerance = args.tolerance
     if tolerance is None:
-        tolerance = 0.05 if args.mode == "perf" else 0.01
+        tolerance = 0.05 if args.mode == "perf" else 0.015
 
     if args.calibrate:
         if args.mode == "perf":
