@@ -47,6 +47,8 @@ import tpu_inference.distributed.utils as dist_utils
 from tpu_inference import envs
 from tpu_inference.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
                                                                PoolSpec)
+from tpu_inference.distributed.kv_transfer.tpu_connector_stats import \
+    TpuKVConnectorStats
 from tpu_inference.logger import init_logger
 
 ReqId = str
@@ -262,6 +264,7 @@ class ZmqShmKvConnectorBase:
             who=f"TPUConnectorWorker node={self.node_id} rank{self.tp_rank}",
             log_interval_s=dist_utils.get_kv_latency_log_interval())
 
+        self.transfer_stats = TpuKVConnectorStats()
         self._init_coord_state()
 
         logger.info(
@@ -1048,6 +1051,7 @@ class ZmqShmKvConnectorBase:
             mbps = mb / max(1e-3, total_ms / 1000.0)
             self._lat.record(_LAT_D2H, total_ms)
             self._lat.record(_LAT_STAGE, total_ms)
+            self.transfer_stats.record_d2h_transfer(total_ms)
             logger.info(
                 "TPUConnectorWorker %s rank%d --> stage_done "
                 "uuid=%s slot=%d issue=%.2fms wait=%.2fms total=%.2fms "
@@ -1372,6 +1376,7 @@ class ZmqShmKvConnectorBase:
             max_unpack = max(u for _c, _w, u, _r, _h in results)
             self._lat.record(_LAT_WIRE, max_wire)
             self._lat.record(_LAT_UNPACK, max_unpack)
+            self.transfer_stats.record_kv_pull(total_ms)
             per_ch_ms = ",".join(f"{w + u:.1f}"
                                  for _c, w, u, _r, _h in results)
             logger.info(
@@ -1385,6 +1390,7 @@ class ZmqShmKvConnectorBase:
                 "TPUConnectorWorker rank0 --> PULL req_id=%s failed: %s",
                 entry.req_id, e)
             entry.pull_ok = False
+            self.transfer_stats.record_failed_transfer()
         finally:
             # Tell workers the slot is ready (or drop it on failure).
             if entry.pull_ok:
@@ -1542,6 +1548,7 @@ class ZmqShmKvConnectorBase:
         self._lat.record(_LAT_H2D, h2d_ms_total)
         self._lat.record(_LAT_INSERT, insert_ms_total)
         self._lat.record(_LAT_SCATTER, h2d_ms_total + insert_ms_total)
+        self.transfer_stats.record_h2d_transfer(h2d_ms_total)
         h2d_mb = h2d_total_bytes / (1024 * 1024)
         h2d_mbps = h2d_mb / max(1e-3, h2d_ms_total / 1000.0)
         logger.info(
@@ -2031,6 +2038,7 @@ class ZmqShmKvConnectorBase:
                 entry.slot_idx, r, entry.num_blocks)
             frames.extend(layer_views)
             total_bytes += sum(len(v) for v in layer_views)
+        self.transfer_stats.record_mb_transferred(total_bytes / (1024 * 1024))
         logger.info(
             "TPUConnectorWorker rank0 --> serving PULL ch=%d uuid=%s "
             "ranks=%s size=%.2fMB", channel_idx, uuid, ranks_on_channel,

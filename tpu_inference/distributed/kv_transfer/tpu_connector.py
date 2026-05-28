@@ -24,6 +24,8 @@ from torch_tpu._internal.batch_transfer import (batch_transfer_d2h,
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorRole)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics, KVConnectorStats, PromMetric, PromMetricT)
 from vllm.utils.math_utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
@@ -34,6 +36,8 @@ if TYPE_CHECKING:
 
 import tpu_inference.distributed.utils as dist_utils
 from tpu_inference.distributed.kv_transfer import kv_scatter
+from tpu_inference.distributed.kv_transfer.tpu_connector_stats import (
+    TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 from tpu_inference.distributed.kv_transfer.zmq_shm_base import (
     LoadMeta, ReqId, SendMeta, TPUConnectorMetadata, ZmqShmKvConnectorBase,
     _CoordRecvEntry, _CoordSendEntry)
@@ -100,6 +104,32 @@ class TPUConnector(KVConnectorBase_V1):
     def get_finished_count(self) -> int:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_finished_count()
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        """
+        Get the KV transfer stats for the connector.
+        """
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.get_kv_connector_stats()
+
+    @classmethod
+    def build_kv_connector_stats(
+            cls,
+            data: dict[str, Any] | None = None) -> KVConnectorStats | None:
+        return (TpuKVConnectorStats(
+            data=data) if data is not None else TpuKVConnectorStats())
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return TpuKVConnectorPromMetrics(vllm_config, metric_types, labelnames,
+                                         per_engine_labelvalues)
 
     # ---- Worker-side methods --------------------------------------------
     def register_kv_caches(self, kv_caches: list[torch.Tensor]):
@@ -283,6 +313,15 @@ class TPUConnectorScheduler:
 class TPUConnectorWorker(ZmqShmKvConnectorBase):
     """TPU-specific transport hooks for the generic ZmqShmKvConnectorBase.
     """
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        """
+        Get the KV transfer stats for the worker.
+        """
+        # Clear stats for next iteration
+        if not self.transfer_stats.is_empty():
+            return self.transfer_stats.clone_and_reset()
+        return None
 
     def _build_d2h_views(self, slot_idx: int, num_blocks: int,
                          block_ids: list[int]) -> tuple[list, list, int]:
