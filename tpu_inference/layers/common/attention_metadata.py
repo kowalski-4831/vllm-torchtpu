@@ -43,15 +43,17 @@ class AttentionMetadataBuilderContext:
     """Per-call inputs the TPU metadata builder reads from the runner.
 
     Stashed on TPUModelRunner before invoking _build_attention_metadata so
-    builder.build() can pick them up. Fields already on CommonAttentionMetadata
-    are read off `cm` directly (num_reqs / seq_lens / query_start_loc); only
-    TPU-specific control state (start_index, use_max_model_len) and fields
-    with no cm equivalent (request_distribution, position_ids_override) live
-    here.
+    builder.build() can pick them up. Only fields TPU populates differently from
+    the parent runner (seq_lens / query_start_loc) live in TPU's own _cpu
+    staging tensors, not parent's CpuGpuBuffers) or that have no
+    `CommonAttentionMetadata` equivalent (num_reqs, use_max_model_len,
+    start_index, request_distribution, position_ids_override) live here.
     """
     num_reqs: int
     start_index: int
     use_max_model_len: bool
+    seq_lens: torch.Tensor
+    query_start_loc: torch.Tensor
     request_distribution: torch.Tensor
     position_ids_override: torch.Tensor | None = None
 
@@ -113,7 +115,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
-            seq_lens=common_attn_metadata.seq_lens,
-            query_start_loc=common_attn_metadata.query_start_loc,
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
             request_distribution=ctx.request_distribution,
         )

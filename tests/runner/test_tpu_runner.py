@@ -307,10 +307,6 @@ class TestTPURunner:
         self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
         self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(
             self.runner)
-        # Parent normally allocates these in its __init__; stub them so the
-        # numpy-view aliases in TPU __init__ succeed.
-        self.runner.query_start_loc = MagicMock()
-        self.runner.optimistic_seq_lens_cpu = MagicMock()
 
         with patch.object(GPUModelRunner, '__init__', return_value=None), \
              patch('tpu_inference.runner.tpu_runner._torch_tpu_wrapper',
@@ -445,51 +441,44 @@ class TestAttentionMetadataBuilder:
             kv_cache_group_id=kv_cache_group_id,
         )
 
-    def _make_cm(self, num_reqs, seq_lens=None, query_start_loc=None):
-        """Minimal CommonAttentionMetadata stand-in — build() reads num_reqs,
-        seq_lens, and query_start_loc off it (parent's
-        _build_attention_metadata constructs these from parent's CpuGpuBuffer
-        + device tensor, both of which TPU now populates via the same
-        buffers)."""
+    def _make_cm(self, num_reqs):
+        """Minimal CommonAttentionMetadata stand-in — build() only reads
+        num_reqs off it (everything else still comes from ctx because TPU
+        bypasses parent's CpuGpuBuffers)."""
         cm = MagicMock()
         cm.num_reqs = num_reqs
-        cm.seq_lens = seq_lens if seq_lens is not None else torch.ones(
-            (num_reqs, ), dtype=torch.int32)
-        cm.query_start_loc = (query_start_loc if query_start_loc is not None
-                              else torch.arange(num_reqs + 1,
-                                                dtype=torch.int32))
         return cm
 
     def test_build_runner_state_path(self):
         """Normal _prepare_inputs path: copy from the right per-group block
         table at the right start_index, pad remaining rows, and reuse
-        runner.position_ids. seq_lens / query_start_loc / num_reqs are
-        sourced from cm; only TPU-specific bits live on ctx."""
+        runner.position_ids. target_num_reqs is sourced from cm.num_reqs
+        (the only field we currently read from common_attn_metadata)."""
         runner = self._make_runner_mock(num_groups=2)
         # Build for group 1 to cover the per-group block_table lookup too.
         builder = self._make_builder(runner, kv_cache_group_id=1)
 
         target_num_reqs, num_reqs, start_index = 4, 2, 1
+        seq_lens = torch.tensor([10, 12, 0, 0], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32)
         request_distribution = torch.tensor([2, 2, 2], dtype=torch.int32)
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
             use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
             request_distribution=request_distribution,
         )
 
-        cm_seq_lens = torch.tensor([10, 12, 0, 0], dtype=torch.int32)
-        cm_query_start_loc = torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32)
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(
-                                 target_num_reqs,
-                                 seq_lens=cm_seq_lens,
-                                 query_start_loc=cm_query_start_loc))
+        meta = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=self._make_cm(target_num_reqs))
 
         assert isinstance(meta, AttentionMetadata)
         assert meta.input_positions is runner.position_ids
-        assert meta.seq_lens is cm_seq_lens
-        assert meta.query_start_loc is cm_query_start_loc
+        assert meta.seq_lens is seq_lens
+        assert meta.query_start_loc is query_start_loc
         assert meta.request_distribution is request_distribution
 
         # Group 1 (not 0) should have been read; group 0 untouched.
@@ -521,6 +510,8 @@ class TestAttentionMetadataBuilder:
             num_reqs=4,
             start_index=0,
             use_max_model_len=True,
+            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
             request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
             position_ids_override=override,
         )
@@ -545,6 +536,8 @@ class TestAttentionMetadataBuilder:
             num_reqs=2,
             start_index=0,
             use_max_model_len=False,
+            seq_lens=torch.tensor([8, 16, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
             request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
         )
 
