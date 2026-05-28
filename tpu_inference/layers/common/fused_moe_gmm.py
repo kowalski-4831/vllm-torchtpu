@@ -119,14 +119,13 @@ def moe_gmm(
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-
     gmm2_res = gmm_wrapper(gmm1_res,
                            w2,
                            w2_scale,
                            w2_bias,
                            group_sizes,
                            group_offset,
-                           zero_initialize=True,
+                           zero_initialize=False,
                            preferred_element_type=x.dtype)
 
     token_hidden = gmm2_res[argsort_revert_indices]
