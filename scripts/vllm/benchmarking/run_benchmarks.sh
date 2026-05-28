@@ -149,9 +149,11 @@ start_vllm_server() {
     if [ -n "$QUANTIZATION" ]; then
         extra_args="$extra_args --quantization $QUANTIZATION"
     fi
-    if [ -n "${ATTENTION_BACKEND:-}" ]; then
-        extra_args="$extra_args --attention-backend $ATTENTION_BACKEND"
-    fi
+    # Default to the batched-RPA Pallas kernel (PallasBatchedRPAAttentionBackend).
+    # Without --attention-backend CUSTOM, vLLM falls back to FLASH_ATTN with
+    # block_size=16 and benchmarks regress ~12% (see PR #191 / 9467829).
+    local attn_backend="${ATTENTION_BACKEND:-CUSTOM}"
+    extra_args="$extra_args --attention-backend $attn_backend"
     if [ -n "${EXTRA_SERVE_ARGS:-}" ]; then
         extra_args="$extra_args $EXTRA_SERVE_ARGS"
     fi

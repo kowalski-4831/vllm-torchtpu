@@ -112,7 +112,8 @@ Start the server with the following command:
 vllm serve "Qwen/Qwen3-Coder-30B-A3B-Instruct" \
   --tensor_parallel_size=1 \
   --max-model-len=256 \
-  --max-num-batched-tokens=256
+  --max-num-batched-tokens=256 \
+  --attention-backend CUSTOM
 ```
 
 > [!TIP]

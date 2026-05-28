@@ -14,7 +14,8 @@ vllm serve --model=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
   --max-model-len=16384 --max-num-batched-tokens=8192 --max-num-seqs=512 \
   --port 8000 --async-scheduling --no-enable-prefix-caching \
   --gpu-memory-utilization=0.95 --kv-cache-dtype=fp8 \
-  --enable-expert-parallel --quantization fp8
+  --enable-expert-parallel --quantization fp8 \
+  --attention-backend CUSTOM
 ```
 
 ## Client
