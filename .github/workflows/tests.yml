@@ -38,13 +38,19 @@ jobs:
         job_info: [
           {
             runner: "linux-x86-tpu7x-224-4tpu",
-            container: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest",
+            container: "us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest",
           }
         ]
         python-version: [3.12]
     runs-on: ${{ matrix.job_info.runner }}
     container:
       image: ${{ matrix.job_info.container }}
+      # TODO investigate making a GH Action to make all this preamble reusable.
+      options: --privileged --net=host --shm-size=16g --device /dev/fuse
+      env:
+        HF_HOME: /local_hf_cache
+        SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
 
     env:
       FORCE_COLOR: "1"
@@ -73,23 +79,19 @@ jobs:
           echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
-          # Bootstrap keyring auth for private registry
+      - name: Setup Keyring for Auth
+        run: |
           uv pip install --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
-
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
 
-      - name: Install torchtpu-vllm from source
-        if: ${{ inputs.wheel-gcs-path == '' }}
-        run: uv sync --extra test --prerelease allow --no-install-package vllm
+      - name: Install test dependencies
+        run: uv pip install ".[test]"
 
       # In nightly workflow, we test the torchtpu-vllm package by installing the
       # prebuilt wheel instead of building from source.
       - name: Install torchtpu-vllm using prebuilt wheel
         if: ${{ inputs.wheel-gcs-path != '' }}
         run: |
-          # Install Dependencies
-          uv sync --no-install-project --extra test --prerelease allow --no-install-package vllm
-
           # Download the torchtpu-vllm wheel from GCS
           mkdir -p dist
           gcloud storage cp "${{ inputs.wheel-gcs-path }}/*.whl" dist/
@@ -97,40 +99,18 @@ jobs:
           WHEEL_FILE=$(ls dist/*.whl)
           uv pip install "${WHEEL_FILE}"
 
-      - name: Install vLLM from source (TPU)
-        run: |
-          git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git /tmp/vllm
-          cd /tmp/vllm
-          sed -i '/tpu-inference/d' requirements/tpu.txt
-          uv pip install -r requirements/tpu.txt
-          # --no-build-isolation avoids creating a temp venv with duplicate build deps (~GBs)
-          SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
-          rm -rf /tmp/vllm
-          rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
-          echo "Disk usage after vLLM install:" && df -h .
-
-      - name: Pre-download test models
-        run: |
-          huggingface-cli download Qwen/Qwen3-0.6B
-          huggingface-cli download Qwen/Qwen3-Coder-30B-A3B-Instruct
-
       - name: Wait For Connection
         uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
 
-      - name: Run tests
+      - name: Install crc32c for gsutil
+        run: uv pip install crc32c
+
+      - name: Copy model to local cache
         run: |
-          echo "Installed packages:"
-          uv pip freeze
+          mkdir -p /local_hf_cache/hub
+          gsutil -m cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-0.6B/ /local_hf_cache/hub/
 
-          export MODEL_IMPL_TYPE="vllm"
-
-          # Run tests from a temp dir to force Python to test the installed package, not local source files.
-          TEST_DIR="$PWD/tests"
-          cd "$(mktemp -d)"
-          if [ "${{ inputs.nightly }}" = "yes" ]; then
-            pytest "$TEST_DIR" -sv --timeout=300
-          else
-            pytest "$TEST_DIR" -sv --timeout=300 -m "not nightly"
-          fi
+      - name: Run tests
+        run: bash ./scripts/vllm/benchmarking/run_unit_test.sh ${{ inputs.nightly }}

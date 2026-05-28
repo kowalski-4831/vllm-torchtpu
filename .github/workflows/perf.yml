@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: CI - Perf and Eval Regression on TPU
+# isolation (each `vllm serve` gets a clean TPU device + container)
+# without duplicating YAML across 4 separate workflow files.
+#
+# Do NOT collapse the matrix back into a bash `for cfg in ...` loop in
+# a single job: running multiple vllm serve invocations sequentially in
+# one container has historically caused the 2nd config's server to
+# never reach ready (suspected libtpu / device-handle state leak across
+# pkill -9 cleanup).
+
+name: CI - Perf and Eval on TPU
 
 on:
   workflow_dispatch:
@@ -36,14 +45,12 @@ permissions:
   issues: read
 
 # Cancel old PR runs when superseded by new commits, but not on main.
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # PR-time guard: runs two configs in series on every PR. Each config
-  # serves vllm + runs vllm bench serve + compares output JSON to a frozen
-  # baseline. Then it runs lm_eval against the live server.
   check_changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -68,239 +75,24 @@ jobs:
               - '!DCO'
               - '!MANIFEST.in'
 
-  perf-eval-guard:
-    name: "Perf and Eval Guard (PR)"
+  # Combined Perf and Eval job using matrix and run_on filtering.
+  perf-eval:
+    name: "Perf and Eval (${{ matrix.config.name }})"
     needs: check_changes
     if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && needs.check_changes.outputs.should_run == 'true')
+      always() && (
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'schedule' ||
+        (github.event_name == 'pull_request' && needs.check_changes.outputs.should_run == 'true')
+      )
     runs-on: linux-x86-tpu7x-224-4tpu
     container:
-      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
-    timeout-minutes: 180
-
-    env:
-      FORCE_COLOR: "1"
-      UV_NO_CACHE: "1"
-      TQDM_MININTERVAL: "30"
-
-    steps:
-      - name: Redirect torch_tpu cache off /dev/shm
-        run: |
-          # /dev/shm is too small on K8s runners; symlink to disk so the
-          # tier-2 compilation cache still works without filling tmpfs.
-          mkdir -p /tmp/torch_tpu_cache
-          ln -sfn /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
-
-      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
-
-      - name: Mark git directory as safe
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Setup Virtual Environment
-        run: |
-          uv venv
-          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-          # Bootstrap keyring auth for private registry
-          uv pip install --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
-          echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
-
-      - name: Install torchtpu-vllm from source
-        run: uv sync --extra test --extra benchmarking --prerelease allow --no-install-package vllm
-
-      - name: Install vLLM from source (TPU)
-        run: |
-          git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git /tmp/vllm
-          cd /tmp/vllm
-          sed -i '/tpu-inference/d' requirements/tpu.txt
-          uv pip install -r requirements/tpu.txt
-          SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
-          rm -rf /tmp/vllm
-          rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
-
-      - name: Save installed packages list
-        run: uv pip list > /tmp/perf_eval_pip_list.txt
-
-      - name: Wait For Connection
-        uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
-        with:
-          halt-dispatch-input: ${{ inputs.halt-for-connection }}
-
-      - name: Run perf and eval guard configs
-        shell: bash
-        env:
-          MODEL_IMPL_TYPE: vllm
-          BENCHMARK_WARMUP_RUNS: "1"
-        run: |
-          set +e
-          fail=0
-
-          cleanup_server() {
-            echo ""
-            echo "Cleaning up vLLM server..."
-            pkill -TERM -f "vllm serve" 2>/dev/null || true
-            sleep 5
-            pkill -9 -f "vllm serve" 2>/dev/null || true
-            pkill -9 -f "VLLM::" 2>/dev/null || true
-            pkill -9 -f "vllm\\.entrypoints" 2>/dev/null || true
-            sleep 2
-            rm -f /tmp/libtpu_lockfile*
-            echo "vLLM server cleanup complete."
-          }
-
-          read_model_from_config() {
-            python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$1"
-          }
-
-          append_summary() {
-            local cfg="$1"
-            local results_dir="$2"
-            local baseline="$3"
-            local check_log="$4"
-            local run_rc="$5"
-            local check_rc="$6"
-            local eval_rc="$7"
-            local eval_check_rc="$8"
-            local eval_log="$9"
-
-            if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
-              return 0
-            fi
-
-            {
-              echo "## Regression: $cfg"
-              echo ""
-              echo "| item | value |"
-              echo "|---|---|"
-              echo "| results dir | \`$results_dir\` |"
-              echo "| benchmark exit | \`$run_rc\` |"
-              echo "| perf regression exit | \`$check_rc\` |"
-              echo "| eval exit | \`$eval_rc\` |"
-              echo "| eval regression exit | \`$eval_check_rc\` |"
-              echo ""
-              echo "### Baseline comparison (Perf)"
-              cat "$check_log" 2>/dev/null || echo "baseline comparison output unavailable"
-              echo ""
-              if [ "$eval_check_rc" != "skipped" ]; then
-                echo "### Baseline comparison (Eval)"
-                cat "$eval_log" 2>/dev/null || echo "eval comparison output unavailable"
-                echo ""
-              fi
-            } >> "$GITHUB_STEP_SUMMARY"
-          }
-
-          for cfg in qwen3-coder-30b-fp8-tp8-ep qwen3-coder-30b-tp8-ep; do
-            results_dir="/tmp/perf_eval_$cfg"
-            baseline="scripts/vllm/benchmarking/baselines/perf/$cfg.baseline.json"
-            check_log="$results_dir/regression_check.md"
-            eval_baseline="scripts/vllm/benchmarking/baselines/eval/$cfg.baseline.json"
-            eval_log="$results_dir/eval_check.md"
-            mkdir -p "$results_dir"
-
-            echo "::group::Dry-run benchmark: $cfg"
-            ./scripts/vllm/benchmarking/run_benchmarks.sh \
-              --config "$cfg" \
-              --results-dir "$results_dir" \
-              --dry-run 2>&1 | tee "$results_dir/dry_run.log"
-            dry_rc=${PIPESTATUS[0]}
-            echo "::endgroup::"
-
-            if [ "$dry_rc" -ne 0 ]; then
-              echo "::error::benchmark dry run failed for $cfg (exit $dry_rc)"
-              append_summary "$cfg" "$results_dir" "$baseline" "$check_log" "skipped" "skipped" "skipped" "skipped" "$eval_log"
-              fail=1
-              continue
-            fi
-
-            echo "::group::Run benchmark: $cfg"
-            ./scripts/vllm/benchmarking/run_benchmarks.sh \
-              --config "$cfg" \
-              --results-dir "$results_dir" \
-              --keep-alive
-            run_rc=$?
-            echo "::endgroup::"
-            if [ "$run_rc" -ne 0 ]; then
-              echo "::error::run_benchmarks.sh failed for $cfg (exit $run_rc)"
-              fail=1
-            fi
-
-            eval_rc="skipped"
-            eval_check_rc="skipped"
-
-            if [ "$run_rc" -eq 0 ]; then
-              MODEL=$(read_model_from_config "$results_dir/config.json")
-
-              if [ -f "$eval_baseline" ]; then
-                echo "::group::Run eval: $cfg"
-                lm_eval \
-                  --model local-chat-completions \
-                  --model_args model="$MODEL",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=128 \
-                  --tasks mmlu_llama,mmlu_pro \
-                  --apply_chat_template \
-                  --fewshot_as_multiturn true \
-                  --limit 100 \
-                  --seed "0,1234,None,1234" \
-                  --gen_kwargs continue_final_message=True add_generation_prompt=False 'chat_template_kwargs={"enable_thinking": False}' \
-                  --output_path "$results_dir" 2>&1 | tee "$results_dir/eval.log"
-                eval_rc=${PIPESTATUS[0]}
-                echo "::endgroup::"
-                if [ "$eval_rc" -ne 0 ]; then
-                  echo "::error::lm_eval failed for $cfg (exit $eval_rc)"
-                  fail=1
-                fi
-
-                echo "::group::Check eval regression: $cfg"
-                python3 scripts/vllm/benchmarking/check_regression.py \
-                  --mode eval \
-                  --results-dir "$results_dir" \
-                  --baseline "$eval_baseline" 2>&1 | tee "$eval_log"
-                eval_check_rc=${PIPESTATUS[0]}
-                echo "::endgroup::"
-                if [ "$eval_check_rc" -ne 0 ]; then
-                  echo "::error::check_regression.py (eval) failed for $cfg (exit $eval_check_rc)"
-                  fail=1
-                fi
-              fi
-            fi
-
-            cleanup_server
-
-            echo "::group::Check perf regression: $cfg"
-            python3 scripts/vllm/benchmarking/check_regression.py \
-              --mode perf \
-              --results-dir "$results_dir" \
-              --baseline "$baseline" 2>&1 | tee "$check_log"
-            check_rc=${PIPESTATUS[0]}
-            echo "::endgroup::"
-            if [ "$check_rc" -ne 0 ]; then
-              echo "::error::check_regression.py (perf) failed for $cfg (exit $check_rc)"
-              fail=1
-            fi
-
-            append_summary "$cfg" "$results_dir" "$baseline" "$check_log" "$run_rc" "$check_rc" "$eval_rc" "$eval_check_rc" "$eval_log"
-          done
-          exit "$fail"
-
-      - name: Upload guard JSON results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-eval-guard-results
-          path: /tmp/perf_eval_*
-          retention-days: 14
-          if-no-files-found: warn
-
-  # Nightly: only the 480B config.
-  perf-eval-nightly:
-    name: "Perf and Eval Nightly: 480B"
-    if: github.event_name == 'schedule'
-    runs-on: linux-x86-tpu7x-224-4tpu
-    container:
-      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
+      image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
+      options: --privileged --net=host --shm-size=16g --device /dev/fuse
+      env:
+        HF_HOME: /local_hf_cache
+        SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
     timeout-minutes: 360
 
     env:
@@ -308,247 +100,124 @@ jobs:
       UV_NO_CACHE: "1"
       TQDM_MININTERVAL: "30"
 
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: qwen3-coder-30b-tp8-ep
+            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/
+            run_on: ["pr"]
+            type: guard
+            retention: 14
+          - name: qwen3-coder-30b-fp8-tp8-ep
+            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-30B-A3B-Instruct-FP8/
+            run_on: ["pr"]
+            type: guard
+            retention: 14
+          - name: qwen3-coder-480b-fp8-tp8-ep
+            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-480B-A35B-Instruct-FP8/
+            run_on: ["nightly"]
+            type: nightly
+            retention: 30
+          - name: qwen3.5-397b-tp8
+            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-397B-TP8/
+            run_on: ["nightly"]
+            type: nightly
+            retention: 30
+
     steps:
+      - name: Decide if to run
+        id: decide
+        shell: bash
+        run: |
+          RUN=false
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            RUN=true
+          elif [[ "${{ github.event_name }}" == "pull_request" ]] && [[ "${{ contains(matrix.config.run_on, 'pr') }}" == "true" ]]; then
+            RUN=true
+          elif [[ "${{ github.event_name }}" == "schedule" ]] && [[ "${{ contains(matrix.config.run_on, 'nightly') }}" == "true" ]]; then
+            RUN=true
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "Decision for ${{ matrix.config.name }}: $RUN"
+
       - name: Redirect torch_tpu cache off /dev/shm
+        if: steps.decide.outputs.run == 'true'
         run: |
           mkdir -p /tmp/torch_tpu_cache
           ln -sfn /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
 
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        if: steps.decide.outputs.run == 'true'
 
       - name: Mark git directory as safe
+        if: steps.decide.outputs.run == 'true'
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Setup uv
+        if: steps.decide.outputs.run == 'true'
         uses: astral-sh/setup-uv@v5
 
+      - name: Save installed packages list
+        if: steps.decide.outputs.run == 'true'
+        run: uv pip list > /tmp/perf_eval_pip_list.txt
+
+      - name: Wait For Connection
+        if: steps.decide.outputs.run == 'true'
+        uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
+        with:
+          halt-dispatch-input: ${{ inputs.halt-for-connection }}
+
       - name: Setup Virtual Environment
+        if: steps.decide.outputs.run == 'true'
         run: |
           uv venv
           echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-          # Bootstrap keyring auth for private registry
+
+      - name: Setup Keyring for Auth
+        if: steps.decide.outputs.run == 'true'
+        run: |
           uv pip install --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
 
-      - name: Install torchtpu-vllm from source
-        run: uv sync --extra test --extra benchmarking --prerelease allow --no-install-package vllm
+      - name: Install crc32c for gsutil
+        if: steps.decide.outputs.run == 'true'
+        run: uv pip install --system crc32c
 
-      - name: Install vLLM from source (TPU)
+      - name: Copy model to local cache
+        if: steps.decide.outputs.run == 'true'
         run: |
-          git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git /tmp/vllm
-          cd /tmp/vllm
-          sed -i '/tpu-inference/d' requirements/tpu.txt
-          uv pip install -r requirements/tpu.txt
-          SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
-          rm -rf /tmp/vllm
-          rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
+          mkdir -p /local_hf_cache/hub
+          gsutil -m cp -r ${{ matrix.config.gs_path }} /local_hf_cache/hub/
 
-      - name: Run 480B nightly perf and eval
+      - name: Run perf and eval
+        if: steps.decide.outputs.run == 'true'
         shell: bash
         env:
           MODEL_IMPL_TYPE: vllm
-          EVALPLUS_DATASETS: "humaneval mbpp"
-          EVALPLUS_PARALLEL: "8"
         run: |
-          set +e
+          uv pip install ".[test,benchmarking]"
+          if [[ "${{ matrix.config.type }}" == "nightly" ]]; then
+            export EVALPLUS_DATASETS="humaneval mbpp"
+            export EVALPLUS_PARALLEL="8"
+            bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config ${{ matrix.config.name }} --run-lm-eval --run-evalplus
+          else
+            export BENCHMARK_WARMUP_RUNS="1"
+            bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config ${{ matrix.config.name }} --run-lm-eval
+          fi
 
-          cleanup_server() {
-            echo ""
-            echo "Cleaning up vLLM server..."
-            pkill -TERM -f "vllm serve" 2>/dev/null || true
-            sleep 5
-            pkill -9 -f "vllm serve" 2>/dev/null || true
-            pkill -9 -f "VLLM::" 2>/dev/null || true
-            pkill -9 -f "vllm\\.entrypoints" 2>/dev/null || true
-            sleep 2
-            rm -f /tmp/libtpu_lockfile*
-            echo "vLLM server cleanup complete."
-          }
+      - name: Stage artifacts for upload
+        if: always() && steps.decide.outputs.run == 'true'
+        run: |
+          mkdir -p perf_eval_results
+          cp -r /tmp/perf_eval_* perf_eval_results/ || true
 
-          read_model_from_config() {
-            python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$1"
-          }
-
-          run_evalplus() {
-            local model="$1"
-            local results_dir="$2"
-            local root="$results_dir/evalplus"
-            local rc=0
-            rm -rf "$root"
-            mkdir -p "$root"
-
-            for dataset in $EVALPLUS_DATASETS; do
-              echo "EvalPlus dataset: $dataset"
-              evalplus.evaluate "$dataset" \
-                --model "$model" \
-                --backend openai \
-                --base_url http://localhost:8000/v1 \
-                --root "$root" \
-                --greedy \
-                --n_samples 1 \
-                --bs 1 \
-                --parallel "$EVALPLUS_PARALLEL" \
-                2>&1 | tee "$root/$dataset.log"
-              dataset_rc=${PIPESTATUS[0]}
-              if [ "$dataset_rc" -ne 0 ]; then
-                echo "::error::EvalPlus failed for $dataset (exit $dataset_rc)"
-                rc="$dataset_rc"
-              fi
-            done
-            return "$rc"
-          }
-
-          append_summary() {
-            local run_rc="$1"
-            local check_rc="$2"
-            local eval_rc="$3"
-            local eval_check_rc="$4"
-            local evalplus_rc="$5"
-            local evalplus_check_rc="$6"
-            local cfg="$7"
-            local results_dir="$8"
-            local check_log="$9"
-            local eval_log="${10}"
-            local evalplus_log="${11}"
-
-            if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
-              return 0
-            fi
-
-            {
-              echo "## Regression: $cfg"
-              echo ""
-              echo "| item | value |"
-              echo "|---|---|"
-              echo "| benchmark exit | \`$run_rc\` |"
-              echo "| perf regression exit | \`$check_rc\` |"
-              echo "| eval exit | \`$eval_rc\` |"
-              echo "| eval regression exit | \`$eval_check_rc\` |"
-              echo "| evalplus exit | \`$evalplus_rc\` |"
-              echo "| evalplus regression exit | \`$evalplus_check_rc\` |"
-              echo ""
-              echo "### Baseline comparison (Perf)"
-              cat "$check_log" 2>/dev/null || echo "baseline comparison output unavailable"
-              echo ""
-              if [ "$eval_check_rc" != "skipped" ]; then
-                echo "### Baseline comparison (Eval)"
-                cat "$eval_log" 2>/dev/null || echo "eval comparison output unavailable"
-                echo ""
-              fi
-              if [ "$evalplus_check_rc" != "skipped" ]; then
-                echo "### Baseline comparison (EvalPlus)"
-                cat "$evalplus_log" 2>/dev/null || echo "evalplus comparison output unavailable"
-                echo ""
-              fi
-            } >> "$GITHUB_STEP_SUMMARY"
-          }
-
-          fail=0
-          for cfg in qwen3-coder-480b-fp8-tp8-ep qwen3.5-397b-tp8; do
-            results_dir="/tmp/perf_eval_$cfg"
-            baseline="scripts/vllm/benchmarking/baselines/perf/$cfg.baseline.json"
-            check_log="$results_dir/regression_check.md"
-            eval_baseline="scripts/vllm/benchmarking/baselines/eval/$cfg.baseline.json"
-            eval_log="$results_dir/eval_check.md"
-            evalplus_baseline="scripts/vllm/benchmarking/baselines/evalplus/$cfg.baseline.json"
-            evalplus_log="$results_dir/evalplus_check.md"
-            mkdir -p "$results_dir"
-
-            echo "::group::Dry-run benchmark: $cfg"
-            ./scripts/vllm/benchmarking/run_benchmarks.sh \
-              --config "$cfg" \
-              --results-dir "$results_dir" \
-              --dry-run 2>&1 | tee "$results_dir/dry_run.log"
-            dry_rc=${PIPESTATUS[0]}
-            echo "::endgroup::"
-
-            if [ "$dry_rc" -ne 0 ]; then
-              echo "::error::benchmark dry run failed for $cfg (exit $dry_rc)"
-              append_summary "skipped" "skipped" "skipped" "skipped" "skipped" "skipped" "$cfg" "$results_dir" "$check_log" "$eval_log" "$evalplus_log"
-              fail=1
-              continue
-            fi
-
-            echo "::group::Run benchmark: $cfg"
-            ./scripts/vllm/benchmarking/run_benchmarks.sh \
-              --config "$cfg" \
-              --results-dir "$results_dir" \
-              --keep-alive
-            run_rc=$?
-            echo "::endgroup::"
-
-            eval_rc="skipped"
-            eval_check_rc="skipped"
-            evalplus_rc="skipped"
-            evalplus_check_rc="skipped"
-
-            if [ "$run_rc" -eq 0 ]; then
-              MODEL=$(read_model_from_config "$results_dir/config.json")
-
-              if [ -f "$eval_baseline" ]; then
-                echo "::group::Run eval: $cfg"
-                lm_eval \
-                  --model local-chat-completions \
-                  --model_args model="$MODEL",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=128 \
-                  --tasks mmlu_llama,mmlu_pro \
-                  --apply_chat_template \
-                  --fewshot_as_multiturn true \
-                  --seed "0,1234,None,1234" \
-                  --gen_kwargs continue_final_message=True add_generation_prompt=False 'chat_template_kwargs={"enable_thinking": False}' \
-                  --output_path "$results_dir" 2>&1 | tee "$results_dir/eval.log"
-                eval_rc=${PIPESTATUS[0]}
-                echo "::endgroup::"
-
-                echo "::group::Check eval regression: $cfg"
-                python3 scripts/vllm/benchmarking/check_regression.py \
-                  --mode eval \
-                  --results-dir "$results_dir" \
-                  --baseline "$eval_baseline" 2>&1 | tee "$eval_log"
-                eval_check_rc=${PIPESTATUS[0]}
-                echo "::endgroup::"
-                if [ "$eval_check_rc" -ne 0 ]; then fail=1; fi
-              fi
-
-              echo "::group::Run EvalPlus: $cfg"
-              run_evalplus "$MODEL" "$results_dir"
-              evalplus_rc=$?
-              echo "::endgroup::"
-
-              if [ -f "$evalplus_baseline" ]; then
-                echo "::group::Check EvalPlus regression: $cfg"
-                python3 scripts/vllm/benchmarking/check_regression.py \
-                  --mode evalplus \
-                  --results-dir "$results_dir" \
-                  --baseline "$evalplus_baseline" 2>&1 | tee "$evalplus_log"
-                evalplus_check_rc=${PIPESTATUS[0]}
-                echo "::endgroup::"
-                if [ "$evalplus_check_rc" -ne 0 ]; then fail=1; fi
-              fi
-            else
-              fail=1
-            fi
-
-            cleanup_server
-
-            echo "::group::Check perf regression: $cfg"
-            python3 scripts/vllm/benchmarking/check_regression.py \
-              --mode perf \
-              --results-dir "$results_dir" \
-              --baseline "$baseline" 2>&1 | tee "$check_log"
-            check_rc=${PIPESTATUS[0]}
-            echo "::endgroup::"
-            if [ "$check_rc" -ne 0 ]; then fail=1; fi
-
-            append_summary "$run_rc" "$check_rc" "$eval_rc" "$eval_check_rc" "$evalplus_rc" "$evalplus_check_rc" "$cfg" "$results_dir" "$check_log" "$eval_log" "$evalplus_log"
-          done
-          exit "$fail"
-
-      - name: Upload nightly JSON results
-        if: always()
+      - name: Upload JSON results
+        if: always() && steps.decide.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: perf-eval-nightly-results
-          path: /tmp/perf_eval_*
-          retention-days: 30
+          name: perf-eval-${{ matrix.config.type }}-results-${{ matrix.config.name }}
+          path: perf_eval_results/
+          retention-days: ${{ matrix.config.retention }}
           if-no-files-found: warn

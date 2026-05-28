@@ -12,8 +12,7 @@ cd "$REPO_DIR"
 # Mark git directory as safe to avoid dubious ownership error in container
 git config --global --add safe.directory "$REPO_DIR"
 
-echo "Installing test dependencies..."
-uv pip install --system ".[test]"
+# Dependencies are installed in the workflow file (.github/workflows/tests.yml)
 
 export MODEL_IMPL_TYPE="vllm"
 TEST_DIR="$REPO_DIR/tests"

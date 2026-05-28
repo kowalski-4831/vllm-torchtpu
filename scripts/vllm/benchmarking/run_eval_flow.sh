@@ -2,6 +2,7 @@
 # Full evaluation flow script: supports manual and CI execution
 set -euo pipefail
 
+PORT="${PORT:-8000}"
 CONFIG_NAME=""
 RESULTS_DIR=""
 RUN_LM_EVAL=0
@@ -40,6 +41,9 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Register cleanup trap
+trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT
+
 if [ -z "$RESULTS_DIR" ]; then
     RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
 fi
@@ -70,7 +74,7 @@ run_evalplus() {
         evalplus.evaluate "$dataset" \
             --model "$model" \
             --backend openai \
-            --base_url http://localhost:8000/v1 \
+            --base_url "http://localhost:$PORT/v1" \
             --root "$root" \
             --greedy \
             --n_samples 1 \
@@ -114,7 +118,7 @@ if [ "$RUN_LM_EVAL" = "1" ] && [ -f "$EVAL_BASELINE" ]; then
     echo "Running lm_eval..."
     lm_eval \
       --model local-chat-completions \
-      --model_args model="$MODEL",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=128 \
+      --model_args model="$MODEL",base_url=http://localhost:"$PORT"/v1/chat/completions,num_concurrent=128 \
       --tasks mmlu_llama,mmlu_pro \
       --apply_chat_template \
       --fewshot_as_multiturn true \
@@ -126,8 +130,9 @@ if [ "$RUN_LM_EVAL" = "1" ] && [ -f "$EVAL_BASELINE" ]; then
     echo "=== Checking Eval Regression ==="
     python3 scripts/vllm/benchmarking/check_regression.py \
       --mode eval \
+      --tolerance 0.02 \
       --results-dir "$RESULTS_DIR" \
-      --baseline "$EVAL_BASELINE" 2>&1 | tee "$EVAL_LOG" || fail=1
+      --baseline "$EVAL_BASELINE" 2>&1 | tee "$EVAL_LOG" || { echo "::error::Eval regression check failed! See logs above for details."; fail=1; }
 fi
 
 # ========================================================
@@ -146,25 +151,19 @@ if [ "$RUN_EVALPLUS" = "1" ]; then
         python3 scripts/vllm/benchmarking/check_regression.py \
           --mode evalplus \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || fail=1
+          --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || { echo "::error::EvalPlus regression check failed! See logs above for details."; fail=1; }
     fi
 fi
 
 # ========================================================
-# 5. Cleanup after tests
-# ========================================================
-echo "=== Final Cleanup ==="
-bash "$SCRIPT_DIR/cleanup_server.sh"
-
-# ========================================================
-# 6. Check Perf Regression
+# 5. Check Perf Regression
 # ========================================================
 if [ -f "$PERF_BASELINE" ]; then
     echo "=== Checking Perf Regression ==="
     python3 scripts/vllm/benchmarking/check_regression.py \
       --mode perf \
       --results-dir "$RESULTS_DIR" \
-      --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || fail=1
+      --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
 fi
 
 exit "$fail"
