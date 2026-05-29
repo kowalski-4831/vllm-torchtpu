@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Ensure environment overrides are applied before any other imports,
+# especially torch_tpu which might read them at import time.
+import tpu_inference.env_override  # noqa: F401  # isort: skip
+
 import bisect
 import contextlib
 import dataclasses

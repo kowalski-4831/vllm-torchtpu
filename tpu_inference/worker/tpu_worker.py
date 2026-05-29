@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Ensure environment overrides are applied before any other imports,
+# especially torch_tpu which might read them at import time.
+import tpu_inference.env_override  # noqa: F401  # isort: skip
+
 import os
 import time
 from typing import Dict, Tuple
