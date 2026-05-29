@@ -9,15 +9,7 @@ QUANTIZATION="fp8"
 ISL_OSL_CONFIGS="1024:1024 1024:8192 8192:1024"
 CONCURRENCY_OPTIONS="64"
 RANDOM_RANGE_RATIO="0.8"
-
-# Use batched RPA kernel if applicable
-export USE_BATCHED_RPA_KERNEL=1
-
-# Set headroom for TPU KV cache
-export TPU_KV_CACHE_HEADROOM_MIB=32768
-
-# Control GPU memory utilization
-GPU_MEMORY_UTILIZATION=0.9
+ATTENTION_BACKEND=FLASH_ATTN
 
 # Extra arguments for vllm serve
 EXTRA_SERVE_ARGS="--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0}"

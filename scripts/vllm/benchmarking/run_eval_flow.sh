@@ -112,7 +112,18 @@ fail=0
 evalplus_rc=0
 
 # ========================================================
-# 3. Run lm_eval
+# 3. Check Perf Regression
+# ========================================================
+if [ -f "$PERF_BASELINE" ]; then
+    echo "=== Checking Perf Regression ==="
+    python3 scripts/vllm/benchmarking/check_regression.py \
+      --mode perf \
+      --results-dir "$RESULTS_DIR" \
+      --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
+fi
+
+# ========================================================
+# 4. Run lm_eval
 # ========================================================
 if [ "$RUN_LM_EVAL" = "1" ] && [ -f "$EVAL_BASELINE" ]; then
     echo "Running lm_eval..."
@@ -136,7 +147,7 @@ if [ "$RUN_LM_EVAL" = "1" ] && [ -f "$EVAL_BASELINE" ]; then
 fi
 
 # ========================================================
-# 4. Run EvalPlus
+# 5. Run EvalPlus
 # ========================================================
 if [ "$RUN_EVALPLUS" = "1" ]; then
     echo "=== Running EvalPlus ==="
@@ -153,17 +164,6 @@ if [ "$RUN_EVALPLUS" = "1" ]; then
           --results-dir "$RESULTS_DIR" \
           --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || { echo "::error::EvalPlus regression check failed! See logs above for details."; fail=1; }
     fi
-fi
-
-# ========================================================
-# 5. Check Perf Regression
-# ========================================================
-if [ -f "$PERF_BASELINE" ]; then
-    echo "=== Checking Perf Regression ==="
-    python3 scripts/vllm/benchmarking/check_regression.py \
-      --mode perf \
-      --results-dir "$RESULTS_DIR" \
-      --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
 fi
 
 exit "$fail"
