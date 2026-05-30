@@ -44,7 +44,8 @@ def _build_fused_moe_custom_op(
     wrapped_fn = functools.partial(fused_moe_func,
                                    experts_start=experts_start,
                                    topk=topk,
-                                   activation=activation)
+                                   activation=activation,
+                                   use_ep=experts_start is not None)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -111,7 +112,8 @@ def fused_moe_gmm(
     linear EP placement (or ``None`` for non-EP). It is a Python int derived at
     load time from ``ep_rank``, ``ep_size``, and ``global_num_experts``, baked
     into the JAX kernel closure as a compile-time constant -- so the global->
-    local remap is a literal subtract fused into the routing loop.
+    local remap is a literal subtract fused into the routing loop. When
+    present, the sparse-core parity path dispatches ragged gather/scatter.
     """
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,

@@ -218,7 +218,8 @@ def test_fused_moe_global_id_remap_matches_local(num_local_experts,
                               topk_weights=topk_weights,
                               topk_ids=local_ids,
                               topk=topk,
-                              activation="silu")
+                              activation="silu",
+                              use_ep=True)
     actual = fused_moe_func(hidden_states=hidden_states,
                             w1=w1,
                             w2=w2,
@@ -230,7 +231,8 @@ def test_fused_moe_global_id_remap_matches_local(num_local_experts,
                             topk_ids=global_ids,
                             experts_start=experts_start,
                             topk=topk,
-                            activation="silu")
+                            activation="silu",
+                            use_ep=True)
     np.testing.assert_allclose(np.asarray(actual),
                                np.asarray(expected),
                                atol=1e-1,
@@ -259,7 +261,8 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
                               topk_weights=masked_weights,
                               topk_ids=local_ids,
                               topk=topk,
-                              activation="silu")
+                              activation="silu",
+                              use_ep=True)
     actual = fused_moe_func(hidden_states=hidden_states,
                             w1=w1,
                             w2=w2,
@@ -271,7 +274,8 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
                             topk_ids=global_ids,
                             experts_start=experts_start,
                             topk=topk,
-                            activation="silu")
+                            activation="silu",
+                            use_ep=True)
     np.testing.assert_allclose(np.asarray(actual),
                                np.asarray(expected),
                                atol=1e-1,

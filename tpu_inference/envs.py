@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
+    SC_KERNEL_THRESHOLD: int = 16777216
+    SC_KERNEL_COL_CHUNK_SIZE: int = 3072
 
 
 def env_with_choices(
@@ -179,6 +181,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ref", "chunked_jax_pd", "chunked_kernel_pd", "chunked_kernel_p_jax_d",
         "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd"
     ]),
+    # SparseCore gather-reduce knobs. Threshold is compared with routed
+    # row count; this path is disabled until its numeric issue is fixed.
+    # Column chunk size is in output columns and must divide the output
+    # hidden size before sc_gather_reduce is re-enabled.
+    "SC_KERNEL_THRESHOLD":
+    lambda: int(os.getenv("SC_KERNEL_THRESHOLD") or "16777216"),
+    "SC_KERNEL_COL_CHUNK_SIZE":
+    lambda: int(os.getenv("SC_KERNEL_COL_CHUNK_SIZE") or "3072"),
 }
 
 

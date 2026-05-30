@@ -34,6 +34,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "tpu_inference/layers/vllm/fused_moe.py",
     "tpu_inference/layers/common/fused_moe_gmm.py",
     "tpu_inference/kernels/megablox",
+    "tpu_inference/kernels/sparse_core",
     "tpu_inference/layers/vllm/attention.py",
     "tpu_inference/layers/common/attention_interface.py",
     "tpu_inference/kernels/ragged_paged_attention/v3",

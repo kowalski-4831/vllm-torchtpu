@@ -26,6 +26,8 @@ dependencies = [
     "pathwaysutils",
     "vllm==0.19.0",
     "torch-tpu==0.1.1.dev20260515095303",
+    "jax==0.10.0",
+    "jaxlib==0.10.0",
     # Keep the PJRT runtime pinned with the torch-tpu wheel. libtpu 0.0.41
     # regresses GDN compilation with scoped VMEM OOMs in CI.
     "libtpu==0.0.40",
