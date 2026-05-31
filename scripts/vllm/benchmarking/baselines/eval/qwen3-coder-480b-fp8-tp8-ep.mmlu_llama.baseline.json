@@ -18,9 +18,5 @@
   "mmlu_llama_stem": {
     "exact_match,strict_match": 0.8912147161433556,
     "exact_match_stderr,strict_match": 0.00542975755737809
-  },
-  "mmlu_pro": {
-    "exact_match,custom-extract": 0.7687001329787234,
-    "exact_match_stderr,custom-extract": 0.003722724117728774
   }
 }

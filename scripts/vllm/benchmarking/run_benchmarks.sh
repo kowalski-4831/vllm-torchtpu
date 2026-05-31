@@ -89,6 +89,7 @@ ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
 RANDOM_RANGE_RATIO=""
 BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=false
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
@@ -195,12 +196,12 @@ start_vllm_server() {
     echo "Server started (pid=$SERVER_PID)"
     echo "Server log: $RESULTS_DIR/server.log"
 
-    # Wait for server to be ready (up to 90 minutes for large model compilation)
-    local max_wait=$((90 * 60))
+    # Wait for server to be ready (up to 120 minutes for large model compilation)
+    local max_wait=$((120 * 60))
     local waited=0
     while ! curl -s -o /dev/null --connect-timeout 1 "http://localhost:$PORT/health" 2>/dev/null; do
         if [ "$waited" -ge "$max_wait" ]; then
-            echo "ERROR: Server did not become ready within 90 minutes."
+            echo "ERROR: Server did not become ready within 120 minutes."
             stop_vllm_server
             exit 1
         fi
@@ -312,7 +313,8 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "max_num_seqs": $max_num_seqs,
     "capture_profile": $capture_profile_json,
     "profile_dir": $profile_dir_json,
-    "timestamp": "$TIMESTAMP"
+    "timestamp": "$TIMESTAMP",
+    "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS
 }
 EOF
 
