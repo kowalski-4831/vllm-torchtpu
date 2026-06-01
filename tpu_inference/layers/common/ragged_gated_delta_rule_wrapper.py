@@ -20,6 +20,9 @@ import jax
 import jax.numpy as jnp
 
 from tpu_inference.kernels.gdn import triangle_solver
+from tpu_inference.kernels.gdn.v2.gdn_decode_kernel import \
+    ragged_gated_delta_rule_decode_only
+from tpu_inference.kernels.gdn.v2.recurrent_scan_v2 import recurrent_scan
 from tpu_inference.layers.common import \
     ragged_gated_delta_rule_chunked as jax_impl
 
@@ -35,14 +38,29 @@ class RaggedGatedDeltaRuleImpl(enum.Enum):
     """Implementation options for the ragged gated delta rule."""
     REF = 'ref'
     CHUNKED_JAX_PD = 'chunked_jax_pd'
+    # Full kernel path: fused Pallas recurrent-scan prefill kernel + fused Pallas
+    # decode kernel.
+    CHUNKED_KERNEL_PD = 'chunked_kernel_pd'
 
     @property
     def prefill_impl(self) -> str:
-        return 'jax'
+        if self in (
+                RaggedGatedDeltaRuleImpl.REF,
+                RaggedGatedDeltaRuleImpl.CHUNKED_JAX_PD,
+        ):
+            return 'jax'
+        else:
+            return 'recurrent_scan_v2'
 
     @property
     def decode_impl(self) -> str:
-        return 'jax'
+        if self in (
+                RaggedGatedDeltaRuleImpl.REF,
+                RaggedGatedDeltaRuleImpl.CHUNKED_JAX_PD,
+        ):
+            return 'jax'
+        else:
+            return 'fused'
 
     def to_config(self) -> RaggedGatedDeltaRuleConfig:
         return RaggedGatedDeltaRuleConfig(
@@ -129,7 +147,26 @@ def ragged_gated_delta_rule_wrapper(
 
     def decode_only_branch(_):
         impl = config.decode_impl
-        if impl == 'jax':
+        if impl == 'fused':
+            new_state, output = ragged_gated_delta_rule_decode_only(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                recurrent_state=recurrent_state,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                distribution=distribution,
+                has_initial_state=has_initial_state,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                apply_silu=True,
+            )
+            return new_state, output
+        elif impl == 'jax':
             qkv_in = jax.nn.silu(mixed_qkv)
             num_tokens = qkv_in.shape[0]
             key_dim = n_kq * d_k
@@ -197,6 +234,26 @@ def ragged_gated_delta_rule_wrapper(
                 chunk_size=chunk_size,
                 use_qk_norm_in_gdn=config.use_qk_norm_in_gdn,
                 triangle_solver_impl=triangle_solver_impl,
+                has_initial_state=has_initial_state,
+            )
+        elif impl == 'recurrent_scan_v2':
+            return recurrent_scan(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                recurrent_state=recurrent_state,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                distribution=distribution,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                chunk_size=chunk_size,
+                BT=chunk_size,
+                use_qk_norm_in_gdn=config.use_qk_norm_in_gdn,
                 has_initial_state=has_initial_state,
             )
         else:
