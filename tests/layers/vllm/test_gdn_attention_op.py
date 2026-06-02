@@ -63,6 +63,9 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata = MagicMock()
         mock_attn_metadata.seq_lens = torch.ones(2)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
+        # None exercises the block_tables[:, 0] fallback (uniform / non-compact
+        # mamba); compact mamba sets a real tensor instead.
+        mock_attn_metadata.mamba_state_indices = None
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
@@ -156,6 +159,9 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata = MagicMock()
         mock_attn_metadata.seq_lens = torch.ones(2)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
+        # None exercises the block_tables[:, 0] fallback (uniform / non-compact
+        # mamba); compact mamba sets a real tensor instead.
+        mock_attn_metadata.mamba_state_indices = None
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
@@ -195,6 +201,65 @@ class TestVllmGatedDeltaNetAttention:
 
         assert torch.all(output[:num_tokens] == 5)
         assert torch.all(output[num_tokens:] == 0)
+
+    @patch(
+        "tpu_inference.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
+    )
+    def test_forward_uses_compact_mamba_state_indices(
+            self, mock_get_forward_context):
+        """Compact mamba: when attn_metadata.mamba_state_indices is set, the op
+        passes it through verbatim and ignores block_tables[:, 0]."""
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.head_v_dim = 16
+        attn.num_v_heads = 4
+        attn.tp_size = 1
+        attn.prefix = "test_layer"
+        attn.gqa_interleaved_layout = True
+
+        attn.conv1d = MagicMock()
+        attn.conv1d.weight = torch.randn(1)
+        attn.conv1d.bias = torch.randn(1)
+        attn.A_log = torch.randn(1)
+        attn.dt_bias = torch.randn(1)
+        attn.kv_cache = (torch.ones(1), torch.ones(1))
+        attn.gdn_op = MagicMock()
+
+        attn.in_proj_qkv = MagicMock()
+        attn.in_proj_z = MagicMock()
+        attn.in_proj_ba = MagicMock()
+        attn.norm = MagicMock()
+        attn.out_proj = MagicMock()
+
+        num_tokens = 2
+        hidden_states = torch.randn(num_tokens, 64)
+        output = torch.zeros(5, 64)
+
+        attn.in_proj_qkv.return_value = (torch.randn(num_tokens, 96), None)
+        attn.in_proj_z.return_value = (torch.randn(num_tokens, 64), None)
+        attn.in_proj_ba.return_value = (torch.randn(num_tokens, 32), None)
+        attn.norm.return_value = torch.randn(num_tokens, 4, 16)
+        attn.out_proj.return_value = (torch.ones(num_tokens, 64) * 5, None)
+        attn.gdn_op.return_value = torch.randn(num_tokens, 4, 16)
+
+        mock_fc = MagicMock()
+        mock_attn_metadata = MagicMock()
+        mock_attn_metadata.seq_lens = torch.ones(2)
+        # block_tables would yield [5, 7] via the fallback; the compact slot
+        # ids [3, 1] must win instead.
+        mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
+        mock_attn_metadata.mamba_state_indices = torch.tensor(
+            [3, 1], dtype=torch.int32)
+        mock_attn_metadata.query_start_loc = torch.zeros(2)
+        mock_attn_metadata.request_distribution = torch.zeros(3)
+        mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
+        mock_get_forward_context.return_value = mock_fc
+
+        attn.forward(hidden_states, output)
+
+        assert attn.gdn_op.call_count == 1
+        core_args = attn.gdn_op.call_args[0]
+        assert torch.all(
+            core_args[9] == torch.tensor([3, 1], dtype=torch.int32))
 
     @patch(
         "tpu_inference.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
@@ -242,6 +307,9 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata = MagicMock()
         mock_attn_metadata.seq_lens = torch.ones(2)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
+        # None exercises the block_tables[:, 0] fallback (uniform / non-compact
+        # mamba); compact mamba sets a real tensor instead.
+        mock_attn_metadata.mamba_state_indices = None
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}

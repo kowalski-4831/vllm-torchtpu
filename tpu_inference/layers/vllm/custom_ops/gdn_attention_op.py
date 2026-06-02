@@ -197,14 +197,25 @@ class VllmGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata = fc.attn_metadata[self.prefix]
 
             conv_state, recurrent_state = kv_cache
-            # Extract block tables and convert them to state indices
-            max_reqs = attn_metadata.seq_lens.shape[0]
-            max_blocks_per_req = attn_metadata.block_tables.shape[0] // max_reqs
-            block_tables_2d = torch.reshape(
-                attn_metadata.block_tables,
-                (max_reqs, max_blocks_per_req),
-            )
-            state_indices = block_tables_2d[:, 0].to(torch.int32)
+            # Recurrent-state slot id per persistent-batch position.
+            # Compact-mamba: the mamba pool has only `_mamba_num_blocks` slots
+            # (< attention `num_blocks`), so the slot id is carried explicitly
+            # in `mamba_state_indices` (∈ [0, _mamba_num_blocks)) rather than
+            # derived from the attention `block_tables[:, 0]`. Fall back to
+            # `block_tables[:, 0]` only when compact sizing was skipped and
+            # mamba shares the attention block pool (uniform layout).
+            if attn_metadata.mamba_state_indices is not None:
+                state_indices = attn_metadata.mamba_state_indices.to(
+                    torch.int32)
+            else:
+                max_reqs = attn_metadata.seq_lens.shape[0]
+                max_blocks_per_req = (attn_metadata.block_tables.shape[0] //
+                                      max_reqs)
+                block_tables_2d = torch.reshape(
+                    attn_metadata.block_tables,
+                    (max_reqs, max_blocks_per_req),
+                )
+                state_indices = block_tables_2d[:, 0].to(torch.int32)
 
             # Execute the TorchTPU custom op
             core_attn_out = self.gdn_op(

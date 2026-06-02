@@ -212,6 +212,27 @@ class TPUModelRunner(GPUModelRunner):
         # models so vLLM sees a uniform page size across groups.
         self._hybrid_uniform_page_size_bytes: int | None = None
 
+        # Compact-mamba sizing.
+        # When set, mamba/GDN layers allocate only `_mamba_num_blocks`
+        # recurrent slots (= max_num_reqs + 1, slot 0 = null block) instead of
+        # the full attention `num_blocks`, and the per-request slot id is
+        # carried in `AttentionMetadata.mamba_state_indices` instead of being
+        # derived from the attention `block_tables[:, 0]`. None until the
+        # override runs (and stays None if it is skipped, e.g. CPU-only tests
+        # or a user-pinned num_gpu_blocks_override) — in which case mamba and
+        # attention share the uniform `num_blocks` as before.
+        self._mamba_num_blocks: int | None = None
+        # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
+        # allocated when a request first appears and returned when it leaves
+        # the persistent batch. Keying on req_id (rather than persistent-batch
+        # position) makes the mapping immune to condense/swap reordering in
+        # upstream vLLM's InputBatch, which we do not subclass.
+        self._mamba_slot_by_req_id: dict[str, int] = {}
+        self._free_mamba_slots: list[int] = []
+        # True once the slot pool is initialized (hybrid model with mamba
+        # layers); gates per-step mamba_state_indices construction.
+        self._has_mamba_state: bool = False
+
         # TPU env-var flags.
         self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = envs.VLLM_XLA_USE_SPMD
@@ -271,6 +292,11 @@ class TPUModelRunner(GPUModelRunner):
             (self.max_num_reqs, self.max_num_blocks_per_req),
             dtype=torch.int32,
             device="cpu")
+        # CPU staging for compact-mamba per-request recurrent-slot ids; H2D
+        # copied each step into `AttentionMetadata.mamba_state_indices`.
+        self.mamba_state_indices_cpu = torch.zeros(self.max_num_reqs,
+                                                   dtype=torch.int32,
+                                                   device="cpu")
         if self.uses_mrope:
             # Override parent's int64 mrope buffer with int32 so the H2D copy is
             # dtype-identical to what the TPU model expects. Parent's
@@ -690,17 +716,198 @@ class TPUModelRunner(GPUModelRunner):
         self._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
         self.cache_config.mamba_page_size_padded = int(uniform_page_size_bytes)
 
-        # Pin vLLM's num_blocks via a two-step flooring that keeps peak
-        # HBM within `gpu_memory_utilization × total_hbm` at high
-        # utilization. See `_maybe_set_num_blocks_override` for the
-        # formula and rationale; the short version is that vLLM's
-        # single-step `floor(avail / (uniform × group_size))` can land
-        # one block higher than the two-step value, and that extra
-        # block × group_size × uniform bytes is enough to push past the
-        # budget against imprecision in vLLM's `avail` estimate.
-        self._maybe_set_num_blocks_override(attn_page_size_bytes,
-                                            int(uniform_page_size_bytes),
-                                            group_size)
+        # Prefer compact-mamba sizing: cap each mamba layer at
+        # `max_num_reqs + 1` recurrent slots and give the freed HBM to the
+        # attention pool. Mamba state is recurrent — one slot per active
+        # request — so the uniform layout wastes `num_blocks - max_num_reqs`
+        # mamba slots forever. On success this pins
+        # `num_gpu_blocks_override` to the (larger) attention block count and
+        # sets `_mamba_num_blocks`.
+        self._maybe_set_compact_mamba_num_blocks_override(
+            attn_page_size_bytes, int(unpadded_mamba_page_size),
+            num_attn_groups, num_mamba_groups, group_size)
+
+        # Fallback (compact sizing skipped, e.g. CPU-only tests or a
+        # user-pinned override): pin vLLM's num_blocks via the two-step
+        # flooring that keeps peak HBM within `gpu_memory_utilization ×
+        # total_hbm` at high utilization. See `_maybe_set_num_blocks_override`
+        # for the formula and rationale; the short version is that vLLM's
+        # single-step `floor(avail / (uniform × group_size))` can land one
+        # block higher than the two-step value, and that extra block ×
+        # group_size × uniform bytes is enough to push past the budget against
+        # imprecision in vLLM's `avail` estimate.
+        if self._mamba_num_blocks is None:
+            self._maybe_set_num_blocks_override(attn_page_size_bytes,
+                                                int(uniform_page_size_bytes),
+                                                group_size)
+
+    def _maybe_set_compact_mamba_num_blocks_override(
+            self, attn_page_size_bytes: int,
+            unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
+            num_mamba_groups: int, group_size: int) -> None:
+        """Cap mamba layers at `max_num_reqs + 1` recurrent slots and pin
+        `cache_config.num_gpu_blocks_override` so the freed HBM grows the
+        attention pool.
+
+        Tradeoff vs. the uniform num_blocks layout
+        ------------------------------------------
+        Mamba state is recurrent: one slot per *active* request, regardless of
+        context length. The uniform layout (set by
+        `_maybe_set_num_blocks_override`) gives every layer the same
+        `num_blocks`, leaving `num_blocks - max_num_reqs` mamba slots idle
+        forever. The compact layout caps mamba at `max_num_reqs + 1` (the `+1`
+        is the null/sentinel slot), which is strictly better for any model
+        where `num_blocks > max_num_reqs` — i.e. all production hybrid configs
+        we run. Cost: the GDN op must index mamba state by per-request slot id
+        (`AttentionMetadata.mamba_state_indices`) rather than by
+        `block_tables[:, 0]`, since the mamba leading dim is now smaller than
+        the attention pool.
+
+        Sizing math
+        -----------
+        vLLM allocates `group_size` KVCacheTensors, each shared across
+        `num_attn_groups` attention layers + `num_mamba_groups` mamba layers.
+        With per-tensor budget `B = avail / group_size` and
+        `N_mamba = max_num_reqs + 1`,
+            N_attn = floor((B - num_mamba_groups × N_mamba × mamba_unpadded)
+                            / (num_attn_groups × attn_page)).
+
+        We do NOT round to a sharding divisor: our single-process
+        TP layout does not shard the mamba/attention block (leading) dim — TP
+        sharding is on the head dims via the model — so any positive block
+        count is valid.
+
+        Args:
+            attn_page_size_bytes: TPU-actual bytes per block per attention
+                layer (accounts for dtype packing like fp8).
+            unpadded_mamba_page_size_bytes: bytes per slot per mamba layer
+                (`prod(shape) × dtype_size`, no padding).
+            num_attn_groups: # attention layers backed by each KVCacheTensor.
+            num_mamba_groups: # mamba layers backed by each KVCacheTensor.
+            group_size: # KVCacheTensors vLLM allocates (= layers per
+                kv-cache group); the same value passed to
+                `_maybe_set_num_blocks_override`.
+
+        On success: sets `cache_config.num_gpu_blocks_override` (attention
+        block count) and `_mamba_num_blocks`. On any precondition-fail path:
+        leaves both unset so the caller falls back to uniform sizing.
+        """
+        cache_config = self.cache_config
+        if cache_config.num_gpu_blocks_override is not None:
+            return
+        if group_size <= 0:
+            return
+
+        gpu_mem_util = cache_config.gpu_memory_utilization
+        # Shares utils.compute_hbm_budget() with
+        # TPUWorker.determine_available_memory(), so the pinned block counts
+        # match the KV-cache budget vLLM is given (incl. the headroom knob).
+        budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
+        avail = budget.available
+        if avail <= 0:
+            return
+
+        # +1 reserves slot 0 as the null/sentinel block (never handed to a
+        # request); padded tail positions in `mamba_state_indices` also point
+        # here, so their writes can never corrupt an active request's state.
+        mamba_num_blocks = self.max_num_reqs + 1
+
+        avail_per_tensor = avail // group_size
+        mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
+                            unpadded_mamba_page_size_bytes)
+        attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
+        if attn_per_tensor_avail <= 0:
+            # Mamba alone saturates the budget — pathological config. Skip the
+            # override and let the uniform fallback run; if the model genuinely
+            # doesn't fit it will OOM there too, and we want that signal.
+            logger.warning(
+                "Compact-mamba sizing skipped: mamba alone (mamba_num_blocks="
+                "%d × num_mamba_groups=%d × mamba_unpadded=%d) exceeds "
+                "per-tensor budget %d. Lower `gpu_memory_utilization` or "
+                "`max_num_seqs`.", mamba_num_blocks, num_mamba_groups,
+                unpadded_mamba_page_size_bytes, avail_per_tensor)
+            return
+
+        attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
+                                                    attn_page_size_bytes)
+        if attn_num_blocks <= 0:
+            logger.warning(
+                "Compact-mamba sizing skipped: attn_num_blocks=0 "
+                "(avail_per_tensor=%d, mamba_per_tensor=%d).",
+                avail_per_tensor, mamba_per_tensor)
+            return
+
+        cache_config.num_gpu_blocks_override = int(attn_num_blocks)
+        self._mamba_num_blocks = int(mamba_num_blocks)
+
+        # Total HBM = group_size KVCacheTensors, each holding num_attn_groups
+        # attention blocks + num_mamba_groups mamba slots.
+        attn_bytes = (group_size * num_attn_groups * attn_num_blocks *
+                      attn_page_size_bytes)
+        mamba_bytes = (group_size * num_mamba_groups * mamba_num_blocks *
+                       unpadded_mamba_page_size_bytes)
+        logger.info(
+            "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
+            "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "
+            "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.",
+            attn_num_blocks, mamba_num_blocks, attn_bytes / (2**30),
+            mamba_bytes / (2**30), (attn_bytes + mamba_bytes) / (2**30),
+            avail / (2**30))
+
+    def _init_mamba_slot_pool(self, mamba_num_blocks: int) -> None:
+        """(Re)initialize the per-request mamba recurrent-slot allocator.
+
+        Slot 0 is the null/sentinel block (used for padded persistent-batch
+        positions and never handed to a request). Usable slots are
+        `[1, mamba_num_blocks)`, popped from the high end so the first request
+        gets slot 1 (stable pool ordering for easier debugging).
+        Called once after KV cache allocation, when the true mamba block count
+        is known. The mapping itself is keyed on req_id and rebuilt lazily in
+        `_build_mamba_state_indices`, so re-init only resets the free pool.
+        """
+        self._mamba_slot_by_req_id = {}
+        self._free_mamba_slots = list(range(mamba_num_blocks - 1, 0, -1))
+        self._has_mamba_state = True
+
+    def _build_mamba_state_indices(self, start_index: int, num_reqs: int,
+                                   target_num_reqs: int) -> torch.Tensor:
+        """Build the device `mamba_state_indices` for the current chunk.
+
+        Reconciles the req_id->slot map against the live persistent batch:
+          * frees slots whose req_id is no longer present (request finished),
+          * allocates a fresh unique slot for any new req_id.
+        Returns an int32 device tensor of length `target_num_reqs`: positions
+        `[0, num_reqs)` hold the slot for `req_ids[start_index + i]`; the
+        padded tail `[num_reqs, target_num_reqs)` holds slot 0 (null block) so
+        the GDN op (which scans the full length every step) cannot alias an
+        active slot — the null-tail invariant.
+
+        Slot assignment follows the request through upstream vLLM's
+        condense/swap reordering automatically because the map is keyed on the
+        stable req_id, not the moving persistent-batch position.
+        """
+        live_req_ids = set(self.input_batch.req_id_to_index.keys())
+        # Free slots for requests that left the batch.
+        for req_id in list(self._mamba_slot_by_req_id.keys()):
+            if req_id not in live_req_ids:
+                self._free_mamba_slots.append(
+                    self._mamba_slot_by_req_id.pop(req_id))
+
+        indices = self.mamba_state_indices_cpu[:target_num_reqs]
+        indices.fill_(0)
+        req_ids = self.input_batch.req_ids
+        for i in range(num_reqs):
+            req_id = req_ids[start_index + i]
+            assert req_id is not None
+            slot = self._mamba_slot_by_req_id.get(req_id)
+            if slot is None:
+                # New request: take a fresh unique slot. The pool is sized to
+                # max_num_reqs + 1, so it can never be exhausted while the
+                # batch holds at most max_num_reqs requests.
+                slot = self._free_mamba_slots.pop()
+                self._mamba_slot_by_req_id[req_id] = slot
+            indices[i] = slot
+        return indices.to(self.device, non_blocking=True)
 
     def _maybe_set_num_blocks_override(self, attn_page_size_bytes: int,
                                        uniform_page_size_bytes: int,
@@ -1105,6 +1312,14 @@ class TPUModelRunner(GPUModelRunner):
                 self._cached_logits_indices = logits_indices
                 self._cached_request_distribution = request_distribution
 
+        # Compact-mamba: per-request recurrent-slot ids for this chunk. Only
+        # built for hybrid models (slot pool initialized in
+        # initialize_kv_cache); None otherwise so non-mamba models are
+        # unaffected.
+        mamba_state_indices = (self._build_mamba_state_indices(
+            start_index, num_reqs, target_num_reqs)
+                               if self._has_mamba_state else None)
+
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -1112,6 +1327,7 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            mamba_state_indices=mamba_state_indices,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
@@ -1544,6 +1760,13 @@ class TPUModelRunner(GPUModelRunner):
             dtype=torch.int32).to(self.device)
 
         if getattr(self, "kv_cache_config", None) is not None:
+            # Dummy compact-mamba slot ids (all null slot 0): the dummy run
+            # only traces shapes/HBM, so the recurrent state read/written is
+            # never consumed. Shape must match the GDN op's max_reqs
+            # (= seq_lens length = num_reqs).
+            dummy_mamba_state_indices = (torch.zeros(
+                (num_reqs, ), dtype=torch.int32).to(self.device)
+                                         if self._has_mamba_state else None)
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
@@ -1552,6 +1775,7 @@ class TPUModelRunner(GPUModelRunner):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
+                mamba_state_indices=dummy_mamba_state_indices,
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
@@ -1871,6 +2095,10 @@ class TPUModelRunner(GPUModelRunner):
                 layer_name_to_spec[layer_name] = group.kv_cache_spec
 
         kv_caches: dict[str, torch.Tensor] = {}
+        # Actual leading-dim block count used for mamba state arrays, captured
+        # at allocation time so the slot pool below is sized to exactly what
+        # was allocated (compact `_mamba_num_blocks`, or uniform `num_blocks`).
+        allocated_mamba_num_blocks: int | None = None
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # If the KV cache tensor is shared by multiple layers, then we
             # duplicate cache for each layer and `num_blocks` is calculated
@@ -1916,10 +2144,18 @@ class TPUModelRunner(GPUModelRunner):
                 kv_cache_spec = layer_name_to_spec[layer_name]
 
                 if isinstance(kv_cache_spec, MambaSpec):
+                    # Compact-mamba: allocate only `_mamba_num_blocks`
+                    # recurrent slots (= max_num_reqs + 1) when the override
+                    # succeeded; otherwise fall back to the uniform
+                    # `num_blocks`. Attention layers always keep `num_blocks`.
+                    mamba_num_blocks = (self._mamba_num_blocks
+                                        if self._mamba_num_blocks is not None
+                                        else num_blocks)
+                    allocated_mamba_num_blocks = mamba_num_blocks
                     mamba_states = []
                     for _, (shape, dtype) in enumerate(
                             zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)):
-                        cache_shape = (num_blocks, *shape)
+                        cache_shape = (mamba_num_blocks, *shape)
                         mamba_states.append(
                             torch.zeros(cache_shape,
                                         dtype=dtype).to(self.device))
@@ -1986,6 +2222,12 @@ class TPUModelRunner(GPUModelRunner):
                 kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self)
+
+        # Initialize the compact-mamba slot allocator now that the true mamba
+        # block count is known. When compact sizing was skipped, mamba shares
+        # the attention `num_blocks`, so the pool spans that range instead.
+        if allocated_mamba_num_blocks is not None:
+            self._init_mamba_slot_pool(allocated_mamba_num_blocks)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.

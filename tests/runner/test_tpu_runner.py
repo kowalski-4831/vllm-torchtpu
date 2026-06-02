@@ -113,6 +113,11 @@ class TestTPURunner:
             self.runner)
         self.runner._maybe_set_num_blocks_override = TPUModelRunner._maybe_set_num_blocks_override.__get__(
             self.runner)
+        self.runner._maybe_set_compact_mamba_num_blocks_override = (
+            TPUModelRunner._maybe_set_compact_mamba_num_blocks_override.
+            __get__(self.runner))
+        # Compact-mamba state starts unset (matches real __init__).
+        self.runner._mamba_num_blocks = None
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
             self.runner)
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
@@ -144,11 +149,19 @@ class TestTPURunner:
         assert self.runner._hybrid_uniform_page_size_bytes == 203776
         assert self.runner.cache_config.mamba_page_size_padded == 203776
 
-        # Check that num blocks override calculation was called
+        # Compact-mamba sizing runs first and wins (it can read HBM here).
+        # It caps mamba at max_num_reqs + 1 = 17 recurrent slots and gives the
+        # rest of the budget to the attention pool.
+        #   1 attn + 3 mamba layers -> group_size=min=1 (3 < 1*1.5 is False),
+        #   num_attn_groups=1, num_mamba_groups=3.
+        #   avail = 10GB * 0.9 = 9,663,676,416 (headroom pinned to 0)
+        #   avail_per_tensor = avail // 1 = 9,663,676,416
+        #   mamba_per_tensor = 3 * 17 * 66560 = 3,394,560
+        #   attn_num_blocks =
+        #       (9,663,676,416 - 3,394,560) // (1 * 4096) = 2,358,467
         mock_mem_info.assert_called_once()
-        # Headroom pinned to 0, so avail is the full gpu_memory_utilization
-        # cap: (10GB * 0.9 = 9,663,676,416) // 4096 * 4096 // 203776 = 47423
-        assert self.runner.cache_config.num_gpu_blocks_override == 47423
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.cache_config.num_gpu_blocks_override == 2358467
 
     @patch(
         'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
@@ -214,6 +227,10 @@ class TestTPURunner:
 
         self.runner.input_batch = mock_input_batch.return_value
         self.runner.kv_caches = []
+        # Compact-mamba sizing not exercised here (initialize_kv_cache is
+        # called directly with a fixed config): mamba shares the uniform
+        # num_blocks. _mamba_num_blocks=None selects that fallback path.
+        self.runner._mamba_num_blocks = None
         self.runner.initialize_kv_cache(kv_cache_config)
 
         mock_bind_kv_cache.assert_called_once()
@@ -221,14 +238,94 @@ class TestTPURunner:
 
         assert len(created_caches) == 4
 
+        # Mamba shares the uniform num_blocks (compact sizing not applied).
         for name in ["mamba.0", "mamba.1", "mamba.2"]:
             assert isinstance(created_caches[name], tuple)
             assert len(created_caches[name]) == 2
             assert created_caches[name][0].shape == (num_blocks, 4, 128)
             assert created_caches[name][1].shape == (num_blocks, 8, 64, 32)
 
+        # Slot pool initialized to the (uniform) mamba block count.
+        self.runner._init_mamba_slot_pool.assert_called_once_with(num_blocks)
+
         assert isinstance(created_caches["attn.0"], torch.Tensor)
         assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
+
+    @patch(
+        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+        return_value=(100, 16, 2, 1, 128))
+    @patch(
+        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        return_value=4096)
+    @patch('tpu_inference.runner.tpu_runner.bind_kv_cache')
+    @patch('tpu_inference.runner.tpu_runner.has_kv_transfer_group',
+           return_value=False)
+    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
+    def test_initialize_kv_cache_compact_mamba(self, mock_input_batch,
+                                               mock_has_kv_transfer,
+                                               mock_bind_kv_cache,
+                                               mock_get_page_size,
+                                               mock_get_shape):
+        """Compact-mamba: when _mamba_num_blocks is set, mamba layers allocate
+        exactly that many recurrent slots while attention keeps num_blocks, and
+        the slot pool is initialized to _mamba_num_blocks."""
+        num_blocks = 100
+        mamba_num_blocks = 17  # max_num_reqs(16) + 1
+        uniform_size = 203776
+        tensor_size = uniform_size * num_blocks
+
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=uniform_size)
+        mamba_spec = MambaSpec(block_size=16,
+                               shapes=[(4, 128), (8, 64, 32)],
+                               dtypes=[torch.bfloat16, torch.float32],
+                               page_size_padded=uniform_size)
+        layer_names = ["attn.0", "mamba.0", "mamba.1", "mamba.2"]
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
+            KVCacheGroupSpec(layer_names=["mamba.0"],
+                             kv_cache_spec=mamba_spec),
+            KVCacheGroupSpec(layer_names=["mamba.1"],
+                             kv_cache_spec=mamba_spec),
+            KVCacheGroupSpec(layer_names=["mamba.2"],
+                             kv_cache_spec=mamba_spec),
+        ]
+        kv_cache_config = KVCacheConfig(num_blocks=num_blocks,
+                                        kv_cache_tensors=[
+                                            KVCacheTensor(
+                                                size=tensor_size,
+                                                shared_by=layer_names)
+                                        ],
+                                        kv_cache_groups=kv_cache_groups)
+
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        mock_block_tables = []
+        for _ in kv_cache_groups:
+            mock_bt = MagicMock()
+            mock_bt.max_num_blocks_per_req = 1
+            mock_bt.get_cpu_tensor.return_value = torch.zeros(
+                (1, 1), dtype=torch.int32)
+            mock_block_tables.append(mock_bt)
+        mock_input_batch.return_value.block_table = mock_block_tables
+        self.runner.input_batch = mock_input_batch.return_value
+        self.runner.kv_caches = []
+        self.runner._mamba_num_blocks = mamba_num_blocks
+        self.runner.initialize_kv_cache(kv_cache_config)
+
+        created_caches = mock_bind_kv_cache.call_args[0][0]
+        # Mamba: only mamba_num_blocks slots; attention: full num_blocks.
+        for name in ["mamba.0", "mamba.1", "mamba.2"]:
+            assert created_caches[name][0].shape == (mamba_num_blocks, 4, 128)
+            assert created_caches[name][1].shape == (mamba_num_blocks, 8, 64,
+                                                     32)
+        assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
+        # Slot pool sized to the compact mamba block count.
+        self.runner._init_mamba_slot_pool.assert_called_once_with(
+            mamba_num_blocks)
 
     @patch('tpu_inference.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
@@ -546,3 +643,91 @@ class TestAttentionMetadataBuilder:
 
         # cdiv(32, 16) = 2; flattened length = target_num_reqs * 2 = 8.
         assert meta.block_tables.shape == (4 * 2, )
+
+
+class TestCompactMambaSlotPool:
+    """Unit tests for the compact-mamba recurrent-slot allocator
+    (_init_mamba_slot_pool + _build_mamba_state_indices). The slot index is
+    correctness-critical: a wrong slot = silent recurrent-state corruption."""
+
+    def _make_runner(self, max_num_reqs=4, mamba_num_blocks=5):
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.device = torch.device("cpu")
+        runner.max_num_reqs = max_num_reqs
+        runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs,
+                                                     dtype=torch.int32)
+        runner.input_batch = MagicMock()
+        # Bind the real methods.
+        runner._init_mamba_slot_pool = (
+            TPUModelRunner._init_mamba_slot_pool.__get__(runner))
+        runner._build_mamba_state_indices = (
+            TPUModelRunner._build_mamba_state_indices.__get__(runner))
+        return runner
+
+    def _set_batch(self, runner, req_ids):
+        """Set the persistent batch to the given ordered req_ids."""
+        runner.input_batch.req_ids = list(req_ids)
+        runner.input_batch.req_id_to_index = {
+            r: i
+            for i, r in enumerate(req_ids)
+        }
+
+    def test_unique_slots_and_null_tail(self):
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)  # usable slots 1..4, slot 0 = null
+        self._set_batch(runner, ["a", "b"])
+
+        idx = runner._build_mamba_state_indices(start_index=0,
+                                                num_reqs=2,
+                                                target_num_reqs=4).cpu()
+        # Two active requests get distinct non-null slots.
+        assert idx[0] != 0 and idx[1] != 0
+        assert idx[0] != idx[1]
+        # Padded tail points at the null slot (0).
+        assert idx[2] == 0 and idx[3] == 0
+
+    def test_slot_follows_req_id_through_condense(self):
+        """A request keeps its slot even when its persistent-batch position
+        changes (upstream condense moves it to a lower index)."""
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a", "b"])
+        idx0 = runner._build_mamba_state_indices(0, 2, 4).cpu()
+        slot_b = int(idx0[1])
+
+        # "a" finishes; "b" condenses to position 0.
+        self._set_batch(runner, ["b"])
+        idx1 = runner._build_mamba_state_indices(0, 1, 4).cpu()
+        assert int(idx1[0]) == slot_b  # same physical slot as before
+
+    def test_freed_slot_is_reused(self):
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a", "b", "c", "d"])
+        idx0 = runner._build_mamba_state_indices(0, 4, 4).cpu()
+        used = {int(x) for x in idx0}
+        assert used == {1, 2, 3, 4}  # all usable slots allocated, none null
+
+        # All finish; a fresh request must reuse a freed slot (pool not
+        # exhausted, no out-of-range index).
+        self._set_batch(runner, ["e"])
+        idx1 = runner._build_mamba_state_indices(0, 1, 4).cpu()
+        assert 1 <= int(idx1[0]) <= 4
+
+    def test_chunked_build_allocates_all(self):
+        """Two chunks in one step: each chunk allocates its own requests; all
+        get distinct slots."""
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a", "b", "c", "d"])
+
+        # clone: the result aliases a reused staging buffer (no copy on CPU).
+        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4).clone()
+        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4).clone()
+        slots = {
+            int(idx_chunk0[0]),
+            int(idx_chunk0[1]),
+            int(idx_chunk1[0]),
+            int(idx_chunk1[1])
+        }
+        assert slots == {1, 2, 3, 4}
