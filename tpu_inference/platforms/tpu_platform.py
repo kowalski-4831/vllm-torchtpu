@@ -367,9 +367,11 @@ class TpuPlatform(Platform):
                         single host without tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "uni"
             else:
-                logger.info("Force using MultiprocExecutor for TPU on \
+                logger.info("Force using TpuMultiprocExecutor for TPU on \
                         single host with tensor/pipeline parallelism.")
-                parallel_config.distributed_executor_backend = "mp"
+                from tpu_inference.executors.tpu_multiproc_executor import \
+                    TpuMultiprocExecutor
+                parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
             from tpu_inference.executors.ray_distributed_executor import \
                 RayDistributedExecutor
@@ -394,6 +396,7 @@ class TpuPlatform(Platform):
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
                 "TPUConnectorHMA",
+                "OffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
                 _TPU_SUPPORTED_KV_CONNECTORS, (

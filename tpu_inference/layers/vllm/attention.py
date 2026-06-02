@@ -228,6 +228,18 @@ class PallasAttentionBackend(AttentionBackend):
         # The Pallas kernels expect a 5D KV cache: [L, S, Kx2 / kv_packing, kv_packing, H]
         # where Kx2 = num_kv_heads for hd64 and Kx2 = num_kv_heads * 2 for v3.
         use_hd64 = (head_size == 64)
+        # vLLM's OffloadingConnectorWorker.register_kv_caches probes this
+        # method without a concrete dtype to discover the num_blocks logical
+        # dimension (it only reads test_shape.index(num_blocks); see
+        # vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py).
+        # num_blocks is at dim 0 in our layout regardless of dtype, so return
+        # a placeholder shape that satisfies the probe without resolving the
+        # dtype.
+        if (isinstance(cache_dtype_str, str)
+                and cache_dtype_str.lower().strip() == "auto"):
+            num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
+            return (num_blocks, block_size, num_kv_heads_x2, 1,
+                    padded_head_size)
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         if not is_floating_dtype(kv_dtype):
             raise NotImplementedError(

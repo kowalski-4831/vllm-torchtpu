@@ -2114,6 +2114,23 @@ class TPUModelRunner(GPUModelRunner):
                 with self.maybe_setup_dummy_loras(self.lora_config):
                     self._precompile_sampling_subgraphs()
 
+    def get_kv_prewarm_shapes(self) -> list[int]:
+        if not has_kv_transfer_group():
+            return []
+        kv_connector = get_kv_transfer_group()
+        cw = getattr(kv_connector, "connector_worker", None)
+        if cw is None or not hasattr(cw.spec, "prewarm_shapes"):
+            return []
+        return cw.spec.prewarm_shapes
+
+    def prewarm_kv_offload_shape(self, p: int) -> None:
+        if not has_kv_transfer_group():
+            return
+        kv_connector = get_kv_transfer_group()
+        cw = getattr(kv_connector, "connector_worker", None)
+        if cw is not None and hasattr(cw.spec, "prewarm_shape"):
+            cw.spec.prewarm_shape(p)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
