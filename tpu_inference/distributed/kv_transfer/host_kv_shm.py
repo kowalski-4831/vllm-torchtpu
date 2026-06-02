@@ -229,9 +229,9 @@ class HostKVShmPool:
             pass
         shm = shared_memory.SharedMemory(name=name, create=True, size=size)
         logger.info(
-            "HostKVShmPool --> created name=%s size=%.2fGB "
-            "(num_slots=%d, tp_size=%d, num_layers=%d, per_slot=%.2fMB)", name,
-            size / (1024**3), spec.num_slots, spec.tp_size, spec.num_layers,
+            "%s --> created name=%s size=%.2fGB "
+            "(num_slots=%d, tp_size=%d, per_slot=%.2fMB)", cls.__name__, name,
+            size / (1024**3), spec.num_slots, spec.tp_size,
             spec.per_slot_bytes / (1024**2))
         return cls(spec, shm, owner=True)
 
@@ -240,9 +240,9 @@ class HostKVShmPool:
         shm = shared_memory.SharedMemory(name=name, create=False)
         if shm.size < spec.total_bytes:
             raise RuntimeError(
-                f"HostKVShmPool attach: shm size {shm.size} < expected "
+                f"{cls.__name__} attach: shm size {shm.size} < expected "
                 f"{spec.total_bytes}. Spec mismatch between ranks?")
-        logger.info("HostKVShmPool --> attached name=%s size=%.2fGB", name,
+        logger.info("%s --> attached name=%s size=%.2fGB", cls.__name__, name,
                     shm.size / (1024**3))
         return cls(spec, shm, owner=False)
 

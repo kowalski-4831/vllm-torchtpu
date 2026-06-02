@@ -400,10 +400,7 @@ class ZmqShmKvConnectorBase:
         kv_caches = runner.kv_caches
         assert len(kv_caches) > 0, (
             "register_runner called before kv_caches were allocated")
-        kv_layer = kv_caches[0]
-        self.num_layers = len(kv_caches)
-        self.shape = list(kv_layer.shape)
-        self.dtype = kv_layer.dtype
+        self._extract_kv_layout()
         logger.info(
             "TPUConnectorWorker --> register_runner | node_id=%s | "
             "num_layers=%d | layer_shape=%s | dtype=%s | device=%s",
@@ -419,6 +416,28 @@ class ZmqShmKvConnectorBase:
                     "TPUConnectorWorker %s rank%d --> warmup failed "
                     "(continuing; first real request will pay the compile "
                     "cost): %s", self.node_id, self.tp_rank, e)
+
+    def _extract_kv_layout(self) -> None:
+        """Default (uniform) layout: every kv cache layer has the same shape
+        and dtype. """
+        kv_caches = self.runner.kv_caches
+        kv_layer = kv_caches[0]
+        self.num_layers = len(kv_caches)
+        self.shape = list(kv_layer.shape)
+        self.dtype = kv_layer.dtype
+
+    def _blocks_token(self, local_block_ids: Any) -> Any:
+        return len(local_block_ids)
+
+    def _pull_response_header(self, entry: "_CoordSendEntry") -> dict:
+        return {
+            "tp_size": self.tp_size,
+            "num_layers": self.num_layers,
+            "num_blocks": entry.num_blocks,
+            "dtype": str(self._coord_pool_spec.dtype),
+            "layer_shard_shape":
+            list(self._coord_pool_spec.layer_shard_shape[1:]),
+        }
 
     def _replace_runner_kv_cache(self, layer_idx: int,
                                  new_cache: torch.Tensor) -> None:
@@ -546,9 +565,9 @@ class ZmqShmKvConnectorBase:
     # slice of a slot. Control messages between rank 0 and the rest flow
     # over ZMQ ROUTER/DEALER on ipc:// .
 
-    def _coord_setup(self) -> None:
-        """Allocate the shm pool, bind ZMQ endpoints, spawn threads. Called
-        from register_runner() once kv_caches are known."""
+    def _build_pool_spec(self) -> Any:
+        """Build the per-host shm pool spec. Subclasses
+        override this and return their own spec."""
         kv_layer = self.runner.kv_caches[0]
         block_size = self.vllm_config.cache_config.block_size
         max_model_len = self.vllm_config.model_config.max_model_len
@@ -577,7 +596,7 @@ class ZmqShmKvConnectorBase:
             "per_slot=%.2fMB -> num_slots=%d", self.node_id, self.tp_rank,
             budget_bytes / (1024**3), per_slot_bytes / (1024**2), num_slots)
 
-        self._coord_pool_spec = PoolSpec(
+        return PoolSpec(
             num_slots=num_slots,
             tp_size=self.tp_size,
             num_layers=self.num_layers,
@@ -586,12 +605,25 @@ class ZmqShmKvConnectorBase:
             dtype=kv_layer.dtype,
         )
 
+    def _pool_create(self, spec: Any, shm_name: str) -> Any:
+        """Rank-0: create the per-host shm pool."""
+        return HostKVShmPool.create(spec, shm_name)
+
+    def _pool_attach(self, spec: Any, shm_name: str) -> Any:
+        """Non-rank-0: attach to the per-host shm pool."""
+        return HostKVShmPool.attach(spec, shm_name)
+
+    def _coord_setup(self) -> None:
+        """Allocate the shm pool, bind ZMQ endpoints, spawn threads. Called
+        from register_runner() once kv_caches are known."""
+        self._coord_pool_spec = self._build_pool_spec()
+
         shm_name = dist_utils.get_shm_name(self.node_id)
         ipc_path = dist_utils.get_ipc_socket_path(self.node_id)
 
         if self.tp_rank == 0:
-            self._coord_pool = HostKVShmPool.create(self._coord_pool_spec,
-                                                    shm_name)
+            self._coord_pool = self._pool_create(self._coord_pool_spec,
+                                                 shm_name)
             self._coord_setup_rank0(ipc_path)
         else:
             self._coord_pool = self._coord_attach_shm_with_retry(
@@ -607,15 +639,14 @@ class ZmqShmKvConnectorBase:
         if dist_utils.get_kv_pin_shm():
             self._coord_pool.mlock_async(my_rank=self.tp_rank)
 
-    def _coord_attach_shm_with_retry(self, spec: PoolSpec,
-                                     name: str) -> HostKVShmPool:
+    def _coord_attach_shm_with_retry(self, spec: Any, name: str) -> Any:
         """Non-rank-0 ranks may race ahead of rank 0. Poll the shm name a
         few seconds before giving up."""
         deadline = time.perf_counter() + 30.0
         last_err: Optional[Exception] = None
         while time.perf_counter() < deadline:
             try:
-                return HostKVShmPool.attach(spec, name)
+                return self._pool_attach(spec, name)
             except FileNotFoundError as e:
                 last_err = e
                 time.sleep(0.1)
@@ -833,10 +864,10 @@ class ZmqShmKvConnectorBase:
         drained by the IPC thread every ~50ms) lets non-zero ranks begin
         their own inline stage in parallel with us."""
         assert self.is_producer
-        num_blocks = len(req_meta.local_block_ids)
+        num_blocks = self._blocks_token(req_meta.local_block_ids)
         logger.info(
             "TPUConnectorWorker rank0 --> handle_new_send req_id=%s uuid=%s "
-            "blocks=%d", req_id, req_meta.uuid, num_blocks)
+            "blocks=%s", req_id, req_meta.uuid, num_blocks)
         logger.info("PERF P handle_new_send req_id=%s uuid=%s ts=%.6f", req_id,
                     req_meta.uuid, time.time())
         try:
@@ -957,7 +988,7 @@ class ZmqShmKvConnectorBase:
         DMA."""
         logger.info(
             "TPUConnectorWorker %s rank%d --> stage_shard enqueue "
-            "uuid=%s slot=%d blocks=%d layers=%d", self.node_id, self.tp_rank,
+            "uuid=%s slot=%d blocks=%s layers=%d", self.node_id, self.tp_rank,
             uuid, slot_idx, num_blocks, len(self.runner.kv_caches))
         enqueue_t0 = time.perf_counter()
         future, src_refs, dst_refs, d2h_total_bytes = self._stage_d2h(
@@ -1138,8 +1169,7 @@ class ZmqShmKvConnectorBase:
                 self._coord_broadcast(_IPC_LOAD_SKIP, (req_meta.uuid, ))
             return
 
-        num_blocks = len(req_meta.local_block_ids)
-        assert num_blocks == len(req_meta.remote_block_ids)
+        num_blocks = self._blocks_token(req_meta.local_block_ids)
         # Preemption dedup: vLLM's scheduler re-emits update_state_after_alloc
         # for requests that were preempted and rescheduled. The LoadMeta
         # carries the same uuid (assigned by the producer) but new
@@ -1163,7 +1193,7 @@ class ZmqShmKvConnectorBase:
                 # will read the updated local_blocks when it publishes.
                 logger.warning(
                     "TPUConnectorWorker rank0 --> dedup preempted load "
-                    "req_id=%s uuid=%s (pull in flight, new blocks=%d)",
+                    "req_id=%s uuid=%s (pull in flight, new blocks=%s)",
                     req_id, req_meta.uuid, num_blocks)
             else:
                 # Pull already completed and LOAD_NOTIFY fired with the
@@ -1175,7 +1205,7 @@ class ZmqShmKvConnectorBase:
                 logger.warning(
                     "TPUConnectorWorker rank0 --> dedup preempted load "
                     "req_id=%s uuid=%s (pull already complete, "
-                    "rebroadcasting LOAD_NOTIFY with new blocks=%d)", req_id,
+                    "rebroadcasting LOAD_NOTIFY with new blocks=%s)", req_id,
                     req_meta.uuid, num_blocks)
                 self._coord_broadcast(
                     _IPC_LOAD_NOTIFY,
@@ -1241,7 +1271,7 @@ class ZmqShmKvConnectorBase:
                                          protocol=pickle.HIGHEST_PROTOCOL)
         logger.info(
             "TPUConnectorWorker rank0 --> PULL req_id=%s uuid=%s "
-            "from=%s:%s+0..%d blocks=%d n_channels=%d", entry.req_id,
+            "from=%s:%s+0..%d blocks=%s n_channels=%d", entry.req_id,
             entry.uuid, entry.remote_host, base_port, n_channels - 1,
             entry.num_blocks, n_channels)
 
@@ -1777,7 +1807,7 @@ class ZmqShmKvConnectorBase:
                 uuid, slot_idx, num_blocks, block_ids = obj
                 logger.info(
                     "TPUConnectorWorker rank%d --> STAGE_NOTIFY received "
-                    "uuid=%s slot=%d blocks=%d", self.tp_rank, uuid, slot_idx,
+                    "uuid=%s slot=%d blocks=%s", self.tp_rank, uuid, slot_idx,
                     num_blocks)
                 # Hand off to the main thread (waiting in
                 # _coord_worker_stage_inline); don't stage in an executor
@@ -2017,18 +2047,7 @@ class ZmqShmKvConnectorBase:
             str(len(ranks_on_channel)).encode("utf-8")
         ]
         if channel_idx == 0:
-            header = {
-                "tp_size":
-                self.tp_size,
-                "num_layers":
-                self.num_layers,
-                "num_blocks":
-                entry.num_blocks,
-                "dtype":
-                str(self._coord_pool_spec.dtype),
-                "layer_shard_shape":
-                list(self._coord_pool_spec.layer_shard_shape[1:]),
-            }
+            header = self._pull_response_header(entry)
             frames.append(
                 pickle.dumps(header, protocol=pickle.HIGHEST_PROTOCOL))
         total_bytes = 0
