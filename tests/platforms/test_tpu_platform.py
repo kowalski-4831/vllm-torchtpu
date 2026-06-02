@@ -37,6 +37,7 @@ class TestTpuPlatform:
         vllm_config.scheduler_config = MagicMock()
         vllm_config.scheduler_config.max_num_batched_tokens = 2048
         vllm_config.scheduler_config.is_multimodal_model = False
+        vllm_config.speculative_config = None
         vllm_config.parallel_config = MagicMock()
         vllm_config.parallel_config.world_size = 1
         vllm_config.parallel_config.pipeline_parallel_size = 1

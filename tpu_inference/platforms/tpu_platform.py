@@ -331,6 +331,12 @@ class TpuPlatform(Platform):
                        == "CUSTOM" else PallasAttentionBackend)
         is_hybrid = getattr(vllm_config.model_config, "is_hybrid", False)
         cls._is_hybrid = is_hybrid
+        cls._speculative_enabled = vllm_config.speculative_config is not None
+        if cls._speculative_enabled and \
+                vllm_config.scheduler_config.async_scheduling:
+            raise NotImplementedError(
+                "Speculative decoding with async scheduling is not yet "
+                "supported on TPU; run with async_scheduling=False.")
         if not is_hybrid and block_size_was_unspecified:
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]
@@ -445,6 +451,11 @@ class TpuPlatform(Platform):
                 raise ValueError(
                     f"Sampling type {params.sampling_type} is not supported on TPU."
                 )
+            if getattr(cls, "_speculative_enabled",
+                       False) and params.sampling_type != SamplingType.GREEDY:
+                raise NotImplementedError(
+                    "Speculative decoding currently only supports greedy "
+                    "sampling (temperature=0) on TPU.")
             if params.top_k != 0 or params.top_p != 1.0:
                 logger.warning(
                     "Top-K and Top-P are not yet supported on TPU and will be ignored."

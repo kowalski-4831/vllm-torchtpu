@@ -42,8 +42,9 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
-                             LogprobsTensors, ModelRunnerOutput)
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
+                             LogprobsLists, LogprobsTensors, ModelRunnerOutput)
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
@@ -55,9 +56,12 @@ from tpu_inference.layers.common.attention_metadata import (
 from tpu_inference.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend)
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
+from tpu_inference.layers.vllm.sample.rejection_sampler import RejectionSampler
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from tpu_inference.runner.speculative_decoding_manager import (
+    SpecDecodeMetadata, SpeculativeDecodingManager)
 from tpu_inference.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
@@ -71,6 +75,7 @@ class ExecuteModelState:
     scheduler_output: "SchedulerOutput"
     logits_list: list[torch.Tensor]
     num_reqs_list: list[int]
+    spec_decode_metadata_list: list["SpecDecodeMetadata | None"]
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -364,6 +369,9 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
 
+        self.speculative_config = self.vllm_config.speculative_config
+        self.spec_decode_manager = SpeculativeDecodingManager(self)
+        self._init_speculative_decoding()
         # JAX Mesh for shard_map ops in TPU kernels (data=1, model=tp_size).
         self.mesh = self._create_mesh_for_parallelism()
 
@@ -401,6 +409,18 @@ class TPUModelRunner(GPUModelRunner):
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
         return finished
+
+    def _init_speculative_decoding(self) -> None:
+        self.drafter = None
+        self.rejection_sampler = None
+        if self.speculative_config:
+            self.rejection_sampler = RejectionSampler()
+            if self.speculative_config.method == "ngram":
+                self.drafter = NgramProposer(self.vllm_config)
+            else:
+                raise NotImplementedError(
+                    "Unsupported speculative decoding method: "
+                    f"{self.speculative_config.method}")
 
     def _create_mesh_for_parallelism(self) -> Mesh:
         # Per-worker JAX mesh is always single-chip; vLLM native multiprocess
@@ -1267,7 +1287,22 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs, self.max_num_reqs)
         decode_cache_key = (num_reqs, padded_num_reqs, use_max_model_len)
 
-        if is_decode_only and decode_cache_key == self._decode_device_cache_key:
+        # Speculative decoding metadata.
+        spec_decode_metadata = None
+        if self.speculative_config:
+            num_draft_tokens = np.array([
+                len(
+                    scheduler_output.scheduled_spec_decode_tokens.get(
+                        req_id, ())) for req_id in
+                self.input_batch.req_ids[start_index:start_index + num_reqs]
+            ],
+                                        dtype=np.int32)
+            if num_draft_tokens.any():
+                spec_decode_metadata = self.spec_decode_manager.get_spec_decode_metadata(
+                    num_draft_tokens, self.query_start_loc_np[1:num_reqs + 1],
+                    padded_num_reqs)
+
+        if is_decode_only and decode_cache_key == self._decode_device_cache_key and spec_decode_metadata is None:
             # Reuse cached device tensors — skip 3 H2D copies.
             query_start_loc = self._cached_query_start_loc
             logits_indices = self._cached_logits_indices
@@ -1289,10 +1324,14 @@ class TPUModelRunner(GPUModelRunner):
                                                                non_blocking=True
                                                            )
 
-            # Indices at which we sample (positions of last token in the
-            # sequence). Padded to avoid recompiling when `num_reqs` varies.
-            logits_indices = (self.query_start_loc_cpu[1:padded_num_reqs + 1] -
-                              1).to(self.device, non_blocking=True)
+            if spec_decode_metadata is not None:
+                logits_indices = spec_decode_metadata.final_logits_indices
+            else:
+                # Indices at which we sample (positions of last token in the
+                # sequence). Padded to avoid recompiling when `num_reqs` varies.
+                logits_indices = (
+                    self.query_start_loc_cpu[1:padded_num_reqs + 1] - 1).to(
+                        self.device, non_blocking=True)
 
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
@@ -1305,7 +1344,7 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True)
 
-            if is_decode_only:
+            if is_decode_only and spec_decode_metadata is None:
                 # Cache for future decode steps.
                 self._decode_device_cache_key = decode_cache_key
                 self._cached_query_start_loc = query_start_loc
@@ -1362,6 +1401,7 @@ class TPUModelRunner(GPUModelRunner):
             end_index,
             cur_input_indices,
             pre_next_tokens_indices,
+            spec_decode_metadata,
         )
 
     def _get_model_inputs(
@@ -1414,6 +1454,7 @@ class TPUModelRunner(GPUModelRunner):
         start_index = 0
         logits_list = []
         num_reqs_list = []
+        spec_decode_metadata_list = []
 
         # NOTE: setup current batch's metadata for kv connector.
         # Currently, only verified with NixlConnector
@@ -1422,8 +1463,8 @@ class TPUModelRunner(GPUModelRunner):
 
         while start_index < self.input_batch.num_reqs:
             (attn_metadata, logits_indices, padded_num_reqs, num_reqs,
-             end_index, cur_input_indices,
-             pre_next_tokens_indices) = (self._prepare_inputs(
+             end_index, cur_input_indices, pre_next_tokens_indices,
+             spec_decode_metadata) = (self._prepare_inputs(
                  scheduler_output, start_index, num_decode_reqs))
 
             input_ids = self._apply_async_token_substitution(
@@ -1450,6 +1491,7 @@ class TPUModelRunner(GPUModelRunner):
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
+            spec_decode_metadata_list.append(spec_decode_metadata)
 
             start_index = end_index
 
@@ -1457,8 +1499,14 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output=scheduler_output,
             logits_list=logits_list,
             num_reqs_list=num_reqs_list,
+            spec_decode_metadata_list=spec_decode_metadata_list,
         )
         return None
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self.spec_decode_manager is None:
+            return None
+        return self.spec_decode_manager.take_draft_token_ids()
 
     @torch.no_grad()
     def sample_tokens(
@@ -1492,61 +1540,107 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_offset = 0
         combined_logprobs: list[Any] = []
 
-        cur_start_idx = 0
-        req_ids = cast(list[str],
-                       self.input_batch.req_ids[:self.input_batch.num_reqs])
-        all_greedy = self.input_batch.all_greedy
-        for logits, num_reqs in zip(state.logits_list, state.num_reqs_list):
-            cur_end_idx = cur_start_idx + num_reqs
-            if grammar_output is not None:
-                require_struct_decoding, grammar_bitmask_padded, arange = (
-                    self.prepare_structured_decoding_input(
-                        logits, grammar_output))
-                logits = self.structured_decode(require_struct_decoding,
-                                                grammar_bitmask_padded, logits,
-                                                arange)
-            if all_greedy:
-                dummy_placeholder = torch.empty((1, 1),
-                                                dtype=logits.dtype,
-                                                device=logits.device)
-                selected_token_ids = self.sample_from_logits_func(
-                    logits,
-                    dummy_placeholder,
-                    dummy_placeholder,
-                    all_greedy=True)
-            else:
-                temperatures_tpu = self._build_padded_temperatures(
-                    cur_start_idx, cur_end_idx, logits)
-                u = torch.rand_like(logits)
-                selected_token_ids = self.sample_from_logits_func(
-                    logits, temperatures_tpu, u, all_greedy=all_greedy)
-            # NOTE (NickLucche) Use the original logits (before any penalties or
-            # temperature scaling) for the top-k logprobs. We can't enforce it
-            # due to recompilations outside torch.compiled code, so just make
-            # sure `sample_from_logits` does not modify the logits in-place.
-            logprobs = (self.gather_logprobs(logits, selected_token_ids)
-                        if needs_logprobs else None)
-
-            # Keep the bucketed (padded) tensor; trim happens on the host
-            # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
-            combined_selected_tokens.append(selected_token_ids)
-            combined_selected_tokens_real_lens.append(num_reqs)
-            if self.scheduler_config.async_scheduling:
-                next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
-                for req_idx in range(cur_start_idx, cur_end_idx):
-                    next_token_indices[req_idx] = (next_tokens_tpu_offset +
-                                                   req_idx - cur_start_idx)
-                next_tokens_tpu_offset += selected_token_ids.shape[0]
+        use_spec = any(md is not None
+                       for md in state.spec_decode_metadata_list)
+        if use_spec:
             if needs_logprobs:
-                sliced_logprobs = LogprobsTensors(
-                    logprobs.logprob_token_ids[:num_reqs],
-                    logprobs.logprobs[:num_reqs],
-                    logprobs.selected_token_ranks[:num_reqs],
-                    logprobs.cu_num_generated_tokens)
-                combined_logprobs.append(sliced_logprobs)
+                raise NotImplementedError(
+                    "Logprobs are not supported with speculative decoding on "
+                    "TPU yet.")
+            for logits, num_reqs, md in zip(state.logits_list,
+                                            state.num_reqs_list,
+                                            state.spec_decode_metadata_list):
+                if md is not None:
+                    # Extract bonus tokens from the target model logits.
+                    bonus_token_ids = torch.argmax(
+                        logits[md.bonus_logits_indices], dim=-1)
+                    next_tokens = self.rejection_sampler(
+                        draft_token_ids=md.draft_token_ids,
+                        num_draft_tokens=md.draft_lengths,
+                        target_logits=logits[md.target_logits_indices],
+                        bonus_token_ids=bonus_token_ids,
+                        segment_ids=md.segment_ids,
+                        group_indices=md.group_indices,
+                        max_draft_tokens=self.speculative_config.
+                        num_speculative_tokens,
+                    )
+                    combined_selected_tokens.append(next_tokens)
+                    combined_selected_tokens_real_lens.append(num_reqs)
+                else:
+                    dummy = torch.empty((1, 1),
+                                        dtype=logits.dtype,
+                                        device=logits.device)
+                    selected = self.sample_from_logits_func(logits,
+                                                            dummy,
+                                                            dummy,
+                                                            all_greedy=True)
+                    padded = torch.full(
+                        (selected.shape[0],
+                         self.speculative_config.num_speculative_tokens + 1),
+                        INVALID_TOKEN_ID,
+                        dtype=selected.dtype,
+                        device=selected.device)
+                    padded[:, 0] = selected.view(-1)
+                    combined_selected_tokens.append(padded)
+                    combined_selected_tokens_real_lens.append(num_reqs)
+        else:
+            cur_start_idx = 0
+            req_ids = cast(
+                list[str],
+                self.input_batch.req_ids[:self.input_batch.num_reqs])
+            all_greedy = self.input_batch.all_greedy
+            for logits, num_reqs in zip(state.logits_list,
+                                        state.num_reqs_list):
+                cur_end_idx = cur_start_idx + num_reqs
+                if grammar_output is not None:
+                    require_struct_decoding, grammar_bitmask_padded, arange = (
+                        self.prepare_structured_decoding_input(
+                            logits, grammar_output))
+                    logits = self.structured_decode(require_struct_decoding,
+                                                    grammar_bitmask_padded,
+                                                    logits, arange)
+                if all_greedy:
+                    dummy_placeholder = torch.empty((1, 1),
+                                                    dtype=logits.dtype,
+                                                    device=logits.device)
+                    selected_token_ids = self.sample_from_logits_func(
+                        logits,
+                        dummy_placeholder,
+                        dummy_placeholder,
+                        all_greedy=True)
+                else:
+                    temperatures_tpu = self._build_padded_temperatures(
+                        cur_start_idx, cur_end_idx, logits)
+                    u = torch.rand_like(logits)
+                    selected_token_ids = self.sample_from_logits_func(
+                        logits, temperatures_tpu, u, all_greedy=all_greedy)
+                # NOTE (NickLucche) Use the original logits (before any penalties or
+                # temperature scaling) for the top-k logprobs. We can't enforce it
+                # due to recompilations outside torch.compiled code, so just make
+                # sure `sample_from_logits` does not modify the logits in-place.
+                logprobs = (self.gather_logprobs(logits, selected_token_ids)
+                            if needs_logprobs else None)
 
-            self._update_num_xla_graphs("decoding_step")
-            cur_start_idx = cur_end_idx
+                # Keep the bucketed (padded) tensor; trim happens on the host
+                # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
+                combined_selected_tokens.append(selected_token_ids)
+                combined_selected_tokens_real_lens.append(num_reqs)
+                if self.scheduler_config.async_scheduling:
+                    next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
+                    for req_idx in range(cur_start_idx, cur_end_idx):
+                        next_token_indices[req_idx] = (next_tokens_tpu_offset +
+                                                       req_idx - cur_start_idx)
+                    next_tokens_tpu_offset += selected_token_ids.shape[0]
+                if needs_logprobs:
+                    sliced_logprobs = LogprobsTensors(
+                        logprobs.logprob_token_ids[:num_reqs],
+                        logprobs.logprobs[:num_reqs],
+                        logprobs.selected_token_ranks[:num_reqs],
+                        logprobs.cu_num_generated_tokens)
+                    combined_logprobs.append(sliced_logprobs)
+
+                self._update_num_xla_graphs("decoding_step")
+                cur_start_idx = cur_end_idx
 
         # NOTE: current kv load and save get h2d/d2h copies involved.
         # Those copies are blocking. Once they become async., kv_save
@@ -1663,13 +1757,20 @@ class TPUModelRunner(GPUModelRunner):
                 if not valid_tokens:
                     continue
                 req_idx = self.input_batch.req_id_to_index[req_id]
-                self.input_batch.num_tokens_no_spec[req_idx] += len(
-                    valid_tokens)
-                target_slice = slice(seq_len - len(valid_tokens) + 1,
-                                     seq_len + 1)
-                self.input_batch.token_ids_cpu[req_idx,
-                                               target_slice] = valid_tokens
+
+                # Update the persistent batch.
+                start_tok_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_tok_idx = start_tok_idx + len(valid_tokens)
+                self.input_batch.token_ids_cpu[
+                    req_idx, start_tok_idx:end_tok_idx] = valid_tokens
+                self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
+
                 req_state.output_token_ids.extend(valid_tokens)
+
+            if self.speculative_config:
+                self.spec_decode_manager.propose_draft_token_ids(
+                    final_output.sampled_token_ids)
+
             return final_output
 
         return async_output
