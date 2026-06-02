@@ -196,12 +196,13 @@ start_vllm_server() {
     echo "Server started (pid=$SERVER_PID)"
     echo "Server log: $RESULTS_DIR/server.log"
 
-    # Wait for server to be ready (up to 120 minutes for large model compilation)
-    local max_wait=$((120 * 60))
+    # Wait for server to be ready (env-overridable; large hybrid models need a
+    # long AOT-precompile window before /health is up).
+    local max_wait=$(( ${SERVER_READY_WAIT_MIN:-90} * 60 ))
     local waited=0
     while ! curl -s -o /dev/null --connect-timeout 1 "http://localhost:$PORT/health" 2>/dev/null; do
         if [ "$waited" -ge "$max_wait" ]; then
-            echo "ERROR: Server did not become ready within 120 minutes."
+            echo "ERROR: Server did not become ready within $((max_wait / 60)) minutes."
             stop_vllm_server
             exit 1
         fi
@@ -285,9 +286,9 @@ run_benchmark_once() {
 # =============================================================================
 # Covers the worst-case sampled length for ISL/OSL=8192 with --random-range-ratio=0.8
 # (max ≈ 1.8*8192 + 1.8*1024 = 16590); pre-16384 runs silently dropped ~40% of these.
-max_model_len=16384
-max_batched_tokens=8192
-max_num_seqs=512
+max_model_len=${MAX_MODEL_LEN:-16384}
+max_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
+max_num_seqs=${MAX_NUM_SEQS:-512}
 
 # JSON-encode capture_profile + profile_dir for config.json.
 capture_profile_json=${CAPTURE_PROFILE:-0}
