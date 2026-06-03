@@ -54,6 +54,7 @@ def prepare_routed_gmm_inputs(
     local_num_experts: int,
     topk: int,
     use_ep: bool,
+    use_sparse_core: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -82,7 +83,7 @@ def prepare_routed_gmm_inputs(
                          valid_mask[:, None].astype(jnp.int32))
     group_sizes_local = group_sizes_local.sum(axis=0)
 
-    if use_ep:
+    if use_ep and use_sparse_core:
         # Match uLLM/reference EP routing: materialize the valid local
         # expert prefix through SparseCore ragged_gather. Invalid
         # non-local rows are sorted after the valid prefix.
@@ -116,6 +117,7 @@ def moe_gmm(
     num_tokens: int,
     topk: int,
     use_ep: bool,
+    use_sparse_core: bool,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -140,7 +142,7 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    if (topk_weights_flat.size % 128 == 0
+    if (use_sparse_core and topk_weights_flat.size % 128 == 0
             and gather_reduce_sc.is_supported_by_sc_gather_reduce(
                 gmm1_res.shape[0], envs.SC_KERNEL_THRESHOLD)):
         gmm2_res = gmm_wrapper(gmm1_res,
@@ -170,7 +172,7 @@ def moe_gmm(
                            zero_initialize=False,
                            preferred_element_type=x.dtype)
 
-    if use_ep:
+    if use_ep and use_sparse_core:
         valid_count = group_sizes.sum(dtype=jnp.int32)
         token_hidden = ragged_scatter(
             gmm2_res,
@@ -196,6 +198,7 @@ def moe_gmm(
         "topk",
         "activation",
         "use_ep",
+        "use_sparse_core",
     ),
 )
 def fused_moe_func(
@@ -212,14 +215,16 @@ def fused_moe_func(
     topk: int = 1,
     activation: str = "silu",
     use_ep: bool = False,
+    use_sparse_core: bool = True,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, bound as a Python int (compile-time constant) by the
     torch bridge. The kernel remaps global ids to local ids with an elementwise
-    subtract and masks non-local experts. ``use_ep`` is a static flag
-    controlling SparseCore ragged gather/scatter dispatch.
+    subtract and masks non-local experts. ``use_ep`` is a static flag enabling
+    EP routing; ``use_sparse_core`` is a static flag selecting the #193
+    SparseCore ragged gather/scatter (vs the pre-#193 plain-JAX path).
     """
     num_tokens, hidden_size = hidden_states.shape
     _, padded_hidden_size, _ = w1.shape
@@ -247,6 +252,7 @@ def fused_moe_func(
          local_num_experts=w1.shape[0],
          topk=topk,
          use_ep=use_ep,
+         use_sparse_core=use_sparse_core,
      )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
@@ -265,5 +271,6 @@ def fused_moe_func(
         num_tokens=num_tokens,
         topk=topk,
         use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
     )
     return x[:num_tokens, :hidden_size]

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
     SC_KERNEL_THRESHOLD: int = 16777216
     SC_KERNEL_COL_CHUNK_SIZE: int = 3072
+    USE_MOE_SPARSE_CORE: bool = True
 
 
 def env_with_choices(
@@ -189,6 +190,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("SC_KERNEL_THRESHOLD") or "16777216"),
     "SC_KERNEL_COL_CHUNK_SIZE":
     lambda: int(os.getenv("SC_KERNEL_COL_CHUNK_SIZE") or "3072"),
+    # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
+    # gather/scatter and sc_gather_reduce fall back to the pre-#193 plain-JAX
+    # path (functionally equivalent; valid-mask gating unchanged). Mirrors
+    # upstream vLLM's VLLM_USE_FLASHINFER_MOE_* style of env-gated MoE kernel
+    # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
+    "USE_MOE_SPARSE_CORE":
+    lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
 }
 
 

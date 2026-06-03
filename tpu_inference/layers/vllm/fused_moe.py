@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import torch
 from torch_tpu._internal import pallas
 
+import tpu_inference.envs as envs
 from tpu_inference.layers.common.fused_moe_gmm import fused_moe_func
 
 _kernel_instance_counter = 0
@@ -41,11 +42,20 @@ def _build_fused_moe_custom_op(
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
 
+    # TODO: once the pod's vLLM includes --moe-backend (added upstream in
+    # vLLM PR #33807, 2026-03-01; absent in the 0.19.0 we run), register the
+    # SparseCore vs plain variants through that selector + the MoE oracle
+    # instead of this env flag -- the MoE analog of how #191 moved batched
+    # RPA onto --attention-backend CUSTOM. Note MoEBackend has no CUSTOM slot
+    # yet, so that also needs an upstream OOT-backend hook.
+    use_sparse_core = envs.USE_MOE_SPARSE_CORE
+
     wrapped_fn = functools.partial(fused_moe_func,
                                    experts_start=experts_start,
                                    topk=topk,
                                    activation=activation,
-                                   use_ep=experts_start is not None)
+                                   use_ep=experts_start is not None,
+                                   use_sparse_core=use_sparse_core)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
