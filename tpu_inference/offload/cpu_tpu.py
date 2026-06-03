@@ -15,14 +15,14 @@
 
 This module plugs into vllm's `OffloadingConnector` framework to give TPU
 inference a large CPU-resident host pool for KV-cache blocks evicted from
-HBM. Cache hits on the host pool are streamed back into HBM via Pallas
-DMA before attention reads them.
+HBM. Cache hits on the host pool are streamed back into HBM via host-side
+gather + DMA copy, then scattered into the live `kv_cache` via torch
+in-place indexing.
 
 Architecture
 ------------
 - `TPUCPUOffloadingSpec` subclasses `vllm.v1.kv_offload.cpu.spec.
-  CPUOffloadingSpec`; it overrides `get_handlers()` to wire up Pallas
-  gather/scatter kernels and exposes
+  CPUOffloadingSpec`; it overrides `get_handlers()` and exposes
   `estimate_hbm_reserve_bytes(vllm_config) -> int` so the worker can
   reserve HBM for the H2D staging buffer before profile_run.
 - `CpuTpuOffloadingHandlers` holds one D2H and one H2D
@@ -33,6 +33,16 @@ Architecture
 - Oversized H2D loads (more than `KV_H2D_POOL_MAX_BLOCKS` blocks) are
   split into max-buffer-sized chunks; each chunk consumes one engine
   step's worth of latency, the depth-1 invariant is preserved.
+- Scatter dispatch is **scheduler-gated**: per-rank `get_finished` only
+  defers the scatter (adds the chunk to `_pending_scatters` and reports
+  `finished_recving` based on `dma_done`). The actual scatter HLO is
+  enqueued from a monkey-patched `OffloadingConnectorWorker.
+  start_kv_transfers`, filtered by `scatter_now_req_ids` set on the
+  metadata by a monkey-patched `OffloadingConnectorScheduler.
+  build_connector_meta` from `scheduler_output.num_scheduled_tokens`.
+  A request only enters that set after `KVOutputAggregator` released
+  `finished_recving` from every rank, so the scatter HLOs dispatch in
+  lockstep across ranks at the same broadcast-sync entry point.
 
 Usage
 -----
@@ -68,14 +78,11 @@ Environment knobs (all optional)
     Caps the H2D staging buffer's `(max_padded, …)` first dim. Rounded
     to the next power of 2. Larger = fewer chunked loads on long-prefix
     workloads but more HBM reserved up front.
-- `MAX_H2D_PREWARM_BLOCKS` (default 2048)
-    Caps the number of power-of-2 shapes the H2D Pallas scatter HLO is
-    pre-compiled for at engine init.
-- `MAX_D2H_PREWARM_BLOCKS` (default 64)
-    Same, for D2H Pallas gather.
-- `TPU_PREMAPPED_BUFFER_SIZE` (libtpu env)
-    Bumping to 8 GiB is required for `--kv-offloading-size` above ~350
-    GiB; otherwise the lazy `copy_` falls back to slower per-call pinning.
+- `TPU_PREMAPPED_BUFFER_SIZE` (libtpu env, **per device**)
+    Sized so libtpu's premap pool can absorb one H2D transfer worth of
+    pinned-host staging. 16 GiB per chip works for the standard 480B
+    overflow workload (see recipe). Bigger is fine on host RAM budget;
+    too small forces lazy `copy_` to fall back to slower per-call pinning.
 """
 from __future__ import annotations
 
@@ -88,7 +95,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch_tpu._internal import pallas as tpu_pallas
 from torch_tpu._internal.sync import synchronize as _tpu_sync
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -102,16 +108,113 @@ from vllm.v1.kv_offload.worker.worker import (OffloadingHandler,
                                               TransferResult, TransferSpec)
 
 from tpu_inference.logger import init_logger
-from tpu_inference.offload.pallas_kv_gather import pallas_kv_gather
-from tpu_inference.offload.pallas_kv_scatter import pallas_kv_scatter
 
 logger = init_logger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Module-level Pallas kernel bridges (compiled once per process).
+# Module-level patches: route scatter dispatch through a scheduler-driven
+# "ready set" so all ranks scatter the same transfers at the same step
+# boundary.
+#
+# Design
+# ------
+# Two hooks, both idempotent:
+#
+# 1. SCHEDULER side — `OffloadingConnectorScheduler.build_connector_meta`
+#    is wrapped to annotate req_ids in THIS step's active batch.
+#
+# 2. WORKER side — `OffloadingConnectorWorker.start_kv_transfers` is
+#    reimplemented to:
+#      a. Pass `scatter_now_req_ids` into each handler's
+#         `flush_pending_scatters`, which filters the deferred scatter
+#         list and only dispatches HLOs for transfers whose `req_id` is
+#         in the set.
+#      b. Stash `req_id` on the handler keyed by `job_id` *before*
+#         calling `worker.transfer_async`, so the handler can tag the
+#         resulting `Transfer` for later lookup.
+#    All ranks reach this from the same `execute_model` broadcast
+#    (~µs jitter), so the scatter HLOs go onto libtpu in lockstep.
+#
 # ---------------------------------------------------------------------------
-_scatter_fn = tpu_pallas.custom_jax_kernel(pallas_kv_scatter)
-_gather_fn = tpu_pallas.custom_jax_kernel(pallas_kv_gather)
+def _install_scheduler_scatter_now_hook() -> None:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
+        OffloadingConnectorScheduler  # noqa: E501
+
+    orig = OffloadingConnectorScheduler.build_connector_meta
+    if getattr(orig, "_tpu_scatter_now_patched", False):
+        return
+
+    def build_connector_meta_with_scatter_now(
+            self, scheduler_output):  # type: ignore[no-untyped-def]
+        meta = orig(self, scheduler_output)
+        # Active-batch req_ids: a req enters the batch only after the
+        # aggregator released finished_recving from ALL ranks (or it
+        # didn't need a KV load at all). Either way, a req_id in this
+        # set is safe to scatter on every rank in lockstep.
+        meta.scatter_now_req_ids = set(
+            scheduler_output.num_scheduled_tokens.keys())
+        return meta
+
+    build_connector_meta_with_scatter_now._tpu_scatter_now_patched = True  # type: ignore[attr-defined]
+    OffloadingConnectorScheduler.build_connector_meta = (
+        build_connector_meta_with_scatter_now)
+
+
+def _install_flush_pending_scatters_hook() -> None:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
+        OffloadingConnectorWorker
+
+    orig = OffloadingConnectorWorker.start_kv_transfers
+    if getattr(orig, "_tpu_flush_patched", False):
+        return
+
+    def start_kv_transfers_with_flush(
+            self, metadata):  # type: ignore[no-untyped-def]
+        # Step 1: drain deferred scatter, filtered by scheduler signal.
+        # All ranks reach this point from the same `execute_model`
+        # broadcast, so the scatter HLOs land on libtpu in lockstep.
+        # `scatter_now_req_ids` is unconditionally annotated by the
+        # scheduler-side hook above — AttributeError here means the
+        # scheduler hook failed to install (loud failure, by design).
+        scatter_now = metadata.scatter_now_req_ids
+        for handler in self.worker.handlers:
+            if hasattr(handler, "flush_pending_scatters"):
+                handler.flush_pending_scatters(scatter_now)
+
+        # Step 2: dispatch pending stores (deferred from prior step's
+        # `prepare_store_kv`). Stores don't carry the req_id stash —
+        # they're not subject to the scatter-now gate.
+        for job_id, transfer_spec in self._unsubmitted_store_jobs:
+            success = self.worker.transfer_async(job_id, transfer_spec)
+            assert success
+        self._unsubmitted_store_jobs.clear()
+
+        # Step 3: dispatch new loads. Stash req_id on the appropriate
+        # H2D handler BEFORE calling `worker.transfer_async` so the
+        # handler can copy it onto the resulting Transfer.
+        for req_id, transfer_spec in metadata.reqs_to_load.items():
+            job_id = self._generate_job_id()
+            self._jobs[job_id] = (req_id, False)
+            assert req_id not in self._load_job
+            self._load_job[req_id] = job_id
+            # Find the handler that will receive this transfer.
+            src, dst = transfer_spec
+            ttype = (src.medium(), dst.medium())
+            handler = self.worker.transfer_type_to_handler.get(ttype)
+            if handler is not None and hasattr(handler,
+                                               "_stash_req_id_for_job"):
+                handler._stash_req_id_for_job(job_id, req_id)
+            success = self.worker.transfer_async(job_id, transfer_spec)
+            assert success
+
+    start_kv_transfers_with_flush._tpu_flush_patched = True  # type: ignore[attr-defined]
+    OffloadingConnectorWorker.start_kv_transfers = (
+        start_kv_transfers_with_flush)
+
+
+_install_scheduler_scatter_now_hook()
+_install_flush_pending_scatters_hook()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -235,6 +338,27 @@ class Transfer:
     # Set by the DMA worker task if it raises. get_finished() reads this to
     # report success=False.
     error: BaseException | None = None
+    # Request ID owning this transfer. Stashed at transfer_async time from
+    # the connector_worker's _jobs mapping. Used by flush_pending_scatters
+    # to filter against scheduler-side `scatter_now_req_ids` so scatter
+    # dispatch happens in lockstep across ranks (gated by the aggregator,
+    # never by per-rank coordination).
+    req_id: str | None = None
+
+
+@dataclass
+class _PendingScatter:
+    """A chunk whose H2D completed; scatter HLO awaits the next
+    broadcast-synchronized `start_kv_transfers` for dispatch.
+
+    Snapshotting device_buffer + dst_ids_i32 here lets the underlying
+    Transfer be re-submitted for its next chunk (which overwrites
+    Transfer.device_buffer) before this snapshot is consumed.
+    """
+    transfer: Transfer
+    device_buffer: list
+    dst_ids_i32: object  # torch.Tensor (lazy import)
+    is_last_chunk: bool
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +382,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.dst_tensors = dst_tensors
 
         min_factor = min(src_block_size_factor, dst_block_size_factor)
+        assert src_block_size_factor % min_factor == 0
+        assert dst_block_size_factor % min_factor == 0
         self.src_block_size_factor = src_block_size_factor // min_factor
         self.dst_block_size_factor = dst_block_size_factor // min_factor
 
@@ -274,6 +400,13 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         self._transfer_map: dict[int, Transfer] = {}
         self._transfers: deque[Transfer] = deque()
+        # Bridge from connector_worker (which knows req_id at start_kv
+        # _transfers time) to handler.transfer_async (which builds the
+        # Transfer). Used by H2D loads only — D2H stores don't get tagged
+        # because they're not subject to the scatter-now gate — but
+        # initialized here so the unconditional `Transfer.req_id` lookup
+        # in `transfer_async` works on both directions' instances.
+        self._req_id_by_job_id: dict[int, str] = {}
 
         # Lightweight diagnostics — printed sparingly to spot stalls.
 
@@ -310,35 +443,53 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             # Force materialization so subsequent copy_ calls don't go
             # through a lazy-allocation path that could stall PJRT.
             _tpu_sync(self._h2d_device_buffer, wait=True)
+            # Buffer-reuse gate. SET = device buffer is logically free for
+            # the worker to write the next H2D into. CLEARED = a transfer
+            # is mid-flight (worker is writing) OR pending scatter (main
+            # thread hasn't yet enqueued the TC HLO that reads it).
+            #
+            # Main thread `set()`s after enqueuing scatter on libtpu's
+            # command stream (NOT after the scatter completes on device —
+            # we rely on XLA's HBM-range dependency tracking to serialize
+            # the next H2D DMA after the scatter on the device). This
+            # keeps main thread non-blocking; the worker is the only one
+            # that ever waits.
+            self._h2d_buffer_free = threading.Event()
+            self._h2d_buffer_free.set()
+            # H2D: chunks whose DMA completed; scatter HLO deferred to the
+            # next broadcast-synchronized `start_kv_transfers`.
+            self._pending_scatters: list[_PendingScatter] = []
             logger.info(
                 "[kv-offload] H2D device buffer: %d blocks (max_padded)",
                 max_padded,
             )
 
-        # Pre-compile Pallas kernels for all power-of-2 shapes to avoid
-        # Python JAX tracing (GIL-holding) during inference.
-        self._prewarm_kernels()
-
     # -- H2D deferred-submission management ----------------------------------
 
+    def _stash_req_id_for_job(self, job_id: int, req_id: str) -> None:
+        """Called from monkey-patched `OffloadingConnectorWorker.
+        start_kv_transfers` immediately before `worker.transfer_async`,
+        so the downstream `self.transfer_async` can tag the Transfer
+        with its owning req_id without a framework signature change.
+        """
+        self._req_id_by_job_id[job_id] = req_id
+
     def _start_h2d_dma(self, t: Transfer) -> None:
-        """Kick the worker thread on the H2D DMA for transfer `t`.
+        """Submit the worker closure that will host-gather, gate on the
+        device buffer being free, and DMA the chunk into device_buffer.
 
-        Builds the worker closure that:
-          1. Allocates host_buffer and runs index_select(cpu_pool, src_ids)
-             — i.e., the host-side gather that *was* on the main thread.
-          2. Per-layer blocking copy_ from host_buffer → device_buffer.
-        Both steps run inside the worker so transfer_async stays fast and
-        only one H2D's host_buffer is ever alive (in-flight=1).
-
-        Caller (always `_ensure_h2d_in_flight`) must guarantee no other H2D
-        is in flight at the moment of call — i.e., the prior transfer's
-        scatter completed synchronously in get_finished.
+        Submission is eager (called from transfer_async and from
+        get_finished for the next chunk of an oversized transfer). The
+        worker queue serializes execution; the `_h2d_buffer_free` Event
+        gates the actual DMA enqueue so libtpu sees:
+            scatter(prev) → H2D(this)
+        in that command-stream order. XLA's HBM-range dependency on
+        `device_buffer` then serializes them on-device — no host-side
+        `_tpu_sync` is needed and the main thread never blocks.
 
         For oversized transfers (chunks_total > 1), dispatches just the
-        chunk indexed by `t.chunks_done`. get_finished() resets `dma_done`
-        to None after each chunk's scatter so subsequent calls re-enter
-        here for the next chunk.
+        chunk indexed by `t.chunks_done`. get_finished() re-submits so
+        the worker picks up the next chunk.
         """
         chunk_size = self._h2d_max_padded
         start = t.chunks_done * chunk_size
@@ -360,12 +511,16 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             full[:n_chunk_padded] for full in self._h2d_device_buffer
         ]
         src_tensors = self.src_tensors  # cpu_pool, captured for the closure
+        buffer_free = self._h2d_buffer_free  # captured for the closure
 
         def _h2d_task(devs: list, src_tensors: list, src_ids_padded):
             try:
                 src_ids_torch = torch.from_numpy(src_ids_padded).to(
                     torch.int64)
                 n_padded = len(src_ids_padded)
+                # Host-side gather first. Safe at any time — it touches only
+                # cpu_pool (read-only here) and a freshly allocated host
+                # buffer; no shared TPU state.
                 hosts = []
                 for cpu_pool in src_tensors:
                     h = torch.empty(
@@ -374,9 +529,13 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     )
                     torch.index_select(cpu_pool, 0, src_ids_torch, out=h)
                     hosts.append(h)
-                # Per-layer BLOCKING copy_. Hits the prewarmed single-layer
-                # HLO; the combined N-layer compile was observed to trigger
-                # a SparseCore UserFatal, so we keep the per-layer dispatch.
+                # Gate on the device buffer being free. Blocks the WORKER
+                # thread, never the main thread. Main `set()`s after
+                # enqueuing the scatter HLO for the prior transfer, which
+                # guarantees: prev scatter is on libtpu's command stream
+                # before this H2D's copy_ enqueue lands on it.
+                buffer_free.wait()
+                buffer_free.clear()
                 for d, h in zip(devs, hosts):
                     d.copy_(h)
             except BaseException as e:
@@ -387,130 +546,12 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         t.dma_done = self._dma_worker.submit(_h2d_task, device_buffer,
                                              src_tensors, src_chunk_padded)
 
-    def _ensure_h2d_in_flight(self) -> None:
-        """Start the H2D DMA for the next pending transfer iff nothing is
-        currently in-flight.
-
-        Scans `self._transfers` in order. If the head transfer already has
-        `dma_done` set on it, an H2D is already in flight and this is a
-        no-op. Otherwise kick that transfer.
-        """
-        for t in self._transfers:
-            if t.dma_done is not None:
-                return  # already in-flight
-            self._start_h2d_dma(t)
-            return
-
-    # -- Diagnostics ----------------------------------------------------------
-
-    # -- Pallas kernel prewarm ------------------------------------------------
-
     @property
     def prewarm_shapes(self) -> list[int]:
-        """Power-of-2 block-count shapes for H2D scatter prewarm.
+        return []
 
-        Capped at MAX_H2D_PREWARM_BLOCKS (default 2048) because the combined
-        64-layer scatter HLO compilation time grows super-linearly with shape:
-        p=2048 ~13s, p=4096 ~35s, p=8192 >60s (exceeds shm_broadcast timeout).
-        """
-        if self.tpu_to_cpu:
-            return []
-        max_prewarm = int(os.environ.get("MAX_H2D_PREWARM_BLOCKS", "2048"))
-        max_n = min(self.dst_tensors[0].shape[0], max_prewarm)
-        max_shape = 1
-        while max_shape < max_n:
-            max_shape <<= 1
-        shapes, p = [], 1
-        while p <= max_shape:
-            shapes.append(p)
-            p <<= 1
-        return shapes
-
-    def prewarm_shape(self, p: int) -> None:
-        """Pre-compile H2D Pallas scatter, d.copy_(h), and id .to(device).
-
-        Three compile artifacts per shape:
-          1. Pallas scatter (tt_jit_custom_kernel)
-          2. d.copy_(h) (tt_jit_copy__copy_from_as_strided_inverse)
-          3. ids.to(self._device) (tt_jit_to_copy_copy__copy_from_as_strided)
-        """
-        assert not self.tpu_to_cpu, "prewarm_shape is for H2D only"
-        dummy_ids = torch.zeros(p, dtype=torch.int32, device=self._device)
-        dummy_devs = [
-            torch.empty((p, ) + kv_l.shape[1:],
-                        dtype=kv_l.dtype,
-                        device=self._device) for kv_l in self.dst_tensors
-        ]
-        # (1) Pallas scatter prewarm.
-        dummy_kv = [torch.zeros_like(kv_l) for kv_l in self.dst_tensors]
-        for kv_d, d in zip(dummy_kv, dummy_devs):
-            kv_d[:] = _scatter_fn(kv_d, d, dummy_ids)
-        _tpu_sync(dummy_kv, wait=True)
-        # (2) H2D copy_ prewarm — use an actual SLICE of _h2d_device_buffer
-        #     so the storage / stride / view pattern matches runtime exactly.
-        if self._h2d_device_buffer and p <= self._h2d_max_padded:
-            slice_d = self._h2d_device_buffer[0][:p]
-            slice_h = torch.empty(slice_d.shape, dtype=slice_d.dtype)
-            slice_d.copy_(slice_h)
-            _tpu_sync([slice_d], wait=True)
-            del slice_d, slice_h
-        # (3) id .to(self._device) prewarm — matches runtime line ~616.
-        _ = (torch.from_numpy(np.zeros(p, dtype=np.int32)).to(torch.int32).to(
-            self._device))
-        del dummy_devs, dummy_kv
-        logger.debug("[kv-offload] Pre-warmed H2D for shape p=%d", p)
-
-    def _prewarm_kernels(self) -> None:
-        """Pre-compile D2H gather Pallas + h.copy_(d) for power-of-2 shapes.
-
-        H2D scatter is pre-warmed separately via prewarm_shape() because each
-        shape needs its own 60-second shm_broadcast window.
-
-        ROI-targeted copy_ prewarm: single-layer dummy tensors only — each
-        layer shares the same per-layer shape, so one prewarm per p covers
-        every layer. Runtime D2H hits exactly one unique
-        (shape, dtype, stride) per p across all TP workers.
-        """
-        if not self.tpu_to_cpu:
-            return  # H2D prewarm is deferred to prewarm_shape()
-
-        # Cap at MAX_D2H_PREWARM_BLOCKS (default 64). Runtime D2H tends to
-        # only hit small p; unbounded prewarm up to the full TPU KV cache
-        # size caused HBM bloat / OOM.
-        max_prewarm = int(os.environ.get("MAX_D2H_PREWARM_BLOCKS", "64"))
-        max_n = min(self.src_tensors[0].shape[0], max_prewarm)
-        max_shape = 1
-        while max_shape < max_n:
-            max_shape <<= 1
-
-        count = 0
-        p = 1
-        while p <= max_shape:
-            dummy_ids = torch.zeros(p, dtype=torch.int32, device=self._device)
-            # (1) Pallas gather prewarm — all layers (one HLO per p).
-            all_gather = [
-                _gather_fn(kv_l, dummy_ids) for kv_l in self.src_tensors
-            ]
-            # (2) D2H copy_ prewarm — single layer only. copy_ will block
-            #     until the gather materializes, so no explicit sync needed.
-            single_d = all_gather[0]
-            single_h = torch.empty(single_d.shape, dtype=single_d.dtype)
-            single_h.copy_(single_d)
-            # (3) id .to(self._device) prewarm — matches runtime line ~532.
-            _ = (torch.from_numpy(np.zeros(p, dtype=np.int32)).to(
-                torch.int32).to(self._device))
-            # Drop refs so the gather HBM is freed before next iteration.
-            del all_gather, single_d, single_h
-            count += 1
-            p <<= 1
-
-        logger.debug(
-            "[kv-offload] Pre-warmed D2H gather+copy for %d power-of-2 "
-            "shapes (max_shape=%d, max_n=%d)",
-            count,
-            max_shape,
-            max_n,
-        )
+    def prewarm_shape(self, p: int) -> None:  # noqa: ARG002
+        return None
 
     # -- OffloadingHandler interface -----------------------------------------
 
@@ -553,9 +594,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             # (1) Compute stream (main thread): Pallas gather + flush IR.
             # Stays on the main thread because moving it would force XLA
             # to coordinate kv_l (live KV cache) reads across threads.
-            device_buffer = [
-                _gather_fn(kv_l, src_ids_i32) for kv_l in self.src_tensors
-            ]
+            src_ids_i64 = src_ids_i32.to(torch.int64)
+            device_buffer = [kv_l[src_ids_i64] for kv_l in self.src_tensors]
             _tpu_sync(device_buffer, wait=False)
 
             # (2) Unpinned host staging matching the gathered device shape.
@@ -631,75 +671,156 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 chunks_done=0,
             )
 
+        # Tag the Transfer with its owning req_id so flush_pending_scatters
+        # can later filter against scheduler-provided `scatter_now_req_ids`.
+        # The req_id was stashed by the monkey-patched start_kv_transfers
+        # immediately before this call.
+        t.req_id = self._req_id_by_job_id.pop(job_id, None)
         self._transfer_map[job_id] = t
         self._transfers.append(t)
         if not self.tpu_to_cpu:
-            self._ensure_h2d_in_flight()
+            # Eager submit. Worker queue serializes; the buffer_free Event
+            # gates the actual DMA enqueue against the prior scatter.
+            self._start_h2d_dma(t)
         return True
+
+    def flush_pending_scatters(self, scatter_now_req_ids: set[str]) -> None:
+        """Dispatch H2D scatter HLOs for deferred chunks whose owning
+        request has been promoted to the active batch on ALL ranks.
+
+        `scatter_now_req_ids` is the set of req_ids in the current step's
+        scheduled batch, populated by the scheduler-side hook from
+        `scheduler_output.num_scheduled_tokens`. A request only enters
+        that set after `KVOutputAggregator` released its `finished_recving`
+        from every rank — set membership is the "all ranks done" signal
+        that lets each rank dispatch its scatter in lockstep with the
+        others. Transfers whose req_id isn't in the set stay in
+        `_pending_scatters` for a later step's flush.
+
+        For chunked transfers, re-submits the next chunk to the worker
+        after this chunk's scatter is enqueued — preserving the libtpu
+        command-stream order `scatter(prev) → H2D(next)` that XLA needs
+        to serialize same-buffer reads/writes correctly.
+        """
+        # Check tpu_to_cpu FIRST — `_pending_scatters` is only initialized
+        # on the H2D handler (see __init__'s `if not self.tpu_to_cpu` block).
+        # The D2H handler shares this class but has no deferred-scatter
+        # concept; bail before touching the missing attribute.
+        if self.tpu_to_cpu or not self._pending_scatters:
+            return
+
+        # Intermediate (non-last) chunks of a chunked transfer flush
+        # eagerly — they write to KV-cache slots already reserved for the
+        # request and the request hasn't been promoted yet (its
+        # `finished_recving` only fires on the LAST chunk). Gating
+        # intermediate chunks on `scatter_now_req_ids` would deadlock:
+        # the next chunk can't dispatch until the prior chunk's scatter is
+        # enqueued (buffer-reuse invariant), but the req_id won't enter
+        # `scatter_now_req_ids` until `finished_recving` is reported,
+        # which only happens on the last chunk's `get_finished`.
+        to_flush = [
+            ps for ps in self._pending_scatters if
+            (not ps.is_last_chunk or ps.transfer.req_id in scatter_now_req_ids)
+        ]
+        to_keep = [
+            ps for ps in self._pending_scatters
+            if (ps.is_last_chunk
+                and ps.transfer.req_id not in scatter_now_req_ids)
+        ]
+
+        if not to_flush:
+            # Nothing to dispatch on this rank this step. Return early
+            # so we don't accidentally freed _h2d_buffer_free below.
+            return
+
+        try:
+            for ps in to_flush:
+                if ps.transfer.error is not None:
+                    continue
+                dst_ids_i64 = ps.dst_ids_i32.to(torch.int64)
+                for kv_cache_l, dev_buf in zip(self.dst_tensors,
+                                               ps.device_buffer):
+                    kv_cache_l[dst_ids_i64] = dev_buf
+        finally:
+            # Scatter HLOs are now enqueued on libtpu's command stream;
+            # the worker may proceed with the next H2D (XLA serializes
+            # via device_buffer's HBM-range event chain).
+            self._h2d_buffer_free.set()
+        # Re-submit the next chunk of any flushed transfer whose chunk
+        # was not its last. The newly-submitted DMA will block on the
+        # worker thread's `buffer_free.wait()` if the buffer is still
+        # held by another deferred chunk (depth=1 invariant).
+        for ps in to_flush:
+            if ps.transfer.error is None and not ps.is_last_chunk:
+                self._start_h2d_dma(ps.transfer)
+        self._pending_scatters = to_keep
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        if self._transfers:
-            pass
         while self._transfers:
             t = self._transfers[0]
 
-            # For H2D, dma_done is None until `_start_h2d_dma` kicks the
-            # worker (deferred submission). If we're at the head and no DMA
-            # has been started yet, kick it now and bail until next poll —
-            # we don't want to block the main thread waiting for the DMA.
-            if t.dma_done is None:
-                if not self.tpu_to_cpu:
-                    self._ensure_h2d_in_flight()
-                break
-            # dma_done is set by _DmaWorker after the task's terminating
-            # _tpu_sync(wait=True) (D2H) or blocking copy_ (H2D) returns —
-            # i.e., the DMA is physically complete on-device.
-            if not t.dma_done.is_set():
+            # dma_done is set by _DmaWorker when the task returns.
+            #  - D2H: the task's blocking h.copy_(d) waits for the DMA to
+            #    drain into host, then runs the cpu_pool host scatter, so
+            #    dma_done.is_set() ⇒ both copy AND scatter are done.
+            #  - H2D: the task's d.copy_(h) returns once the op is enqueued
+            #    on libtpu's command stream (the DMA itself may still be
+            #    in flight on the DMA engine).
+            #
+            # `dma_done is None` is the chunked re-entry marker: we set it
+            # to None after queueing a chunk for deferred scatter, and the
+            # next chunk's re-submission (from flush_pending_scatters) will
+            # set it to a fresh Event.
+            if t.dma_done is None or not t.dma_done.is_set():
                 break
 
             if self.tpu_to_cpu:
-                # D2H: dma_done.is_set() (verified above) means the worker
-                # task ran both the device -> host copy AND the cpu_pool host
-                # scatter. The main thread only has to drop buffer refs.
+                # D2H: the worker task ran both the device→host copy AND
+                # the cpu_pool host scatter. The main thread only has to
+                # drop buffer refs.
                 self._transfers.popleft()
                 t.host_buffer = None
                 t.device_buffer = None
             else:
-                # H2D: dma_done.is_set() (verified above) means the worker
-                # task ran the host->device copy_ to completion, so the
-                # current chunk's bytes are in device_buffer on-device.
-                # Dispatch the Pallas scatter and wait for it synchronously
-                # — this is what lets the single _h2d_device_buffer be
-                # safely reused by the next chunk (or next transfer).
-                # Combined all-layer scatter HLO is prewarmed in
-                # prewarm_shape().
+                # H2D: defer the scatter HLO dispatch to
+                # `flush_pending_scatters`, which runs at the next
+                # broadcast-synchronized `start_kv_transfers` on all ranks
+                # at once. Reporting `finished_recving` here (without
+                # scattering yet) is safe because the scheduler's
+                # KVOutputAggregator waits for ALL ranks to report before
+                # promoting the request; the request's forward at step k+1
+                # is preceded by start_kv_transfers's flush on the same
+                # step, so XLA sees `scatter → forward` on the kv_cache
+                # buffer and serializes correctly.
+                t.chunks_done += 1
+                is_last = (t.error is not None
+                           or t.chunks_done >= t.chunks_total)
                 if t.error is None:
-                    for kv_cache_l, dev_buf in zip(self.dst_tensors,
-                                                   t.device_buffer):
-                        kv_cache_l[:] = _scatter_fn(kv_cache_l, dev_buf,
-                                                    t.dst_ids_i32)
-                    # wait=True: block the main thread until the scatter
-                    # HLO has finished reading device_buffer. Required for
-                    # the depth=1 buffer-reuse invariant.
-                    _tpu_sync(list(self.dst_tensors), wait=True)
+                    self._pending_scatters.append(
+                        _PendingScatter(
+                            transfer=t,
+                            device_buffer=t.device_buffer,
+                            dst_ids_i32=t.dst_ids_i32,
+                            is_last_chunk=is_last,
+                        ))
+                else:
+                    # Error path: no scatter needed; release the buffer so
+                    # the worker isn't stuck on `buffer_free.wait()`.
+                    self._h2d_buffer_free.set()
+                # Detach so the next chunk's `_start_h2d_dma` (called from
+                # flush_pending_scatters) can replace these fields without
+                # clobbering this chunk's snapshot in `_pending_scatters`.
                 t.device_buffer = None
                 t.host_buffer = None
-                t.chunks_done += 1
-                # More chunks pending → leave the transfer at the head and
-                # kick its next chunk via _ensure_h2d_in_flight. The next
-                # get_finished() call will scatter that chunk. Skips the
-                # TransferResult / pop until the final chunk lands so the
-                # scheduler doesn't see the load as complete prematurely.
-                if t.error is None and t.chunks_done < t.chunks_total:
-                    t.dma_done = None
-                    self._ensure_h2d_in_flight()
+                t.dma_done = None  # re-entry marker for chunked transfers
+                if not is_last:
+                    # Non-last chunk: keep Transfer at head; do NOT report
+                    # finished_recving yet. flush_pending_scatters will
+                    # re-submit the next chunk after enqueuing this chunk's
+                    # scatter.
                     break
                 self._transfers.popleft()
-                # Scatter completed (or transfer errored) → the single device
-                # buffer is now safe to reuse. Kick the next pending H2D
-                # so the worker thread overlaps with main-thread work.
-                self._ensure_h2d_in_flight()
 
             results.append(
                 TransferResult(
@@ -711,8 +832,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     transfer_type=self.transfer_type,
                 ))
             del self._transfer_map[t.job_id]
-        if results:
-            pass
         return results
 
     def wait(self, job_ids: set[int]) -> None:
@@ -741,6 +860,20 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     f"wait() called on H2D handler for job={jid}; "
                     "OffloadingConnector should never invoke this path.")
 
+    def shutdown(self) -> None:
+        """Tear down the worker thread cleanly.
+
+        For H2D, the worker may be blocked inside `_h2d_task` on
+        `buffer_free.wait()` — `_dma_worker.shutdown()` alone would
+        deadlock because the worker can't pull the shutdown sentinel
+        until the current task returns. Set the buffer-free Event first
+        to unblock the wait; the task then runs its (possibly futile)
+        copy_ to completion and the worker thread exits on the sentinel.
+        """
+        if not self.tpu_to_cpu:
+            self._h2d_buffer_free.set()
+        self._dma_worker.shutdown()
+
 
 # ---------------------------------------------------------------------------
 # Factory: allocates CPU pinned tensors, creates bidirectional handlers
@@ -760,7 +893,7 @@ class CpuTpuOffloadingHandlers:
         gpu_block_size: int,
         cpu_block_size: int,
         num_cpu_blocks: int,
-        kv_caches: "CanonicalKVCaches",
+        kv_caches: CanonicalKVCaches,
         kernel_block_size: int,
         kv_dtype: torch.dtype,
         per_block_shape: tuple[int, ...],
@@ -935,7 +1068,7 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
 
     def get_handlers(
         self,
-        kv_caches: "CanonicalKVCaches",
+        kv_caches: CanonicalKVCaches,
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec],
                         OffloadingHandler]]:
         if self._tpu_handlers is None:

@@ -215,6 +215,115 @@ class TestChunkingMath(unittest.TestCase):
         self.assertEqual(self._chunks(2049, 512), 5)
 
 
+class TestMultiChunkH2D(unittest.TestCase):
+    """Chunked H2D loads must progress chunk-by-chunk through the
+    `get_finished` / `flush_pending_scatters` cycle even before the
+    owning request enters `scatter_now_req_ids`.
+
+    The owning request is in WAITING_FOR_REMOTE_KVS until the LAST
+    chunk's `finished_recving` is reported. That means the req_id is
+    *not* in `scheduler_output.num_scheduled_tokens` (the source of
+    `scatter_now_req_ids`) for any intermediate chunk. So
+    `flush_pending_scatters` MUST treat intermediate chunks as eligible
+    for dispatch independently of the scheduler-gate set — otherwise no
+    chunked transfer can ever complete.
+
+    The test drives the handler's chunk FSM directly without TPU
+    dependencies: `__init__` is bypassed (it would allocate the
+    device-staging buffer via `torch.zeros`) and `_start_h2d_dma` is
+    stubbed to immediately signal `dma_done`.
+    """
+
+    def _make_handler(self):
+        """Construct a barely-initialized H2D handler — just enough state
+        for `get_finished` and `flush_pending_scatters` to run."""
+        import threading
+        from collections import deque
+
+        from tpu_inference.offload.cpu_tpu import \
+            SingleDirectionOffloadingHandler
+
+        h = SingleDirectionOffloadingHandler.__new__(
+            SingleDirectionOffloadingHandler)
+        h.tpu_to_cpu = False
+        h.src_tensors = []
+        h.dst_tensors = []
+        h._transfer_map = {}
+        h._transfers = deque()
+        h._req_id_by_job_id = {}
+        h._h2d_buffer_free = threading.Event()
+        h._h2d_buffer_free.set()
+        h._pending_scatters = []
+        h._dma_worker = MagicMock()
+        h.transfer_type = ("CPU", "GPU")
+        h.total_block_size_in_bytes = 1
+        # Record chunks the handler dispatches.
+        h._dispatched_chunks: list[int] = []
+
+        def fake_start(t):
+            h._dispatched_chunks.append(t.chunks_done)
+            ev = threading.Event()
+            ev.set()
+            t.dma_done = ev
+            t.device_buffer = [MagicMock()]
+            t.dst_ids_i32 = MagicMock()
+            t.dst_ids_i32.to = lambda dtype: MagicMock()
+
+        h._start_h2d_dma = fake_start
+        return h
+
+    def _build_chunked_transfer(self, n_ids: int, req_id: str = "req-A"):
+        import numpy as np
+
+        from tpu_inference.offload.cpu_tpu import Transfer
+        return Transfer(
+            job_id=1,
+            num_bytes=0,
+            n=n_ids,
+            dma_done=None,
+            src_ids=np.arange(n_ids, dtype=np.int64),
+            dst_ids=np.arange(n_ids, dtype=np.int64),
+            chunks_total=4,  # 4 chunks of 2 ids each
+            chunks_done=0,
+            req_id=req_id,
+        )
+
+    def test_intermediate_chunks_dispatch_without_scheduler_gate(self):
+        """Each intermediate chunk must dispatch before `finished_recving`
+        is reported (otherwise the owning request never gets promoted and
+        the LAST chunk never lands). Only the LAST chunk is subject to
+        `scatter_now_req_ids`.
+
+        Contract: starting from chunk 0 in flight, looping
+        `get_finished` + `flush_pending_scatters(empty_set)` must
+        eventually dispatch every chunk and report `finished_recving` on
+        the last one."""
+        h = self._make_handler()
+        t = self._build_chunked_transfer(n_ids=8)
+        h._transfer_map[t.job_id] = t
+        h._transfers.append(t)
+        h._start_h2d_dma(t)  # chunk 0 in flight
+
+        empty_scatter_now: set[str] = set()
+        for _ in range(t.chunks_total + 2):
+            results = h.get_finished()
+            h.flush_pending_scatters(empty_scatter_now)
+            if results:
+                self.assertEqual(results[0].job_id, t.job_id)
+                self.assertEqual(t.chunks_done, t.chunks_total)
+                self.assertEqual(h._dispatched_chunks,
+                                 list(range(t.chunks_total)))
+                return
+
+        self.fail(
+            "Chunked transfer stalled: dispatched only chunks "
+            f"{h._dispatched_chunks} of {t.chunks_total} total; "
+            f"{len(h._pending_scatters)} chunks left in `_pending_scatters`. "
+            "Intermediate chunks were not eligible for flush despite the "
+            "owning req_id correctly being absent from `scatter_now_req_ids` "
+            "(the request is still in WAITING_FOR_REMOTE_KVS).")
+
+
 class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
     """tpu_worker._estimate_kv_connector_hbm_reserve dynamically resolves
     the configured spec via kv_connector_extra_config without hardcoding
