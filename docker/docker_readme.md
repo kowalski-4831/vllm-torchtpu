@@ -69,7 +69,7 @@ Use this image for CI and test infrastructure. It includes extra tooling on top 
 Example build using the standard helper script:
 
 ```bash
-./docker/build_image.sh --target ci -t ci:latest
+./docker/build_image.sh --target ci --torch-tpu-registry -t ci:latest
 ```
 
 ### `dev:latest`
@@ -83,7 +83,7 @@ This image is based on the `ci` stage, copies the repository into the image, and
 Example build using the standard helper script:
 
 ```bash
-./docker/build_image.sh --target dev -t dev:latest
+./docker/build_image.sh --target dev --torch-tpu-registry -t dev:latest
 ```
 
 ### `prod:latest`
@@ -94,7 +94,7 @@ This image is intended for regular runtime usage. It performs a standard install
 Example build using the standard helper script:
 
 ```bash
-./docker/build_image.sh --target prod -t prod:latest
+./docker/build_image.sh --target prod --torch-tpu-registry -t prod:latest
 ```
 
 ## Useful build arguments
