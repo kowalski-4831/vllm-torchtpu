@@ -3,7 +3,89 @@
 # shellcheck disable=all
 set -e
 
-MODEL="Qwen/Qwen2.5-0.5B-Instruct"
+
+
+wait_for_server() {
+  local port=$1
+  timeout 1200 bash -c "
+    until curl -s localhost:${port}/health > /dev/null; do
+      sleep 1
+    done" && return 0 || return 1
+}
+# Function to print logs on exit
+print_logs_on_exit() {
+  echo "--- Script exiting, displaying logs ---"
+
+  # The logs are written inside containers to /root/logs, which is mapped from $LOG_DIR on the host.
+  LOG_DIR=$HOME/logs
+
+  if [ -d "$LOG_DIR" ]; then
+    echo "--- Contents of $LOG_DIR/prefill_0.txt ---"
+    if [ -f "$LOG_DIR/prefill_0.txt" ]; then
+      cat "$LOG_DIR/prefill_0.txt"
+    else
+      echo "File not found."
+    fi
+
+    echo "--- Contents of $LOG_DIR/decode_0.txt ---"
+    if [ -f "$LOG_DIR/decode_0.txt" ]; then
+      cat "$LOG_DIR/decode_0.txt"
+    else
+      echo "File not found."
+    fi
+
+    echo "--- Contents of $LOG_DIR/benchmark_0.txt ---"
+    if [ -f "$LOG_DIR/benchmark_0.txt" ]; then
+      cat "$LOG_DIR/benchmark_0.txt"
+    else
+      echo "File not found."
+    fi
+  else
+    echo "Log directory '$LOG_DIR' not found."
+  fi
+  echo "--- End of logs ---"
+}
+
+check_failed_requests() {
+  local log_file="$1"
+  local failed_requests
+  failed_requests=$(grep "Failed requests:" "$log_file" | awk '{print $3}' || true)
+
+  if [ -z "$failed_requests" ]; then
+    echo "Error: Could not find 'Failed requests:' in the benchmark output." >&2
+    return 1
+  fi
+
+  if [ "$failed_requests" -gt 0 ]; then
+    echo "Error: Benchmark reported $failed_requests failed requests." >&2
+    return 1
+  fi
+
+  echo "Success: Benchmark reported $failed_requests failed requests." >&2
+  return 0
+}
+
+cleanup_instances() {
+  echo "Cleaning up any running vLLM instances..."
+  pkill -f "vllm" || true
+  pkill -f "toy_proxy_server" || true
+  sleep 5
+  pkill -9 -f "vllm" || true
+  pkill -9 -f "toy_proxy_server" || true
+  fuser -k -9 /dev/vfio/* || true
+  fuser -k -9 /dev/accel* || true
+  rm -rf /tmp/jax_cache_* || true
+  rm -f /tmp/libtpu_lockfile || true
+}
+
+# Register the cleanup function to be called on script exit (normal or error)
+trap print_logs_on_exit EXIT
+
+MODEL=${MODEL:="Qwen/Qwen3-0.6B"}
+INPUT_LEN=${INPUT_LEN:=512}
+OUTPUT_LEN=${OUTPUT_LEN:=128}
+NUM_PROMPTS=${NUM_PROMPTS:=200}
+REQUEST_RATE=${REQUEST_RATE:=4}
 
 NUM_PREFILL_INSTANCES=1
 NUM_DECODE_INSTANCES=1
@@ -18,23 +100,16 @@ DECODE_PORTS=()
 # Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
 TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
 
-wait_for_server() {
-  local port=$1
-  timeout 1200 bash -c "
-    until curl -s localhost:${port}/health > /dev/null; do
-      sleep 1
-    done" && return 0 || return 1
-}
+LOG_DIR=$HOME/logs
 
-cleanup_instances() {
-  echo "Cleaning up any running vLLM instances..."
-  pkill -f "vllm serve" || true
-  pkill -f "toy_proxy_server" || true
-  sleep 1
-}
+if [ ! -d $LOG_DIR ]; then
+  mkdir -p $LOG_DIR
+else
+  # Delete old log files to avoid printing stale logs at the end
+  rm -f $LOG_DIR/prefill_0.txt $LOG_DIR/decode_0.txt $LOG_DIR/benchmark_0.txt $LOG_DIR/proxy_0.txt
+fi
 
-mkdir -p $HOME/logs
-
+cleanup_instances
 
 # Start prefill instances
 for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
@@ -57,7 +132,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     --tensor-parallel-size $PREFILLER_TP_SIZE \
     --attention-backend CUSTOM \
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}" \
-    > $HOME/logs/prefill_$i.txt 2>&1 &
+    > $LOG_DIR/prefill_$i.txt 2>&1 &
 
     PREFILL_HOSTS+=("localhost")
     PREFILL_PORTS+=($PORT)
@@ -86,7 +161,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     --tensor-parallel-size $DECODER_TP_SIZE \
     --attention-backend CUSTOM \
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}" \
-    > $HOME/logs/decode_$i.txt 2>&1 &
+    > $LOG_DIR/decode_$i.txt 2>&1 &
 
     DECODE_HOSTS+=("localhost")
     DECODE_PORTS+=($PORT)
@@ -107,13 +182,34 @@ done
 # Start proxy server
 python $HOME/tpu-inference/examples/disagg/toy_proxy_server.py \
 --host localhost \
---port 7080 \
+--port 8000 \
 --prefiller-hosts ${PREFILL_HOSTS[@]} \
 --prefiller-ports ${PREFILL_PORTS[@]} \
 --decoder-hosts ${DECODE_HOSTS[@]} \
 --decoder-ports ${DECODE_PORTS[@]} \
-> $HOME/logs/proxy.txt 2>&1 &
+> $LOG_DIR/proxy_0.txt 2>&1 &
 
+# run benchmark for both disagg and non-disagg
+LOG_FILE="$LOG_DIR/benchmark_0.txt"
+echo "--- Running Disagg Benchmark ---" > $LOG_FILE
+
+# run ben for disagg
+set -x
+vllm bench serve \
+  --model=$MODEL \
+  --num-warmups=3 \
+  --dataset-name=random \
+  --random-input-len=${INPUT_LEN} \
+  --random-output-len=${OUTPUT_LEN} \
+  --num-prompts=${NUM_PROMPTS} \
+  --ignore-eos \
+  --host=localhost \
+  --port 8000 \
+  --request-rate=${REQUEST_RATE} \
+  >> $LOG_FILE 2>&1
+set +x
+
+check_failed_requests "$LOG_FILE"
 
 cat <<'EOF'
 The proxy server has been launched on: 127.0.0.1:7080
