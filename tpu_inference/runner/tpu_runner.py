@@ -2119,7 +2119,8 @@ class TPUModelRunner(GPUModelRunner):
             return []
         kv_connector = get_kv_transfer_group()
         cw = getattr(kv_connector, "connector_worker", None)
-        if cw is None or not hasattr(cw.spec, "prewarm_shapes"):
+        if (cw is None or not hasattr(cw, "spec")
+                or not hasattr(cw.spec, "prewarm_shapes")):
             return []
         return cw.spec.prewarm_shapes
 
@@ -2128,7 +2129,8 @@ class TPUModelRunner(GPUModelRunner):
             return
         kv_connector = get_kv_transfer_group()
         cw = getattr(kv_connector, "connector_worker", None)
-        if cw is not None and hasattr(cw.spec, "prewarm_shape"):
+        if (cw is not None and hasattr(cw, "spec")
+                and hasattr(cw.spec, "prewarm_shape")):
             cw.spec.prewarm_shape(p)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
