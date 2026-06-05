@@ -40,7 +40,7 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   # Don't cancel in-progress jobs for main branch
-  cancel-in-progress: ${{ github.ref != 'main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check_changes:
@@ -76,6 +76,14 @@ jobs:
     with:
       halt-for-connection: ${{ inputs.halt-for-connection }}
 
+  run_perf_eval:
+    needs: check_changes
+    if: github.event.repository.fork == false && needs.check_changes.outputs.should_run == 'true'
+    uses: ./.github/workflows/perf.yml
+    name: "Run Perf and Eval"
+    with:
+      halt-for-connection: ${{ inputs.halt-for-connection }}
+
   # This check exists as a target for branch protection. The tests on TPU are
   # not always run, but if they *are* run we want to make sure they pass before
   # the PR is merged, and it turns out to be a little difficult to represent
@@ -90,7 +98,7 @@ jobs:
   # As a result, it's easier to just have this job with a static name that
   # always runs and have it check whether the other jobs we ran were successful.
   presubmit_tpu_gate:
-    needs: [check_changes, run_tests]
+    needs: [check_changes, run_tests, run_perf_eval]
     # always() = always run whether or not previous jobs succeeded
     # !cancelled() = only run if the job wasn't explicitly cancelled
     if: always() && !cancelled()
@@ -101,9 +109,11 @@ jobs:
         run: |
           CHECK_CHANGES_RESULT="${{ needs.check_changes.result }}"
           RUN_TESTS_RESULT="${{ needs.run_tests.result }}"
+          PERF_EVAL_RESULT="${{ needs.run_perf_eval.result }}"
 
           echo "check_changes result: $CHECK_CHANGES_RESULT"
           echo "run_tests result: $RUN_TESTS_RESULT"
+          echo "run_perf_eval result: $PERF_EVAL_RESULT"
 
           if [ "$CHECK_CHANGES_RESULT" = "failure" ]; then
             echo "check_changes failed"
@@ -117,6 +127,16 @@ jobs:
 
           if [ "$RUN_TESTS_RESULT" = "cancelled" ]; then
             echo "run_tests was cancelled"
+            exit 1
+          fi
+
+          if [ "$PERF_EVAL_RESULT" = "failure" ]; then
+            echo "perf/eval failed"
+            exit 1
+          fi
+
+          if [ "$PERF_EVAL_RESULT" = "cancelled" ]; then
+            echo "perf/eval was cancelled"
             exit 1
           fi
 

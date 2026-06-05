@@ -24,6 +24,13 @@
 name: CI - Perf and Eval on TPU
 
 on:
+  workflow_call:
+    inputs:
+      halt-for-connection:
+        description: 'Should this workflow run wait for a remote connection?'
+        type: string
+        default: 'no'
+
   workflow_dispatch:
     inputs:
       halt-for-connection:
@@ -33,9 +40,6 @@ on:
         options:
           - 'yes'
           - 'no'
-  pull_request:
-    branches:
-      - main
   schedule:
     - cron: '0 10 * * *' # 10 AM UTC, after nightly build
 
@@ -44,11 +48,10 @@ permissions:
   pull-requests: read
   issues: read
 
-# Cancel old PR runs when superseded by new commits, but not on main.
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+# No `concurrency` block here: this runs as a reusable workflow from
+# presubmit-tpu.yml, where `github.workflow` resolves to the caller. A group
+# would match the caller's and deadlock the reusable run, so the caller owns
+# concurrency (matching tests.yml).
 
 jobs:
   check_changes:
@@ -61,6 +64,7 @@ jobs:
       - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
         id: filter
         with:
+          predicate-quantifier: 'every'
           filters: |
             src:
               - '!**.md'
