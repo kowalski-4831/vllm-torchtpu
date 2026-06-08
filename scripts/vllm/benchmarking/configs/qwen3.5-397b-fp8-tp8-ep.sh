@@ -10,6 +10,7 @@ ISL_OSL_CONFIGS="1024:1024 1024:8192 8192:1024"
 CONCURRENCY_OPTIONS="64"
 RANDOM_RANGE_RATIO="0.8"
 ATTENTION_BACKEND=FLASH_ATTN
+SERVER_READY_WAIT_MIN=120
 
 # Extra arguments for vllm serve
 EXTRA_SERVE_ARGS="--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
