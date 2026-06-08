@@ -118,6 +118,8 @@ class TestTPURunner:
             __get__(self.runner))
         # Compact-mamba state starts unset (matches real __init__).
         self.runner._mamba_num_blocks = None
+        self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
+                                             is not None)
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
             self.runner)
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(

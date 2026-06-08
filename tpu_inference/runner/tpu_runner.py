@@ -237,6 +237,10 @@ class TPUModelRunner(GPUModelRunner):
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
+        # Use uniform Mamba layout for disagg until compact cache is supported
+        # for disagg serving.
+        self._uniform_mamba_layout: bool = (self.vllm_config.kv_transfer_config
+                                            is not None)
 
         # TPU env-var flags.
         self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
@@ -812,6 +816,9 @@ class TPUModelRunner(GPUModelRunner):
         block count) and `_mamba_num_blocks`. On any precondition-fail path:
         leaves both unset so the caller falls back to uniform sizing.
         """
+        if self._uniform_mamba_layout:
+            logger.info("Compact mamba sizing skipped.")
+            return
         cache_config = self.cache_config
         if cache_config.num_gpu_blocks_override is not None:
             return
@@ -2346,7 +2353,8 @@ class TPUModelRunner(GPUModelRunner):
         # Initialize the compact-mamba slot allocator now that the true mamba
         # block count is known. When compact sizing was skipped, mamba shares
         # the attention `num_blocks`, so the pool spans that range instead.
-        if allocated_mamba_num_blocks is not None:
+        if (allocated_mamba_num_blocks is not None
+                and not self._uniform_mamba_layout):
             self._init_mamba_slot_pool(allocated_mamba_num_blocks)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
