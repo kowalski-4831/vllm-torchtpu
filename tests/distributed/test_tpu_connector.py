@@ -23,7 +23,8 @@ from tpu_inference.distributed.kv_transfer.tpu_connector_stats import (
 
 from tpu_inference.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
-    TPUConnectorWorker, _CoordRecvEntry, _CoordSendEntry)
+    TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
+    TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -36,7 +37,9 @@ _BASE = "tpu_inference.distributed.kv_transfer.zmq_shm_base"
 def _make_vllm_config(*, is_producer: bool = True, block_size: int = 16):
     cfg = MagicMock()
     cfg.kv_transfer_config.is_kv_producer = is_producer
+    cfg.kv_transfer_config.kv_connector_extra_config = {}
     cfg.cache_config.block_size = block_size
+    cfg.model_config.max_model_len = 64
     return cfg
 
 
@@ -46,6 +49,14 @@ def _make_scheduler(*, is_producer: bool = False):
     with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value="127.0.0.1"), \
          patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100):
         return TPUConnectorScheduler(cfg)
+
+
+def _make_raiden_scheduler(*, is_producer: bool = False):
+    """Construct a TPURaidenConnectorScheduler with network calls patched."""
+    cfg = _make_vllm_config(is_producer=is_producer)
+    with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value="127.0.0.1"), \
+         patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100):
+        return TPURaidenConnectorScheduler(cfg)
 
 
 def _make_worker(*,
@@ -70,6 +81,19 @@ def _make_worker(*,
          patch(f"{_BASE}.dist_utils.get_kv_latency_log_interval", return_value=0.0), \
          patch(f"{_BASE}.zmq.Context"):
         return TPUConnectorWorker(cfg)
+
+
+def _make_raiden_worker(*,
+                        tp_rank: int = 1,
+                        tp_size: int = 4,
+                        is_producer: bool = True) -> TPURaidenConnectorWorker:
+    cfg = _make_vllm_config(is_producer=is_producer)
+    with patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=tp_rank), \
+         patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=tp_size), \
+         patch(f"{_MOD}.dist_utils.get_node_id", return_value=0), \
+         patch(f"{_MOD}.dist_utils.get_host_ip", return_value="127.0.0.1"), \
+         patch(f"{_MOD}.dist_utils.get_kv_transfer_port", return_value="9100"):
+        return TPURaidenConnectorWorker(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +162,65 @@ class TestTPUConnector:
 
         connector._connector_metadata = meta
         connector.start_load_kv(None)
-        worker.process_send_load.assert_called_once_with(meta)
+        worker.process_send_load.assert_called_once_with(
+            meta, wait_for_completion=False, report_completion=True)
 
         connector.get_finished(set())
         worker.get_finished.assert_called_once_with()
+
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
+    @patch(f"{_MOD}.TPUConnectorWorker")
+    @patch(f"{_MOD}.TPUConnectorScheduler")
+    def test_init_defaults_to_zmq_backend(self, mock_sched_cls,
+                                          mock_worker_cls,
+                                          mock_raiden_sched_cls,
+                                          mock_raiden_worker_cls):
+        cfg = _make_vllm_config()
+        TPUConnector(cfg, KVConnectorRole.SCHEDULER)
+        TPUConnector(cfg, KVConnectorRole.WORKER)
+
+        mock_sched_cls.assert_called_once_with(cfg)
+        mock_worker_cls.assert_called_once_with(cfg)
+        mock_raiden_sched_cls.assert_not_called()
+        mock_raiden_worker_cls.assert_not_called()
+
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
+    @patch(f"{_MOD}.TPUConnectorWorker")
+    @patch(f"{_MOD}.TPUConnectorScheduler")
+    def test_init_uses_raiden_backend_when_flag_enabled(
+            self, mock_sched_cls, mock_worker_cls, mock_raiden_sched_cls,
+            mock_raiden_worker_cls):
+        cfg = _make_vllm_config()
+        cfg.kv_transfer_config.kv_connector_extra_config = {
+            "use_raiden_connector": True,
+        }
+
+        TPUConnector(cfg, KVConnectorRole.SCHEDULER)
+        TPUConnector(cfg, KVConnectorRole.WORKER)
+
+        mock_raiden_sched_cls.assert_called_once_with(cfg)
+        mock_raiden_worker_cls.assert_called_once_with(cfg)
+        mock_sched_cls.assert_not_called()
+        mock_worker_cls.assert_not_called()
+
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
+    @patch(f"{_MOD}.TPUConnectorWorker")
+    @patch(f"{_MOD}.TPUConnectorScheduler")
+    def test_explicit_raiden_connector_forces_raiden_backend(
+            self, mock_sched_cls, mock_worker_cls, mock_raiden_sched_cls,
+            mock_raiden_worker_cls):
+        cfg = _make_vllm_config()
+
+        TPURaidenConnector(cfg, KVConnectorRole.SCHEDULER)
+        TPURaidenConnector(cfg, KVConnectorRole.WORKER)
+
+        mock_raiden_sched_cls.assert_called_once_with(cfg)
+        mock_raiden_worker_cls.assert_called_once_with(cfg)
+        mock_sched_cls.assert_not_called()
+        mock_worker_cls.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +408,222 @@ class TestTPUConnectorScheduler:
     def test_get_finished_count_multi_host(self):
         self.consumer.kv_ip = ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
         assert self.consumer.get_finished_count() == 3
+
+
+# ---------------------------------------------------------------------------
+# TestTPURaidenConnectorScheduler — Raiden-specific scheduler behavior
+# ---------------------------------------------------------------------------
+
+
+class TestTPURaidenConnectorScheduler:
+
+    def setup_method(self):
+        self.consumer = _make_raiden_scheduler(is_producer=False)
+        self.producer = _make_raiden_scheduler(is_producer=True)
+
+    @patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=True)
+    def test_inline_full_hit_recomputes_last_token(self, _inline):
+        req = MagicMock()
+        req.request_id = "req-inline"
+        req.prompt_token_ids = [0] * 32
+        req.kv_transfer_params = {"uuid": 1}
+
+        n, is_async = self.consumer.get_num_new_matched_tokens(req, 0)
+
+        assert n == 31
+        assert not is_async
+
+    @patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=True)
+    def test_inline_partial_hit_stays_block_aligned(self, _inline):
+        req = MagicMock()
+        req.request_id = "req-inline-partial"
+        req.prompt_token_ids = [0] * 35
+        req.kv_transfer_params = {"uuid": 1}
+
+        n, is_async = self.consumer.get_num_new_matched_tokens(req, 0)
+
+        assert n == 32
+        assert not is_async
+
+    def test_update_consumer_uses_unhashed_blocks(self):
+        req = MagicMock()
+        req.request_id = "req-1"
+        req.kv_transfer_params = {
+            "uuid": 42,
+            "remote_block_ids": [10, 11],
+            "remote_host": "2.2.2.2",
+            "remote_port": 9200,
+        }
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids.return_value = [1, 2]
+
+        self.consumer.update_state_after_alloc(req, blocks, 32)
+
+        meta = self.consumer.reqs_to_load["req-1"]
+        assert meta.uuid == 42
+        assert meta.local_block_ids == [1, 2]
+        assert meta.remote_block_ids == [10, 11]
+        assert meta.remote_host == "2.2.2.2"
+        assert meta.remote_port == 9200
+        blocks.get_block_ids.assert_not_called()
+
+    def test_update_consumer_partial_prefix_hit_loads_only_suffix(self):
+        req = MagicMock()
+        req.request_id = "req-prefix"
+        req.kv_transfer_params = {
+            "uuid": 43,
+            "remote_block_ids": [10, 11, 12, 13],
+            "remote_host": "2.2.2.2",
+            "remote_port": 9200,
+        }
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids.return_value = [4]
+
+        self.consumer.update_state_after_alloc(req, blocks, 16)
+
+        meta = self.consumer.reqs_to_load["req-prefix"]
+        assert meta.local_block_ids == [4]
+        assert meta.remote_block_ids == [13]
+
+    def test_update_consumer_empty_unhashed_blocks_releases_remote_send(self):
+        req = MagicMock()
+        req.request_id = "req-hit"
+        req.kv_transfer_params = {
+            "uuid": 44,
+            "remote_block_ids": [10, 11],
+            "remote_host": "2.2.2.2",
+            "remote_port": 9200,
+        }
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids.return_value = []
+
+        self.consumer.update_state_after_alloc(req, blocks, 16)
+
+        meta = self.consumer.reqs_to_load["req-hit"]
+        assert meta.local_block_ids is None
+        assert meta.remote_block_ids is None
+
+    def test_get_finished_count_uses_vllm_world_size(self):
+        assert self.consumer.get_finished_count() == 0
+
+
+class _FakeRaidenEngine:
+
+    def __init__(self):
+        self.calls = []
+        self.poll_results = [(["sent"], ["recv"], [])]
+
+    def register_send(self, req_id, uuid, block_ids):
+        self.calls.append(("register_send", req_id, uuid, block_ids))
+        return 1
+
+    def submit_load(self, req_id, uuid, endpoint, remote_blocks, local_blocks):
+        self.calls.append(("submit_load", req_id, uuid, endpoint,
+                           remote_blocks, local_blocks))
+        return 2
+
+    def poll_finished(self):
+        self.calls.append(("poll_finished", ))
+        if self.poll_results:
+            return self.poll_results.pop(0)
+        return [], [], []
+
+
+class TestTPURaidenConnectorWorker:
+
+    def setup_method(self):
+        self.worker = _make_raiden_worker(is_producer=True)
+        self.engine = _FakeRaidenEngine()
+        self.worker._raiden_transfer_engine = self.engine
+
+    def test_producer_registers_sends_with_raiden(self):
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["req"] = MagicMock(uuid=123, local_block_ids=[7, 8])
+
+        self.worker.process_send_load(meta)
+
+        assert self.engine.calls == [("register_send", "req", 123, [7, 8])]
+
+    def test_consumer_submits_loads_to_rank_endpoint(self):
+        worker = _make_raiden_worker(is_producer=False)
+        worker._raiden_transfer_engine = self.engine
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["req"] = LoadMeta(uuid=5,
+                                            local_block_ids=[1],
+                                            remote_block_ids=[9],
+                                            remote_host="10.1.2.3",
+                                            remote_port=9200)
+
+        worker.process_send_load(meta)
+
+        assert self.engine.calls == [("submit_load", "req", 5, "10.1.2.3:9202",
+                                      [9], [1])]
+
+    def test_consumer_releases_cleared_remote_metadata(self):
+        worker = _make_raiden_worker(is_producer=False)
+        worker._raiden_transfer_engine = self.engine
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["req"] = LoadMeta(uuid=5,
+                                            local_block_ids=None,
+                                            remote_block_ids=None,
+                                            remote_host="10.1.2.3",
+                                            remote_port=9200)
+
+        worker.process_send_load(meta)
+
+        assert self.engine.calls == [("submit_load", "req", 5, "10.1.2.3:9202",
+                                      [], [])]
+
+    def test_get_finished_returns_engine_sets(self):
+        assert self.worker.get_finished() == ({"sent"}, {"recv"})
+        assert self.engine.calls == [("poll_finished", )]
+
+    def test_consumer_waits_for_submitted_load_completion(self):
+        worker = _make_raiden_worker(is_producer=False)
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], []), ([], ["req"], [])]
+        worker._raiden_transfer_engine = engine
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["req"] = LoadMeta(uuid=5,
+                                            local_block_ids=[1],
+                                            remote_block_ids=[9],
+                                            remote_host="10.1.2.3",
+                                            remote_port=9200)
+
+        worker.process_send_load(meta, wait_for_completion=True)
+
+        assert engine.calls == [
+            ("submit_load", "req", 5, "10.1.2.3:9202", [9], [1]),
+            ("poll_finished", ),
+            ("poll_finished", ),
+        ]
+        assert worker.get_finished() == (set(), {"req"})
+
+    def test_consumer_wait_can_suppress_completion_report(self):
+        worker = _make_raiden_worker(is_producer=False)
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], []), ([], ["req"], [])]
+        worker._raiden_transfer_engine = engine
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["req"] = LoadMeta(uuid=5,
+                                            local_block_ids=[1],
+                                            remote_block_ids=[9],
+                                            remote_host="10.1.2.3",
+                                            remote_port=9200)
+
+        worker.process_send_load(meta,
+                                 wait_for_completion=True,
+                                 report_completion=False)
+
+        assert worker.get_finished() == (set(), set())
+
+    def test_num_slots_can_be_overridden(self):
+        runner = MagicMock()
+        runner.kv_caches = [torch.empty((128, 2), dtype=torch.bfloat16)]
+        self.worker.runner = runner
+        with patch(f"{_MOD}.dist_utils.get_raiden_transfer_num_slots",
+                   return_value=3):
+            assert self.worker._num_raiden_slots(max_blocks=4) == 3
 
 
 # ---------------------------------------------------------------------------

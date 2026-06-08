@@ -6,10 +6,11 @@ Ported from tpu_inference/distributed/tpu_connector.py in the tpu-inference
 (JAX) project, with the JAX transfer-server data plane replaced by a ZMQ-based
 pull-on-demand transport that moves torch tensors over the TPU host network.
 
-The generic shm-staged ZMQ machinery lives in
+The default generic shm-staged ZMQ machinery lives in
 ``tpu_inference.distributed.kv_transfer.zmq_shm_base.ZmqShmKvConnectorBase``;
 this file holds the TPU-specific transport hooks plus the scheduler half
-of the connector.
+of the connector. A Raiden C++ transfer backend is available as an opt-in
+alternative via ``kv_connector_extra_config.use_raiden_connector``.
 """
 
 import time
@@ -26,6 +27,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorRole)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics, KVConnectorStats, PromMetric, PromMetricT)
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.utils.math_utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
@@ -36,6 +39,8 @@ if TYPE_CHECKING:
 
 import tpu_inference.distributed.utils as dist_utils
 from tpu_inference.distributed.kv_transfer import kv_scatter
+from tpu_inference.distributed.kv_transfer.raiden_transfer_engine import \
+    RaidenTransferEngine
 from tpu_inference.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 from tpu_inference.distributed.kv_transfer.zmq_shm_base import (
@@ -50,6 +55,9 @@ __all__ = [
     "TPUConnector",
     "TPUConnectorScheduler",
     "TPUConnectorWorker",
+    "TPURaidenConnector",
+    "TPURaidenConnectorScheduler",
+    "TPURaidenConnectorWorker",
     "TPUConnectorMetadata",
     "SendMeta",
     "LoadMeta",
@@ -58,18 +66,54 @@ __all__ = [
 ]
 
 
+def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
+    config = vllm_config.kv_transfer_config
+    if config is None:
+        return {}
+    return getattr(config, "kv_connector_extra_config", None) or {}
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in ("1", "true", "yes", "on"):
+            return True
+        if value in ("0", "false", "no", "off"):
+            return False
+    return bool(value)
+
+
+def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
+    extra_config = _get_extra_config(vllm_config)
+    if "use_raiden_connector" in extra_config:
+        return _as_bool(extra_config["use_raiden_connector"])
+    return dist_utils.get_use_raiden_connector()
+
+
 class TPUConnector(KVConnectorBase_V1):
+    force_raiden_connector = False
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
         assert vllm_config.kv_transfer_config is not None
         self._connector_metadata: Optional[TPUConnectorMetadata] = None
+        use_raiden = self.force_raiden_connector or _use_raiden_connector(
+            vllm_config)
+        scheduler_cls = (TPURaidenConnectorScheduler
+                         if use_raiden else TPUConnectorScheduler)
+        worker_cls = TPURaidenConnectorWorker if use_raiden else TPUConnectorWorker
+        logger.info("TPUConnector --> using %s backend",
+                    "Raiden" if use_raiden else "ZMQ-shm")
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = TPUConnectorScheduler(vllm_config)
+            self.connector_scheduler = scheduler_cls(vllm_config)
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = TPUConnectorWorker(vllm_config)
+            self.connector_worker = worker_cls(vllm_config)
 
     # ---- Scheduler-side methods -----------------------------------------
     def get_num_new_matched_tokens(
@@ -141,10 +185,17 @@ class TPUConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         self.connector_worker.register_runner(runner)
 
-    def start_load_kv(self, _, **kwargs) -> None:
+    def start_load_kv(self,
+                      _,
+                      wait_for_completion: bool = False,
+                      report_completion: bool = True,
+                      **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, TPUConnectorMetadata)
-        self.connector_worker.process_send_load(self._connector_metadata)
+        self.connector_worker.process_send_load(
+            self._connector_metadata,
+            wait_for_completion=wait_for_completion,
+            report_completion=report_completion)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Layer-wise load is not supported on TPU."""
@@ -166,6 +217,13 @@ class TPUConnector(KVConnectorBase_V1):
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+
+class TPURaidenConnector(TPUConnector):
+    """Explicit Raiden connector class for callers that prefer connector name
+    selection over ``kv_connector_extra_config.use_raiden_connector``."""
+
+    force_raiden_connector = True
 
 
 class TPUConnectorScheduler:
@@ -323,6 +381,13 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
             return self.transfer_stats.clone_and_reset()
         return None
 
+    def process_send_load(self,
+                          metadata: TPUConnectorMetadata,
+                          wait_for_completion: bool = False,
+                          report_completion: bool = True) -> None:
+        del wait_for_completion, report_completion
+        super().process_send_load(metadata)
+
     def _build_d2h_views(self, slot_idx: int, num_blocks: int,
                          block_ids: list[int]) -> tuple[list, list, int]:
         indices = torch.tensor(block_ids,
@@ -427,6 +492,272 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
                 "TPUConnectorWorker %s rank%d --> multi-layer scatter "
                 "smoke test failed; falling back to index_put_", self.node_id,
                 self.tp_rank)
+
+
+class TPURaidenConnectorScheduler(TPUConnectorScheduler):
+    """Scheduler half for the opt-in Raiden transfer backend."""
+
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
+        if self.is_producer or not request.kv_transfer_params:
+            return 0, False
+
+        assert num_computed_tokens % self.block_size == 0
+        rounded_num_prompt_tokens = round_down(len(request.prompt_token_ids),
+                                               self.block_size)
+        count = max(rounded_num_prompt_tokens - num_computed_tokens, 0)
+        if count > 0:
+            if dist_utils.get_raiden_inline_load():
+                total_external_tokens = num_computed_tokens + count
+                if total_external_tokens >= len(request.prompt_token_ids):
+                    count = max(count - 1, 0)
+                logger.info(
+                    "TPURaidenConnectorScheduler inline load req_id=%s "
+                    "external_tokens=%d", request.request_id, count)
+                return count, False
+            return count, True
+        return 0, False
+
+    def update_state_after_alloc(self, request: "Request",
+                                 blocks: "KVCacheBlocks",
+                                 num_external_tokens: int):
+        if self.is_producer or not request.kv_transfer_params:
+            return
+
+        params = request.kv_transfer_params
+        if num_external_tokens > 0:
+            local_block_ids = blocks.get_unhashed_block_ids()
+            if not local_block_ids:
+                self.reqs_to_load[request.request_id] = LoadMeta(
+                    uuid=params["uuid"],
+                    local_block_ids=None,
+                    remote_block_ids=None,
+                    remote_host=params["remote_host"],
+                    remote_port=params["remote_port"],
+                )
+                logger.info(
+                    "TPURaidenConnectorScheduler prefix hit req_id=%s "
+                    "releases remote send uuid=%s", request.request_id,
+                    params["uuid"])
+                return
+
+            remote_block_ids = params["remote_block_ids"]
+            if len(local_block_ids) > len(remote_block_ids):
+                raise ValueError(
+                    "TPURaidenConnector cannot pull more local blocks than "
+                    "the producer published: "
+                    f"local={len(local_block_ids)} remote="
+                    f"{len(remote_block_ids)}")
+            remote_block_ids = remote_block_ids[-len(local_block_ids):]
+            self.reqs_to_load[request.request_id] = LoadMeta(
+                uuid=params["uuid"],
+                local_block_ids=local_block_ids,
+                remote_block_ids=remote_block_ids,
+                remote_host=params["remote_host"],
+                remote_port=params["remote_port"],
+            )
+        else:
+            self.reqs_to_load[request.request_id] = LoadMeta(
+                uuid=params["uuid"],
+                local_block_ids=None,
+                remote_block_ids=None,
+                remote_host=params["remote_host"],
+                remote_port=params["remote_port"],
+            )
+        logger.info(
+            "TPURaidenConnectorScheduler update_state_after_alloc --> "
+            "reqs_to_load=%s", self.reqs_to_load)
+
+    def get_finished_count(self) -> int:
+        # Raiden reports completion from every local worker rank. Returning 0
+        # asks vLLM's KVOutputAggregator to use the model runner world size.
+        return 0
+
+
+class TPURaidenConnectorWorker:
+    """Worker-side integration for the opt-in Raiden transfer backend.
+
+    Python owns vLLM request metadata only. Raiden C++ owns host slots, D2H,
+    H2H, H2D, readiness, and completion state.
+    """
+
+    def __init__(self, vllm_config: VllmConfig):
+        self.vllm_config = vllm_config
+        self.config = vllm_config.kv_transfer_config
+        self.is_producer = self.config.is_kv_producer
+        self.runner: Optional[TPUModelRunner] = None
+        self.node_id = dist_utils.get_node_id()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.host_ip = dist_utils.get_host_ip()
+        self.kv_transfer_port = int(dist_utils.get_kv_transfer_port())
+        self._raiden_transfer_engine: Optional[RaidenTransferEngine] = None
+        self._done_sending: set[str] = set()
+        self._done_recving: set[str] = set()
+        self._failed_recving: set[str] = set()
+        self._suppress_done_recving: set[str] = set()
+        logger.info(
+            "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
+            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d",
+            self.host_ip, self.kv_transfer_port, self.is_producer,
+            self.node_id, self.tp_rank, self.tp_size)
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        return None
+
+    def register_runner(self, runner: TPUModelRunner) -> None:
+        self.runner = runner
+        self._ensure_raiden_transfer_engine()
+
+    def process_send_load(self,
+                          metadata: TPUConnectorMetadata,
+                          wait_for_completion: bool = False,
+                          report_completion: bool = True) -> None:
+        engine = self._ensure_raiden_transfer_engine()
+        if self.is_producer:
+            for req_id, req_meta in metadata.reqs_to_send.items():
+                engine.register_send(req_id, req_meta.uuid,
+                                     req_meta.local_block_ids)
+                logger.info(
+                    "TPURaidenConnectorWorker rank%d --> registered send "
+                    "req_id=%s uuid=%s blocks=%d", self.tp_rank, req_id,
+                    req_meta.uuid, len(req_meta.local_block_ids))
+            return
+
+        submitted_loads: set[str] = set()
+        for req_id, req_meta in metadata.reqs_to_load.items():
+            endpoint = self._resolve_remote_endpoint(req_meta)
+            if (req_meta.remote_block_ids is None
+                    and req_meta.local_block_ids is None):
+                engine.submit_load(req_id, req_meta.uuid, endpoint, [], [])
+                logger.info(
+                    "TPURaidenConnectorWorker rank%d --> released remote "
+                    "send req_id=%s uuid=%s endpoint=%s", self.tp_rank, req_id,
+                    req_meta.uuid, endpoint)
+                continue
+            if (req_meta.remote_block_ids is None
+                    or req_meta.local_block_ids is None):
+                raise ValueError(
+                    "TPURaidenConnector load metadata must contain both "
+                    "remote and local block ids, or neither")
+
+            remote_blocks = req_meta.remote_block_ids
+            local_blocks = req_meta.local_block_ids
+            engine.submit_load(req_id, req_meta.uuid, endpoint, remote_blocks,
+                               local_blocks)
+            logger.info(
+                "TPURaidenConnectorWorker rank%d --> submitted load "
+                "req_id=%s uuid=%s endpoint=%s remote_blocks=%d "
+                "local_blocks=%d", self.tp_rank, req_id, req_meta.uuid,
+                endpoint, len(remote_blocks), len(local_blocks))
+            submitted_loads.add(req_id)
+        if wait_for_completion:
+            self._wait_for_recving(submitted_loads)
+            if not report_completion:
+                self._suppress_done_recving.update(submitted_loads)
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        engine = self._ensure_raiden_transfer_engine()
+        self._poll_finished(engine)
+        done_sending = self._done_sending
+        done_recving = self._done_recving - self._suppress_done_recving
+        self._suppress_done_recving.difference_update(self._done_recving)
+        self._done_sending = set()
+        self._done_recving = set()
+        return done_sending, done_recving
+
+    def _poll_finished(self, engine: RaidenTransferEngine) -> None:
+        done_sending, done_recving, failed_recving = engine.poll_finished()
+        self._done_sending.update(done_sending)
+        self._done_recving.update(done_recving)
+        self._failed_recving.update(failed_recving)
+        if failed_recving:
+            logger.error(
+                "TPURaidenConnectorWorker rank%d --> failed_recving=%s",
+                self.tp_rank, failed_recving)
+
+    def _wait_for_recving(self, req_ids: set[str]) -> None:
+        if not req_ids:
+            return
+        engine = self._ensure_raiden_transfer_engine()
+        deadline = (time.perf_counter() +
+                    float(dist_utils.get_p2p_wait_pull_timeout()))
+        while True:
+            finished = self._done_recving | self._failed_recving
+            if req_ids <= finished:
+                return
+            self._poll_finished(engine)
+            finished = self._done_recving | self._failed_recving
+            if req_ids <= finished:
+                return
+            if time.perf_counter() >= deadline:
+                pending = sorted(req_ids - finished)
+                logger.warning(
+                    "TPURaidenConnectorWorker rank%d --> timed out waiting "
+                    "for Raiden load completion for req_ids=%s", self.tp_rank,
+                    pending)
+                return
+            time.sleep(0.001)
+
+    def _ensure_raiden_transfer_engine(self) -> RaidenTransferEngine:
+        if self._raiden_transfer_engine is not None:
+            return self._raiden_transfer_engine
+        if self.runner is None:
+            raise RuntimeError(
+                "register_runner must be called before transfer")
+        max_blocks = self._max_request_blocks()
+        num_slots = self._num_raiden_slots(max_blocks)
+        local_control_port = self._rank_control_port(self.kv_transfer_port)
+        engine = RaidenTransferEngine(
+            kv_caches=list(self.runner.kv_caches),
+            tp_rank=self.tp_rank,
+            local_control_port=local_control_port,
+            max_blocks=max_blocks,
+            num_slots=num_slots,
+            timeout_s=float(dist_utils.get_p2p_wait_pull_timeout()),
+        )
+        self._raiden_transfer_engine = engine
+        logger.info(
+            "TPURaidenConnectorWorker rank%d --> Raiden engine enabled | "
+            "control_port=%d data_port=%d max_blocks=%d num_slots=%d",
+            self.tp_rank, local_control_port, local_control_port + 1,
+            max_blocks, num_slots)
+        return engine
+
+    def _rank_control_port(self, base_port: int) -> int:
+        return int(base_port) + 2 * self.tp_rank
+
+    def _resolve_remote_endpoint(self, req_meta: LoadMeta) -> str:
+        if isinstance(req_meta.remote_host, list):
+            host = req_meta.remote_host[self.node_id]
+            base_port = int(req_meta.remote_port[self.node_id])
+        else:
+            host = req_meta.remote_host
+            base_port = int(req_meta.remote_port)
+        return f"{host}:{self._rank_control_port(base_port)}"
+
+    def _max_request_blocks(self) -> int:
+        block_size = self.vllm_config.cache_config.block_size
+        max_model_len = self.vllm_config.model_config.max_model_len
+        return max(1, (max_model_len + block_size - 1) // block_size)
+
+    def _num_raiden_slots(self, max_blocks: int) -> int:
+        override = dist_utils.get_raiden_transfer_num_slots()
+        if override > 0:
+            return override
+        assert self.runner is not None
+        kv_layer = self.runner.kv_caches[0]
+        dtype_bytes = torch.tensor([], dtype=kv_layer.dtype).element_size()
+        bytes_per_layer = dtype_bytes * max_blocks
+        for dim in kv_layer.shape[1:]:
+            bytes_per_layer *= int(dim)
+        bytes_per_slot = bytes_per_layer * len(self.runner.kv_caches)
+        per_rank_budget = int(dist_utils.get_kv_shm_pool_gb() * (1024**3))
+        per_rank_budget //= max(1, self.tp_size)
+        return max(1, per_rank_budget // max(1, bytes_per_slot))
 
 
 def get_uuid() -> int:

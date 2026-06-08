@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import codecs
 import itertools
 import logging
 import os
@@ -61,6 +62,39 @@ def _proxy_latency_interval() -> float:
 
 
 _PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
+
+
+def _json_escape_non_ascii(text: str) -> bytes:
+    """Encode text as ASCII bytes while preserving JSON string semantics."""
+    if text.isascii():
+        return text.encode("ascii")
+
+    parts = []
+    for char in text:
+        codepoint = ord(char)
+        if codepoint < 128:
+            parts.append(char)
+        elif codepoint <= 0xFFFF:
+            parts.append(f"\\u{codepoint:04x}")
+        else:
+            codepoint -= 0x10000
+            high_surrogate = 0xD800 + (codepoint >> 10)
+            low_surrogate = 0xDC00 + (codepoint & 0x3FF)
+            parts.append(f"\\u{high_surrogate:04x}\\u{low_surrogate:04x}")
+    return "".join(parts).encode("ascii")
+
+
+class _AsciiSafeStreamEncoder:
+    """Converts UTF-8 stream chunks to ASCII-only JSON-compatible chunks."""
+
+    def __init__(self):
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def encode(self, chunk: bytes = b"", *, final: bool = False) -> bytes:
+        text = self._decoder.decode(chunk, final=final)
+        if not text:
+            return b""
+        return _json_escape_non_ascii(text)
 
 
 @asynccontextmanager
@@ -236,7 +270,13 @@ async def stream_from_decode(client_info: dict, endpoint: str, req_data: dict,
                                             json=req_data,
                                             headers=headers) as response:
         response.raise_for_status()
+        encoder = _AsciiSafeStreamEncoder()
         async for chunk in response.aiter_bytes():
+            chunk = encoder.encode(chunk)
+            if chunk:
+                yield chunk
+        chunk = encoder.encode(final=True)
+        if chunk:
             yield chunk
 
 

@@ -86,6 +86,19 @@ def _get_nonnegative_int_env(name: str, default: int) -> int:
     return parsed
 
 
+def _get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    logger.warning("Invalid %s=%r; using %s", name, value, default)
+    return default
+
+
 def get_kv_coord_executor_max_workers() -> int:
     """Request-level pull executor size.
 
@@ -188,3 +201,26 @@ def get_kv_pin_shm() -> bool:
     to the D2H direction's latency by keeping pages resident in RAM."""
     enable_str = os.getenv("TPU_KV_PIN_SHM", "false").lower()
     return enable_str in ("true", "1", "yes")
+
+
+def get_use_raiden_connector() -> bool:
+    """Whether TPUConnector should use the opt-in Raiden backend.
+
+    The vLLM config flag ``kv_connector_extra_config.use_raiden_connector``
+    takes precedence when present. This environment variable is retained for
+    manual launch scripts and defaults to disabled.
+    """
+    return _get_bool_env("TPU_USE_RAIDEN_CONNECTOR", False)
+
+
+def get_raiden_transfer_num_slots() -> int:
+    """Override for Raiden-owned per-rank host staging slots.
+
+    0 means auto-size from TPU_KV_SHM_POOL_GB, split across TP ranks.
+    """
+    return _get_nonnegative_int_env("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0)
+
+
+def get_raiden_inline_load() -> bool:
+    """Load remote KV before the first forward instead of a no-forward step."""
+    return _get_bool_env("TPU_RAIDEN_INLINE_LOAD", False)

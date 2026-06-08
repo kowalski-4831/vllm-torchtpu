@@ -6,6 +6,7 @@ import tpu_inference.env_override  # noqa: F401  # isort: skip
 
 import bisect
 import contextlib
+import copy
 import dataclasses
 import os
 import time
@@ -50,6 +51,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
 
 from tpu_inference import utils
+from tpu_inference.distributed import utils as dist_utils
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
@@ -390,7 +392,10 @@ class TPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         torch.tpu.synchronize()
 
-    def maybe_setup_kv_connector(self, scheduler_output) -> None:
+    def maybe_setup_kv_connector(self,
+                                 scheduler_output,
+                                 wait_for_completion: bool = False,
+                                 report_completion: bool = True) -> None:
         if not has_kv_transfer_group():
             return
         kv_connector = get_kv_transfer_group()
@@ -398,7 +403,12 @@ class TPUModelRunner(GPUModelRunner):
         kv_connector.bind_connector_metadata(
             scheduler_output.kv_connector_metadata)
         # forward_context is unused by TPUConnector; pass None.
-        kv_connector.start_load_kv(None)
+        if wait_for_completion:
+            kv_connector.start_load_kv(None,
+                                       wait_for_completion=True,
+                                       report_completion=report_completion)
+        else:
+            kv_connector.start_load_kv(None)
 
     def maybe_wait_for_kv_save(self) -> None:
         if has_kv_transfer_group():
@@ -413,6 +423,22 @@ class TPUModelRunner(GPUModelRunner):
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
         return finished
+
+    def kv_connector_no_forward(self, scheduler_output,
+                                vllm_config) -> ModelRunnerOutput:
+        self.maybe_setup_kv_connector(scheduler_output,
+                                      wait_for_completion=True)
+        finished_sending, finished_recving = self.get_finished_kv_transfers(
+            scheduler_output)
+        kv_connector_output = KVConnectorOutput(
+            finished_sending=finished_sending,
+            finished_recving=finished_recving,
+        )
+        if kv_connector_output.is_empty():
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.kv_connector_output = kv_connector_output
+        return output
 
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
@@ -1466,7 +1492,11 @@ class TPUModelRunner(GPUModelRunner):
         # NOTE: setup current batch's metadata for kv connector.
         # Currently, only verified with NixlConnector
         with set_forward_context(None, self.vllm_config):
-            self.maybe_setup_kv_connector(scheduler_output)
+            report_kv_completion = not dist_utils.get_raiden_inline_load()
+            self.maybe_setup_kv_connector(
+                scheduler_output,
+                wait_for_completion=True,
+                report_completion=report_kv_completion)
 
         while start_index < self.input_batch.num_reqs:
             (attn_metadata, logits_indices, padded_num_reqs, num_reqs,

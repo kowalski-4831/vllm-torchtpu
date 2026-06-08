@@ -79,3 +79,35 @@ class TestTpuPlatform:
         assert vllm_config.cache_config.block_size == 123
         # And get_page_size shouldn't even be called because is_hybrid is True
         mock_pallas.get_page_size.assert_not_called()
+
+    @pytest.mark.parametrize("connector_name",
+                             ["TPUConnector", "TPURaidenConnector"])
+    @patch("tpu_inference.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "tpu_inference.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
+    )
+    @patch(
+        "tpu_inference.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    @patch(
+        "tpu_inference.core.sched.dp_scheduler.update_vllm_config_for_dp_scheduler"
+    )
+    @patch("tpu_inference.platforms.tpu_platform.vllm_envs")
+    def test_check_and_update_config_accepts_tpu_disagg_connectors(
+            self, mock_vllm_envs, mock_update_dp, mock_prepare_env,
+            mock_sharding, mock_apply_patches, vllm_config, connector_name):
+        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+        vllm_config.kv_transfer_config = MagicMock()
+        vllm_config.kv_transfer_config.kv_connector = connector_name
+        vllm_config.cache_config.block_size = 16
+
+        mock_pallas = MagicMock()
+        mock_pallas.get_page_size.return_value = 16
+        mock_pallas.get_min_page_size.return_value = 16
+
+        with patch.dict(
+                'sys.modules', {
+                    'tpu_inference.layers.vllm.attention':
+                    MagicMock(PallasAttentionBackend=mock_pallas)
+                }):
+            TpuPlatform.check_and_update_config(vllm_config)

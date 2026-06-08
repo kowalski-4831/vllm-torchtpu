@@ -395,6 +395,7 @@ class TpuPlatform(Platform):
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
+                "TPURaidenConnector",
                 "TPUConnectorHMA",
                 "OffloadingConnector",
             }
