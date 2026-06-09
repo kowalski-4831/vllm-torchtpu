@@ -7,11 +7,17 @@ set -e
 
 wait_for_server() {
   local port=$1
+  local pid=$2
   timeout 1200 bash -c "
     until curl -s localhost:${port}/health > /dev/null; do
+      if ! kill -0 $pid 2>/dev/null; then
+        echo \"Error: vLLM server on port $port (PID $pid) crashed or failed to start!\" >&2
+        exit 1
+      fi
       sleep 1
     done" && return 0 || return 1
 }
+
 # Function to print logs on exit
 print_logs_on_exit() {
   echo "--- Script exiting, displaying logs ---"
@@ -118,6 +124,8 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     SIDE_PORT=$((6100 + i))
     CHIP_IDX=$i
 
+    echo TPU_VISIBLE_DEVICE_PATHS will be set to ${TPU_DEVICE_PATHS[$CHIP_IDX]}
+
     TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
     TPU_PROCESS_BOUNDS=1,1,1 \
     TPU_VISIBLE_DEVICE_PATHS=${TPU_DEVICE_PATHS[$CHIP_IDX]} \
@@ -136,6 +144,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
 
     PREFILL_HOSTS+=("localhost")
     PREFILL_PORTS+=($PORT)
+    PREFILL_PIDS+=($!)
 done
 
 
@@ -146,6 +155,8 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     # Same as prefill SIDE_PORT
     SIDE_PORT=$((6100 + i))
     CHIP_IDX=$((NUM_PREFILL_INSTANCES + i))
+    echo TPU_VISIBLE_DEVICE_PATHS will be set to ${TPU_DEVICE_PATHS[$CHIP_IDX]}
+
 
     TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
     TPU_PROCESS_BOUNDS=1,1,1 \
@@ -165,22 +176,27 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
 
     DECODE_HOSTS+=("localhost")
     DECODE_PORTS+=($PORT)
+    DECODE_PIDS+=($!)
 done
 
 # Wait for all instances to start
-for PORT in "${PREFILL_PORTS[@]}"; do
+# Wait for all instances to start
+for i in "${!PREFILL_PORTS[@]}"; do
+    PORT=${PREFILL_PORTS[$i]}
     echo "Waiting for prefill on port $PORT to start..."
-    wait_for_server $PORT
+    wait_for_server $PORT ${PREFILL_PIDS[$i]}
 done
 
-for PORT in "${DECODE_PORTS[@]}"; do
+for i in "${!DECODE_PORTS[@]}"; do
+    PORT=${DECODE_PORTS[$i]}
     echo "Waiting for decode on port $PORT to start..."
-    wait_for_server $PORT
+    wait_for_server $PORT ${DECODE_PIDS[$i]}
 done
 
-
+echo "starting proxy server"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 # Start proxy server
-python $HOME/tpu-inference/examples/disagg/toy_proxy_server.py \
+python $SCRIPT_DIR/toy_proxy_server.py \
 --host localhost \
 --port 8000 \
 --prefiller-hosts ${PREFILL_HOSTS[@]} \
