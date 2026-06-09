@@ -16,7 +16,10 @@ def _load_toy_proxy_server():
     return module
 
 
-_AsciiSafeStreamEncoder = _load_toy_proxy_server()._AsciiSafeStreamEncoder
+_toy_proxy_server = _load_toy_proxy_server()
+_AsciiSafeStreamEncoder = _toy_proxy_server._AsciiSafeStreamEncoder
+_replace_prompt_with_rendered_token_ids = (
+    _toy_proxy_server._replace_prompt_with_rendered_token_ids)
 
 
 def test_ascii_safe_stream_encoder_handles_split_utf8() -> None:
@@ -44,3 +47,46 @@ def test_ascii_safe_stream_encoder_leaves_ascii_unchanged() -> None:
 
     assert encoder.encode(message) == message
     assert encoder.encode(final=True) == b""
+
+
+def test_replace_prompt_with_rendered_token_ids_single_prompt() -> None:
+    request = {
+        "model": "test-model",
+        "prompt": "hello",
+        "prompt_embeds": b"unused-after-render",
+    }
+    rendered = [{"token_ids": [1, 2, 3]}]
+
+    converted = _replace_prompt_with_rendered_token_ids(request, rendered)
+
+    assert converted["prompt"] == [1, 2, 3]
+    assert "prompt_embeds" not in converted
+    assert request["prompt"] == "hello"
+
+
+def test_replace_prompt_with_rendered_token_ids_multi_prompt() -> None:
+    request = {
+        "model": "test-model",
+        "prompt": ["hello", "world"],
+    }
+    rendered = [{"token_ids": [1, 2, 3]}, {"token_ids": [4, 5]}]
+
+    converted = _replace_prompt_with_rendered_token_ids(request, rendered)
+
+    assert converted["prompt"] == [[1, 2, 3], [4, 5]]
+
+
+def test_replace_prompt_with_rendered_token_ids_rejects_bad_response() -> None:
+    request = {
+        "model": "test-model",
+        "prompt": "hello",
+    }
+
+    try:
+        _replace_prompt_with_rendered_token_ids(request, [{
+            "token_ids": ["1"]
+        }])
+    except ValueError as exc:
+        assert "token_ids" in str(exc)
+    else:
+        raise AssertionError("malformed render response should fail")

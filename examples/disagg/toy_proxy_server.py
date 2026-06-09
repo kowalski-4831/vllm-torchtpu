@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
@@ -62,6 +63,39 @@ def _proxy_latency_interval() -> float:
 
 
 _PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
+
+
+def _render_endpoint_for_api(api: str) -> str | None:
+    if api == "/v1/completions":
+        return "/v1/completions/render"
+    return None
+
+
+def _token_ids_from_completion_render(
+        rendered: Any) -> list[int] | list[list[int]]:
+    if not isinstance(rendered, list) or not rendered:
+        raise ValueError("Completion render response must be a non-empty list")
+
+    prompts: list[list[int]] = []
+    for item in rendered:
+        if not isinstance(item, dict):
+            raise ValueError("Completion render item must be an object")
+        token_ids = item.get("token_ids")
+        if (not isinstance(token_ids, list) or not all(
+                type(token_id) is int and token_id >= 0
+                for token_id in token_ids)):
+            raise ValueError("Completion render item must contain token_ids")
+        prompts.append(token_ids)
+
+    return prompts[0] if len(prompts) == 1 else prompts
+
+
+def _replace_prompt_with_rendered_token_ids(req_data: dict,
+                                            rendered: Any) -> dict:
+    req_data = req_data.copy()
+    req_data["prompt"] = _token_ids_from_completion_render(rendered)
+    req_data.pop("prompt_embeds", None)
+    return req_data
 
 
 def _json_escape_non_ascii(text: str) -> bytes:
@@ -254,6 +288,26 @@ async def send_request_to_prefill(client_info: dict, endpoint: str,
     return response
 
 
+async def render_completion_prompt(client_info: dict, endpoint: str,
+                                   req_data: dict, request_id: str):
+    """
+    Render/tokenize a completion request once so downstream P/D requests can
+    use prompt token IDs instead of retokenizing raw text independently.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id
+    }
+
+    response = await client_info['client'].post(endpoint,
+                                                json=req_data,
+                                                headers=headers)
+    response.raise_for_status()
+
+    return response
+
+
 async def stream_from_decode(client_info: dict, endpoint: str, req_data: dict,
                              request_id: str):
     """
@@ -291,6 +345,12 @@ async def _handle_completions(api: str, request: Request):
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info = get_next_client(request.app, 'prefill')
+        render_endpoint = _render_endpoint_for_api(api)
+        if render_endpoint is not None:
+            render_response = await render_completion_prompt(
+                prefill_client_info, render_endpoint, req_data, request_id)
+            req_data = _replace_prompt_with_rendered_token_ids(
+                req_data, render_response.json())
 
         # Send request to prefill service
         t_prefill_send = time.time()
