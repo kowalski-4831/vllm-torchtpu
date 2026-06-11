@@ -427,8 +427,12 @@ class TPUModelRunner(GPUModelRunner):
 
     def kv_connector_no_forward(self, scheduler_output,
                                 vllm_config) -> ModelRunnerOutput:
-        self.maybe_setup_kv_connector(scheduler_output,
-                                      wait_for_completion=True)
+        # Only Raiden inline mode blocks; otherwise the no-forward step returns
+        # immediately and the scheduler re-polls get_finished each step until
+        # the loads land.
+        self.maybe_setup_kv_connector(
+            scheduler_output,
+            wait_for_completion=dist_utils.get_raiden_inline_load())
         finished_sending, finished_recving = self.get_finished_kv_transfers(
             scheduler_output)
         kv_connector_output = KVConnectorOutput(
@@ -1592,13 +1596,17 @@ class TPUModelRunner(GPUModelRunner):
         spec_decode_metadata_list = []
 
         # NOTE: setup current batch's metadata for kv connector.
-        # Currently, only verified with NixlConnector
+        # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
         with set_forward_context(None, self.vllm_config):
-            report_kv_completion = not dist_utils.get_raiden_inline_load()
-            self.maybe_setup_kv_connector(
-                scheduler_output,
-                wait_for_completion=True,
-                report_completion=report_kv_completion)
+            # Raiden overlap: block the worker main thread on the KV load only
+            # in inline mode. In the default async mode the load (network pull
+            # + DMA H2D into the cache) runs entirely on the Raiden C++
+            # threads while this step's forward computes; the request stays in
+            # WAITING_FOR_REMOTE_KVS until every rank reports done_recving.
+            raiden_inline = dist_utils.get_raiden_inline_load()
+            self.maybe_setup_kv_connector(scheduler_output,
+                                          wait_for_completion=raiden_inline,
+                                          report_completion=not raiden_inline)
 
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
