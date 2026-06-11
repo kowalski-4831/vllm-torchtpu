@@ -96,11 +96,19 @@ def apply_tpu_patches() -> None:
     All patches are idempotent.
     """
     from tpu_inference import (_patch_default_moe_runner_select_forward,
+                               _patch_disable_sequence_parallel_moe,
+                               _patch_moe_no_ep_tp_scope,
                                _patch_vllm_tpu_group_custom_ops)
     from tpu_inference.layers.vllm.custom_ops import _register_custom_ops
     _register_custom_ops()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
+    _patch_disable_sequence_parallel_moe()
+    _patch_moe_no_ep_tp_scope()
+    from tpu_inference import (_patch_disable_dp_ubatch,
+                               _patch_multiproc_worker_global_rank_env)
+    _patch_disable_dp_ubatch()
+    _patch_multiproc_worker_global_rank_env()
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
 
@@ -171,9 +179,14 @@ class TpuPlatform(Platform):
         os.environ.setdefault("TORCH_TPU_XPROF_SESSION_ID",
                               str(time.time_ns()))
 
-        sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
-        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-            f"localhost:{p}" for p in sb_ports)
+        sb_addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
+        sb_count = len(sb_addresses.split(",")) if sb_addresses else 0
+        if sb_count != world_size:
+            sb_ports = [
+                portpicker.pick_unused_port() for _ in range(world_size)
+            ]
+            os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+                f"localhost:{p}" for p in sb_ports)
 
         if world_size == 1:
             os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1"
@@ -249,6 +262,27 @@ class TpuPlatform(Platform):
     @classmethod
     def get_compile_backend(cls) -> str:
         return "tpu_inference.compilation.tpu_compiler.TpuCompilerAdaptor"
+
+    @classmethod
+    def set_additional_forward_context(cls, *args, **kwargs) -> dict:
+        """Move DP metadata onto the TPU for DP+EP.
+
+        vLLM builds ``num_tokens_across_dp_cpu`` on CPU, but TPU compiled
+        forwards require tensor arguments to be on device.
+        """
+        dp_metadata = kwargs.get("dp_metadata")
+        if dp_metadata is not None:
+            t = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
+            if t is not None and getattr(t, "device", None) is not None \
+                    and t.device.type == "cpu":
+                tpu_t = t.to("tpu")
+                try:
+                    dp_metadata.num_tokens_across_dp_cpu = tpu_t
+                except Exception:
+                    # Frozen dataclass fallback.
+                    object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu",
+                                       tpu_t)
+        return {}
 
     @classmethod
     def _initialize_sharding_config(cls, vllm_config: VllmConfig) -> None:
@@ -360,8 +394,33 @@ class TpuPlatform(Platform):
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if not multihost_backend:  # Single host
-            cls._prepare_singlehost_tpu_env(parallel_config.world_size)
-            if (parallel_config.pipeline_parallel_size == 1
+            dp_size = parallel_config.data_parallel_size
+            if dp_size > 1:
+                # Single-host DP uses one torch_tpu slice across all DP*TP
+                # workers; the worker spawn shim exposes a DP-adjusted chip
+                # ordinal to TorchTPU for physical binding.
+                cls.device_control_env_var = \
+                    "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+                # vLLM may pass per-engine ParallelConfig objects to workers
+                # with data_parallel_size collapsed to 1. Preserve the original
+                # single-host DP size for TorchTPU rank/env setup.
+                # TODO: Remove TORCH_TPU_DP_SIZE once TorchTPU physical
+                # chip/PjRt binding no longer depends on torchrun-style
+                # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
+                os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
+                os.environ.setdefault(
+                    "TORCH_TPU_DP_MASTER_ADDR",
+                    parallel_config.data_parallel_master_ip or "localhost")
+                os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT",
+                                      str(portpicker.pick_unused_port()))
+                # Full-slice slicebuilder list + topology (TP*PP*DP), once.
+                cls._prepare_singlehost_tpu_env(
+                    parallel_config.world_size_across_dp)
+            else:
+                os.environ.pop("TORCH_TPU_DP_SIZE", None)
+                cls._prepare_singlehost_tpu_env(parallel_config.world_size)
+            if (parallel_config.data_parallel_size == 1
+                    and parallel_config.pipeline_parallel_size == 1
                     and parallel_config.tensor_parallel_size == 1):
                 logger.info("Force using UniProcExecutor for TPU on \
                         single host without tensor/pipeline parallelism.")
@@ -406,10 +465,6 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
 
-        from tpu_inference.core.sched.dp_scheduler import \
-            update_vllm_config_for_dp_scheduler
-        update_vllm_config_for_dp_scheduler(vllm_config)
-
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         # TODO: TPU still sets block_size in check_and_update_config.
@@ -423,10 +478,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        # vLLM's default TPU communicator depends on torch_xla. For TorchTPU,
-        # use the generic communicator on top of torch.distributed groups, with
-        # `dist_backend=tpu_dist` for device-side collectives.
-        return "vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"  # noqa
+        return "tpu_inference.distributed.tpu_communicator.TpuDeviceCommunicator"  # noqa
 
     @classmethod
     def use_all_gather(cls) -> bool:

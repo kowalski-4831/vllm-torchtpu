@@ -12,6 +12,12 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 class TpuMultiprocExecutor(MultiprocExecutor):
 
+    def _init_executor(self) -> None:
+        # EngineCore does not run platform patch setup before spawning workers.
+        from tpu_inference import _patch_multiproc_worker_global_rank_env
+        _patch_multiproc_worker_global_rank_env()
+        super()._init_executor()
+
     def initialize_from_config(self,
                                kv_cache_configs: list[KVCacheConfig]) -> None:
         super().initialize_from_config(kv_cache_configs)

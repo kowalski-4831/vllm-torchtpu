@@ -46,12 +46,12 @@ def sharded_flash_attention(
     vmem_limit_bytes: int | None = None,
 ) -> Callable[..., Any]:
     in_specs = (
-        P("data", "model", None, None),  # q
-        P("data", "model", None, None),  # k
-        P("data", "model", None, None),  # v
+        P(None, "model", None, None),  # q
+        P(None, "model", None, None),  # k
+        P(None, "model", None, None),  # v
         P(),  # segment_ids
     )
-    out_specs = P("data", "model", None, None)
+    out_specs = P(None, "model", None, None)
 
     def _flash_attention(q, k, v, segment_ids):
         return flash_attention(q,
@@ -259,11 +259,11 @@ def sharded_splash_attention(
     is_mqa: bool = False,
 ) -> Callable[..., Any]:
     in_specs = (
-        P("data", "model", None, None),  # q
-        P("data", "model", None, None),  # k
-        P("data", "model", None, None),  # vx
+        P(None, "model", None, None),  # q
+        P(None, "model", None, None),  # k
+        P(None, "model", None, None),  # vx
     )
-    out_specs = P("data", "model", None, None)
+    out_specs = P(None, "model", None, None)
     return jax.jit(
         shard_map.shard_map(
             functools.partial(

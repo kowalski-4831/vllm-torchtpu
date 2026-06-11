@@ -378,7 +378,8 @@ class TPUModelRunner(GPUModelRunner):
         self.speculative_config = self.vllm_config.speculative_config
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
-        # JAX Mesh for shard_map ops in TPU kernels (data=1, model=tp_size).
+        # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
+        # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
 
     # ----- Backend hooks overridden from GPUModelRunner -----
@@ -463,8 +464,8 @@ class TPUModelRunner(GPUModelRunner):
         local_devices = list(jax.local_devices())
         if not local_devices:
             raise ValueError("No TPU devices are visible to create JAX mesh.")
-        mesh_devices = np.asarray(local_devices[:1]).reshape((1, 1))
-        mesh = Mesh(mesh_devices, axis_names=("data", "model"))
+        mesh_devices = np.asarray(local_devices[:1]).reshape((1, ))
+        mesh = Mesh(mesh_devices, axis_names=("model", ))
         logger.info("Init mesh | tp_size=1 | device_id=%s",
                     getattr(local_devices[0], "id", str(local_devices[0])))
         return mesh
@@ -1094,6 +1095,17 @@ class TPUModelRunner(GPUModelRunner):
             input_ids, cur_input_indices, pre_next_tokens_indices,
             self._pre_async_results.next_tokens_tpu)
 
+    def _flush_disjoint_async_results(self) -> None:
+        if self._pre_async_results is None:
+            return
+        current_req_ids = set(
+            self.input_batch.req_ids[:self.input_batch.num_reqs])
+        previous_req_ids = self._pre_async_results.req_id_to_index_copy
+        if any(req_id in current_req_ids for req_id in previous_req_ids):
+            return
+        self._modify_prev_results()
+        self._pre_async_results = None
+
     def _modify_prev_results(self):
         if self._pre_async_results is None:
             return
@@ -1284,6 +1296,9 @@ class TPUModelRunner(GPUModelRunner):
         # Do the padding and copy the tensors to the TPU.
         padded_total_num_scheduled_tokens = _get_padded_token_len(
             self.num_tokens_paddings, total_num_scheduled_tokens)
+        _dp_bucket = getattr(self, "_dp_target_bucket", None)
+        if _dp_bucket is not None and _dp_bucket > padded_total_num_scheduled_tokens:
+            padded_total_num_scheduled_tokens = _dp_bucket
         # Zero out to avoid spurious values from prev iteration (last cp chunk)
         self.input_ids_cpu[
             total_num_scheduled_tokens:padded_total_num_scheduled_tokens] = 0
@@ -1462,6 +1477,82 @@ class TPUModelRunner(GPUModelRunner):
             # then the embedding layer is not included in the CUDA graph.
             return input_ids, None
 
+    def _dp_size(self) -> int:
+        return int(os.environ.get("TORCH_TPU_DP_SIZE", "0")) or int(
+            self.parallel_config.data_parallel_size or 1)
+
+    def _dp_lockstep_enabled(self) -> bool:
+        # EP combine reduces partial expert outputs across DP engines; those
+        # ranks must enter the same collectives with matching token buckets.
+        # Non-EP DP engines remain independently schedulable.
+        return (self._dp_size() > 1
+                and self.parallel_config.enable_expert_parallel)
+
+    def _count_input_chunks(self, scheduler_output: "SchedulerOutput") -> int:
+        """Match _prepare_inputs chunking without staging any tensors."""
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return 0
+
+        num_reqs = self.input_batch.num_reqs
+        start_index = 0
+        num_chunks = 0
+        while start_index < num_reqs:
+            use_max_model_len = self.most_model_len is None
+            for i in range(start_index, num_reqs):
+                req_id = self.input_batch.req_ids[i]
+                assert req_id is not None
+                num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                if (not use_max_model_len and self.most_model_len is not None
+                        and num_tokens > self.most_model_len):
+                    use_max_model_len = True
+
+            if use_max_model_len:
+                chunk_reqs = self.num_reqs_max_model_len
+            else:
+                assert self.num_reqs_most_model_len is not None
+                chunk_reqs = self.num_reqs_most_model_len
+            start_index += min(chunk_reqs, num_reqs - start_index)
+            num_chunks += 1
+        return num_chunks
+
+    def _dp_coordinated_step(
+            self, local_num_tokens: int,
+            local_num_chunks: int) -> "tuple[int | None, int]":
+        """Return the DP-wide padded token bucket and forward chunk count."""
+        if not self._dp_lockstep_enabled():
+            return None, local_num_chunks
+        from vllm.distributed.parallel_state import get_dp_group
+
+        # Token/chunk metadata is synchronized on vLLM's CPU DP group. The
+        # model forward below receives this result explicitly as
+        # num_tokens_across_dp, so set_forward_context does not run a second
+        # DP synchronization.
+        t = torch.tensor([int(local_num_tokens),
+                          int(local_num_chunks)],
+                         dtype=torch.int64,
+                         device="cpu")
+        torch.distributed.all_reduce(t,
+                                     op=torch.distributed.ReduceOp.MAX,
+                                     group=get_dp_group().cpu_group)
+        bucket = _get_padded_token_len(self.num_tokens_paddings,
+                                       int(t[0].item()))
+        return bucket, int(t[1].item())
+
+    def _run_dp_dummy_chunk(self, bucket: int) -> None:
+        self._dummy_run(bucket,
+                        self.num_reqs_max_model_len,
+                        self.max_num_blocks_per_req,
+                        use_max_model_len=True,
+                        dp_lockstep=True)
+
+    def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
+        if not self._dp_lockstep_enabled():
+            return None
+        return torch.full((self._dp_size(), ),
+                          num_tokens,
+                          dtype=torch.int32,
+                          device="cpu")
+
     @torch.no_grad()
     def execute_model(
         self,
@@ -1473,7 +1564,13 @@ class TPUModelRunner(GPUModelRunner):
                                "after execute_model() returns None.")
         # Update cached state
         self._update_states(scheduler_output)
+        if self.scheduler_config.async_scheduling:
+            self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
+            if self._dp_lockstep_enabled():
+                # EngineCore calls execute_dummy_batch() after a zero-token
+                # step; doing DP collectives here would enter lockstep twice.
+                return EMPTY_MODEL_RUNNER_OUTPUT
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
             return self.kv_connector_no_forward(scheduler_output,
@@ -1484,7 +1581,12 @@ class TPUModelRunner(GPUModelRunner):
 
         num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
 
+        local_num_chunks = self._count_input_chunks(scheduler_output)
+        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
+            scheduler_output.total_num_scheduled_tokens, local_num_chunks)
+
         start_index = 0
+        chunk_index = 0
         logits_list = []
         num_reqs_list = []
         spec_decode_metadata_list = []
@@ -1498,7 +1600,13 @@ class TPUModelRunner(GPUModelRunner):
                 wait_for_completion=True,
                 report_completion=report_kv_completion)
 
-        while start_index < self.input_batch.num_reqs:
+        while chunk_index < target_num_chunks:
+            if start_index >= self.input_batch.num_reqs:
+                assert self._dp_target_bucket is not None
+                self._run_dp_dummy_chunk(self._dp_target_bucket)
+                chunk_index += 1
+                continue
+
             (attn_metadata, logits_indices, padded_num_reqs, num_reqs,
              end_index, cur_input_indices, pre_next_tokens_indices,
              spec_decode_metadata) = (self._prepare_inputs(
@@ -1512,10 +1620,13 @@ class TPUModelRunner(GPUModelRunner):
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
+            num_tokens_padded = input_ids.shape[0]
             with set_forward_context(
                     attn_metadata,
                     self.vllm_config,
-                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=self._dp_num_tokens_across_dp(
+                        num_tokens_padded),
             ), set_vllm_model_wrapper_context(mesh=self.mesh):
                 hidden_states = self.forward_model(
                     input_ids=input_ids,
@@ -1531,6 +1642,7 @@ class TPUModelRunner(GPUModelRunner):
             spec_decode_metadata_list.append(spec_decode_metadata)
 
             start_index = end_index
+            chunk_index += 1
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -1865,7 +1977,8 @@ class TPUModelRunner(GPUModelRunner):
                    num_tokens: int,
                    num_reqs: int,
                    num_blocks: int,
-                   use_max_model_len: bool = True) -> None:
+                   use_max_model_len: bool = True,
+                   dp_lockstep: bool = False) -> None:
         if self.supports_mm_inputs:
             input_ids = None
             inputs_embeds = torch.zeros(
@@ -1949,13 +2062,24 @@ class TPUModelRunner(GPUModelRunner):
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
-                set_forward_context(per_layer_attn_metadata, self.vllm_config,
-                                    0),
+                set_forward_context(
+                    per_layer_attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens if dp_lockstep else 0,
+                    num_tokens_across_dp=self._dp_num_tokens_across_dp(
+                        num_tokens) if dp_lockstep else None),
                 set_vllm_model_wrapper_context(mesh=self.mesh),
         ):
             out = self.forward_model(input_ids=input_ids,
                                      positions=position_ids,
                                      inputs_embeds=inputs_embeds)
+            if dp_lockstep:
+                # Idle DP engines must issue the same TP logits collective as
+                # busy engines before the next DP synchronization.
+                _idx = torch.zeros(num_reqs,
+                                   dtype=torch.int32,
+                                   device=out.device)
+                _ = self.compute_selected_logits(out, _idx)
             sync.synchronize(out, wait=True)
         self._hidden_states_dtype = out.dtype
 

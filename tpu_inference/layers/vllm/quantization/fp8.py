@@ -364,6 +364,19 @@ def _process_fp8_moe_weights(
         axis=(1, 2),
         out_dtype=torch.float32,
     )
+    padded_intermediate = layer.moe_config.intermediate_size_per_partition
+    unpadded_intermediate = (
+        layer.moe_config.intermediate_size_per_partition_unpadded)
+    if padded_intermediate != unpadded_intermediate:
+        full_intermediate = unpadded_intermediate * layer.tp_size
+        local_start = padded_intermediate * layer.tp_rank
+        local_real = max(
+            0, min(padded_intermediate, full_intermediate - local_start))
+        if local_real < padded_intermediate:
+            w13[:, local_real:padded_intermediate, :] = 0
+            w13[:, padded_intermediate + local_real:2 *
+                padded_intermediate, :] = 0
+            w2[:, :, local_real:padded_intermediate] = 0
 
     w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
         w13,
@@ -464,6 +477,30 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         self.weight_scale_name = ("weight_scale_inv"
                                   if self.block_quant else "weight_scale")
         self.fp8_backend = None
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config,
+    ) -> tuple[int, int]:
+        hidden_size, intermediate_size_per_partition = (
+            Fp8MoEMethod.maybe_roundup_sizes(
+                self,
+                hidden_size,
+                intermediate_size_per_partition,
+                act_dtype,
+                moe_parallel_config,
+            ))
+        if self.quant_config.is_checkpoint_fp8_serialized and self.block_quant:
+            assert self.weight_block_size is not None
+            block_n, block_k = self.weight_block_size
+            block_size = max(block_n, block_k)
+            intermediate_size_per_partition = (
+                (intermediate_size_per_partition + block_size - 1) //
+                block_size * block_size)
+        return hidden_size, intermediate_size_per_partition
 
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype,

@@ -12,15 +12,15 @@ from tpu_inference import envs, utils
 if TYPE_CHECKING:
     from vllm.v1.configs.vllm_config import VllmConfig
 
-MESH_AXIS_NAMES = ("data", "attn_dp", "expert", "model")
-MESH_AXIS_NAMES_2D = ('data', 'model')
+MESH_AXIS_NAMES = ("attn_dp", "expert", "model")
+MESH_AXIS_NAMES_2D = ('model', )
 
 
 class ShardingAxisNameBase:
     """Base class for sharding axis names."""
-    SEQUENCE = ('data', 'attn_dp')
-    ATTN_DATA = ('data', 'attn_dp')
-    MLP_DATA = 'data'
+    SEQUENCE = 'attn_dp'
+    ATTN_DATA = 'attn_dp'
+    MLP_DATA = None
     ATTN_HEAD = 'model'
     ATTN_TENSOR = None
     MLP_TENSOR = ('attn_dp', 'model', 'expert')
@@ -35,15 +35,15 @@ class ShardingAxisName2D:
     We should use ShardingAxisNameBase once the new MoE kernel supports
     more general mesh shapes. For now, this is the default sharding axes.
     """
-    SEQUENCE = 'data'
-    ATTN_DATA = 'data'
-    MLP_DATA = 'data'
+    SEQUENCE = None
+    ATTN_DATA = None
+    MLP_DATA = None
     ATTN_HEAD = 'model'
     ATTN_TENSOR = None
     MLP_TENSOR = 'model'
     MOE_TENSOR = 'model'
     EXPERT = 'model'
-    VOCAB = ('data', 'model')
+    VOCAB = 'model'
 
 
 try:
@@ -110,7 +110,8 @@ class ShardingConfigManager:
             "sharding", {}).get("sharding_strategy", {})
         parallel_config = vllm_config.parallel_config
         tensor_parallelism = parallel_config.tensor_parallel_size
-        data_parallelism = parallel_config.data_parallel_size
+        # Native vLLM multi-engine DP is not represented in the JAX mesh.
+        data_parallelism = 1
         expert_parallelism = sharding_strategy.get("expert_parallelism", 1)
         sequence_parallelism = sharding_strategy.get("sequence_parallelism", 1)
         device_indexes = sharding_strategy.get("device_indexes", None)
@@ -145,12 +146,6 @@ class ShardingConfigManager:
             expert_parallelism=expert_parallelism,
             sequence_parallelism=sequence_parallelism,
             attention_data_parallelism=attn_dp)
-
-        # Must override here to avoid vLLM spinning up multiple DP engines.
-        if vllm_config.parallel_config.data_parallel_size > 1:
-            vllm_config.parallel_config.data_parallel_size = 1
-            vllm_config.parallel_config.data_parallel_rank = 0
-            vllm_config.parallel_config.data_parallel_size_local = 1
 
         cls.validate(vllm_config, sharding_strategy)
         return cls(sharding_strategy, device_indexes)
@@ -349,7 +344,6 @@ def build_mesh(devices, strategy: dict[str, int]) -> Mesh:
     """
 
     axis_order = {
-        "data": strategy.get("data_parallelism", 1),
         "expert": strategy.get("expert_parallelism", 1),
         "seq": strategy.get("sequence_parallelism", 1),
         "model": strategy.get("tensor_parallelism", 1),
@@ -363,9 +357,7 @@ def build_mesh(devices, strategy: dict[str, int]) -> Mesh:
 
     if not mesh_shape:
         mesh_shape = [1]
-        mesh_axis_names = [
-            'data'
-        ]  # default to data parallelism if no other strategy is specified
+        mesh_axis_names = ['model']
 
     devices = np.asarray(devices).reshape(mesh_shape)
     return Mesh(devices, axis_names=tuple(mesh_axis_names))

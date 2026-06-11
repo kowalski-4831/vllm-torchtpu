@@ -116,46 +116,106 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def init_device(self):
-        # vLLM's MultiprocExecutor passes rank/local_rank as constructor
-        # args, but torch_tpu's C++ layer (discovery.cc) reads torchrun-style
-        # env vars. Bridge the gap by setting them here before any TPU
-        # device usage in this worker.
+        # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
+        # constructor args. Native vLLM DP keeps those values local to the DP
+        # engine and lets init_distributed_environment() derive the global
+        # distributed rank from ParallelConfig.data_parallel_rank.
+        #
+        # TorchTPU currently also reads torchrun-style env vars for physical
+        # chip/PjRt binding. Keep that as a compatibility shim only: env rank
+        # values describe the unified TPU slice, while the vLLM distributed
+        # init below still receives upstream-shaped local rank/world args.
         # TORCH_TPU_SLICEBUILDER_ADDRESSES and TORCH_TPU_TOPOLOGY are
         # already inherited from the parent process (set by
         # prepare_tpu_environment() in tpu_platform.py).
-        os.environ["RANK"] = str(self.rank)
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["WORLD_SIZE"] = str(self.parallel_config.world_size)
-        local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
-        if not local_world_size:
-            local_world_size = self.parallel_config.world_size
-        os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
+        pc = self.parallel_config
+        dp_size = int(os.environ.get("TORCH_TPU_DP_SIZE",
+                                     "0")) or pc.data_parallel_size
+        if dp_size > 1:
+            per_engine_world = pc.world_size
+            dp_rank = getattr(pc, "data_parallel_index", None)
+            if dp_rank is None:
+                dp_rank = pc.data_parallel_rank
+            dp_rank = int(dp_rank or 0)
 
-        parsed = urlparse(self.distributed_init_method)
-        if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
-            raise ValueError(
-                "Expected tcp://<host>:<port> distributed_init_method, "
-                f"got: {self.distributed_init_method!r}")
-        os.environ.setdefault("MASTER_ADDR", parsed.hostname)
-        os.environ.setdefault("MASTER_PORT", str(parsed.port))
+            # TorchTPU uses independent per-engine tpu_dist worlds unless EP
+            # needs a unified DP*TP world for expert collectives.
+            if pc.enable_expert_parallel:
+                pc.data_parallel_size = dp_size
+                pc.data_parallel_rank = dp_rank
+                if pc.data_parallel_rank_local is None:
+                    pc.data_parallel_rank_local = dp_rank
+            else:
+                pc.data_parallel_size = 1
+                pc.data_parallel_rank = 0
+                pc.data_parallel_rank_local = 0
+
+            tpu_chip_rank = dp_rank * per_engine_world + self.local_rank
+            tpu_global_rank = dp_rank * per_engine_world + self.rank
+            global_world = per_engine_world * dp_size
+            master_addr = os.environ.get("TORCH_TPU_DP_MASTER_ADDR",
+                                         "localhost")
+            master_port = os.environ["TORCH_TPU_DP_MASTER_PORT"]
+
+            os.environ["RANK"] = str(tpu_global_rank)
+            # Single-host TorchTPU indexes chips in the unified DP*TP slice.
+            os.environ["LOCAL_RANK"] = str(tpu_chip_rank)
+            os.environ["WORLD_SIZE"] = str(global_world)
+            os.environ["LOCAL_WORLD_SIZE"] = str(global_world)
+            os.environ["MASTER_ADDR"] = str(master_addr)
+            os.environ["MASTER_PORT"] = str(master_port)
+
+            if pc.enable_expert_parallel:
+                init_rank = self.rank
+                init_world = per_engine_world
+                dist_init_method = self.distributed_init_method
+            else:
+                init_rank = self.rank
+                init_world = per_engine_world
+                dist_init_method = self.distributed_init_method
+            logger.info(
+                "TPU DP worker: dp_size=%d dp_rank=%d per_engine_world=%d "
+                "self.rank=%d self.local_rank=%d -> tpu_rank=%d "
+                "tpu_local_rank=%d global_world=%d "
+                "(vllm_init_rank=%d vllm_init_world=%d)", dp_size, dp_rank,
+                per_engine_world, self.rank, self.local_rank, tpu_global_rank,
+                tpu_chip_rank, global_world, init_rank, init_world)
+            local_rank_env = tpu_chip_rank
+        else:
+            global_world = pc.world_size
+            dist_init_method = self.distributed_init_method
+            parsed = urlparse(dist_init_method)
+            if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
+                raise ValueError(
+                    "Expected tcp://<host>:<port> distributed_init_method, "
+                    f"got: {dist_init_method!r}")
+            local_world = os.environ.get("LOCAL_WORLD_SIZE") or pc.world_size
+            local_rank_env = self.local_rank
+            init_rank = self.rank
+            init_world = pc.world_size
+            os.environ["RANK"] = str(self.rank)
+            os.environ["LOCAL_RANK"] = str(self.local_rank)
+            os.environ["WORLD_SIZE"] = str(pc.world_size)
+            os.environ["LOCAL_WORLD_SIZE"] = str(local_world)
+            os.environ.setdefault("MASTER_ADDR", parsed.hostname)
+            os.environ.setdefault("MASTER_PORT", str(parsed.port))
 
         if not self.devices:
             self.devices = [torch.device("tpu")]
 
-        # Initialize vLLM distributed state using true rank/world-size so TP
-        # uses native vLLM model-parallel groups.
         from vllm.platforms import current_platform
         dist_backend = current_platform.get_worker_distributed_backend(
-            self.parallel_config.world_size)
+            global_world)
 
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
-                world_size=self.parallel_config.world_size,
-                rank=self.rank,
-                local_rank=self.local_rank,
-                distributed_init_method=self.distributed_init_method,
+                world_size=init_world,
+                rank=init_rank,
+                local_rank=local_rank_env,
+                distributed_init_method=dist_init_method,
                 backend=dist_backend,
             )
+        with set_current_vllm_config(self.vllm_config):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.
                 tensor_parallel_size,
@@ -269,6 +329,22 @@ class TPUWorker(WorkerBase):
 
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
+
+    def execute_dummy_batch(self) -> None:
+        """Run an idle DP step with the same collective pattern as active DP."""
+        runner = self.model_runner
+        bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
+        if bucket is None:
+            # TPU compiles exact token buckets, so the idle-engine dummy must
+            # use one of the precompiled model-forward shapes.
+            dummy_tokens = runner.num_tokens_paddings[0]
+            runner._dummy_run(dummy_tokens,
+                              runner.num_reqs_max_model_len,
+                              runner.max_num_blocks_per_req,
+                              use_max_model_len=True)
+            return
+        for _ in range(target_num_chunks):
+            runner._run_dp_dummy_chunk(bucket)
 
     def profile(self,
                 is_start: bool = True,

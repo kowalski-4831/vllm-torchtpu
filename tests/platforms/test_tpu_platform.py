@@ -40,6 +40,9 @@ class TestTpuPlatform:
         vllm_config.speculative_config = None
         vllm_config.parallel_config = MagicMock()
         vllm_config.parallel_config.world_size = 1
+        vllm_config.parallel_config.world_size_across_dp = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.enable_expert_parallel = False
         vllm_config.parallel_config.pipeline_parallel_size = 1
         vllm_config.parallel_config.tensor_parallel_size = 1
         vllm_config.kv_transfer_config = None
@@ -53,13 +56,12 @@ class TestTpuPlatform:
     @patch(
         "tpu_inference.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch(
-        "tpu_inference.core.sched.dp_scheduler.update_vllm_config_for_dp_scheduler"
-    )
     @patch("tpu_inference.platforms.tpu_platform.vllm_envs")
-    def test_check_and_update_config_hybrid_block_size(
-            self, mock_vllm_envs, mock_update_dp, mock_prepare_env,
-            mock_sharding, mock_apply_patches, vllm_config):
+    def test_check_and_update_config_hybrid_block_size(self, mock_vllm_envs,
+                                                       mock_prepare_env,
+                                                       mock_sharding,
+                                                       mock_apply_patches,
+                                                       vllm_config):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 123  # already set
@@ -89,13 +91,10 @@ class TestTpuPlatform:
     @patch(
         "tpu_inference.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch(
-        "tpu_inference.core.sched.dp_scheduler.update_vllm_config_for_dp_scheduler"
-    )
     @patch("tpu_inference.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_accepts_tpu_disagg_connectors(
-            self, mock_vllm_envs, mock_update_dp, mock_prepare_env,
-            mock_sharding, mock_apply_patches, vllm_config, connector_name):
+            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
+            mock_apply_patches, vllm_config, connector_name):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = connector_name

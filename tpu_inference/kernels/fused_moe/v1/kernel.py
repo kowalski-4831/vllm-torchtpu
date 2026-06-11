@@ -265,8 +265,7 @@ def _fused_ep_moe_kernel(
     num_bd2 = cdiv(hidden_size, bd2)
 
     def get_mesh_device_id(ep_rank):
-        dp_rank = jax.lax.axis_index("data")
-        return (dp_rank, ep_rank)
+        return (ep_rank, )
 
     def sync_barrier():
         barrier_sem = pltpu.get_barrier_semaphore()
@@ -1182,10 +1181,8 @@ def fused_ep_moe(
     ep_axis_name: str = "model",
 ):
     # TODO(jevinjiang): move all these assertions to validation function.
-    # Assert all other axes have length of 1
-    assert len(mesh.shape) == 2, "Expect 2D mesh"
-    assert ("data" in mesh.shape
-            and mesh.shape["data"] == 1), "Expect data axis size of 1"
+    assert len(mesh.shape) == 1, "Expect 1D mesh"
+    assert ep_axis_name in mesh.shape, f"Expect {ep_axis_name} axis in mesh"
 
     ep_size = mesh.shape[ep_axis_name]
     num_devices = ep_size
