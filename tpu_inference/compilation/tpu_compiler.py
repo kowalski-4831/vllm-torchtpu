@@ -111,6 +111,17 @@ class TpuCompilerAdaptor(CompilerInterface):
                          cache_dir: str,
                          disable_cache: bool = False,
                          prefix: str = "") -> None:
+        vllm_xla_cache_path = os.getenv("VLLM_XLA_CACHE_PATH")
+        if vllm_xla_cache_path:
+            try:
+                from vllm.envs import VLLM_CACHE_ROOT
+                rel_path = os.path.relpath(cache_dir, VLLM_CACHE_ROOT)
+                cache_dir = os.path.join(vllm_xla_cache_path, rel_path)
+            except Exception as e:
+                logger.warning(
+                    "[TpuCompilerAdaptor] Failed to relocate cache directory "
+                    "using VLLM_XLA_CACHE_PATH: %s", e)
+
         self.cache_dir = cache_dir
         self._disable_cache = disable_cache
 

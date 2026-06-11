@@ -16,3 +16,13 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 # to allow functional collectives to compile under SPMD, which is safe and
 # required for Tensor Parallelism.
 os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] = "false"
+
+# Map VLLM_XLA_CACHE_PATH to TorchTPU compilation cache environment variables
+vllm_xla_cache_path = os.getenv("VLLM_XLA_CACHE_PATH")
+if vllm_xla_cache_path:
+    # Route Tier-3 native cache to a subdirectory under VLLM_XLA_CACHE_PATH
+    os.environ.setdefault("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
+                          os.path.join(vllm_xla_cache_path, "torch_tpu_tier3"))
+    # Enable Tier-2 cache in memory (required by Tier-3)
+    os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
+                          "tpu_tier2_cache")
