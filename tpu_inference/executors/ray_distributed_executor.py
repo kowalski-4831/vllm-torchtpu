@@ -544,6 +544,15 @@ class RayWorkerWrapper(RayWorkerWrapperV1):
         self._execute_model_outputs = dict()  # type: ignore
         self.result_id = int(0)
 
+    def setup_device_if_necessary(self):
+        # TODO(swang): This is needed right now because Ray CG executes
+        # on a background thread, so we need to reset torch's current
+        # device.
+        # We can remove this API after it is fixed in compiled graph.
+        assert self.worker is not None, "Worker is not initialized"
+        if not self.compiled_dag_cuda_device_set:
+            self.compiled_dag_cuda_device_set = True
+
     # Override the execute_model method to suppprt async scheduling.
     # Once the vLLM V1 Ray executor supports async scheduling natively,
     # we can remove this method.
