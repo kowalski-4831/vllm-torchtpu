@@ -11,6 +11,7 @@ CONCURRENCY_OPTIONS="64"
 RANDOM_RANGE_RATIO="0.8"
 ATTENTION_BACKEND=FLASH_ATTN
 SERVER_READY_WAIT_MIN=120
+GPU_MEMORY_UTILIZATION=0.9
 
 # Extra arguments for vllm serve
 EXTRA_SERVE_ARGS="--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"

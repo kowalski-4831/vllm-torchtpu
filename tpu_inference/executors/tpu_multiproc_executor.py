@@ -7,7 +7,7 @@ instead of all 14 shapes sharing a single window and timing out.
 """
 
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 
 class TpuMultiprocExecutor(MultiprocExecutor):
@@ -17,6 +17,20 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         from tpu_inference import _patch_multiproc_worker_global_rank_env
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
+
+    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        specs = super().get_kv_cache_specs()
+
+        if self.vllm_config.cache_config.num_gpu_blocks_override is None:
+            # Compact-mamba sizing sets `num_gpu_blocks_override` on the worker's
+            # cache_config during the RPC above; workers are separate processes, so
+            # copy it to the engine-side config here.
+            overrides = self.collective_rpc("get_num_gpu_blocks_override")
+            assert len(set(overrides)) == 1
+            self.vllm_config.cache_config.num_gpu_blocks_override = (
+                overrides[0])
+
+        return specs
 
     def initialize_from_config(self,
                                kv_cache_configs: list[KVCacheConfig]) -> None:
