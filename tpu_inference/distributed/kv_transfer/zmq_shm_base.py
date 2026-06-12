@@ -26,6 +26,7 @@ pool plus ZMQ ROUTER/DEALER coordination.
     releases the slot once all ranks have copied.
 """
 
+import os
 import pickle
 import queue
 import threading
@@ -147,8 +148,8 @@ class _CoordRecvEntry:
     num_blocks: int
     local_blocks: list[int]
     remote_blocks: list[int]
-    remote_host: str
-    remote_port: int
+    remote_host: str | list[str]
+    remote_port: int | list[int]
     # Set by the async pull thread once data has been written to shm.
     load_complete: threading.Event = field(default_factory=threading.Event)
     # Ranks that have sent COPY_DONE. Once |copied| == tp_size we can notify
@@ -247,10 +248,15 @@ class ZmqShmKvConnectorBase:
 
         self.tp_rank: int = get_tensor_model_parallel_rank()
         self.tp_size: int = get_tensor_model_parallel_world_size()
+        self.ranks_per_host = self.tp_size // int(
+            os.getenv("TPU_NUM_HOSTS", "1"))
+        self.local_tp_rank = self.tp_rank % self.ranks_per_host
+        self._is_host_coordinator = (self.local_tp_rank == 0)
 
         self.host_ip = dist_utils.get_host_ip()
         self.kv_transfer_port = int(dist_utils.get_kv_transfer_port())
-        self.side_channel_port = int(dist_utils.get_side_channel_port())
+        self.side_channel_port = int(
+            dist_utils.get_side_channel_port()) + self.node_id
 
         # One ZMQ I/O thread per parallel data socket. Default io_threads=1
         # funnels all tp_size data sockets through a single kernel-I/O
@@ -261,18 +267,18 @@ class ZmqShmKvConnectorBase:
         self._stop_event = threading.Event()
 
         self._lat = _LatencyTracker(
-            who=f"TPUConnectorWorker node={self.node_id} rank{self.tp_rank}",
+            who=f"TPUConnectorWorker({self.node_id}) rank{self.tp_rank}",
             log_interval_s=dist_utils.get_kv_latency_log_interval())
 
         self.transfer_stats = TpuKVConnectorStats()
         self._init_coord_state()
 
         logger.info(
-            "TPUConnectorWorker --> init | ip=%s | kv_transfer_port=%s | "
-            "side_channel_port=%s | is_producer=%s | node_id=%s | "
-            "tp_rank=%d | tp_size=%d", self.host_ip, self.kv_transfer_port,
-            self.side_channel_port, self.is_producer, self.node_id,
-            self.tp_rank, self.tp_size)
+            "TPUConnectorWorker(%s) --> init | ip=%s | kv_transfer_port=%s | "
+            "side_channel_port=%s | is_producer=%s | node_id=%d | "
+            "tp_rank=%d | tp_size=%d", self.node_id, self.host_ip,
+            self.kv_transfer_port, self.side_channel_port, self.is_producer,
+            self.node_id, self.tp_rank, self.tp_size)
 
     def _init_coord_state(self) -> None:
         """Minimum state needed on both rank-0 and the other ranks. The
@@ -286,7 +292,8 @@ class ZmqShmKvConnectorBase:
         n_channels = self.tp_size if n_cfg <= 0 else min(n_cfg, self.tp_size)
         self._n_channels: int = max(1, n_channels)
         self._kv_transfer_ports: list[int] = [
-            self.kv_transfer_port + i for i in range(self._n_channels)
+            self.kv_transfer_port + self.node_id * self._n_channels + i
+            for i in range(self._n_channels)
         ]
 
         # Multi-layer batched HBM->HBM scatter kernel (kv_scatter): one
@@ -303,14 +310,20 @@ class ZmqShmKvConnectorBase:
         # queue each iteration, so send_multipart() is only ever called from
         # one thread (ZMQ sockets are not thread-safe).
         self._coord_ipc_out: queue.Queue = queue.Queue()
+
+        # Local rank to global rank mapping
+        self._coord_local_to_global_rank: dict[int, int] = {}
+        self._coord_local_to_global_rank[self.local_tp_rank] = self.tp_rank
+
         # Request-level pulls run asynchronously so the worker main thread can
         # keep servicing vLLM RPCs. Each request then fans out to channel pulls
         # on a separate bounded executor. Keeping these pools close to the
         # actual channel count avoids dozens of Python unpack tasks contending
         # for the GIL while the network is already saturated.
+        num_hosts = int(os.getenv("TPU_NUM_HOSTS", "1"))
         channel_workers = dist_utils.get_kv_channel_executor_max_workers()
         if channel_workers == 0:
-            channel_workers = max(1, self._n_channels * 2)
+            channel_workers = max(1, self._n_channels * num_hosts * 2)
         coord_workers = dist_utils.get_kv_coord_executor_max_workers()
         if coord_workers == 0:
             coord_workers = max(1, min(2, channel_workers))
@@ -319,8 +332,8 @@ class ZmqShmKvConnectorBase:
         self._coord_channel_executor = ThreadPoolExecutor(
             max_workers=channel_workers, thread_name_prefix="tpu-kv-channel")
         logger.info(
-            "TPUConnectorWorker --> coord executors | request_workers=%d | "
-            "channel_workers=%d | n_channels=%d", coord_workers,
+            "TPUConnectorWorker(%s) --> coord executors | request_workers=%d | "
+            "channel_workers=%d | n_channels=%d", self.node_id, coord_workers,
             channel_workers, self._n_channels)
 
         # Rank-0 authoritative state. Non-zero ranks leave these empty and
@@ -353,7 +366,7 @@ class ZmqShmKvConnectorBase:
         # eagerly so the first request doesn't eat a 5s false-positive
         # timeout in _coord_process_send_load.
         self._coord_workers_ready: threading.Event = threading.Event()
-        if self.tp_size == 1:
+        if self.ranks_per_host == 1:
             self._coord_workers_ready.set()
 
         # Ranks != 0: state for work the coordinator has told us to do.
@@ -402,9 +415,10 @@ class ZmqShmKvConnectorBase:
             "register_runner called before kv_caches were allocated")
         self._extract_kv_layout()
         logger.info(
-            "TPUConnectorWorker --> register_runner | node_id=%s | "
+            "TPUConnectorWorker(%d) --> register_runner | node_id=%d | "
             "num_layers=%d | layer_shape=%s | dtype=%s | device=%s",
-            self.node_id, self.num_layers, self.shape, self.dtype, self.device)
+            self.node_id, self.node_id, self.num_layers, self.shape,
+            self.dtype, self.device)
         self._coord_setup()
         self._maybe_enable_kv_scatter()
 
@@ -413,7 +427,7 @@ class ZmqShmKvConnectorBase:
                 self._warmup_kv_ops()
             except Exception as e:
                 logger.exception(
-                    "TPUConnectorWorker %s rank%d --> warmup failed "
+                    "TPUConnectorWorker(%s) rank%d --> warmup failed "
                     "(continuing; first real request will pay the compile "
                     "cost): %s", self.node_id, self.tp_rank, e)
 
@@ -480,7 +494,7 @@ class ZmqShmKvConnectorBase:
         `index_put_` path. Both are done per-layer, matching runtime."""
         sizes = self._warmup_block_sizes()
         logger.info(
-            "TPUConnectorWorker %s rank%d --> warmup starting | role=%s | "
+            "TPUConnectorWorker(%s) rank%d --> warmup starting | role=%s | "
             "num_layers=%d | block_sizes=%s", self.node_id, self.tp_rank,
             "producer" if self.is_producer else "consumer", self.num_layers,
             sizes)
@@ -491,10 +505,10 @@ class ZmqShmKvConnectorBase:
             t0 = time.perf_counter()
             self._warmup_coord_once(n)
             logger.info(
-                "TPUConnectorWorker %s rank%d --> warmup num_blocks=%d "
+                "TPUConnectorWorker(%s) rank%d --> warmup num_blocks=%d "
                 "took %.2fs", self.node_id, self.tp_rank, n,
                 time.perf_counter() - t0)
-        logger.info("TPUConnectorWorker %s rank%d --> warmup done in %.2fs",
+        logger.info("TPUConnectorWorker(%s) rank%d --> warmup done in %.2fs",
                     self.node_id, self.tp_rank,
                     time.perf_counter() - start)
 
@@ -520,8 +534,8 @@ class ZmqShmKvConnectorBase:
             # so the first real request paid a 3-8s recompile.
             use_kv_scatter = self._kv_scatter_enabled
             src_views = [
-                self._coord_pool.layer_view(slot_idx, self.tp_rank, layer_idx,
-                                            num_blocks)
+                self._coord_pool.layer_view(slot_idx, self.local_tp_rank,
+                                            layer_idx, num_blocks)
                 for layer_idx in range(len(kv_caches))
             ]
             h2d_future, device_shards = self._h2d_into_device_async(src_views)
@@ -588,17 +602,18 @@ class ZmqShmKvConnectorBase:
         per_layer_bytes = dtype_bytes
         for d in layer_shard_shape:
             per_layer_bytes *= d
-        per_slot_bytes = self.tp_size * self.num_layers * per_layer_bytes
+        per_slot_bytes = self.ranks_per_host * self.num_layers * per_layer_bytes
         budget_bytes = int(dist_utils.get_kv_shm_pool_gb() * (1024**3))
         num_slots = max(1, budget_bytes // per_slot_bytes)
         logger.info(
-            "TPUConnectorWorker %s rank%d --> shm pool budget=%.2fGB "
+            "TPUConnectorWorker(%s) rank=%d (local_rank=%d)--> shm pool budget=%.2fGB "
             "per_slot=%.2fMB -> num_slots=%d", self.node_id, self.tp_rank,
-            budget_bytes / (1024**3), per_slot_bytes / (1024**2), num_slots)
+            self.local_tp_rank, budget_bytes / (1024**3),
+            per_slot_bytes / (1024**2), num_slots)
 
         return PoolSpec(
             num_slots=num_slots,
-            tp_size=self.tp_size,
+            tp_size=self.ranks_per_host,
             num_layers=self.num_layers,
             max_blocks=max_blocks,
             layer_shard_shape=layer_shard_shape,
@@ -621,7 +636,7 @@ class ZmqShmKvConnectorBase:
         shm_name = dist_utils.get_shm_name(self.node_id)
         ipc_path = dist_utils.get_ipc_socket_path(self.node_id)
 
-        if self.tp_rank == 0:
+        if self._is_host_coordinator:
             self._coord_pool = self._pool_create(self._coord_pool_spec,
                                                  shm_name)
             self._coord_setup_rank0(ipc_path)
@@ -637,7 +652,7 @@ class ZmqShmKvConnectorBase:
         # Lock only this rank's slice -- each rank only reads its own
         # shard for transfer_h2d_batch.
         if dist_utils.get_kv_pin_shm():
-            self._coord_pool.mlock_async(my_rank=self.tp_rank)
+            self._coord_pool.mlock_async(my_rank=self.local_tp_rank)
 
     def _coord_attach_shm_with_retry(self, spec: Any, name: str) -> Any:
         """Non-rank-0 ranks may race ahead of rank 0. Poll the shm name a
@@ -662,7 +677,7 @@ class ZmqShmKvConnectorBase:
         _try_remove_ipc_endpoint(ipc_path)
         ipc.bind(ipc_path)
         self._coord_ipc_sock = ipc
-        logger.info("TPUConnectorWorker %s rank0 --> IPC listening on %s",
+        logger.info("TPUConnectorWorker(%s) rank0 --> IPC listening on %s",
                     self.node_id, ipc_path)
 
         # IPC listener thread.
@@ -718,15 +733,16 @@ class ZmqShmKvConnectorBase:
         sock = self.zmq_cxt.socket(zmq.DEALER)
         sock.setsockopt(zmq.LINGER, 0)
         # Identity encodes rank so the coordinator can address us explicitly.
-        ident = f"tpu_rank_{self.tp_rank}".encode("utf-8")
+        ident = f"tpu_rank_{self.local_tp_rank}".encode("utf-8")
         sock.setsockopt(zmq.IDENTITY, ident)
         sock.connect(ipc_path)
         self._coord_ipc_sock = sock
         # Announce ourselves; messages buffer on DEALER until coord ROUTER
         # reads them, so this is safe even if coord isn't up yet.
-        self._coord_send_ipc(_IPC_HELLO, (self.tp_rank, ))
-        logger.info("TPUConnectorWorker %s rank%d --> IPC connected to %s",
-                    self.node_id, self.tp_rank, ipc_path)
+        self._coord_send_ipc(_IPC_HELLO, (self.local_tp_rank, self.tp_rank))
+        logger.info(
+            "TPUConnectorWorker(%s) rank%d, local_rank%d --> IPC connected to %s",
+            self.node_id, self.tp_rank, self.local_tp_rank, ipc_path)
 
         t = threading.Thread(target=self._coord_worker_ipc_loop,
                              name=f"tpu_conn_worker_ipc_{self.tp_rank}",
@@ -780,7 +796,7 @@ class ZmqShmKvConnectorBase:
                         sock.send_multipart([ident, tag, data])
                 except zmq.ZMQError as e:
                     logger.warning(
-                        "TPUConnectorWorker %s --> IPC send tag=%s failed: %s",
+                        "TPUConnectorWorker(%s) --> IPC send tag=%s failed: %s",
                         self.node_id, tag, e)
         except queue.Empty:
             return
@@ -824,15 +840,16 @@ class ZmqShmKvConnectorBase:
         # and the PULL timed out. Inline stage drains each rank's XLA queue
         # before model_forward adds anything to it.
 
-        if self.tp_rank == 0:
+        if self._is_host_coordinator:
             if metadata.reqs_to_send or metadata.reqs_to_load:
                 # Only gate on worker registration when we actually need to
                 # broadcast. If all HELLO's are still in flight, wait briefly.
                 if not self._coord_workers_ready.wait(timeout=5.0):
                     logger.warning(
-                        "TPUConnectorWorker rank0 --> still waiting on "
-                        "HELLOs: %d/%d registered",
-                        len(self._coord_rank_to_identity), self.tp_size - 1)
+                        "TPUConnectorWorker(%d) rank0 --> still waiting on "
+                        "HELLOs: %d/%d registered", self.node_id,
+                        len(self._coord_rank_to_identity),
+                        self.ranks_per_host - 1)
                 for req_id, req_meta in metadata.reqs_to_send.items():
                     self._coord_rank0_handle_new_send(req_id, req_meta)
                 for req_id, req_meta in metadata.reqs_to_load.items():
@@ -866,8 +883,8 @@ class ZmqShmKvConnectorBase:
         assert self.is_producer
         num_blocks = self._blocks_token(req_meta.local_block_ids)
         logger.info(
-            "TPUConnectorWorker rank0 --> handle_new_send req_id=%s uuid=%s "
-            "blocks=%s", req_id, req_meta.uuid, num_blocks)
+            "TPUConnectorWorker(%s) rank0 --> handle_new_send req_id=%s uuid=%s "
+            "blocks=%s", self.node_id, req_id, req_meta.uuid, num_blocks)
         logger.info("PERF P handle_new_send req_id=%s uuid=%s ts=%.6f", req_id,
                     req_meta.uuid, time.time())
         try:
@@ -887,9 +904,9 @@ class ZmqShmKvConnectorBase:
                 ]
                 self._coord_done_sending.add(req_id)
             logger.error(
-                "TPUConnectorWorker rank0 --> shm pool exhausted for "
+                "TPUConnectorWorker(%s) rank0 --> shm pool exhausted for "
                 "req_id=%s (producer). send_holders=%s recv_holders=%s",
-                req_id, send_holders, recv_holders)
+                self.node_id, req_id, send_holders, recv_holders)
             return
 
         entry = _CoordSendEntry(
@@ -908,9 +925,9 @@ class ZmqShmKvConnectorBase:
             _IPC_STAGE_NOTIFY,
             (req_meta.uuid, slot_idx, num_blocks, req_meta.local_block_ids))
         logger.info(
-            "TPUConnectorWorker rank0 --> handle_new_send broadcast uuid=%s "
-            "slot=%d to %d non-zero ranks", req_meta.uuid, slot_idx,
-            len(self._coord_rank_to_identity))
+            "TPUConnectorWorker(%d) rank0 --> handle_new_send broadcast uuid=%s "
+            "slot=%d to %d non-zero ranks", self.node_id, req_meta.uuid,
+            slot_idx, len(self._coord_rank_to_identity))
 
         # Rank 0 enqueues its own async D2H on the main thread; the waiter
         # thread emits STAGE_DONE once the future completes. Returning here
@@ -922,8 +939,8 @@ class ZmqShmKvConnectorBase:
                                     req_meta.local_block_ids)
         except Exception as ex:
             logger.exception(
-                "TPUConnectorWorker rank0 --> stage_self uuid=%s failed: %s",
-                req_meta.uuid, ex)
+                "TPUConnectorWorker(%d) rank0 --> stage_self uuid=%s failed: %s",
+                self.node_id, req_meta.uuid, ex)
 
     def _coord_worker_stage_inline(self,
                                    uuid: int,
@@ -935,8 +952,9 @@ class ZmqShmKvConnectorBase:
         thread enters model_forward, otherwise .to("cpu") will block behind
         the first-time decode compile."""
         logger.info(
-            "TPUConnectorWorker rank%d --> stage_inline waiting for "
-            "STAGE_NOTIFY req_id=%s uuid=%s", self.tp_rank, req_id, uuid)
+            "TPUConnectorWorker(%d) rank%d --> stage_inline waiting for "
+            "STAGE_NOTIFY req_id=%s uuid=%s", self.node_id, self.tp_rank,
+            req_id, uuid)
         deadline = time.perf_counter() + timeout
         info: Optional[tuple[int, int, list[int]]] = None
         with self._worker_pending_stage_cv:
@@ -944,9 +962,9 @@ class ZmqShmKvConnectorBase:
                 rem = deadline - time.perf_counter()
                 if rem <= 0:
                     logger.warning(
-                        "TPUConnectorWorker rank%d --> stage_inline timeout "
-                        "uuid=%s (STAGE_NOTIFY never arrived)", self.tp_rank,
-                        uuid)
+                        "TPUConnectorWorker(%d) rank%d --> stage_inline timeout "
+                        "uuid=%s (STAGE_NOTIFY never arrived)", self.node_id,
+                        self.tp_rank, uuid)
                     return
                 self._worker_pending_stage_cv.wait(timeout=rem)
             info = self._worker_pending_stage.pop(uuid)
@@ -955,8 +973,8 @@ class ZmqShmKvConnectorBase:
             self._coord_stage_shard(uuid, slot_idx, num_blocks, block_ids)
         except Exception as e:
             logger.exception(
-                "TPUConnectorWorker rank%d --> stage_inline uuid=%s failed: %s",
-                self.tp_rank, uuid, e)
+                "TPUConnectorWorker(%d) rank%d --> stage_inline uuid=%s failed: %s",
+                self.node_id, self.tp_rank, uuid, e)
             # Enqueue path didn't run, so the waiter won't fire STAGE_DONE
             # for us. Signal it directly with failed=True so rank 0 marks
             # the entry stage_failed and PULL serving will _MSG_ERR rather
@@ -987,7 +1005,7 @@ class ZmqShmKvConnectorBase:
         device buffer and destination shm backing stay alive across the
         DMA."""
         logger.info(
-            "TPUConnectorWorker %s rank%d --> stage_shard enqueue "
+            "TPUConnectorWorker(%s) rank%d --> stage_shard enqueue "
             "uuid=%s slot=%d blocks=%s layers=%d", self.node_id, self.tp_rank,
             uuid, slot_idx, num_blocks, len(self.runner.kv_caches))
         enqueue_t0 = time.perf_counter()
@@ -1007,7 +1025,7 @@ class ZmqShmKvConnectorBase:
                            issue_t1=issue_t1,
                            total_bytes=d2h_total_bytes))
         logger.info(
-            "TPUConnectorWorker %s rank%d --> stage_shard enqueued "
+            "TPUConnectorWorker(%s) rank%d --> stage_shard enqueued "
             "uuid=%s slot=%d enqueue=%.2fms", self.node_id, self.tp_rank, uuid,
             slot_idx, enqueue_ms)
 
@@ -1052,7 +1070,7 @@ class ZmqShmKvConnectorBase:
                         continue
                     if now >= deadline:
                         logger.warning(
-                            "TPUConnectorWorker %s rank%d --> stage_waiter "
+                            "TPUConnectorWorker(%s) rank%d --> stage_waiter "
                             "uuid=%s slot=%d future.wait() exceeded "
                             "%.1fs; signaling failed STAGE_DONE (worker "
                             "thread leaks until wait returns)", self.node_id,
@@ -1084,14 +1102,14 @@ class ZmqShmKvConnectorBase:
             self._lat.record(_LAT_STAGE, total_ms)
             self.transfer_stats.record_d2h_transfer(total_ms)
             logger.info(
-                "TPUConnectorWorker %s rank%d --> stage_done "
+                "TPUConnectorWorker(%s) rank%d --> stage_done "
                 "uuid=%s slot=%d issue=%.2fms wait=%.2fms total=%.2fms "
                 "throughput=%.2fMiB/s", self.node_id, self.tp_rank, entry.uuid,
                 entry.slot_idx, issue_ms, wait_ms, total_ms, mbps)
         except Exception as e:
             failed = True
             logger.exception(
-                "TPUConnectorWorker %s rank%d --> stage_waiter uuid=%s "
+                "TPUConnectorWorker(%s) rank%d --> stage_waiter uuid=%s "
                 "future.wait() raised: %s", self.node_id, self.tp_rank,
                 entry.uuid, e)
         self._complete_stage_entry(entry, failed=failed)
@@ -1117,7 +1135,7 @@ class ZmqShmKvConnectorBase:
         to rank 0's listener, which performs the same update. If `failed`
         is True the entry is tagged stage_failed so PULL serving aborts
         cleanly with _MSG_ERR rather than shipping stale shm data."""
-        if self.tp_rank == 0:
+        if self._is_host_coordinator:
             fired_complete = False
             staged_count = 0
             per_rank_event: Optional[threading.Event] = None
@@ -1127,13 +1145,14 @@ class ZmqShmKvConnectorBase:
                     return
                 if failed:
                     entry.stage_failed = True
-                entry.staged.add(0)
+                entry.staged.add(0)  ## local_tp_rank?
                 staged_count = len(entry.staged)
-                if staged_count == self.tp_size:
+                if staged_count == self.ranks_per_host:
                     entry.stage_complete.set()
                     fired_complete = True
-                if 0 < len(entry.staged_events):
-                    per_rank_event = entry.staged_events[0]
+                if 0 < len(entry.staged_events):  ## self.local_tp_rank?
+                    per_rank_event = entry.staged_events[
+                        0]  ## self.local_tp_rank?
             # Set the per-rank event outside the lock; the wait side is
             # _coord_rank0_build_pull_response, which only takes the lock
             # briefly to look up the entry, then waits on the event.
@@ -1141,12 +1160,14 @@ class ZmqShmKvConnectorBase:
                 per_rank_event.set()
             if fired_complete:
                 logger.info(
-                    "TPUConnectorWorker rank0 --> stage_complete uuid=%s "
-                    "(all %d ranks staged, self-fire)", uuid, self.tp_size)
-                logger.info("PERF P stage_complete uuid=%s ts=%.6f", uuid,
-                            time.time())
+                    "TPUConnectorWorker(%d) rank0 --> stage_complete uuid=%s "
+                    "(all %d ranks staged, self-fire for node %d)",
+                    self.node_id, uuid, self.ranks_per_host, self.node_id)
+                logger.info("PERF P stage_complete(%s) uuid=%s ts=%.6f",
+                            self.node_id, uuid, time.time())
         else:
-            self._coord_send_ipc(_IPC_STAGE_DONE, (uuid, self.tp_rank, failed))
+            self._coord_send_ipc(_IPC_STAGE_DONE,
+                                 (uuid, self.local_tp_rank, failed))
 
     # =========================================================
     # Rank 0 consumer path: pull, write shm, broadcast LOAD_NOTIFY
@@ -1192,9 +1213,9 @@ class ZmqShmKvConnectorBase:
                 # LOAD_NOTIFY hasn't been broadcast yet; the pull thread
                 # will read the updated local_blocks when it publishes.
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> dedup preempted load "
+                    "TPUConnectorWorker(%s) rank0 --> dedup preempted load "
                     "req_id=%s uuid=%s (pull in flight, new blocks=%s)",
-                    req_id, req_meta.uuid, num_blocks)
+                    self.node_id, req_id, req_meta.uuid, num_blocks)
             else:
                 # Pull already completed and LOAD_NOTIFY fired with the
                 # old blocks. Re-broadcast so workers' cached
@@ -1203,10 +1224,10 @@ class ZmqShmKvConnectorBase:
                 # already popped the old entry, but scatter under the
                 # correct blocks is still the right intent.
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> dedup preempted load "
+                    "TPUConnectorWorker(%s) rank0 --> dedup preempted load "
                     "req_id=%s uuid=%s (pull already complete, "
-                    "rebroadcasting LOAD_NOTIFY with new blocks=%s)", req_id,
-                    req_meta.uuid, num_blocks)
+                    "rebroadcasting LOAD_NOTIFY with new blocks=%s)",
+                    self.node_id, req_id, req_meta.uuid, num_blocks)
                 self._coord_broadcast(
                     _IPC_LOAD_NOTIFY,
                     (existing.uuid, existing.slot_idx, existing.num_blocks,
@@ -1232,10 +1253,11 @@ class ZmqShmKvConnectorBase:
                 ]
                 self._coord_done_recving.add(req_id)
             logger.error(
-                "TPUConnectorWorker rank0 --> shm pool exhausted for "
+                "TPUConnectorWorker(%d) rank0 --> shm pool exhausted for "
                 "req_id=%s; surfacing done_recving so scheduler advances "
                 "(expect wrong output for this req). recv_holders=%s "
-                "send_holders=%s", req_id, recv_holders, send_holders)
+                "send_holders=%s", self.node_id, req_id, recv_holders,
+                send_holders)
             return
 
         remote_host, remote_port = self._resolve_remote_host_port(req_meta)
@@ -1255,35 +1277,40 @@ class ZmqShmKvConnectorBase:
         self._coord_executor.submit(self._coord_rank0_pull, entry)
 
     def _coord_rank0_pull(self, entry: _CoordRecvEntry) -> None:
-        """Pull the full KV blob (all ranks' shards) from remote coord and
-        unpack it into shm. Then broadcast LOAD_NOTIFY and set the
+        """Pull the full KV blob (all ranks' shards) from remote coord for all hosts
+        and unpack it into shm. Then broadcast LOAD_NOTIFY and set the
         load_complete event so get_finished() returns done_recving.
 
         Uses ``self._n_channels`` parallel DEALER sockets (one per thread)
         to N producer ROUTER ports ``base_port + ch``. Each channel carries
         its subset of rank payloads; we reassemble them into a single
         rank->payload map then unpack all shards into shm."""
+        hosts = entry.remote_host if isinstance(entry.remote_host,
+                                                list) else [entry.remote_host]
+        ports = entry.remote_port if isinstance(entry.remote_port,
+                                                list) else [entry.remote_port]
+        num_hosts = len(hosts)
         n_channels = self._n_channels
-        base_port = int(entry.remote_port)
         uuid_bytes = str(entry.uuid).encode("utf-8")
         timeout_s = dist_utils.get_p2p_wait_pull_timeout()
         req_blocks_pickle = pickle.dumps(entry.remote_blocks,
                                          protocol=pickle.HIGHEST_PROTOCOL)
         logger.info(
-            "TPUConnectorWorker rank0 --> PULL req_id=%s uuid=%s "
-            "from=%s:%s+0..%d blocks=%s n_channels=%d", entry.req_id,
-            entry.uuid, entry.remote_host, base_port, n_channels - 1,
+            "TPUConnectorWorker(%s) rank0 --> PULL req_id=%s uuid=%s "
+            "from=%s:%s+0..%s blocks=%s n_channels=%s", self.node_id,
+            entry.req_id, entry.uuid, entry.remote_host, ports, n_channels - 1,
             entry.num_blocks, n_channels)
 
         num_layers = self.num_layers
 
-        def _pull_channel(ch: int):
+        def _pull_channel(h: int, ch: int):
             """Pull one channel's subset of ranks AND unpack their layer
             frames into shm inline. Returns per-channel (wire_ms,
             unpack_ms, ranks_handled) so the orchestrator can log the
             breakdown but does not need to reassemble anything."""
-            port = base_port + ch
-            sock_path = make_zmq_path("tcp", entry.remote_host, port)
+            port = ports[h] + ch
+            host = hosts[h]
+            sock_path = make_zmq_path("tcp", host, port)
             sock = make_zmq_socket(ctx=self.zmq_cxt,
                                    path=sock_path,
                                    socket_type=zmq.DEALER,
@@ -1294,8 +1321,9 @@ class ZmqShmKvConnectorBase:
             sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
             try:
                 t0 = time.perf_counter()
-                logger.info("PERF D pull_send ch=%d uuid=%s ts=%.6f", ch,
-                            entry.uuid, time.time())
+                logger.info(
+                    "PERF D pull_send host_idx=%d ch=%d uuid=%s ts=%.6f", h,
+                    ch, entry.uuid, time.time())
                 sock.send_multipart([_MSG_PULL, uuid_bytes, req_blocks_pickle])
                 deadline = t0 + timeout_s
                 frames = None
@@ -1310,18 +1338,19 @@ class ZmqShmKvConnectorBase:
                         break
                 if frames is None:
                     raise TimeoutError(
-                        f"PULL ch={ch} timed out after {timeout_s}s "
+                        f"PULL host_idx={h} ch={ch} timed out after {timeout_s}s "
                         f"for req_id={entry.req_id}")
                 if bytes(frames[0].buffer) != _MSG_OK:
                     tag = bytes(frames[0].buffer)
                     payload_hint = (bytes(frames[1].buffer)
                                     if len(frames) > 1 else b"")
                     raise RuntimeError(
-                        f"PULL ch={ch} failed for req_id={entry.req_id}: "
+                        f"PULL host_idx={h} ch={ch} failed for req_id={entry.req_id}: "
                         f"[{tag!r}, {payload_hint!r}]")
                 t_wire_done = time.perf_counter()
-                logger.info("PERF D wire_done ch=%d uuid=%s ts=%.6f", ch,
-                            entry.uuid, time.time())
+                logger.info(
+                    "PERF D wire_done host_idx=%d ch=%d uuid=%s ts=%.6f", h,
+                    ch, entry.uuid, time.time())
 
                 # Wire format after OK:
                 #   frames[1]=uuid echo, frames[2]=n_ranks ascii
@@ -1336,29 +1365,41 @@ class ZmqShmKvConnectorBase:
                     idx += 1
 
                 ranks_handled: list[int] = []
+                # Construct reverse mapping global_rank -> local_rank
+                with self._coord_lock:
+                    global_to_local = {
+                        global_rank: local_rank
+                        for local_rank, global_rank in
+                        self._coord_local_to_global_rank.items()
+                    }
+
                 for _ in range(n_ranks):
-                    rank_idx = int(bytes(frames[idx].buffer).decode("utf-8"))
+                    global_rank = int(
+                        bytes(frames[idx].buffer).decode("utf-8"))
                     idx += 1
                     layer_buffers = [
                         frames[idx + li].buffer for li in range(num_layers)
                     ]
                     idx += num_layers
-                    self._coord_pool.unpack_rank_layers(
-                        entry.slot_idx, rank_idx, entry.num_blocks,
-                        layer_buffers)
-                    ranks_handled.append(rank_idx)
+
+                    if global_rank in global_to_local:
+                        local_rank = global_to_local[global_rank]
+                        self._coord_pool.unpack_rank_layers(
+                            entry.slot_idx, local_rank, entry.num_blocks,
+                            layer_buffers)
+                        ranks_handled.append(global_rank)
                 t_unpack_done = time.perf_counter()
                 wire_ms = (t_wire_done - t0) * 1000.0
                 unpack_ms = (t_unpack_done - t_wire_done) * 1000.0
-                return ch, wire_ms, unpack_ms, ranks_handled, header_frame
+                return h, ch, wire_ms, unpack_ms, ranks_handled, header_frame
             finally:
                 sock.close(linger=0)
 
         t_total0 = time.perf_counter()
         try:
             futures = [
-                self._coord_channel_executor.submit(_pull_channel, ch)
-                for ch in range(n_channels)
+                self._coord_channel_executor.submit(_pull_channel, h, ch)
+                for h in range(num_hosts) for ch in range(n_channels)
             ]
             results: list[tuple[int, float, float, list[int],
                                 Optional[zmq.Frame]]] = []
@@ -1377,10 +1418,10 @@ class ZmqShmKvConnectorBase:
                 raise first_error
             t_done = time.perf_counter()
 
-            # Sanity-check all ranks were delivered exactly once.
+            # Sanity-check all local ranks were delivered exactly once.
             seen: set[int] = set()
             header_frame: Optional[zmq.Frame] = None
-            for _ch, _w, _u, ranks, hdr in results:
+            for _h, _ch, _w, _u, ranks, hdr in results:
                 if hdr is not None:
                     header_frame = hdr
                 for r in ranks:
@@ -1392,33 +1433,33 @@ class ZmqShmKvConnectorBase:
             if header_frame is None:
                 raise RuntimeError(
                     f"PULL req_id={entry.req_id}: channel 0 omitted header")
-            if len(seen) != self.tp_size:
+            if len(seen) != self.ranks_per_host:
                 raise RuntimeError(
                     f"PULL req_id={entry.req_id}: got {len(seen)} ranks, "
-                    f"expected {self.tp_size}")
+                    f"expected {self.ranks_per_host}")
 
             total_ms = (t_done - t_total0) * 1000.0
             # With inline unpack per channel, wire+unpack are already
             # overlapped; the outer total is max over channels of
             # (wire+unpack). Report them separately for continuity
             # with the existing latency tracker.
-            max_wire = max(w for _c, w, _u, _r, _h in results)
-            max_unpack = max(u for _c, _w, u, _r, _h in results)
+            max_wire = max(w for _h, _c, w, _u, _r, _hdr in results)
+            max_unpack = max(u for _h, _c, _w, u, _r, _hdr in results)
             self._lat.record(_LAT_WIRE, max_wire)
             self._lat.record(_LAT_UNPACK, max_unpack)
             self.transfer_stats.record_kv_pull(total_ms)
             per_ch_ms = ",".join(f"{w + u:.1f}"
-                                 for _c, w, u, _r, _h in results)
+                                 for _h, _c, w, u, _r, _hdr in results)
             logger.info(
-                "TPUConnectorWorker rank0 --> done PULL req_id=%s uuid=%s "
+                "TPUConnectorWorker(%d) rank0 --> done PULL req_id=%s uuid=%s "
                 "total=%.2fms max_wire=%.2fms max_unpack=%.2fms "
-                "per_ch_ms=[%s]", entry.req_id, entry.uuid, total_ms, max_wire,
-                max_unpack, per_ch_ms)
+                "per_ch_ms=[%s]", self.node_id, entry.req_id, entry.uuid,
+                total_ms, max_wire, max_unpack, per_ch_ms)
             entry.pull_ok = True
         except Exception as e:
             logger.exception(
-                "TPUConnectorWorker rank0 --> PULL req_id=%s failed: %s",
-                entry.req_id, e)
+                "TPUConnectorWorker(%d) rank0 --> PULL req_id=%s failed: %s",
+                self.node_id, entry.req_id, e)
             entry.pull_ok = False
             self.transfer_stats.record_failed_transfer()
         finally:
@@ -1455,19 +1496,20 @@ class ZmqShmKvConnectorBase:
             self._coord_scatter_shard(slot_idx, num_blocks, local_blocks)
         except Exception as e:
             logger.exception(
-                "TPUConnectorWorker %s rank%d --> scatter req_id=%s failed: %s",
+                "TPUConnectorWorker(%s) rank%d --> scatter req_id=%s failed: %s",
                 self.node_id, self.tp_rank, req_id, e)
         finally:
-            if self.tp_rank == 0:
-                self._coord_rank0_register_copy(uuid)
+            if self._is_host_coordinator:
+                self._coord_rank0_register_copy(uuid, self.local_tp_rank)
             else:
-                self._coord_send_ipc(_IPC_COPY_DONE, (uuid, self.tp_rank))
+                self._coord_send_ipc(_IPC_COPY_DONE,
+                                     (uuid, self.local_tp_rank))
             logger.info("PERF D drain_done rank=%d req_id=%s uuid=%s ts=%.6f",
                         self.tp_rank, req_id, uuid, time.time())
 
     def _coord_drain_scatter(self, req_id: ReqId, req_meta: LoadMeta) -> None:
         uuid = req_meta.uuid
-        if self.tp_rank == 0:
+        if self._is_host_coordinator:
             # Rank 0's state is in _coord_recv; grab slot info from there.
             with self._coord_lock:
                 entry = self._coord_recv.get(uuid)
@@ -1517,7 +1559,8 @@ class ZmqShmKvConnectorBase:
             src_views = []
             h2d_total_bytes = 0
             for layer_idx in range(len(kv_caches)):
-                src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
+                src_view = self._coord_pool.layer_view(slot_idx,
+                                                       self.local_tp_rank,
                                                        layer_idx, num_blocks)
                 src_views.append(src_view)
                 h2d_total_bytes += src_view.numel() * src_view.element_size()
@@ -1551,7 +1594,8 @@ class ZmqShmKvConnectorBase:
             src_views = []
             h2d_total_bytes = 0
             for layer_idx in range(len(kv_caches)):
-                src_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
+                src_view = self._coord_pool.layer_view(slot_idx,
+                                                       self.local_tp_rank,
                                                        layer_idx, num_blocks)
                 src_views.append(src_view)
                 h2d_total_bytes += src_view.numel() * src_view.element_size()
@@ -1582,21 +1626,23 @@ class ZmqShmKvConnectorBase:
         h2d_mb = h2d_total_bytes / (1024 * 1024)
         h2d_mbps = h2d_mb / max(1e-3, h2d_ms_total / 1000.0)
         logger.info(
-            "TPUConnectorWorker %s rank%d --> scatter slot=%d blocks=%d "
+            "TPUConnectorWorker(%s) rank%d --> scatter slot=%d blocks=%d "
             "layers=%d alloc=%.2fms h2d=%.2fms h2d_issue=%.2fms "
             "h2d_wait=%.2fms insert=%.2fms h2d_throughput=%.2fMiB/s path=%s",
             self.node_id, self.tp_rank, slot_idx, num_blocks, len(kv_caches),
             alloc_ms_total, h2d_ms_total, h2d_issue_ms, h2d_wait_ms,
             insert_ms_total, h2d_mbps, path)
 
-    def _coord_rank0_register_copy(self, uuid: int) -> None:
+    def _coord_rank0_register_copy(self, uuid: int, rank_idx: int = 0) -> None:
         entry_for_notify = None
         with self._coord_lock:
             entry = self._coord_recv.get(uuid)
             if entry is None:
                 return
-            entry.copied.add(0)
-            if len(entry.copied) == self.tp_size:
+            entry.copied.add(rank_idx)
+            num_hosts = int(os.getenv("TPU_NUM_HOSTS", "1"))
+            ranks_per_host = self.tp_size // num_hosts
+            if len(entry.copied) == ranks_per_host:
                 entry_for_notify = self._coord_recv.pop(uuid, None)
         if entry_for_notify is not None:
             # Notify remote P and release slot.
@@ -1616,26 +1662,32 @@ class ZmqShmKvConnectorBase:
                     entry_for_notify.req_id, uuid, time.time())
 
     def _coord_rank0_send_notify(self, req_meta: LoadMeta, uuid: int) -> None:
-        remote_host = req_meta.remote_host
-        if isinstance(remote_host, list):
-            remote_host = remote_host[self.node_id]
-        sock_path = make_zmq_path("tcp", remote_host, self.side_channel_port)
-        # DEALER is not thread-safe; serialize create+send under the lock.
-        with self._coord_sockets_lock:
-            sock = self._coord_notif_sockets.get(sock_path)
-            new_sock = sock is None
+        remote_hosts = req_meta.remote_host
+        if not isinstance(remote_hosts, list):
+            remote_hosts = [remote_hosts]
+
+        base_side_channel_port = int(dist_utils.get_side_channel_port())
+        for h_idx, r_host in enumerate(remote_hosts):
+            side_port = base_side_channel_port + h_idx
+            sock_path = make_zmq_path("tcp", r_host, side_port)
+            # DEALER is not thread-safe; serialize create+send under the lock.
+            with self._coord_sockets_lock:
+                sock = self._coord_notif_sockets.get(sock_path)
+                new_sock = sock is None
+                if new_sock:
+                    sock = make_zmq_socket(ctx=self.zmq_cxt,
+                                           path=sock_path,
+                                           socket_type=zmq.DEALER,
+                                           bind=False)
+                    self._coord_notif_sockets[sock_path] = sock
+                sock.send_string(str(uuid))
             if new_sock:
-                sock = make_zmq_socket(ctx=self.zmq_cxt,
-                                       path=sock_path,
-                                       socket_type=zmq.DEALER,
-                                       bind=False)
-                self._coord_notif_sockets[sock_path] = sock
-            sock.send_string(str(uuid))
-        if new_sock:
-            logger.info("TPUConnectorWorker rank0 --> notify channel to %s",
-                        sock_path)
-        logger.info("TPUConnectorWorker rank0 --> notify pull-done uuid=%s",
-                    uuid)
+                logger.info(
+                    "TPUConnectorWorker(%d) rank0 --> notify channel to %s",
+                    self.node_id, sock_path)
+            logger.info(
+                "TPUConnectorWorker(%d) rank0 --> notify pull-done uuid=%s to %s",
+                self.node_id, uuid, r_host)
 
     # =========================================================
     # Non-zero rank: wait for coord messages then act
@@ -1678,34 +1730,38 @@ class ZmqShmKvConnectorBase:
                 return
             except zmq.ZMQError as e:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> IPC recv error: %s", e)
+                    "TPUConnectorWorker(%d) rank0 --> IPC recv error: %s",
+                    self.node_id, e)
                 continue
             # ROUTER gives us [identity, tag, payload].
             if len(frames) != 3:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> IPC malformed frames n=%d",
-                    len(frames))
+                    "TPUConnectorWorker(%d) rank0 --> IPC malformed frames n=%d",
+                    self.node_id, len(frames))
                 continue
             identity, tag, payload = frames
             try:
                 obj = pickle.loads(payload)
             except Exception as e:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> bad IPC "
-                    "payload tag=%s: %s", tag, e)
+                    "TPUConnectorWorker(%d) rank0 --> bad IPC "
+                    "payload tag=%s: %s", self.node_id, tag, e)
                 continue
             if tag == _IPC_HELLO:
-                (rank, ) = obj
+                local_rank, global_rank = obj
                 with self._coord_lock:
-                    self._coord_rank_to_identity[rank] = identity
+                    self._coord_rank_to_identity[local_rank] = identity
+                    self._coord_local_to_global_rank[local_rank] = global_rank
                     # All non-zero ranks registered? Unblock new-req
                     # processing on rank 0.
-                    if len(self._coord_rank_to_identity) == self.tp_size - 1:
+                    if len(self._coord_rank_to_identity
+                           ) == self.ranks_per_host - 1:
                         self._coord_workers_ready.set()
                 logger.info(
-                    "TPUConnectorWorker rank0 --> HELLO from rank=%d "
-                    "(%d/%d registered)", rank,
-                    len(self._coord_rank_to_identity), self.tp_size - 1)
+                    "TPUConnectorWorker(%d) rank0 --> HELLO from local_rank=%d global_rank=%d "
+                    "(%d/%d registered)",
+                    self.node_id, local_rank, global_rank,
+                    len(self._coord_rank_to_identity), self.ranks_per_host - 1)
             elif tag == _IPC_STAGE_DONE:
                 # Payload is (uuid, rank, failed). All workers run from
                 # the same code so we don't need a length-tolerant unpack.
@@ -1721,7 +1777,7 @@ class ZmqShmKvConnectorBase:
                         entry.stage_failed = True
                     entry.staged.add(rank)
                     staged_count = len(entry.staged)
-                    if staged_count == self.tp_size:
+                    if staged_count == self.ranks_per_host:
                         entry.stage_complete.set()
                         fired_complete = True
                     if 0 <= rank < len(entry.staged_events):
@@ -1733,15 +1789,16 @@ class ZmqShmKvConnectorBase:
                     per_rank_event.set()
                 if fired_complete:
                     logger.info(
-                        "TPUConnectorWorker rank0 --> stage_complete uuid=%s "
-                        "(all %d ranks staged)", uuid, self.tp_size)
+                        "TPUConnectorWorker(%d) rank0 --> stage_complete uuid=%s "
+                        "(all %d ranks staged)", self.node_id, uuid,
+                        self.ranks_per_host)
                     logger.info("PERF P stage_complete uuid=%s ts=%.6f", uuid,
                                 time.time())
                 else:
                     logger.info(
-                        "TPUConnectorWorker rank0 --> STAGE_DONE uuid=%s "
-                        "rank=%d (%d/%d)", uuid, rank, staged_count,
-                        self.tp_size)
+                        "TPUConnectorWorker(%d) rank0 --> STAGE_DONE uuid=%s "
+                        "rank=%d (%d/%d)", self.node_id, uuid, rank,
+                        staged_count, self.ranks_per_host)
             elif tag == _IPC_COPY_DONE:
                 uuid, rank = obj
                 entry_for_notify = None
@@ -1750,7 +1807,7 @@ class ZmqShmKvConnectorBase:
                     if entry is None:
                         continue
                     entry.copied.add(rank)
-                    if len(entry.copied) == self.tp_size:
+                    if len(entry.copied) == self.ranks_per_host:
                         entry_for_notify = self._coord_recv.pop(uuid, None)
                 if entry_for_notify is not None:
                     # Synthesize a LoadMeta-like object for the notify path.
@@ -1772,7 +1829,8 @@ class ZmqShmKvConnectorBase:
                             entry_for_notify.req_id, uuid, time.time())
             else:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> unknown IPC tag=%s", tag)
+                    "TPUConnectorWorker(%d) rank0 --> unknown IPC tag=%s",
+                    self.node_id, tag)
 
     def _coord_worker_ipc_loop(self) -> None:
         sock = self._coord_ipc_sock
@@ -1786,29 +1844,29 @@ class ZmqShmKvConnectorBase:
                 return
             except zmq.ZMQError as e:
                 logger.warning(
-                    "TPUConnectorWorker rank%d --> IPC recv error: %s",
-                    self.tp_rank, e)
+                    "TPUConnectorWorker(%d) rank%d --> IPC recv error: %s",
+                    self.node_id, self.tp_rank, e)
                 continue
             # DEALER gives us [tag, payload].
             if len(frames) != 2:
                 logger.warning(
-                    "TPUConnectorWorker rank%d --> IPC malformed frames n=%d",
-                    self.tp_rank, len(frames))
+                    "TPUConnectorWorker(%d) rank%d --> IPC malformed frames n=%d",
+                    self.node_id, self.tp_rank, len(frames))
                 continue
             tag, payload = frames
             try:
                 obj = pickle.loads(payload)
             except Exception as e:
                 logger.warning(
-                    "TPUConnectorWorker rank%d --> bad IPC payload tag=%s: %s",
-                    self.tp_rank, tag, e)
+                    "TPUConnectorWorker(%d) rank%d --> bad IPC payload tag=%s: %s",
+                    self.node_id, self.tp_rank, tag, e)
                 continue
             if tag == _IPC_STAGE_NOTIFY:
                 uuid, slot_idx, num_blocks, block_ids = obj
                 logger.info(
-                    "TPUConnectorWorker rank%d --> STAGE_NOTIFY received "
-                    "uuid=%s slot=%d blocks=%s", self.tp_rank, uuid, slot_idx,
-                    num_blocks)
+                    "TPUConnectorWorker(%s) rank%d --> STAGE_NOTIFY received "
+                    "uuid=%s slot=%d blocks=%d", self.node_id, self.tp_rank,
+                    uuid, slot_idx, num_blocks)
                 # Hand off to the main thread (waiting in
                 # _coord_worker_stage_inline); don't stage in an executor
                 # here, otherwise .to("cpu") races with model_forward.
@@ -1845,8 +1903,8 @@ class ZmqShmKvConnectorBase:
                     self._worker_pending_stage_cv.notify_all()
             else:
                 logger.warning(
-                    "TPUConnectorWorker rank%d --> unknown IPC tag=%s",
-                    self.tp_rank, tag)
+                    "TPUConnectorWorker(%d) rank%d --> unknown IPC tag=%s",
+                    self.node_id, self.tp_rank, tag)
 
     # =========================================================
     # Rank 0: external data-server (producer serves PULL)
@@ -1871,13 +1929,13 @@ class ZmqShmKvConnectorBase:
                         max(1,
                             dist_utils.get_p2p_wait_pull_timeout() * 1000))
         ranks_on_channel = [
-            r for r in range(self.tp_size)
+            r for r in range(self.ranks_per_host)
             if r % self._n_channels == channel_idx
         ]
         logger.info(
-            "TPUConnectorWorker rank0 --> data server ch=%d listening on "
-            "tcp://%s:%s serving ranks=%s", channel_idx, self.host_ip, port,
-            ranks_on_channel)
+            "TPUConnectorWorker(%d) rank0 --> data server ch=%d listening on "
+            "tcp://%s:%s serving ranks=%s", self.node_id, channel_idx,
+            self.host_ip, port, ranks_on_channel)
 
         ready_responses: queue.Queue = queue.Queue()
 
@@ -1888,8 +1946,8 @@ class ZmqShmKvConnectorBase:
                     uuid, uuid_bytes, channel_idx, ranks_on_channel)
             except Exception:
                 logger.exception(
-                    "TPUConnectorWorker rank0 --> build_pull_response "
-                    "ch=%d uuid=%s failed", channel_idx, uuid)
+                    "TPUConnectorWorker(%d) rank0 --> build_pull_response "
+                    "ch=%d uuid=%s failed", self.node_id, channel_idx, uuid)
                 response = None
             ready_responses.put((client_id, uuid, uuid_bytes, response))
 
@@ -1905,8 +1963,9 @@ class ZmqShmKvConnectorBase:
                         sock.send_multipart([client_id, _MSG_ERR, uuid_bytes])
                     except zmq.ZMQError as e:
                         logger.warning(
-                            "TPUConnectorWorker rank0 --> data send ERR "
-                            "ch=%d uuid=%s failed: %s", channel_idx, uuid, e)
+                            "TPUConnectorWorker(%d) rank0 --> data send ERR "
+                            "ch=%d uuid=%s failed: %s", self.node_id,
+                            channel_idx, uuid, e)
                     continue
                 # copy=False lets ZMQ send the big per-layer memoryviews
                 # directly from shm via scatter-gather sendmsg, no userland
@@ -1919,8 +1978,9 @@ class ZmqShmKvConnectorBase:
                     sock.send_multipart([client_id, *response], copy=False)
                 except zmq.ZMQError as e:
                     logger.warning(
-                        "TPUConnectorWorker rank0 --> data send ch=%d "
-                        "uuid=%s failed: %s", channel_idx, uuid, e)
+                        "TPUConnectorWorker(%d) rank0 --> data send ch=%d "
+                        "uuid=%s failed: %s", self.node_id, channel_idx, uuid,
+                        e)
                 logger.info(
                     "PERF P send_done ch=%d uuid=%s ts=%.6f dur_ms=%.2f",
                     channel_idx, uuid, time.time(),
@@ -1936,14 +1996,15 @@ class ZmqShmKvConnectorBase:
                 return
             except zmq.ZMQError as e:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> data recv "
-                    "ch=%d error: %s", channel_idx, e)
+                    "TPUConnectorWorker(%d) rank0 --> data recv "
+                    "ch=%d error: %s", self.node_id, channel_idx, e)
                 continue
             # Expected: [client_id, PULL, uuid_bytes, remote_blocks_pickle]
             if len(frames) < 3 or frames[1] != _MSG_PULL:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> data malformed "
-                    "request ch=%d n=%d", channel_idx, len(frames))
+                    "TPUConnectorWorker(%d) rank0 --> data malformed "
+                    "request ch=%d n=%d", self.node_id, channel_idx,
+                    len(frames))
                 continue
             client_id = frames[0]
             uuid_bytes = frames[2]
@@ -1954,12 +2015,12 @@ class ZmqShmKvConnectorBase:
                     sock.send_multipart([client_id, _MSG_ERR, b"bad-uuid"])
                 except zmq.ZMQError as e:
                     logger.warning(
-                        "TPUConnectorWorker rank0 --> data send bad-uuid "
-                        "ch=%d failed: %s", channel_idx, e)
+                        "TPUConnectorWorker(%d) rank0 --> data send bad-uuid "
+                        "ch=%d failed: %s", self.node_id, channel_idx, e)
                 continue
             logger.info(
-                "TPUConnectorWorker rank0 --> PULL received ch=%d uuid=%s",
-                channel_idx, uuid)
+                "TPUConnectorWorker(%d) rank0 --> PULL received ch=%d uuid=%s",
+                self.node_id, channel_idx, uuid)
             logger.info("PERF P pull_recv ch=%d uuid=%s ts=%.6f", channel_idx,
                         uuid, time.time())
             self._coord_channel_executor.submit(_prepare_response, client_id,
@@ -1992,8 +2053,9 @@ class ZmqShmKvConnectorBase:
             time.sleep(0.05)
         if entry is None:
             logger.warning(
-                "TPUConnectorWorker rank0 --> PULL ch=%d unknown uuid=%s "
-                "(timed out waiting for register-send)", channel_idx, uuid)
+                "TPUConnectorWorker(%d) rank0 --> PULL ch=%d unknown uuid=%s "
+                "(timed out waiting for register-send)", self.node_id,
+                channel_idx, uuid)
             return None
         # Wait only for the ranks this channel actually serves. Each
         # channel ch carries shards for ranks where r % n_channels == ch,
@@ -2008,16 +2070,18 @@ class ZmqShmKvConnectorBase:
                 # vector at construction. Fall back to global wait.
                 if not entry.stage_complete.wait(timeout=rem):
                     logger.warning(
-                        "TPUConnectorWorker rank0 --> PULL ch=%d uuid=%s "
+                        "TPUConnectorWorker(%d) rank0 --> PULL ch=%d uuid=%s "
                         "timed out waiting for staging (have %d of %d)",
-                        channel_idx, uuid, len(entry.staged), self.tp_size)
+                        self.node_id, channel_idx, uuid, len(entry.staged),
+                        self.ranks_per_host)
                     return None
                 break
             if not entry.staged_events[r].wait(timeout=rem):
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> PULL ch=%d uuid=%s timed "
+                    "TPUConnectorWorker(%d) rank0 --> PULL ch=%d uuid=%s timed "
                     "out waiting for rank %d to stage (have %d of %d)",
-                    channel_idx, uuid, r, len(entry.staged), self.tp_size)
+                    self.node_id, channel_idx, uuid, r, len(entry.staged),
+                    self.ranks_per_host)
                 return None
         with self._coord_lock:
             entry.expiration_time = max(entry.expiration_time,
@@ -2029,8 +2093,8 @@ class ZmqShmKvConnectorBase:
             # the consumer drops the request instead of receiving stale
             # shm bytes.
             logger.warning(
-                "TPUConnectorWorker rank0 --> PULL ch=%d uuid=%s "
-                "stage_failed; sending ERR", channel_idx, uuid)
+                "TPUConnectorWorker(%d) rank0 --> PULL ch=%d uuid=%s "
+                "stage_failed; sending ERR", self.node_id, channel_idx, uuid)
             return None
         # Wire format (per channel, after the ROUTER envelope):
         #   ch 0:  [OK, uuid, n_ranks, header,
@@ -2052,16 +2116,17 @@ class ZmqShmKvConnectorBase:
                 pickle.dumps(header, protocol=pickle.HIGHEST_PROTOCOL))
         total_bytes = 0
         for r in ranks_on_channel:
-            frames.append(str(r).encode("utf-8"))
+            global_rank = self._coord_local_to_global_rank[r]
+            frames.append(str(global_rank).encode("utf-8"))
             layer_views = self._coord_pool.rank_layer_views(
                 entry.slot_idx, r, entry.num_blocks)
             frames.extend(layer_views)
             total_bytes += sum(len(v) for v in layer_views)
         self.transfer_stats.record_mb_transferred(total_bytes / (1024 * 1024))
         logger.info(
-            "TPUConnectorWorker rank0 --> serving PULL ch=%d uuid=%s "
-            "ranks=%s size=%.2fMB", channel_idx, uuid, ranks_on_channel,
-            total_bytes / (1024 * 1024))
+            "TPUConnectorWorker(%d) rank0 --> serving PULL ch=%d uuid=%s "
+            "ranks=%s size=%.2fMB", self.node_id, channel_idx, uuid,
+            ranks_on_channel, total_bytes / (1024 * 1024))
         return frames
 
     # =========================================================
@@ -2073,8 +2138,8 @@ class ZmqShmKvConnectorBase:
                                path=sock_path,
                                socket_type=zmq.ROUTER,
                                bind=True)
-        logger.info("TPUConnectorWorker rank0 --> side channel on %s",
-                    sock_path)
+        logger.info("TPUConnectorWorker(%d) rank0 --> side channel on %s",
+                    self.node_id, sock_path)
         while not self._stop_event.is_set():
             try:
                 if sock.poll(timeout=500) == 0:
@@ -2084,7 +2149,8 @@ class ZmqShmKvConnectorBase:
                 return
             except zmq.ZMQError as e:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> notif recv error: %s", e)
+                    "TPUConnectorWorker(%d) rank0 --> notif recv error: %s",
+                    self.node_id, e)
                 continue
             try:
                 uuid = int(uuid_bytes.decode("utf-8"))
@@ -2098,10 +2164,11 @@ class ZmqShmKvConnectorBase:
                     entry.pull_acked = True
             if stray:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> stray pull-done uuid=%s",
-                    uuid)
+                    "TPUConnectorWorker(%d) rank0 --> stray pull-done uuid=%s",
+                    self.node_id, uuid)
                 continue
-            logger.info("TPUConnectorWorker rank0 --> pull-done uuid=%s", uuid)
+            logger.info("TPUConnectorWorker(%d) rank0 --> pull-done uuid=%s",
+                        self.node_id, uuid)
 
     # =========================================================
     # Rank 0: periodic expiration sweep
@@ -2120,7 +2187,8 @@ class ZmqShmKvConnectorBase:
                         expired.append(uuid)
             for uuid in expired:
                 logger.warning(
-                    "TPUConnectorWorker rank0 --> expire send uuid=%s", uuid)
+                    "TPUConnectorWorker(%d) rank0 --> expire send uuid=%s",
+                    self.node_id, uuid)
                 with self._coord_lock:
                     entry = self._coord_send.pop(uuid, None)
                     if entry is None:
@@ -2133,7 +2201,7 @@ class ZmqShmKvConnectorBase:
     # =========================================================
     def _coord_get_finished(self) -> tuple[set[str], set[str]]:
         # Only rank 0 returns non-empty; scheduler unions across workers.
-        if self.tp_rank != 0:
+        if not self._is_host_coordinator:
             return set(), set()
         done_sending: set[str] = set()
         done_recving: set[str] = set()
@@ -2177,11 +2245,11 @@ class ZmqShmKvConnectorBase:
             logger.info("PERF D done_recving req_id=%s uuid=%s ts=%.6f",
                         req_id, uuid, time.time())
         if done_sending:
-            logger.info("TPUConnectorWorker rank0 --> done_sending=%s",
-                        done_sending)
+            logger.info("TPUConnectorWorker(%d) rank0 --> done_sending=%s",
+                        self.node_id, done_sending)
         if done_recving:
-            logger.info("TPUConnectorWorker rank0 --> done_recving=%s",
-                        done_recving)
+            logger.info("TPUConnectorWorker(%d) rank0 --> done_recving=%s",
+                        self.node_id, done_recving)
         return done_sending, done_recving
 
     # ====================================================================

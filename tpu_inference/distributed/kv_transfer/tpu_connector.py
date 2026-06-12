@@ -399,7 +399,8 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         d2h_total_bytes = 0
         for layer_idx, cache in enumerate(kv_caches):
             src_shard = torch.index_select(cache, 0, indices)
-            dest_view = self._coord_pool.layer_view(slot_idx, self.tp_rank,
+            dest_view = self._coord_pool.layer_view(slot_idx,
+                                                    self.local_tp_rank,
                                                     layer_idx, num_blocks)
             tpu_tensors.append(src_shard)
             cpu_tensors.append(dest_view)

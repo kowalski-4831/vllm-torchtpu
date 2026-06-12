@@ -409,6 +409,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 "MASTER_PORT": master_port,
                 "TORCH_TPU_TOPOLOGY": topology,
                 "LOCAL_WORLD_SIZE": str(len(node_tpus[node_id])),
+                "TPU_NUM_HOSTS": str(num_nodes),
             }
             if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
                 import time
@@ -526,7 +527,6 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         refs = self.forward_dag.execute(
             (scheduler_output, grammar_output))  # type: ignore
-        assert not self.has_connector, "async scheduling with connector not yet supported"
         return AsyncResultFuture(refs, self.workers, self.kv_output_aggregator)
 
 
