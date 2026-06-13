@@ -43,18 +43,17 @@ def _patch_default_moe_runner_select_forward() -> None:
     and we'd take ``torch.ops.vllm.moe_forward``, which captures weight
     tensors as closures and trips torch_tpu's MLIR builder.
     """
-    from vllm.model_executor.layers.fused_moe.runner import \
-        default_moe_runner as _dmr
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _dmr
 
-    if getattr(_dmr.DefaultMoERunner, "_tpu_select_forward_patch", False):
+    if getattr(_dmr.MoERunner, "_tpu_select_forward_patch", False):
         return
 
-    def patched_select(self, layer):
+    def patched_select(self):
         return (_dmr._moe_forward
                 if self.shared_experts is None else _dmr._moe_forward_shared)
 
-    _dmr.DefaultMoERunner._select_forward = patched_select
-    _dmr.DefaultMoERunner._tpu_select_forward_patch = True
+    _dmr.MoERunner._select_forward = patched_select
+    _dmr.MoERunner._tpu_select_forward_patch = True
     logger.info(
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 

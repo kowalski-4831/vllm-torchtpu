@@ -19,8 +19,8 @@ import torch
 from einops import rearrange
 from torch_tpu._internal import pallas
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.gdn_linear_attn import \
-    GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
+    QwenGatedDeltaNetAttention
 
 from tpu_inference import envs
 from tpu_inference.layers.common.gdn_attention import (GdnAttentionConfig,
@@ -80,8 +80,8 @@ def gdn_attention_core_tpu(
     return new_conv_state, new_recurrent_state, output
 
 
-@GatedDeltaNetAttention.register_oot
-class VllmGatedDeltaNetAttention(GatedDeltaNetAttention):
+@QwenGatedDeltaNetAttention.register_oot
+class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

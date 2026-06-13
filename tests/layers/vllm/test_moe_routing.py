@@ -44,7 +44,8 @@ def test_get_experts_start_matches_determine_expert_map(
         ep_size, global_num_experts):
     """Parity against vLLM's linear-placement contract for every rank."""
     determine_expert_map = pytest.importorskip(
-        "vllm.model_executor.layers.fused_moe.layer").determine_expert_map
+        "vllm.model_executor.layers.fused_moe.expert_map_manager"
+    ).determine_expert_map
     for ep_rank in range(ep_size):
         _, expert_map, _ = determine_expert_map(
             ep_size=ep_size,

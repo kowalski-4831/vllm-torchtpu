@@ -142,8 +142,11 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         super().__init__(moe)
         # Parent sets _is_monolithic=False on TPU and skips wiring
         # apply_monolithic.  Override both after super().__init__().
-        self._is_monolithic = True
         self.apply_monolithic = self._select_monolithic()
+
+    @property
+    def is_monolithic(self) -> bool:
+        return True
 
     def _select_monolithic(self):
         return self._forward_monolithic_tpu
@@ -231,6 +234,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
         activation_str = layer._tpu_activation_str

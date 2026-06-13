@@ -46,6 +46,7 @@ from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
                                                         FusedMoEMethodBase)
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
+from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import \
@@ -594,6 +595,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
@@ -661,6 +663,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # Set safe defaults so the parent's create_weights doesn't crash.
         self.use_marlin = False
         self.cutlass_block_fp8_supported = False
+        self.is_scale_e8m0 = getattr(quant_config, "is_scale_e8m0", False)
+        self.activation_quant_key = None
+        self.weight_quant_key = None
+        self.input_dtype = torch.get_default_dtype()
+        self.out_dtype = torch.get_default_dtype()
+        vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
         self._linear_quant_config = _get_linear_quant_config(
             self.linear_config)

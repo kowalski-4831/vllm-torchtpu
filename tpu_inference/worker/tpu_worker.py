@@ -19,7 +19,7 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import tpu_inference.distributed.utils as dist_utils
 from tpu_inference import envs, utils
@@ -380,12 +380,12 @@ class TPUWorker(WorkerBase):
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         self.model_runner.load_model()
 
-    def compile_or_warm_up_model(self) -> float:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
-        return compilation_time
+        return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def get_model(self):
         return self.model_runner.get_model()

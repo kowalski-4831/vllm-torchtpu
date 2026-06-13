@@ -501,17 +501,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
         """Forward pass with Pallas attention.
 
         Args:
-            query: shape = [num_tokens, num_heads * head_size]
-            key: shape = [num_tokens, num_kv_heads * head_size]
-            value: shape = [num_tokens, num_kv_heads * head_size]
+            query: shape = [num_tokens, num_heads, head_size]
+            key: shape = [num_tokens, num_kv_heads, head_size]
+            value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: shape =
                 [num_blocks, block_size, num_kv_heads_x2 // kv_packing,
                  kv_packing, padded_head_size] (preferred)
                 or legacy 4D
                 [num_blocks, block_size, num_kv_heads_x2, padded_head_size]
             attn_metadata: Metadata for attention.
+            output: buffer written in place, shape
+                = [num_tokens, num_heads, head_size_v]
         Returns:
-            shape = [num_tokens, num_heads * head_size]
+            shape = [num_tokens, num_heads, head_size]
         """
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
@@ -524,11 +526,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 output = torch.ones_like(query)
             return output
 
-        q_len, q_compute_dim = query.shape
-        k_len, k_compute_dim = key.shape
         assert key.shape == value.shape
-        assert q_compute_dim == self.head_size * self.num_heads
-        assert k_compute_dim == self.head_size * self.num_kv_heads
+        assert query.shape[1:] == (self.num_heads, self.head_size)
+        assert key.shape[1:] == (self.num_kv_heads, self.head_size)
 
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
@@ -544,9 +544,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             "the first forward pass.")
 
         sink = self.sinks
-        query = query.view(q_len, self.num_heads, self.head_size)
-        key = key.view(k_len, self.num_kv_heads, self.head_size)
-        value = value.view(k_len, self.num_kv_heads, self.head_size)
 
         # TODO (geyuhao) the support of this API is pending discussion.
         # This line will only influence performance, not functionality
@@ -570,7 +567,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if not torch.compiler.is_compiling():
             sync.synchronize(kv_cache)
 
-        return outputs.reshape(q_len, self.num_heads * self.head_size)
+        if output is not None:
+            output.copy_(outputs)
+        return outputs
 
 
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
