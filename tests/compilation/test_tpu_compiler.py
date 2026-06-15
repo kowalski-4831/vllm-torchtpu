@@ -26,8 +26,8 @@ class TestTpuCompilerCache:
         }
         with patch.dict(os.environ, env_mock, clear=True):
             # Reload env_override to re-execute its top-level statements
-            import tpu_inference.env_override
-            importlib.reload(tpu_inference.env_override)
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
 
             assert os.environ.get(
                 "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
@@ -44,8 +44,8 @@ class TestTpuCompilerCache:
             "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": "custom_tier2",
         }
         with patch.dict(os.environ, env_mock, clear=True):
-            import tpu_inference.env_override
-            importlib.reload(tpu_inference.env_override)
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
 
             assert os.environ.get(
                 "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
@@ -58,7 +58,7 @@ class TestTpuCompilerCache:
         with patch.dict(os.environ,
                         {"VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_dir"}):
             # Import adaptor
-            from tpu_inference.compilation.tpu_compiler import \
+            from vllm_torchtpu.compilation.tpu_compiler import \
                 TpuCompilerAdaptor
 
             compiler = TpuCompilerAdaptor()
@@ -78,7 +78,7 @@ class TestTpuCompilerCache:
         """Verify that initialize_cache falls back to default cache_dir on exception."""
         with patch.dict(os.environ,
                         {"VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_dir"}):
-            from tpu_inference.compilation.tpu_compiler import \
+            from vllm_torchtpu.compilation.tpu_compiler import \
                 TpuCompilerAdaptor
             compiler = TpuCompilerAdaptor()
 

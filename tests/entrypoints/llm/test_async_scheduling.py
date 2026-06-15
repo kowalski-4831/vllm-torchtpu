@@ -12,7 +12,7 @@ import traceback
 import pytest
 from vllm import LLM, SamplingParams
 
-from tpu_inference.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 

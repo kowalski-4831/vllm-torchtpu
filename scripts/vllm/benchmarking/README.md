@@ -79,7 +79,7 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 ## Prerequisites
 
 - vLLM installed (provides `benchmark_serving.py`)
-- `tpu_inference` installed (this repo)
+- `vllm_torchtpu` installed (this repo)
 - TPU device available
 - Model weights downloaded (or use `--load-format dummy` via config)
 

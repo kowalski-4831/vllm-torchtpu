@@ -28,10 +28,10 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import AttentionGroup
 
-from tpu_inference.layers.common.attention_metadata import (
+from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
-from tpu_inference.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 class DummyMamba(MambaBase):
@@ -125,11 +125,11 @@ class TestTPURunner:
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
             self.runner)
 
-    @patch('tpu_inference.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
+    @patch('vllm_torchtpu.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
     @patch(
-        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
-    @patch('tpu_inference.utils.torch.accelerator.get_memory_info',
+    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
     def test_update_mamba_page_size_padded(self, mock_mem_info,
                                            mock_get_page_size):
@@ -166,13 +166,13 @@ class TestTPURunner:
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
 
     @patch(
-        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))
     @patch(
-        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
-    @patch('tpu_inference.runner.tpu_runner.bind_kv_cache')
-    @patch('tpu_inference.runner.tpu_runner.has_kv_transfer_group',
+    @patch('vllm_torchtpu.runner.tpu_runner.bind_kv_cache')
+    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
     def test_initialize_kv_cache_hybrid_duplication(self, mock_input_batch,
@@ -254,13 +254,13 @@ class TestTPURunner:
         assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
 
     @patch(
-        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))
     @patch(
-        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
-    @patch('tpu_inference.runner.tpu_runner.bind_kv_cache')
-    @patch('tpu_inference.runner.tpu_runner.has_kv_transfer_group',
+    @patch('vllm_torchtpu.runner.tpu_runner.bind_kv_cache')
+    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
     def test_initialize_kv_cache_compact_mamba(self, mock_input_batch,
@@ -329,11 +329,11 @@ class TestTPURunner:
         self.runner._init_mamba_slot_pool.assert_called_once_with(
             mamba_num_blocks)
 
-    @patch('tpu_inference.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
-        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
-    @patch('tpu_inference.utils.torch.accelerator.get_memory_info',
+    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
     def test_get_kv_cache_spec_hybrid_padded_size(self, mock_mem_info,
                                                   mock_get_page_size,
@@ -373,9 +373,9 @@ class TestTPURunner:
             assert isinstance(mamba_spec, MambaSpec)
             assert mamba_spec.page_size_padded == expected_padded_size
 
-    @patch('tpu_inference.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
     @patch(
-        'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
     def test_get_kv_cache_spec_pure_attention_no_cache_config_updates(
             self, mock_get_page_size, mock_get_layers):
@@ -408,9 +408,9 @@ class TestTPURunner:
             self.runner)
 
         with patch.object(GPUModelRunner, '__init__', return_value=None), \
-             patch('tpu_inference.runner.tpu_runner._torch_tpu_wrapper',
+             patch('vllm_torchtpu.runner.tpu_runner._torch_tpu_wrapper',
                    side_effect=lambda: contextlib.nullcontext()), \
-             patch('tpu_inference.runner.tpu_runner._validate_libtpu_version'
+             patch('vllm_torchtpu.runner.tpu_runner._validate_libtpu_version'
                    ), \
              patch.object(TPUModelRunner,
                           '_create_mesh_for_parallelism',
@@ -463,10 +463,10 @@ class TestTPURunner:
         self.runner.input_batch = mock_input_batch
 
         with patch(
-                'tpu_inference.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(1, 16, 2, 1, 128)
-        ), patch('tpu_inference.runner.tpu_runner.bind_kv_cache'), patch(
-                'tpu_inference.runner.tpu_runner.has_kv_transfer_group',
+        ), patch('vllm_torchtpu.runner.tpu_runner.bind_kv_cache'), patch(
+                'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
                 return_value=False):
             self.runner.initialize_kv_cache(kv_cache_config)
 

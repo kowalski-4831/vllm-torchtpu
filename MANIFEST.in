@@ -1,2 +1,2 @@
 include README.md
-include tpu_inference/models/jax/utils/quantization/configs/*.yaml
+include src/vllm_torchtpu/models/jax/utils/quantization/configs/*.yaml

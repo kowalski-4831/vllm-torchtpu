@@ -7,8 +7,8 @@ import os
 from vllm import LLM, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from tpu_inference.core import disagg_utils
-from tpu_inference.logger import init_logger
+from vllm_torchtpu.core import disagg_utils
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -148,7 +148,7 @@ if __name__ == "__main__":
     else:
         from unittest.mock import patch
 
-        from tpu_inference.core.core_tpu import (DisaggEngineCore,
+        from vllm_torchtpu.core.core_tpu import (DisaggEngineCore,
                                                  DisaggEngineCoreProc)
 
         with patch("vllm.v1.engine.core.EngineCore", DisaggEngineCore), patch(

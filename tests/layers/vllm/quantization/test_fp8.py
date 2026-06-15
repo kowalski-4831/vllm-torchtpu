@@ -29,8 +29,8 @@ import jax.numpy as jnp
 import pytest
 import torch
 
-from tpu_inference.layers.vllm.linear_common import _quantized_matmul_jax
-from tpu_inference.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.vllm.linear_common import _quantized_matmul_jax
+from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
 
 
 class FakeQuant:
@@ -411,7 +411,7 @@ class TestOnlineFp8Quantization:
         E, inter, H = 4, 64, 128
         w13 = torch.randn(E, 2 * inter, H, device=device, dtype=torch.float32)
 
-        from tpu_inference.layers.common.quantization import quantize_tensor
+        from vllm_torchtpu.layers.common.quantization import quantize_tensor
 
         w13_q, w13_s = quantize_tensor(w13,
                                        quant_dtype=torch.float8_e4m3fn,
@@ -427,7 +427,7 @@ class TestOnlineFp8Quantization:
 
         from vllm.model_executor.layers.fused_moe import FusedMoE
 
-        from tpu_inference.layers.vllm.quantization.fp8 import \
+        from vllm_torchtpu.layers.vllm.quantization.fp8 import \
             _quantize_bf16_moe_weights
 
         E, inter, H = 4, 64, 128
@@ -455,7 +455,7 @@ class TestOnlineFp8Quantization:
         """FP8 apply_monolithic should use custom_routing_function when present."""
         from unittest.mock import MagicMock, patch
 
-        from tpu_inference.layers.vllm.quantization.fp8 import \
+        from vllm_torchtpu.layers.vllm.quantization.fp8 import \
             VllmFp8MoEMethodTPU
 
         # Create mock layer with custom routing
@@ -476,7 +476,7 @@ class TestOnlineFp8Quantization:
 
         # Call the real apply_monolithic
         with patch(
-                "tpu_inference.layers.vllm.quantization.fp8.fused_moe_gmm",
+                "vllm_torchtpu.layers.vllm.quantization.fp8.fused_moe_gmm",
                 return_value=x,
         ):
             VllmFp8MoEMethodTPU.apply_monolithic(method, layer, x,

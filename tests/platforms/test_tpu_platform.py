@@ -18,7 +18,7 @@ import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 
-from tpu_inference.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
 class TestTpuPlatform:
@@ -49,14 +49,14 @@ class TestTpuPlatform:
         vllm_config.additional_config = {}
         return vllm_config
 
-    @patch("tpu_inference.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "tpu_inference.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
     )
     @patch(
-        "tpu_inference.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("tpu_inference.platforms.tpu_platform.vllm_envs")
+    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_hybrid_block_size(self, mock_vllm_envs,
                                                        mock_prepare_env,
                                                        mock_sharding,
@@ -72,7 +72,7 @@ class TestTpuPlatform:
 
         with patch.dict(
                 'sys.modules', {
-                    'tpu_inference.layers.vllm.attention':
+                    'vllm_torchtpu.layers.vllm.attention':
                     MagicMock(PallasAttentionBackend=mock_pallas)
                 }):
             TpuPlatform.check_and_update_config(vllm_config)
@@ -84,14 +84,14 @@ class TestTpuPlatform:
 
     @pytest.mark.parametrize("connector_name",
                              ["TPUConnector", "TPURaidenConnector"])
-    @patch("tpu_inference.platforms.tpu_platform.apply_tpu_patches")
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "tpu_inference.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
     )
     @patch(
-        "tpu_inference.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("tpu_inference.platforms.tpu_platform.vllm_envs")
+    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_accepts_tpu_disagg_connectors(
             self, mock_vllm_envs, mock_prepare_env, mock_sharding,
             mock_apply_patches, vllm_config, connector_name):
@@ -106,7 +106,7 @@ class TestTpuPlatform:
 
         with patch.dict(
                 'sys.modules', {
-                    'tpu_inference.layers.vllm.attention':
+                    'vllm_torchtpu.layers.vllm.attention':
                     MagicMock(PallasAttentionBackend=mock_pallas)
                 }):
             TpuPlatform.check_and_update_config(vllm_config)

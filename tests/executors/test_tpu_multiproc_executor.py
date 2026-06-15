@@ -18,7 +18,7 @@ import pytest
 from vllm.config import CacheConfig
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
-from tpu_inference.executors.tpu_multiproc_executor import TpuMultiprocExecutor
+from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
 
 # Sentinel returned by the parent get_kv_cache_specs; the override plumbing must
 # pass this through unchanged.

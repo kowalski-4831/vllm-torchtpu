@@ -120,9 +120,9 @@ steps:
            --ignore=/workspace/tpu_inference/tests/kernels \
            --ignore=/workspace/tpu_inference/tests/lora \
            --ignore=/workspace/tpu_inference/tests/e2e \
-           --ignore=/workspace/tpu_inference/tpu_inference/mock \
+           --ignore=/workspace/tpu_inference/src/vllm_torchtpu/mock \
            --ignore=/workspace/tpu_inference/tests/layers/vllm/test_compressed_tensors_moe.py \
-           --cov-config=/workspace/tpu_inference/.coveragerc --cov tpu_inference --cov-report term-missing --cov-fail-under=69
+           --cov-config=/workspace/tpu_inference/.coveragerc --cov vllm_torchtpu --cov-report term-missing --cov-fail-under=69
 
    - label: "JAX unit tests - kernels"
      key: test_8
@@ -131,7 +131,7 @@ steps:
        queue: tpu_v6e_queue
      commands:
        - |
-         if [[ "$$NIGHTLY" == "1" ]] || git diff --name-only HEAD~1 | grep -qE '^(tpu_inference/kernels|tests/kernels|requirements\.txt)'; then
+         if [[ "$$NIGHTLY" == "1" ]] || git diff --name-only HEAD~1 | grep -qE '^(src/vllm_torchtpu/kernels|tests/kernels|requirements\.txt)'; then
            .buildkite/scripts/run_in_docker.sh \
              python3 -m pytest -s -v -x /workspace/tpu_inference/tests/kernels \
              --ignore=/workspace/tpu_inference/tests/kernels/ragged_paged_attention_kernel_v2_test.py \
@@ -150,7 +150,7 @@ steps:
        queue: tpu_v6e_8_queue
      commands:
        - |
-         if [[ "$$NIGHTLY" == "1" ]] || git diff --name-only HEAD~1 | grep -qE '^(tpu_inference/kernels/collectives|tests/kernels/collectives|requirements\.txt)'; then
+         if [[ "$$NIGHTLY" == "1" ]] || git diff --name-only HEAD~1 | grep -qE '^(src/vllm_torchtpu/kernels/collectives|tests/kernels/collectives|requirements\.txt)'; then
            .buildkite/scripts/run_in_docker.sh \
              python3 -m pytest -s -v -x /workspace/tpu_inference/tests/kernels/collectives
          else

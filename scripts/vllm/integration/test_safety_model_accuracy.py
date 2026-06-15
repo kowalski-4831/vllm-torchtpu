@@ -14,7 +14,7 @@ from vllm import LLM
 from vllm.inputs import TokensPrompt
 from vllm.platforms import current_platform
 
-from tpu_inference.core import disagg_utils
+from vllm_torchtpu.core import disagg_utils
 
 # --- HAZARD MAPPING ---
 # This mapping is based on the MLCommons taxonomy and is needed for the data loader.
@@ -206,7 +206,7 @@ def test_safety_model_accuracy_check(
     # 3. Initialize LLM (Mocking the disagg path if necessary)
     if disagg_utils.is_disagg_enabled():
         # NOTE: This assumes the required Disagg classes are accessible/mocked by the runner
-        from tpu_inference.core.core_tpu import (DisaggEngineCore,
+        from vllm_torchtpu.core.core_tpu import (DisaggEngineCore,
                                                  DisaggEngineCoreProc)
         with patch("vllm.v1.engine.core.EngineCore", DisaggEngineCore), patch(
                 "vllm.v1.engine.core.EngineCoreProc", DisaggEngineCoreProc):

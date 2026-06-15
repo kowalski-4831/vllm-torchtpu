@@ -3,13 +3,13 @@ requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tpu_inference"
+name = "vllm_torchtpu"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [
-    { name = "tpu_inference Contributors" }
+    { name = "vllm_torchtpu Contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -68,7 +68,7 @@ benchmarking = [
 # Standard vLLM out-of-tree platform plugin discovery. The function returns
 # the dotted class path when this platform should activate, else None. See
 # https://docs.vllm.ai/en/latest/design/plugin_system/
-torchtpu = "tpu_inference.platforms:register_tpu_platform"
+torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
 [tool.pytest.ini_options]
 markers = [
@@ -78,8 +78,12 @@ markers = [
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.package-dir]
+"" = "src"
+
 [tool.setuptools.packages.find]
-include = ["tpu_inference*"]
+where = ["src"]
+include = ["vllm_torchtpu*"]
 
 [tool.setuptools_scm]
 

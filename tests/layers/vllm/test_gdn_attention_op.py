@@ -16,14 +16,14 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from tpu_inference.layers.vllm.custom_ops.gdn_attention_op import \
+from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
     VllmGatedDeltaNetAttention
 
 
 class TestVllmGatedDeltaNetAttention:
 
     @patch(
-        "tpu_inference.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_cuda_lora(self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
@@ -107,7 +107,7 @@ class TestVllmGatedDeltaNetAttention:
         assert torch.all(output[num_tokens:] == 0)
 
     @patch(
-        "tpu_inference.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_cuda_non_lora_gqa(self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
@@ -203,7 +203,7 @@ class TestVllmGatedDeltaNetAttention:
         assert torch.all(output[num_tokens:] == 0)
 
     @patch(
-        "tpu_inference.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_uses_compact_mamba_state_indices(
             self, mock_get_forward_context):
@@ -262,7 +262,7 @@ class TestVllmGatedDeltaNetAttention:
             core_args[9] == torch.tensor([3, 1], dtype=torch.int32))
 
     @patch(
-        "tpu_inference.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_cuda_non_lora_no_gqa(self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)

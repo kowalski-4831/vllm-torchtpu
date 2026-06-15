@@ -18,10 +18,10 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.request import RequestStatus
 
-from tpu_inference.distributed.kv_transfer.tpu_connector_stats import (
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 
-from tpu_inference.distributed.kv_transfer.tpu_connector import (  # isort: skip
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry)
@@ -30,8 +30,8 @@ from tpu_inference.distributed.kv_transfer.tpu_connector import (  # isort: skip
 # Shared test helpers
 # ---------------------------------------------------------------------------
 
-_MOD = "tpu_inference.distributed.kv_transfer.tpu_connector"
-_BASE = "tpu_inference.distributed.kv_transfer.zmq_shm_base"
+_MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+_BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
 
 
 def _make_vllm_config(*, is_producer: bool = True, block_size: int = 16):

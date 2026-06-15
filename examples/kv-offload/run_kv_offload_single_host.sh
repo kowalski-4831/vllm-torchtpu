@@ -49,7 +49,7 @@ exec vllm serve "$MODEL" \
         "kv_role": "kv_both",
         "kv_connector_extra_config": {
             "spec_name": "TPUCPUOffloadingSpec",
-            "spec_module_path": "tpu_inference.offload.cpu_tpu"
+            "spec_module_path": "vllm_torchtpu.offload.cpu_tpu"
         }
     }' \
     --async-scheduling \

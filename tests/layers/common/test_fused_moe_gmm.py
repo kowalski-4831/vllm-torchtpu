@@ -18,8 +18,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tpu_inference.kernels.megablox.gmm_v2 import apply_act_fn
-from tpu_inference.layers.common.fused_moe_gmm import fused_moe_func
+from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn
+from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
 
 
 def _require_tpu() -> None:

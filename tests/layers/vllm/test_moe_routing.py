@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for tpu_inference.layers.vllm.moe_routing helpers."""
+"""Unit tests for vllm_torchtpu.layers.vllm.moe_routing helpers."""
 
 from types import SimpleNamespace
 
 import pytest
 
-from tpu_inference.layers.vllm import moe_routing
+from vllm_torchtpu.layers.vllm import moe_routing
 
 
 def _make_layer(*, use_ep, ep_size=1, ep_rank=0, global_num_experts=0):

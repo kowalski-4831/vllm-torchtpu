@@ -55,7 +55,7 @@ repos:
   rev: v0.1.6
   hooks:
   - id: detect-missing-init
-    args: ['--create', "--track", "--python-folders", "tpu_inference"]
+    args: ['--create', "--track", "--python-folders", "src/vllm_torchtpu"]
 - repo: local
   hooks:
   - id: signoff-commit

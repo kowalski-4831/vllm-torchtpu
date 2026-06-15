@@ -14,7 +14,7 @@
 """
 Tests for PyTorch MXFP4 requantization functions.
 
-Verifies that PyTorch implementations in `tpu_inference.layers.common.quantization`
+Verifies that PyTorch implementations in `vllm_torchtpu.layers.common.quantization`
 match JAX reference behavior for:
 - e8m0 to float32 conversion
 - uint8 to FP4 unpacking
@@ -38,12 +38,12 @@ import pytest
 import torch
 
 # Import functions under test from production code
-from tpu_inference.layers.common.quantization import (  # isort: skip
+from vllm_torchtpu.layers.common.quantization import (  # isort: skip
     dequantize_mxfp4_packed, e8m0_to_fp32, fp4_indices_to_float,
     pack_fp4_indices, quantize_tensor_to_fp4, unpack_uint8_to_fp4)
 
 # ============================================================================
-# JAX REFERENCE IMPLEMENTATION (from legacy tpu_inference)
+# JAX REFERENCE IMPLEMENTATION (from legacy vllm_torchtpu)
 # These are copied here ONLY for comparison in tests.
 # ============================================================================
 

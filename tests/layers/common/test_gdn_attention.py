@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
-from tpu_inference.layers.common.gdn_attention import (
+from vllm_torchtpu.layers.common.gdn_attention import (
     GdnAttentionConfig, RaggedGatedDeltaRuleImpl, run_jax_gdn_attention_local)
 
 

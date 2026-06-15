@@ -23,7 +23,7 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.v1.metrics.reader import Counter
 
-from tpu_inference import tpu_info
+from vllm_torchtpu import tpu_info
 
 
 def _is_v7x():

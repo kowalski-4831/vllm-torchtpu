@@ -17,7 +17,7 @@ import uuid
 
 import torch
 
-from tpu_inference.distributed.kv_transfer.host_kv_shm_hma import (
+from vllm_torchtpu.distributed.kv_transfer.host_kv_shm_hma import (
     HostKVShmPoolHMA, PoolSpecHMA)
 
 

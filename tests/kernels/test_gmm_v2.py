@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tpu_inference.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
                                                    gmm_v2)
 
 _GroupConfig = collections.namedtuple(

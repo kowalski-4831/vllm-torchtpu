@@ -18,7 +18,7 @@ import uuid
 import pytest
 import torch
 
-from tpu_inference.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
+from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
                                                                PoolSpec)
 
 

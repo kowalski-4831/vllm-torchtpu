@@ -99,7 +99,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system --no-config --index-url https://pypi.org/simple -e ".[test,benchmarking]"
 
 
-ENV PYTHONPATH="/root/tpu_inference"
+ENV PYTHONPATH="/root/tpu_inference/src:/root/tpu_inference"
 CMD ["/bin/bash"]
 
 # Stage 4: Production/Full Image (Regular Install)
@@ -116,5 +116,5 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
       .
 
-ENV PYTHONPATH="/root/tpu_inference"
+ENV PYTHONPATH="/root/tpu_inference/src:/root/tpu_inference"
 CMD ["/bin/bash"]

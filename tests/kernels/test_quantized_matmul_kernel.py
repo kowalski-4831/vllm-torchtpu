@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tpu_inference.kernels.quantized_matmul import (blockwise_kernel, kernel,
+from vllm_torchtpu.kernels.quantized_matmul import (blockwise_kernel, kernel,
                                                     tuned_block_sizes, util)
 
 jax.config.update("jax_numpy_dtype_promotion", "standard")

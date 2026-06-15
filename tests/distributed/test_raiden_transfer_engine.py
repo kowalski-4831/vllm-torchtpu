@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from tpu_inference.distributed.kv_transfer.raiden_transfer_engine import (
+from vllm_torchtpu.distributed.kv_transfer.raiden_transfer_engine import (
     RaidenTransferEngine, _import_backend_module)
 
 
@@ -173,7 +173,7 @@ def test_import_backend_prefers_current_tpu_raiden_api(monkeypatch):
         return backend
 
     monkeypatch.setattr(
-        "tpu_inference.distributed.kv_transfer.raiden_transfer_engine.importlib.import_module",
+        "vllm_torchtpu.distributed.kv_transfer.raiden_transfer_engine.importlib.import_module",
         fake_import)
 
     assert _import_backend_module() is backend
@@ -193,7 +193,7 @@ def test_import_backend_falls_back_to_legacy_api(monkeypatch):
         return backend
 
     monkeypatch.setattr(
-        "tpu_inference.distributed.kv_transfer.raiden_transfer_engine.importlib.import_module",
+        "vllm_torchtpu.distributed.kv_transfer.raiden_transfer_engine.importlib.import_module",
         fake_import)
 
     assert _import_backend_module() is backend
@@ -210,7 +210,7 @@ def test_import_backend_preserves_internal_import_failures(monkeypatch):
                                   name="torch_tpu")
 
     monkeypatch.setattr(
-        "tpu_inference.distributed.kv_transfer.raiden_transfer_engine.importlib.import_module",
+        "vllm_torchtpu.distributed.kv_transfer.raiden_transfer_engine.importlib.import_module",
         fake_import)
 
     with pytest.raises(ModuleNotFoundError, match="torch_tpu"):

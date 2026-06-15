@@ -139,7 +139,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     --gpu-memory-utilization 0.2 \
     --tensor-parallel-size $PREFILLER_TP_SIZE \
     --attention-backend CUSTOM \
-    --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}" \
+    --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}" \
     > $LOG_DIR/prefill_$i.txt 2>&1 &
 
     PREFILL_HOSTS+=("localhost")
@@ -171,7 +171,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     --gpu-memory-utilization 0.2 \
     --tensor-parallel-size $DECODER_TP_SIZE \
     --attention-backend CUSTOM \
-    --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}" \
+    --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}" \
     > $LOG_DIR/decode_$i.txt 2>&1 &
 
     DECODE_HOSTS+=("localhost")

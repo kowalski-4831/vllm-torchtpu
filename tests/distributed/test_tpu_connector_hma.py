@@ -12,14 +12,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.request import RequestStatus
 
-from tpu_inference.distributed.kv_transfer.host_kv_shm_hma import PoolSpecHMA
+from vllm_torchtpu.distributed.kv_transfer.host_kv_shm_hma import PoolSpecHMA
 
-from tpu_inference.distributed.kv_transfer.tpu_connector_hma import (  # isort: skip
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_hma import (  # isort: skip
     TPUConnectorHMA, TPUConnectorHMAScheduler, TPUConnectorHMAWorker)
 
-_HMA_MOD = "tpu_inference.distributed.kv_transfer.tpu_connector_hma"
-_BASE_CONN = "tpu_inference.distributed.kv_transfer.tpu_connector"
-_BASE = "tpu_inference.distributed.kv_transfer.zmq_shm_base"
+_HMA_MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector_hma"
+_BASE_CONN = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+_BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
 
 
 def _make_vllm_config(*, is_producer: bool = True, block_size: int = 16):

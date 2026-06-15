@@ -211,7 +211,7 @@ docker exec -d ${CONTAINER_PREFIX}-0 /bin/bash -c \
     --gpu-memory-utilization 0.3 \
     --tensor-parallel-size 4 \
     --attention-backend CUSTOM \
-    --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.tpu_connector\",\"kv_role\":\"kv_producer\"}' \
+    --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.tpu_connector\",\"kv_role\":\"kv_producer\"}' \
     --no-async-scheduling \
     > /root/logs/prefill.txt 2>&1"
 set +x
@@ -284,7 +284,7 @@ docker exec -d ${CONTAINER_PREFIX}-2-0 /bin/bash -c \
     --gpu-memory-utilization 0.3 \
     --tensor-parallel-size 4 \
     --attention-backend CUSTOM \
-    --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.tpu_connector\",\"kv_role\":\"kv_consumer\"}' \
+    --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.tpu_connector\",\"kv_role\":\"kv_consumer\"}' \
     --no-async-scheduling \
     > /root/logs/decode.txt 2>&1"
 set +x

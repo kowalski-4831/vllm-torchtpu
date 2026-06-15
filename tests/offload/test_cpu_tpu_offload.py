@@ -5,7 +5,7 @@ Unit tests for the TPU↔CPU KV cache offloading stack.
 Covers the pieces that don't require a real TPU:
 - `_resolve_kv_cache_dtype` strictness (raise on "auto") and
   `get_kv_cache_shape` probe-path placeholder semantics in
-  `tpu_inference.layers.vllm.attention`.
+  `vllm_torchtpu.layers.vllm.attention`.
 - `TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes` size formula scales
   proportionally with `KV_H2D_POOL_MAX_BLOCKS`.
 - `TPUCPUOffloadingSpec.prewarm_shapes` / `prewarm_shape` delegate to the
@@ -32,24 +32,24 @@ class TestResolveKvCacheDtype(unittest.TestCase):
     """attention._resolve_kv_cache_dtype contract."""
 
     def test_passes_through_torch_dtype(self):
-        from tpu_inference.layers.vllm.attention import _resolve_kv_cache_dtype
+        from vllm_torchtpu.layers.vllm.attention import _resolve_kv_cache_dtype
         self.assertEqual(_resolve_kv_cache_dtype(torch.bfloat16),
                          torch.bfloat16)
 
     def test_resolves_known_strings(self):
-        from tpu_inference.layers.vllm.attention import _resolve_kv_cache_dtype
+        from vllm_torchtpu.layers.vllm.attention import _resolve_kv_cache_dtype
         self.assertEqual(_resolve_kv_cache_dtype("bfloat16"), torch.bfloat16)
         self.assertEqual(_resolve_kv_cache_dtype("fp8_e4m3"),
                          torch.float8_e4m3fn)
         self.assertEqual(_resolve_kv_cache_dtype("half"), torch.half)
 
     def test_auto_raises(self):
-        from tpu_inference.layers.vllm.attention import _resolve_kv_cache_dtype
+        from vllm_torchtpu.layers.vllm.attention import _resolve_kv_cache_dtype
         with self.assertRaisesRegex(ValueError, "must be resolved"):
             _resolve_kv_cache_dtype("auto")
 
     def test_unknown_raises(self):
-        from tpu_inference.layers.vllm.attention import _resolve_kv_cache_dtype
+        from vllm_torchtpu.layers.vllm.attention import _resolve_kv_cache_dtype
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             _resolve_kv_cache_dtype("not-a-dtype")
 
@@ -62,7 +62,7 @@ class TestGetKvCacheShapeProbe(unittest.TestCase):
     register_kv_caches."""
 
     def test_auto_returns_placeholder_with_num_blocks_at_dim_0(self):
-        from tpu_inference.layers.vllm.attention import PallasAttentionBackend
+        from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
         shape = PallasAttentionBackend.get_kv_cache_shape(num_blocks=1234,
                                                           block_size=16,
                                                           num_kv_heads=1,
@@ -71,7 +71,7 @@ class TestGetKvCacheShapeProbe(unittest.TestCase):
         self.assertEqual(shape.index(1234), 0)
 
     def test_concrete_dtype_returns_real_shape(self):
-        from tpu_inference.layers.vllm.attention import PallasAttentionBackend
+        from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
         shape = PallasAttentionBackend.get_kv_cache_shape(
             num_blocks=2048,
             block_size=16,
@@ -101,7 +101,7 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
         return cfg
 
     def test_doubling_pool_doubles_reserve(self):
-        from tpu_inference.offload.cpu_tpu import TPUCPUOffloadingSpec
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         cfg = self._make_vllm_config()
         with patch.dict(os.environ, {"KV_H2D_POOL_MAX_BLOCKS": "1024"}):
             half = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(cfg)
@@ -110,7 +110,7 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
         self.assertEqual(full, 2 * half)
 
     def test_doubling_layers_doubles_reserve(self):
-        from tpu_inference.offload.cpu_tpu import TPUCPUOffloadingSpec
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         with patch.dict(os.environ, {"KV_H2D_POOL_MAX_BLOCKS": "2048"}):
             small = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
                 self._make_vllm_config(num_layers=32))
@@ -119,7 +119,7 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
         self.assertEqual(large, 2 * small)
 
     def test_pool_blocks_rounds_to_next_power_of_2(self):
-        from tpu_inference.offload.cpu_tpu import TPUCPUOffloadingSpec
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         cfg = self._make_vllm_config()
         with patch.dict(os.environ, {"KV_H2D_POOL_MAX_BLOCKS": "1500"}):
             reserve_1500 = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(cfg)
@@ -135,21 +135,21 @@ class TestPrewarmDelegation(unittest.TestCase):
     are no-ops so the runner's collective_rpc doesn't crash."""
 
     def test_prewarm_shapes_none_when_handlers_not_built(self):
-        from tpu_inference.offload.cpu_tpu import TPUCPUOffloadingSpec
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         spec = TPUCPUOffloadingSpec.__new__(TPUCPUOffloadingSpec)
         spec._tpu_handlers = None
         self.assertEqual(spec.prewarm_shapes, [])
         spec.prewarm_shape(2048)  # must not raise
 
     def test_prewarm_shapes_delegates_to_h2d_handler(self):
-        from tpu_inference.offload.cpu_tpu import TPUCPUOffloadingSpec
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         spec = TPUCPUOffloadingSpec.__new__(TPUCPUOffloadingSpec)
         spec._tpu_handlers = MagicMock()
         spec._tpu_handlers.cpu_to_gpu_handler.prewarm_shapes = [1, 2, 4, 8]
         self.assertEqual(spec.prewarm_shapes, [1, 2, 4, 8])
 
     def test_prewarm_shape_forwards_argument(self):
-        from tpu_inference.offload.cpu_tpu import TPUCPUOffloadingSpec
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         spec = TPUCPUOffloadingSpec.__new__(TPUCPUOffloadingSpec)
         spec._tpu_handlers = MagicMock()
         spec.prewarm_shape(512)
@@ -161,7 +161,7 @@ class TestTransferDataclass(unittest.TestCase):
     """Transfer's chunk-state fields and error-capture pattern."""
 
     def test_defaults(self):
-        from tpu_inference.offload.cpu_tpu import Transfer
+        from vllm_torchtpu.offload.cpu_tpu import Transfer
         t = Transfer(job_id=1, num_bytes=100, n=10, dma_done=None)
         self.assertIsNone(t.host_buffer)
         self.assertIsNone(t.device_buffer)
@@ -175,7 +175,7 @@ class TestTransferDataclass(unittest.TestCase):
     def test_error_capture_pattern(self):
         """The wrapper pattern in _h2d_task / _d2h_task sets t.error
         before re-raising so get_finished can report success=False."""
-        from tpu_inference.offload.cpu_tpu import Transfer
+        from vllm_torchtpu.offload.cpu_tpu import Transfer
         t = Transfer(job_id=1, num_bytes=100, n=10, dma_done=None)
         try:
             try:
@@ -240,7 +240,7 @@ class TestMultiChunkH2D(unittest.TestCase):
         import threading
         from collections import deque
 
-        from tpu_inference.offload.cpu_tpu import \
+        from vllm_torchtpu.offload.cpu_tpu import \
             SingleDirectionOffloadingHandler
 
         h = SingleDirectionOffloadingHandler.__new__(
@@ -275,7 +275,7 @@ class TestMultiChunkH2D(unittest.TestCase):
     def _build_chunked_transfer(self, n_ids: int, req_id: str = "req-A"):
         import numpy as np
 
-        from tpu_inference.offload.cpu_tpu import Transfer
+        from vllm_torchtpu.offload.cpu_tpu import Transfer
         return Transfer(
             job_id=1,
             num_bytes=0,
@@ -331,7 +331,7 @@ class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
 
     @staticmethod
     def _make_worker(kv_transfer_config):
-        from tpu_inference.worker.tpu_worker import TPUWorker
+        from vllm_torchtpu.worker.tpu_worker import TPUWorker
         worker = TPUWorker.__new__(TPUWorker)
         worker.vllm_config = MagicMock()
         worker.vllm_config.kv_transfer_config = kv_transfer_config

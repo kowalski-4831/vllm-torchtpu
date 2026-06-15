@@ -11,7 +11,7 @@ CONCURRENCY_OPTIONS="1 16 32 64 128 256"
 RANDOM_RANGE_RATIO="0.8"
 
 # Switch attention from default RPA v3 to the experimental batched RPA kernel
-# under tpu_inference/kernels/experimental/batched_rpa/, registered as the
+# under src/vllm_torchtpu/kernels/experimental/batched_rpa/, registered as the
 # CUSTOM AttentionBackend. Same flag as the nightly short config. Unset to
 # ablate (defaults to FLASH_ATTN / default RPA v3).
 ATTENTION_BACKEND="CUSTOM"

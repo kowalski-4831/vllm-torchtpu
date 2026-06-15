@@ -15,7 +15,7 @@
 
 import torch
 
-from tpu_inference.layers.common.quantization import (quantize_tensor,
+from vllm_torchtpu.layers.common.quantization import (quantize_tensor,
                                                       quantize_tensor_to_fp4)
 
 
