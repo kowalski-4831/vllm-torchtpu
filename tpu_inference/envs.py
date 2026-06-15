@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
     SC_KERNEL_THRESHOLD: int = 16777216
     SC_KERNEL_COL_CHUNK_SIZE: int = 3072
-    USE_MOE_SPARSE_CORE: bool = True
+    USE_MOE_SPARSE_CORE: bool = False
 
 
 def env_with_choices(
@@ -196,7 +196,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # upstream vLLM's VLLM_USE_FLASHINFER_MOE_* style of env-gated MoE kernel
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
-    lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
+    lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "0")),
 }
 
 

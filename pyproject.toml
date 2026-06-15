@@ -90,6 +90,9 @@ keyring-provider = "subprocess"
 override-dependencies = [
     "numba>=0.62.1",
     "torch==2.10.0",
+    # Restrict fastapi version due to https://github.com/vllm-project/vllm/pull/45629
+    # TODO(shobhitbehl): Remove this pin after the fix is released in vLLM 0.23.0 or later.
+    "fastapi<0.137",
 ]
 
 
