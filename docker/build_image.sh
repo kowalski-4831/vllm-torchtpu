@@ -76,13 +76,29 @@ echo "Base Image: $BASE_IMAGE"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../" && pwd)"
 
+if [ -z "${ACCESS_TOKEN:-}" ]; then
+  if command -v gcloud >/dev/null 2>&1; then
+    ACCESS_TOKEN="$(gcloud auth print-access-token)"
+    export ACCESS_TOKEN
+  elif command -v curl >/dev/null 2>&1; then
+    METADATA_TOKEN_JSON="$(curl -sf -H "Metadata-Flavor: Google" \
+      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+      || true)"
+    ACCESS_TOKEN="$(printf '%s' "${METADATA_TOKEN_JSON}" | \
+      sed -nE 's/.*"access_token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
+    if [ -n "${ACCESS_TOKEN}" ]; then
+      export ACCESS_TOKEN
+    fi
+  fi
+fi
+
 if [ -z "$USE_TORCH_TPU_REGISTRY" ]; then
   echo "Torch TPU Source: artifact"
   echo "Artifact Source: $ARTIFACT_SOURCE"
 else
   if [ -z "${ACCESS_TOKEN:-}" ]; then
-    ACCESS_TOKEN="$(gcloud auth print-access-token)"
-    export ACCESS_TOKEN
+    echo "Missing ACCESS_TOKEN and gcloud is unavailable"
+    exit 1
   fi
   ARTIFACT_SOURCE="$BASE_IMAGE"
   echo "Torch TPU Source: registry"
@@ -116,12 +132,12 @@ DOCKER_ARGS=(
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
 )
 
-if [ -n "$USE_TORCH_TPU_REGISTRY" ]; then
+if [ -n "${ACCESS_TOKEN:-}" ]; then
   DOCKER_ARGS+=(--secret "id=gcloud_token,env=ACCESS_TOKEN")
 fi
 
 # Run docker build
-docker build "${DOCKER_ARGS[@]}" "${REPO_ROOT}"
+DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" "${REPO_ROOT}"
 
 if [ "$CLEANUP_VLLM" = true ]; then
   echo "===> Cleaning up copied vllm source..."

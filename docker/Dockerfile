@@ -33,10 +33,11 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
 # Clear PYTHONPATH inherited from base image if any
 ENV PYTHONPATH=""
 
-WORKDIR /root/tpu_inference
+WORKDIR /root/torchtpu-vllm
 
 # Mark mounted directory as safe for git
-RUN git config --global --add safe.directory /root/tpu_inference
+RUN git config --global --add safe.directory /root/torchtpu-vllm
+RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
 
 RUN pip install uv
 
@@ -48,7 +49,7 @@ RUN cp pyproject.toml /tmp/pyproject.toml && sed -i '/torch-tpu==/d' pyproject.t
 
 ARG VLLM_SOURCE
 # Copy vllm source (might be empty if not provided)
-COPY vllm /root/tpu_inference/vllm
+COPY vllm /root/torchtpu-vllm/vllm
 
 # Install vllm from source if requested
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -59,7 +60,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       sed -i 's/vllm==[^"]*/vllm/' pyproject.toml && \
       VLLM_TARGET_DEVICE="tpu" uv pip install --system \
         --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
-        -e /root/tpu_inference/vllm ; \
+        -e /root/torchtpu-vllm/vllm ; \
     fi
 
 # Install dependencies directly from pyproject.toml
@@ -67,7 +68,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # This layer will be cached!
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config --index-url https://pypi.org/simple .
+    uv pip install --system --no-config --index-url https://pypi.org/simple -r pyproject.toml
 
 # Install torch-tpu either from a fresh artifact image or the pinned registry version.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -99,11 +100,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system --no-config --index-url https://pypi.org/simple -e ".[test,benchmarking]"
 
 
-ENV PYTHONPATH="/root/tpu_inference/src:/root/tpu_inference"
+ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
 CMD ["/bin/bash"]
 
 # Stage 4: Production/Full Image (Regular Install)
 FROM base AS prod
+WORKDIR /root/torchtpu-vllm
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
@@ -116,5 +118,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
       .
 
-ENV PYTHONPATH="/root/tpu_inference/src:/root/tpu_inference"
+RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
+ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
 CMD ["/bin/bash"]

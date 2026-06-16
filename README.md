@@ -1,6 +1,6 @@
 <h1 align="center">vLLM TPU</h1>
 
-This repository contains the integration of **TorchTPU** and **vLLM**. The codebase references both vLLM main and `tpu-inference`, utilizing the vLLM framework for the server logic and custom kernels from `tpu-inference` for optimized performance.
+This repository contains the integration of **TorchTPU** and **vLLM**. It is a vLLM platform plugin packaged as `vllm_torchtpu`, with TPU kernels and runtime code for TorchTPU.
 
 ---
 
@@ -48,8 +48,8 @@ uv tool install keyring --with keyrings.google-artifactregistry-auth
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git ../vllm
 
-# Patch vLLM's TPU requirements to remove tpu-inference to avoid conflicts
-# with the torchtpu-vllm package which is also named tpu-inference
+# Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
+# plugin alongside torchtpu-vllm.
 sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
 
 # Install vLLM in editable mode (forcing the 0.22.1 base version to prevent .dev prerelease mismatch during dependency resolution)
@@ -77,8 +77,8 @@ export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifac
 # Clone vLLM to allow making local patches for debugging
 git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git ../vllm
 
-# Patch vLLM's TPU requirements to remove tpu-inference to avoid conflicts
-# with the torchtpu-vllm package which is also named tpu-inference
+# Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
+# plugin alongside torchtpu-vllm.
 sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
 
 # Install vLLM in editable mode (forcing the 0.22.1 base version to prevent .dev prerelease mismatch during dependency resolution)

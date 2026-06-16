@@ -10,7 +10,7 @@ steps:
     agents:
       queue: tpu_v6e_queue
     commands:
-      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_structured_decoding.py::test_structured_decoding
+      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/torchtpu-vllm/tests/e2e/test_structured_decoding.py::test_structured_decoding
   - label: "Record correctness test result for structured_decoding"
     key: "record_structured_decoding_CorrectnessTest"
     depends_on: "structured_decoding_CorrectnessTest"

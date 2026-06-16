@@ -28,7 +28,7 @@ steps:
     agents:
       queue: tpu_v6e_queue
     commands:
-      - .buildkite/scripts/run_in_docker.sh bash /workspace/tpu_inference/tests/e2e/benchmarking/mm_bench.sh
+      - .buildkite/scripts/run_in_docker.sh bash /workspace/torchtpu-vllm/tests/e2e/benchmarking/mm_bench.sh
   - label: "Record performance test result for Multimodal Inputs"
     key: "record_Multimodal_Inputs_PerformanceTest"
     depends_on: "Multimodal_Inputs_PerformanceTest"

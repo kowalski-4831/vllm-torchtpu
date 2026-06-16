@@ -9,7 +9,7 @@ steps:
     commands:
       - |
         .buildkite/scripts/run_in_docker.sh \
-          python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_speculative_decoding.py::test_eagle3_correctness
+          python3 -m pytest -s -v /workspace/torchtpu-vllm/tests/e2e/test_speculative_decoding.py::test_eagle3_correctness
   - label: "Record correctness test result for Speculative Decoding: Eagle3"
     key: "record_Speculative_Decoding-_Eagle3_CorrectnessTest"
     depends_on: "Speculative_Decoding-_Eagle3_CorrectnessTest"
@@ -32,7 +32,7 @@ steps:
     commands:
       - |
         .buildkite/scripts/run_in_docker.sh \
-          python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_speculative_decoding.py::test_eagle3_performance
+          python3 -m pytest -s -v /workspace/torchtpu-vllm/tests/e2e/test_speculative_decoding.py::test_eagle3_performance
 
   - label: "Record performance test result for Speculative Decoding: Eagle3"
     key: "record_Speculative_Decoding-_Eagle3_PerformanceTest"

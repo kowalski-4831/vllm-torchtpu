@@ -11,7 +11,7 @@ steps:
     agents:
       queue: tpu_v6e_queue
     commands:
-      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_runai_model_streamer_loader.py::test_correctness
+      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/torchtpu-vllm/tests/e2e/test_runai_model_streamer_loader.py::test_correctness
   - label: "Record correctness test result for runai_model_streamer_loader"
     key: "record_runai_model_streamer_loader_CorrectnessTest"
     depends_on: "runai_model_streamer_loader_CorrectnessTest"

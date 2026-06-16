@@ -19,12 +19,12 @@
 #
 #   Using `uv`:
 #   ```bash
-#   uv pip install --pre --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry/simple/ tpu_inference
+#   uv pip install --pre --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry/simple/ vllm_torchtpu
 #   ```
 #
 #   Using `pip`:
 #   ```bash
-#   pip install --pre --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry/simple/ tpu_inference
+#   pip install --pre --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry/simple/ vllm_torchtpu
 #   ```
 name: CI - Nightly Build
 

@@ -125,7 +125,7 @@ if [ "$RUN_IN_BUILDKITE" = "false" ]; then
   local_mounts=(
     # torchtpu-vllm uses vllm v0.13.0, no need to mount
     # -v "$HOME/vllm:/workspace/vllm"
-    -v "$TORCHTPU_VLLM_REPO:/workspace/tpu_inference"
+    -v "$TORCHTPU_VLLM_REPO:/workspace/torchtpu-vllm"
   )
 fi
 
@@ -313,7 +313,7 @@ set +x
 # Start proxy server in the container
 echo "Starting proxy server in container..."
 set -x
-docker exec -d ${CONTAINER_PREFIX}-proxy-benchmark /bin/bash -c "python /workspace/tpu_inference/examples/disagg/toy_proxy_server.py --host localhost --port 8000 > /root/logs/proxy.txt 2>&1"
+docker exec -d ${CONTAINER_PREFIX}-proxy-benchmark /bin/bash -c "python /workspace/torchtpu-vllm/examples/disagg/toy_proxy_server.py --host localhost --port 8000 > /root/logs/proxy.txt 2>&1"
 set +x
 
 # Wait for proxy server to start
@@ -323,7 +323,7 @@ set +x
 if [ "$TEST_MODE" = "1" ] || [ "$TEST_MODE" = "3" ]; then
     echo "Running benchmark test in container."
     set -x
-    docker exec ${CONTAINER_PREFIX}-proxy-benchmark /bin/bash -c "python3 /workspace/tpu_inference/scripts/vllm/benchmarking/benchmark_serving.py \
+    docker exec ${CONTAINER_PREFIX}-proxy-benchmark /bin/bash -c "python3 /workspace/torchtpu-vllm/scripts/vllm/benchmarking/benchmark_serving.py \
         --backend vllm \
         --host localhost \
         --port 8000 \
@@ -343,7 +343,7 @@ fi
 if [ "$TEST_MODE" = "2" ] || [ "$TEST_MODE" = "3" ]; then
     echo "Running correctness test in container."
     set -x
-    docker exec ${CONTAINER_PREFIX}-proxy-benchmark /bin/bash -c "python3 /workspace/tpu_inference/examples/disagg/test_disagg_correctness.py \
+    docker exec ${CONTAINER_PREFIX}-proxy-benchmark /bin/bash -c "python3 /workspace/torchtpu-vllm/examples/disagg/test_disagg_correctness.py \
         --baseline_url http://localhost:9400/v1/completions \
         --disagg_url http://localhost:8000/v1/completions \
         --model ${MODEL} \

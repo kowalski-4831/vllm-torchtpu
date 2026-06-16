@@ -16,8 +16,9 @@ steps:
       - "VLLM_COMMIT_HASH=$$(buildkite-agent meta-data get 'VLLM_COMMIT_HASH')"
       - "VLLM_SHORT_COMMIT=$${VLLM_COMMIT_HASH:0:7}"
       - "BUILDKITE_SHORT_COMMIT=$${BUILDKITE_COMMIT:0:7}"
+      - "ACCESS_TOKEN=$$(gcloud auth print-access-token)"
       - "yes | docker system prune -a"
-      - "docker build --build-arg VLLM_COMMIT_HASH=$$VLLM_COMMIT_HASH --no-cache -f docker/Dockerfile -t vllm/vllm-tpu:nightly -t vllm/vllm-tpu:nightly-$$DATE-$$BUILDKITE_SHORT_COMMIT-$$VLLM_SHORT_COMMIT ."
+      - "DOCKER_BUILDKIT=1 docker build --build-arg VLLM_COMMIT_HASH=$$VLLM_COMMIT_HASH --secret id=gcloud_token,env=ACCESS_TOKEN --no-cache -f docker/Dockerfile -t vllm/vllm-tpu:nightly -t vllm/vllm-tpu:nightly-$$DATE-$$BUILDKITE_SHORT_COMMIT-$$VLLM_SHORT_COMMIT ."
       - "docker push vllm/vllm-tpu:nightly"
       - "docker push vllm/vllm-tpu:nightly-$$DATE-$$BUILDKITE_SHORT_COMMIT-$$VLLM_SHORT_COMMIT"
     plugins:
@@ -36,8 +37,9 @@ steps:
       - "VLLM_COMMIT_HASH=$$(buildkite-agent meta-data get 'VLLM_COMMIT_HASH')"
       - "VLLM_SHORT_COMMIT=$${VLLM_COMMIT_HASH:0:7}"
       - "BUILDKITE_SHORT_COMMIT=$${BUILDKITE_COMMIT:0:7}"
+      - "ACCESS_TOKEN=$$(gcloud auth print-access-token)"
       - "yes | docker system prune -a"
-      - "docker build --build-arg VLLM_COMMIT_HASH=$$VLLM_COMMIT_HASH --no-cache --build-arg IS_FOR_V7X=true -f docker/Dockerfile -t vllm/vllm-tpu:nightly-ironwood -t vllm/vllm-tpu:nightly-ironwood-$$DATE-$$BUILDKITE_SHORT_COMMIT-$$VLLM_SHORT_COMMIT ."
+      - "DOCKER_BUILDKIT=1 docker build --build-arg VLLM_COMMIT_HASH=$$VLLM_COMMIT_HASH --secret id=gcloud_token,env=ACCESS_TOKEN --no-cache --build-arg IS_FOR_V7X=true -f docker/Dockerfile -t vllm/vllm-tpu:nightly-ironwood -t vllm/vllm-tpu:nightly-ironwood-$$DATE-$$BUILDKITE_SHORT_COMMIT-$$VLLM_SHORT_COMMIT ."
       - "docker push vllm/vllm-tpu:nightly-ironwood"
       - "docker push vllm/vllm-tpu:nightly-ironwood-$$DATE-$$BUILDKITE_SHORT_COMMIT-$$VLLM_SHORT_COMMIT"
     plugins:

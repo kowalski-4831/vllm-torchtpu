@@ -60,8 +60,28 @@ setup_environment() {
   echo "Python dependencies installed"
 
   VLLM_COMMIT_HASH=$(buildkite-agent meta-data get "VLLM_COMMIT_HASH" --default "")
+  ACCESS_TOKEN="$(gcloud auth print-access-token)"
+  export ACCESS_TOKEN
 
-  docker build \
+  local cleanup_vllm=false
+  if [ ! -e vllm ]; then
+    mkdir -p vllm
+    touch vllm/.dummy
+    cleanup_vllm=true
+  fi
+
+  set +e
+  DOCKER_BUILDKIT=1 docker build \
       --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
+      --secret id=gcloud_token,env=ACCESS_TOKEN \
       --no-cache -f docker/Dockerfile -t "${IMAGE_NAME}:${BUILDKITE_COMMIT}" .
+  local build_status=$?
+  set -e
+
+  if [ "$cleanup_vllm" = true ]; then
+    rm -rf vllm
+  fi
+  if [ "$build_status" -ne 0 ]; then
+    return "$build_status"
+  fi
 }

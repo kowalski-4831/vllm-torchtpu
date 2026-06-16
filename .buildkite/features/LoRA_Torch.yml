@@ -9,7 +9,7 @@ steps:
     commands:
       - |
         .buildkite/scripts/run_in_docker.sh \
-          bash -c 'MODEL_IMPL_TYPE=vllm TPU_BACKEND_TYPE=jax python3 -m pytest -s -v -x /workspace/tpu_inference/tests/lora/test_lora.py'
+          bash -c 'MODEL_IMPL_TYPE=vllm TPU_BACKEND_TYPE=jax python3 -m pytest -s -v -x /workspace/torchtpu-vllm/tests/lora/test_lora.py'
   - label: "Record correctness test result for LoRA_Torch"
     key: "record_LoRA_Torch_CorrectnessTest"
     depends_on: "LoRA_Torch_CorrectnessTest"

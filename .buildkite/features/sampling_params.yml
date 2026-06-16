@@ -8,7 +8,7 @@ steps:
     agents:
       queue: tpu_v6e_queue
     commands:
-      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_sampling_params.py
+      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/torchtpu-vllm/tests/e2e/test_sampling_params.py
   - label: "Record correctness test result for sampling_params"
     key: "record_sampling_params_CorrectnessTest"
     depends_on: "sampling_params_CorrectnessTest"

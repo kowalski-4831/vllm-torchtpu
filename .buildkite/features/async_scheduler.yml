@@ -7,7 +7,7 @@ steps:
     agents:
       queue: tpu_v6e_queue
     commands:
-      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_async_scheduler.py::test_async_correctness
+      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/torchtpu-vllm/tests/e2e/test_async_scheduler.py::test_async_correctness
   - label: "Record correctness test result for async scheduler"
     key: "record_async_scheduler_CorrectnessTest"
     depends_on: "async_scheduler_CorrectnessTest"
@@ -28,7 +28,7 @@ steps:
     agents:
       queue: tpu_v6e_queue
     commands:
-      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_async_scheduler.py::test_performance
+      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/torchtpu-vllm/tests/e2e/test_async_scheduler.py::test_performance
   - label: "Record performance test result for async scheduler"
     key: "record_async_scheduler_PerformanceTest"
     depends_on: "async_scheduler_PerformanceTest"

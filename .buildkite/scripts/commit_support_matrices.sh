@@ -2,7 +2,7 @@
 set -e
 
 # --- Configuration ---
-REPO_URL="https://github.com/vllm-project/tpu-inference.git"
+REPO_URL="https://github.com/google-pytorch/torchtpu-vllm.git"
 TARGET_BRANCH="main"
 
 # Conditional Configuration for Release vs. Nightly

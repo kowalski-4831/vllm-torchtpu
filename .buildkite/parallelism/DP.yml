@@ -11,7 +11,7 @@ steps:
     commands:
       - |
         .buildkite/scripts/run_in_docker.sh \
-          bash -c 'python3 -m pytest -s -v -x /workspace/tpu_inference/tests/e2e/test_data_parallel.py'
+          bash -c 'python3 -m pytest -s -v -x /workspace/torchtpu-vllm/tests/e2e/test_data_parallel.py'
   - label: "Record correctness test result for DP"
     key: "record_DP_CorrectnessTest"
     depends_on: "DP_CorrectnessTest"
