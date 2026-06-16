@@ -70,10 +70,6 @@ A working launcher script lives at
 
 Environment knobs (all optional)
 --------------------------------
-- `KV_OFFLOAD_LAZY_STORE` (default "0")
-    "1" = only offload blocks at the HBM eviction frontier (recommended
-    for prefix-cache-heavy workloads).
-    "0" = legacy eager double-write on every newly computed block.
 - `KV_H2D_POOL_MAX_BLOCKS` (default 2048)
     Caps the H2D staging buffer's `(max_padded, …)` first dim. Rounded
     to the next power of 2. Larger = fewer chunked loads on long-prefix
@@ -191,19 +187,16 @@ def _install_flush_pending_scatters_hook() -> None:
         # Step 3: dispatch new loads. Stash req_id on the appropriate
         # H2D handler BEFORE calling `worker.transfer_async` so the
         # handler can copy it onto the resulting Transfer.
-        for req_id, transfer_spec in metadata.reqs_to_load.items():
-            job_id = self._generate_job_id()
-            self._jobs[job_id] = (req_id, False)
-            assert req_id not in self._load_job
-            self._load_job[req_id] = job_id
+        for job_id, entry in metadata.load_jobs.items():
+            self._load_jobs[job_id] = entry.req_id
             # Find the handler that will receive this transfer.
-            src, dst = transfer_spec
+            src, dst = entry.transfer_spec
             ttype = (src.medium(), dst.medium())
             handler = self.worker.transfer_type_to_handler.get(ttype)
             if handler is not None and hasattr(handler,
                                                "_stash_req_id_for_job"):
-                handler._stash_req_id_for_job(job_id, req_id)
-            success = self.worker.transfer_async(job_id, transfer_spec)
+                handler._stash_req_id_for_job(job_id, entry.req_id)
+            success = self.worker.transfer_async(job_id, entry.transfer_spec)
             assert success
 
     start_kv_transfers_with_flush._tpu_flush_patched = True  # type: ignore[attr-defined]
@@ -213,7 +206,6 @@ def _install_flush_pending_scatters_hook() -> None:
 
 _install_scheduler_scatter_now_hook()
 _install_flush_pending_scatters_hook()
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

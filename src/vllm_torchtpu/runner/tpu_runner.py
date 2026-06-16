@@ -417,13 +417,22 @@ class TPUModelRunner(GPUModelRunner):
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
-            return None, None
+            return None, None, None
         kv_connector = get_kv_transfer_group()
-        finished = kv_connector.get_finished(scheduler_output.finished_req_ids)
+        finished_sending, finished_recving = kv_connector.get_finished(
+            scheduler_output.finished_req_ids)
+        # vLLM >=0.21 job model: store completions (and load completions) are
+        # reported to the scheduler via the worker meta's `completed_jobs`,
+        # NOT via finished_sending. Without plumbing this, the
+        # OffloadingConnector's complete_store is never called, host-pool
+        # blocks stay not-ready (ref_cnt=-1), and prefix-reuse lookups defer
+        # forever -> the engine busy-spins / hangs. Mirrors
+        # KVConnectorModelRunnerMixin._get_kv_connector_output.
+        worker_meta = kv_connector.build_connector_worker_meta()
         # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
-        return finished
+        return finished_sending, finished_recving, worker_meta
 
     def kv_connector_no_forward(self, scheduler_output,
                                 vllm_config) -> ModelRunnerOutput:
@@ -433,11 +442,12 @@ class TPUModelRunner(GPUModelRunner):
         self.maybe_setup_kv_connector(
             scheduler_output,
             wait_for_completion=dist_utils.get_raiden_inline_load())
-        finished_sending, finished_recving = self.get_finished_kv_transfers(
-            scheduler_output)
+        finished_sending, finished_recving, worker_meta = (
+            self.get_finished_kv_transfers(scheduler_output))
         kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            kv_connector_worker_meta=worker_meta,
         )
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -1805,8 +1815,8 @@ class TPUModelRunner(GPUModelRunner):
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
         self.maybe_wait_for_kv_save()
-        finished_sending, finished_recving = self.get_finished_kv_transfers(
-            scheduler_output)
+        finished_sending, finished_recving, kv_worker_meta = (
+            self.get_finished_kv_transfers(scheduler_output))
 
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
@@ -1852,12 +1862,13 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
-        kv_connector_output = (None if (finished_sending is None
-                                        and finished_recving is None) else
-                               KVConnectorOutput(
-                                   finished_sending=finished_sending,
-                                   finished_recving=finished_recving,
-                               ))
+        kv_connector_output = (
+            None if (finished_sending is None and finished_recving is None
+                     and kv_worker_meta is None) else KVConnectorOutput(
+                         finished_sending=finished_sending,
+                         finished_recving=finished_recving,
+                         kv_connector_worker_meta=kv_worker_meta,
+                     ))
 
         next_tokens_tpu = None
         copy_state = None
