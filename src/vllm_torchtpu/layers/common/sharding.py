@@ -83,13 +83,72 @@ class ShardingConfigManager:
     """Manages sharding configuration parsing and access from vLLM config.
 
     Usage:
-        sharding_config = ShardingConfigManager.from_vllm_config(vllm_config)
-        tp_size = sharding_config.tp_size
+        ShardingConfigManager.initialize(vllm_config)
+        tp_size = ShardingConfigManager.get(vllm_config).tp_size
 
-    During initialization, we set `vllm_config.sharding_config` to
-    `ShardingConfigManager.from_vllm_config(vllm_config)`, so you can access
-    `vllm_config.sharding_config.tp_size` directly.
+    The parsed config is stored as a JSON-native dict under
+    ``vllm_config.additional_config["_sharding_config"]`` and the manager is
+    reconstructed from it on ``get()``.
+
+    Why store a dict (not the manager, not a plain attribute):
+    - A dynamic attribute ``vllm_config.sharding_config = manager`` breaks
+      ``vllm.config.utils.replace`` (it iterates ``__dict__`` and rejects
+      members that are not declared dataclass fields).
+    - ``additional_config`` *is* a declared field, so ``replace``/``deepcopy``
+      handle it correctly, and it travels with a copied config (unlike an
+      id()-keyed side table, which a deepcopy would miss).
+    - But ``VllmConfig.compute_hash`` does ``json.dumps(additional_config)``
+      with the stdlib encoder, so the value must be JSON-native. The manager
+      object isn't serializable; its data (a ``ShardingStrategy`` of ints plus
+      an optional int list) is. We therefore store the dict and rebuild the
+      manager on read. Including the derived sharding in the hash is harmless:
+      it is derived from ``parallel_config`` (already hashed), so it adds no
+      new discrimination, only a one-time absolute-hash change.
+
+    Keeping the data off ``__dict__`` entirely (this class) means there is no
+    attribute for ``replace`` to trip over at any site, so no per-site guarding
+    is needed.
     """
+
+    # Key under vllm_config.additional_config holding the JSON-native sharding
+    # data. Underscore-prefixed to avoid colliding with the user-supplied
+    # "sharding" input key that from_vllm_config reads.
+    _ADDITIONAL_CONFIG_KEY = "_sharding_config"
+
+    @classmethod
+    def initialize(cls, vllm_config: 'VllmConfig') -> 'ShardingConfigManager':
+        """Parse the sharding config and stash a JSON-native copy on the config.
+
+        Idempotent and re-entrant. ``check_and_update_config`` (which calls this)
+        runs inside ``VllmConfig.__post_init__``, so it re-fires every time the
+        config is reconstructed -- e.g. vLLM's ``replace()`` on the Qwen3-VL
+        ``with_hf_config`` path. If the stored key is already present, reuse it
+        via ``get()`` instead of re-parsing, so the parse happens exactly once
+        per config and downstream reads stay stable across reconstructions.
+        Returns the manager for convenience.
+        """
+        if cls._ADDITIONAL_CONFIG_KEY in vllm_config.additional_config:
+            return cls.get(vllm_config)
+        manager = cls.from_vllm_config(vllm_config)
+        device_indexes = manager.device_indexes
+        vllm_config.additional_config[cls._ADDITIONAL_CONFIG_KEY] = {
+            "sharding_strategy":
+            asdict(manager.sharding_strategy),
+            "device_indexes":
+            (list(device_indexes) if device_indexes is not None else None),
+        }
+        return manager
+
+    @classmethod
+    def get(cls, vllm_config: 'VllmConfig') -> 'ShardingConfigManager':
+        """Reconstruct the manager from the JSON-native dict on the config."""
+        data = vllm_config.additional_config.get(cls._ADDITIONAL_CONFIG_KEY)
+        assert data is not None, (
+            "ShardingConfigManager not initialized for this VllmConfig. "
+            "ShardingConfigManager.initialize(vllm_config) must run "
+            "(via TpuPlatform.check_and_update_config) before any get().")
+        return cls(ShardingStrategy(**data["sharding_strategy"]),
+                   data["device_indexes"])
 
     def __init__(self,
                  sharding_strategy: ShardingStrategy,

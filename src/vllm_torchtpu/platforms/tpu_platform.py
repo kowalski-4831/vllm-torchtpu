@@ -287,9 +287,10 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _initialize_sharding_config(cls, vllm_config: VllmConfig) -> None:
-
-        sharding_config = ShardingConfigManager.from_vllm_config(vllm_config)
-        vllm_config.sharding_config = sharding_config
+        # Store the parsed sharding config keyed by vllm_config (not as an
+        # attribute on it) so vLLM's replace()/compute_hash() machinery never
+        # sees it. Read it back via ShardingConfigManager.get(vllm_config).
+        sharding_config = ShardingConfigManager.initialize(vllm_config)
         logger.info(f"Initialized sharding configuration: {sharding_config}")
 
     @classmethod
