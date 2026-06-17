@@ -1571,12 +1571,13 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
-            if self._dp_lockstep_enabled():
-                # EngineCore calls execute_dummy_batch() after a zero-token
-                # step; doing DP collectives here would enter lockstep twice.
-                return EMPTY_MODEL_RUNNER_OUTPUT
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
+            # Even for a zero-token step and if DP lockstep is enabled, we must
+            # still execute the KV coordination logic so the background ZMQ/SHM
+            # threads can start KV transfer in disaggregated serving. This is
+            # safe to do for a zero-token step since no collectives are
+            # triggered.
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
 

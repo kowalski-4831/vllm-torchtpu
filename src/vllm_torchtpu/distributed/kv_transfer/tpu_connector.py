@@ -244,9 +244,19 @@ class TPUConnectorScheduler:
         self.reqs_to_load: dict[ReqId, LoadMeta] = {}
 
         self.kv_ip = dist_utils.get_kv_ips()
-        self.kv_port = dist_utils.get_kv_ports()
-        logger.info("TPUConnectorScheduler --> kv_ip=%s | kv_port=%s",
-                    self.kv_ip, self.kv_port)
+        # Get DP rank and TP size from config and stagger kv_port and side_channel_port
+        dp_rank = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
+        tp_size = vllm_config.parallel_config.tensor_parallel_size if vllm_config.parallel_config else 1
+        port_base = dist_utils.get_kv_ports()
+        if isinstance(port_base, list):
+            self.kv_port = [int(p) + dp_rank * tp_size for p in port_base]
+        else:
+            self.kv_port = int(port_base) + dp_rank * tp_size
+        self.side_channel_port = int(
+            dist_utils.get_side_channel_port()) + dp_rank
+        logger.info(
+            "TPUConnectorScheduler --> kv_ip=%s | kv_port=%s | side_channel_port=%s",
+            self.kv_ip, self.kv_port, self.side_channel_port)
 
     def get_num_new_matched_tokens(
         self,
@@ -303,6 +313,8 @@ class TPUConnectorScheduler:
                 remote_block_ids=params["remote_block_ids"],
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                remote_side_channel_port=params["remote_side_channel_port"]
+                if "remote_side_channel_port" in params else None,
             )
         else:
             # Full prefix-cache hit or async pull done -- we still need to
@@ -313,6 +325,8 @@ class TPUConnectorScheduler:
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                remote_side_channel_port=params["remote_side_channel_port"]
+                if "remote_side_channel_port" in params else None,
             )
         logger.info(
             "TPUConnectorScheduler update_state_after_alloc --> reqs_to_load=%s",
@@ -358,10 +372,12 @@ class TPUConnectorScheduler:
                 uuid=uuid,
                 local_block_ids=computed_block_ids,
                 expiration_time=expiration_time)
-            kv_transfer_params = dict(uuid=uuid,
-                                      remote_block_ids=computed_block_ids,
-                                      remote_host=self.kv_ip,
-                                      remote_port=self.kv_port)
+            kv_transfer_params = dict(
+                uuid=uuid,
+                remote_block_ids=computed_block_ids,
+                remote_host=self.kv_ip,
+                remote_port=self.kv_port,
+                remote_side_channel_port=self.side_channel_port)
             logger.info(
                 "TPUConnectorScheduler --> reqs_to_send=%s | kv_transfer_params=%s",
                 self.reqs_to_send, kv_transfer_params)

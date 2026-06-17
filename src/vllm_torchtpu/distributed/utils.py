@@ -158,18 +158,18 @@ def get_kv_shm_pool_gb() -> float:
     return float(gb_str)
 
 
-def get_ipc_socket_path(node_id: int) -> str:
+def get_ipc_socket_path(node_id: int, dp_rank: int = 0) -> str:
     """Per-host intra-process IPC endpoint used between rank-0 coordinator
     and the other TP ranks."""
     # One socket per host id; workers on the same host share it.
     prefix = os.getenv("TPU_IPC_SOCKET_DIR", "/tmp")
-    return f"ipc://{prefix}/tpu_conn_node{node_id}.sock"
+    return f"ipc://{prefix}/tpu_conn_node{node_id}_{dp_rank}.sock"
 
 
-def get_shm_name(node_id: int) -> str:
+def get_shm_name(node_id: int, dp_rank: int = 0) -> str:
     """Name for the per-host SharedMemory block. Scoped by host id so
     a single host can run multiple disjoint nodes if ever needed."""
-    return f"tpu_conn_kv_node{node_id}"
+    return f"tpu_conn_kv_node{node_id}_{dp_rank}"
 
 
 def get_kv_warmup_enabled() -> bool:

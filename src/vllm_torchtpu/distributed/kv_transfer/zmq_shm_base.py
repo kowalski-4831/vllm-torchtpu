@@ -95,6 +95,7 @@ class LoadMeta:
     remote_block_ids: list[int]
     remote_host: str | list[str]
     remote_port: int | list[int]
+    remote_side_channel_port: Optional[int] = None
 
 
 @dataclass
@@ -150,6 +151,7 @@ class _CoordRecvEntry:
     remote_blocks: list[int]
     remote_host: str | list[str]
     remote_port: int | list[int]
+    remote_side_channel_port: Optional[int] = None
     # Set by the async pull thread once data has been written to shm.
     load_complete: threading.Event = field(default_factory=threading.Event)
     # Ranks that have sent COPY_DONE. Once |copied| == tp_size we can notify
@@ -245,6 +247,7 @@ class ZmqShmKvConnectorBase:
         self.device: Optional[torch.device] = None
         self.multi_host = envs.TPU_MULTIHOST_BACKEND == "ray"
         self.node_id: int = dist_utils.get_node_id()
+        self.dp_rank: int = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
 
         self.tp_rank: int = get_tensor_model_parallel_rank()
         self.tp_size: int = get_tensor_model_parallel_world_size()
@@ -254,9 +257,10 @@ class ZmqShmKvConnectorBase:
         self._is_host_coordinator = (self.local_tp_rank == 0)
 
         self.host_ip = dist_utils.get_host_ip()
-        self.kv_transfer_port = int(dist_utils.get_kv_transfer_port())
+        self.kv_transfer_port = int(
+            dist_utils.get_kv_transfer_port()) + (self.dp_rank * self.tp_size)
         self.side_channel_port = int(
-            dist_utils.get_side_channel_port()) + self.node_id
+            dist_utils.get_side_channel_port()) + self.node_id + self.dp_rank
 
         # One ZMQ I/O thread per parallel data socket. Default io_threads=1
         # funnels all tp_size data sockets through a single kernel-I/O
@@ -276,9 +280,9 @@ class ZmqShmKvConnectorBase:
         logger.info(
             "TPUConnectorWorker(%s) --> init | ip=%s | kv_transfer_port=%s | "
             "side_channel_port=%s | is_producer=%s | node_id=%d | "
-            "tp_rank=%d | tp_size=%d", self.node_id, self.host_ip,
+            "tp_rank=%d | tp_size=%d | dp_rank=%d", self.node_id, self.host_ip,
             self.kv_transfer_port, self.side_channel_port, self.is_producer,
-            self.node_id, self.tp_rank, self.tp_size)
+            self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
     def _init_coord_state(self) -> None:
         """Minimum state needed on both rank-0 and the other ranks. The
@@ -557,7 +561,8 @@ class ZmqShmKvConnectorBase:
     def process_send_load(self, metadata: TPUConnectorMetadata):
         return self._coord_process_send_load(metadata)
 
-    def _resolve_remote_host_port(self, req_meta: LoadMeta) -> tuple[str, int]:
+    def _resolve_remote_host_port(
+            self, req_meta: LoadMeta) -> tuple[str, int, Optional[int]]:
         if isinstance(req_meta.remote_host, list):
             assert len(req_meta.remote_host) == len(req_meta.remote_port)
             host = req_meta.remote_host[self.node_id]
@@ -565,7 +570,10 @@ class ZmqShmKvConnectorBase:
         else:
             host = req_meta.remote_host
             port = req_meta.remote_port
-        return host, int(port)
+        side_channel_port = None
+        if req_meta.remote_side_channel_port:
+            side_channel_port = int(req_meta.remote_side_channel_port)
+        return host, int(port), side_channel_port
 
     # ---- Polled by the runner each step --------------------------------
     def get_finished(self) -> tuple[set[str], set[str]]:
@@ -633,8 +641,9 @@ class ZmqShmKvConnectorBase:
         from register_runner() once kv_caches are known."""
         self._coord_pool_spec = self._build_pool_spec()
 
-        shm_name = dist_utils.get_shm_name(self.node_id)
-        ipc_path = dist_utils.get_ipc_socket_path(self.node_id)
+        # Stagger shm and ipc with dp_rank
+        shm_name = dist_utils.get_shm_name(self.node_id, self.dp_rank)
+        ipc_path = dist_utils.get_ipc_socket_path(self.node_id, self.dp_rank)
 
         if self._is_host_coordinator:
             self._coord_pool = self._pool_create(self._coord_pool_spec,
@@ -1260,7 +1269,8 @@ class ZmqShmKvConnectorBase:
                 send_holders)
             return
 
-        remote_host, remote_port = self._resolve_remote_host_port(req_meta)
+        remote_host, remote_port, remote_side_channel_port = self._resolve_remote_host_port(
+            req_meta)
         entry = _CoordRecvEntry(
             req_id=req_id,
             uuid=req_meta.uuid,
@@ -1270,6 +1280,7 @@ class ZmqShmKvConnectorBase:
             remote_blocks=req_meta.remote_block_ids,
             remote_host=remote_host,
             remote_port=remote_port,
+            remote_side_channel_port=remote_side_channel_port,
         )
         with self._coord_lock:
             self._coord_recv[req_meta.uuid] = entry
@@ -1652,6 +1663,8 @@ class ZmqShmKvConnectorBase:
                 remote_block_ids=entry_for_notify.remote_blocks,
                 remote_host=entry_for_notify.remote_host,
                 remote_port=entry_for_notify.remote_port,
+                remote_side_channel_port=entry_for_notify.
+                remote_side_channel_port,
             )
             try:
                 self._coord_rank0_send_notify(dummy, uuid)
@@ -1666,9 +1679,16 @@ class ZmqShmKvConnectorBase:
         if not isinstance(remote_hosts, list):
             remote_hosts = [remote_hosts]
 
-        base_side_channel_port = int(dist_utils.get_side_channel_port())
+        # Determine the base port for the target DP group (without host/node offset)
+        if req_meta.remote_side_channel_port:
+            target_side_port_base = req_meta.remote_side_channel_port
+        else:
+            # Fallback to current DP group's base port
+            target_side_port_base = int(
+                dist_utils.get_side_channel_port()) + self.dp_rank
+
         for h_idx, r_host in enumerate(remote_hosts):
-            side_port = base_side_channel_port + h_idx
+            side_port = target_side_port_base + h_idx
             sock_path = make_zmq_path("tcp", r_host, side_port)
             # DEALER is not thread-safe; serialize create+send under the lock.
             with self._coord_sockets_lock:
@@ -1817,6 +1837,8 @@ class ZmqShmKvConnectorBase:
                         remote_block_ids=entry_for_notify.remote_blocks,
                         remote_host=entry_for_notify.remote_host,
                         remote_port=entry_for_notify.remote_port,
+                        remote_side_channel_port=entry_for_notify.
+                        remote_side_channel_port,
                     )
                     try:
                         self._coord_rank0_send_notify(dummy,

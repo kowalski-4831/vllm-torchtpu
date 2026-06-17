@@ -11,6 +11,7 @@ TPU.
 import threading
 import unittest
 from functools import partial
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -39,26 +40,45 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
     return KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
 
 
-def _make_vllm_config(*, is_producer: bool = True, block_size: int = 16):
+def _make_vllm_config(*,
+                      is_producer: bool = True,
+                      block_size: int = 16,
+                      dp_rank: int = 0,
+                      tp_size: int = 1):
     cfg = MagicMock()
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.kv_transfer_config.kv_connector_extra_config = {}
     cfg.cache_config.block_size = block_size
     cfg.model_config.max_model_len = 64
+    cfg.parallel_config.data_parallel_rank = dp_rank
+    cfg.parallel_config.tensor_parallel_size = tp_size
     return cfg
 
 
-def _make_scheduler(*, is_producer: bool = False):
+def _make_scheduler(*,
+                    is_producer: bool = False,
+                    dp_rank: int = 0,
+                    tp_size: int = 1,
+                    kv_ips: Any = "127.0.0.1",
+                    kv_ports: Any = 9100):
     """Construct a TPUConnectorScheduler with network calls patched out."""
-    cfg = _make_vllm_config(is_producer=is_producer)
-    with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value="127.0.0.1"), \
-         patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100):
+    cfg = _make_vllm_config(is_producer=is_producer,
+                            dp_rank=dp_rank,
+                            tp_size=tp_size)
+    with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value=kv_ips), \
+         patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=kv_ports), \
+         patch(f"{_MOD}.dist_utils.get_side_channel_port", return_value="9600"):
         return TPUConnectorScheduler(cfg)
 
 
-def _make_raiden_scheduler(*, is_producer: bool = False):
+def _make_raiden_scheduler(*,
+                           is_producer: bool = False,
+                           dp_rank: int = 0,
+                           tp_size: int = 1):
     """Construct a TPURaidenConnectorScheduler with network calls patched."""
-    cfg = _make_vllm_config(is_producer=is_producer)
+    cfg = _make_vllm_config(is_producer=is_producer,
+                            dp_rank=dp_rank,
+                            tp_size=tp_size)
     with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value="127.0.0.1"), \
          patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100):
         return TPURaidenConnectorScheduler(cfg)
@@ -67,7 +87,10 @@ def _make_raiden_scheduler(*, is_producer: bool = False):
 def _make_worker(*,
                  tp_rank: int = 0,
                  tp_size: int = 1,
-                 is_producer: bool = True) -> TPUConnectorWorker:
+                 is_producer: bool = True,
+                 dp_rank: int = 0,
+                 kv_ips: Any = "127.0.0.1",
+                 kv_ports: Any = 9100) -> TPUConnectorWorker:
     """Construct a TPUConnectorWorker with all I/O and device calls mocked.
 
     Patches are applied only during __init__; the returned object has real
@@ -75,12 +98,12 @@ def _make_worker(*,
     register_runner() is intentionally NOT called — tests that need it
     should mock _coord_setup and call it separately.
     """
-    cfg = _make_vllm_config(is_producer=is_producer)
+    cfg = _make_vllm_config(is_producer=is_producer, dp_rank=dp_rank)
     with patch(f"{_BASE}.get_tensor_model_parallel_rank", return_value=tp_rank), \
          patch(f"{_BASE}.get_tensor_model_parallel_world_size", return_value=tp_size), \
          patch(f"{_BASE}.dist_utils.get_node_id", return_value=0), \
-         patch(f"{_BASE}.dist_utils.get_host_ip", return_value="127.0.0.1"), \
-         patch(f"{_BASE}.dist_utils.get_kv_transfer_port", return_value="9100"), \
+         patch(f"{_BASE}.dist_utils.get_host_ip", return_value=kv_ips), \
+         patch(f"{_BASE}.dist_utils.get_kv_transfer_port", return_value=kv_ports), \
          patch(f"{_BASE}.dist_utils.get_side_channel_port", return_value="9600"), \
          patch(f"{_BASE}.dist_utils.get_transfer_channel_number", return_value=0), \
          patch(f"{_BASE}.dist_utils.get_kv_latency_log_interval", return_value=0.0), \
@@ -422,6 +445,49 @@ class TestTPUConnectorScheduler:
         self.consumer.kv_ip = ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
         assert self.consumer.get_finished_count() == 3
 
+    # ---- test DP configurations --------------------------------------------
+    def test_dp_port_configurations_singlehost(self):
+        scheduler = _make_scheduler(dp_rank=0, tp_size=1)
+        assert scheduler.kv_port == 9100
+        assert scheduler.side_channel_port == 9600
+
+        scheduler = _make_scheduler(dp_rank=1, tp_size=1)
+        assert scheduler.kv_port == 9101
+        assert scheduler.side_channel_port == 9601
+
+        scheduler = _make_scheduler(dp_rank=0, tp_size=4)
+        assert scheduler.kv_port == 9100
+        assert scheduler.side_channel_port == 9600
+
+        scheduler = _make_scheduler(dp_rank=1, tp_size=4)
+        assert scheduler.kv_port == 9104
+        assert scheduler.side_channel_port == 9601
+
+    def test_dp_port_configurations_multihost(self):
+        scheduler = _make_scheduler(dp_rank=0,
+                                    tp_size=1,
+                                    kv_ports=[9100, 9200])
+        assert scheduler.kv_port == [9100, 9200]
+        assert scheduler.side_channel_port == 9600
+
+        scheduler = _make_scheduler(dp_rank=1,
+                                    tp_size=1,
+                                    kv_ports=[9100, 9200])
+        assert scheduler.kv_port == [9101, 9201]
+        assert scheduler.side_channel_port == 9601
+
+        scheduler = _make_scheduler(dp_rank=0,
+                                    tp_size=4,
+                                    kv_ports=[9100, 9200])
+        assert scheduler.kv_port == [9100, 9200]
+        assert scheduler.side_channel_port == 9600
+
+        scheduler = _make_scheduler(dp_rank=1,
+                                    tp_size=4,
+                                    kv_ports=[9100, 9200])
+        assert scheduler.kv_port == [9104, 9204]
+        assert scheduler.side_channel_port == 9601
+
 
 # ---------------------------------------------------------------------------
 # TestTPURaidenConnectorScheduler — Raiden-specific scheduler behavior
@@ -688,6 +754,23 @@ class TestTPUConnectorWorkerInit:
         base = int(worker.kv_transfer_port)
         assert worker._kv_transfer_ports == [base, base + 1, base + 2]
 
+    def test_dp_port_configurations(self):
+        worker = _make_worker(dp_rank=0, tp_size=1)
+        assert worker.kv_transfer_port == 9100
+        assert worker.side_channel_port == 9600
+
+        worker = _make_worker(dp_rank=1, tp_size=1)
+        assert worker.kv_transfer_port == 9101
+        assert worker.side_channel_port == 9601
+
+        worker = _make_worker(dp_rank=0, tp_size=4)
+        assert worker.kv_transfer_port == 9100
+        assert worker.side_channel_port == 9600
+
+        worker = _make_worker(dp_rank=1, tp_size=4)
+        assert worker.kv_transfer_port == 9104
+        assert worker.side_channel_port == 9601
+
 
 # ---------------------------------------------------------------------------
 # TestKVCacheReplacement — runner / forward-context consistency
@@ -746,9 +829,11 @@ class TestResolveRemoteHostPort:
                         remote_block_ids=[0],
                         remote_host="1.2.3.4",
                         remote_port=9100)
-        host, port = self.worker._resolve_remote_host_port(meta)
+        host, port, side_channel_port = self.worker._resolve_remote_host_port(
+            meta)
         assert host == "1.2.3.4"
         assert port == 9100
+        assert side_channel_port is None
 
     def test_multi_host_selects_node_id_entry(self):
         # node_id=0 (set in _make_worker) → picks index 0
@@ -757,9 +842,24 @@ class TestResolveRemoteHostPort:
                         remote_block_ids=[0],
                         remote_host=["10.0.0.1", "10.0.0.2"],
                         remote_port=[9100, 9101])
-        host, port = self.worker._resolve_remote_host_port(meta)
+        host, port, side_channel_port = self.worker._resolve_remote_host_port(
+            meta)
         assert host == "10.0.0.1"
         assert port == 9100
+        assert side_channel_port is None
+
+    def test_multi_host_side_channel_port(self):
+        meta = LoadMeta(uuid=3,
+                        local_block_ids=[0],
+                        remote_block_ids=[0],
+                        remote_host=["10.0.0.1", "10.0.0.2"],
+                        remote_port=[9100, 9101],
+                        remote_side_channel_port=9200)
+        host, port, side_channel_port = self.worker._resolve_remote_host_port(
+            meta)
+        assert host == "10.0.0.1"
+        assert port == 9100
+        assert side_channel_port == 9200
 
 
 # ---------------------------------------------------------------------------

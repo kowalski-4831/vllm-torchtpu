@@ -26,6 +26,8 @@ def _make_vllm_config(*, is_producer: bool = True, block_size: int = 16):
     cfg = MagicMock()
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.cache_config.block_size = block_size
+    cfg.parallel_config.data_parallel_rank = 0
+    cfg.parallel_config.tensor_parallel_size = 1
     return cfg
 
 
