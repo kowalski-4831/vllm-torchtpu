@@ -296,6 +296,7 @@ def sharded_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     rpa_func: Callable = ragged_paged_attention,
+    soft_cap: float | None = None,
 ):
     """Shards along KV heads."""
 
@@ -341,6 +342,7 @@ def sharded_ragged_paged_attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            soft_cap=soft_cap,
         )
 
     return shard_map.shard_map(
@@ -366,6 +368,8 @@ def attention(
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
     rpa_func: Callable = ragged_paged_attention,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -382,6 +386,9 @@ def attention(
     if head_dim_original is None:
         head_dim_original = q.shape[-1]
 
+    if sm_scale is None:
+        sm_scale = head_dim_original**-0.5
+
     md = attention_metadata
 
     # (T, N, H)
@@ -396,12 +403,13 @@ def attention(
         md.query_start_loc,
         md.request_distribution,
         sinks,
-        sm_scale=head_dim_original**-0.5,
+        sm_scale=sm_scale,
         attention_chunk_size=attention_chunk_size,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
         rpa_func=rpa_func,
+        soft_cap=soft_cap,
     )
 
     return kv_cache, output

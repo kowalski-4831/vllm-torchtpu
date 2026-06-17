@@ -86,6 +86,8 @@ def _pallas_rpa_kernel_impl(
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
     rpa_func,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -108,6 +110,8 @@ def _pallas_rpa_kernel_impl(
         sinks=sinks,
         attention_chunk_size=sliding_window,
         rpa_func=rpa_func,
+        sm_scale=sm_scale,
+        soft_cap=soft_cap,
     )
     return new_kv_cache, outputs
 
@@ -128,6 +132,8 @@ def _pallas_rpa_kernel_default(
     *,
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -150,6 +156,8 @@ def _pallas_rpa_kernel_default(
         mesh=mesh,
         sliding_window=sliding_window,
         rpa_func=ragged_paged_attention,
+        sm_scale=sm_scale,
+        soft_cap=soft_cap,
     )
 
 
@@ -169,6 +177,8 @@ def _pallas_rpa_kernel_batched(
     *,
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -187,6 +197,8 @@ def _pallas_rpa_kernel_batched(
         mesh=mesh,
         sliding_window=sliding_window,
         rpa_func=ragged_paged_attention_batched,
+        sm_scale=sm_scale,
+        soft_cap=soft_cap,
     )
 
 
@@ -422,8 +434,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # variant) don't collide with the base impl in the shared registry.
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
-        registry_key = (self._kernel_op_prefix, self.sliding_window, id(mesh),
-                        q_scale, k_scale, v_scale)
+        registry_key = (self._kernel_op_prefix,
+                        self.sliding_window, self.scale, self.logits_soft_cap,
+                        id(mesh), q_scale, k_scale, v_scale)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             return existing
@@ -436,6 +449,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self._kernel_entry,
             mesh=mesh,
             sliding_window=self.sliding_window,
+            sm_scale=self.scale,
+            soft_cap=self.logits_soft_cap,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,

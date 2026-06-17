@@ -2381,7 +2381,12 @@ class TPUModelRunner(GPUModelRunner):
         layer_name_to_spec = {}
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
-                layer_name_to_spec[layer_name] = group.kv_cache_spec
+                if hasattr(group.kv_cache_spec, "kv_cache_specs"):
+                    layer_name_to_spec[
+                        layer_name] = group.kv_cache_spec.kv_cache_specs[
+                            layer_name]
+                else:
+                    layer_name_to_spec[layer_name] = group.kv_cache_spec
 
         kv_caches: dict[str, torch.Tensor] = {}
         # Actual leading-dim block count used for mamba state arrays, captured
@@ -2424,10 +2429,11 @@ class TPUModelRunner(GPUModelRunner):
                         raise NotImplementedError
                 num_blocks = tensor_size // total_group_page_size
             else:
-                page_size_bytes = layer_name_to_spec[
-                    shared_by[0]].page_size_bytes
-                assert tensor_size % page_size_bytes == 0
-                num_blocks = tensor_size // page_size_bytes
+                num_blocks = getattr(kv_cache_config, "num_blocks", None)
+                if num_blocks is None:
+                    page_size_bytes = layer_name_to_spec[
+                        shared_by[0]].page_size_bytes
+                    num_blocks = tensor_size // page_size_bytes
 
             for layer_name in shared_by:
                 kv_cache_spec = layer_name_to_spec[layer_name]
