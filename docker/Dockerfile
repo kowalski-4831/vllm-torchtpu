@@ -19,6 +19,10 @@ ARG TORCH_TPU_VERSION=""
 # Install curl for health checks (minimal for base)
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
+# Create the overrides file explicitly to pass to uv pip install
+RUN printf "numba>=0.62.1\ntorch==2.10.0\ntorchvision==0.25.0\nfastapi<0.137\n" > /tmp/overrides.txt
+
+
 # Stage 2.5: The CI Environment (with tools)
 FROM base AS ci
 
@@ -68,7 +72,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # This layer will be cached!
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config --index-url https://pypi.org/simple -r pyproject.toml
+    uv pip install --system --no-config --override /tmp/overrides.txt --index-url https://pypi.org/simple -r pyproject.toml
 
 # Install torch-tpu either from a fresh artifact image or the pinned registry version.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -97,7 +101,7 @@ FROM ci AS dev
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config --index-url https://pypi.org/simple -e ".[test,benchmarking]"
+    uv pip install --system --no-config --override /tmp/overrides.txt --index-url https://pypi.org/simple -e ".[test,benchmarking]"
 
 
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
@@ -113,7 +117,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     TOKEN=""; \
     if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config \
+    uv pip install --system --no-config --override /tmp/overrides.txt \
       --index-url https://pypi.org/simple \
       --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
       .
