@@ -31,6 +31,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.utils.math_utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
@@ -97,7 +98,9 @@ def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
 class TPUConnector(KVConnectorBase_V1):
     force_raiden_connector = False
 
-    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
+    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
+                 kv_cache_config: KVCacheConfig):
+        super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         self._connector_metadata: Optional[TPUConnectorMetadata] = None
         use_raiden = self.force_raiden_connector or _use_raiden_connector(

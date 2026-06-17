@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import torch
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -32,6 +33,10 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
 
 _MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
 _BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
+
+
+def _make_test_kv_cache_config() -> KVCacheConfig:
+    return KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
 
 
 def _make_vllm_config(*, is_producer: bool = True, block_size: int = 16):
@@ -107,7 +112,8 @@ class TestTPUConnector:
     @patch(f"{_MOD}.TPUConnectorScheduler")
     def test_init_scheduler_role(self, mock_sched_cls, mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER)
+        connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER,
+                                 _make_test_kv_cache_config())
         mock_sched_cls.assert_called_once_with(cfg)
         mock_worker_cls.assert_not_called()
         assert connector.connector_scheduler is not None
@@ -117,7 +123,8 @@ class TestTPUConnector:
     @patch(f"{_MOD}.TPUConnectorScheduler")
     def test_init_worker_role(self, mock_sched_cls, mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnector(cfg, KVConnectorRole.WORKER)
+        connector = TPUConnector(cfg, KVConnectorRole.WORKER,
+                                 _make_test_kv_cache_config())
         mock_worker_cls.assert_called_once_with(cfg)
         mock_sched_cls.assert_not_called()
         assert connector.connector_scheduler is None
@@ -128,7 +135,8 @@ class TestTPUConnector:
     def test_scheduler_method_delegation(self, mock_sched_cls,
                                          mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER)
+        connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER,
+                                 _make_test_kv_cache_config())
         sched = mock_sched_cls.return_value
         req, blocks, sched_out = MagicMock(), MagicMock(), MagicMock()
 
@@ -153,7 +161,8 @@ class TestTPUConnector:
     @patch(f"{_MOD}.TPUConnectorScheduler")
     def test_worker_method_delegation(self, mock_sched_cls, mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnector(cfg, KVConnectorRole.WORKER)
+        connector = TPUConnector(cfg, KVConnectorRole.WORKER,
+                                 _make_test_kv_cache_config())
         worker = mock_worker_cls.return_value
         runner, meta = MagicMock(), TPUConnectorMetadata()
 
@@ -177,8 +186,9 @@ class TestTPUConnector:
                                           mock_raiden_sched_cls,
                                           mock_raiden_worker_cls):
         cfg = _make_vllm_config()
-        TPUConnector(cfg, KVConnectorRole.SCHEDULER)
-        TPUConnector(cfg, KVConnectorRole.WORKER)
+        TPUConnector(cfg, KVConnectorRole.SCHEDULER,
+                     _make_test_kv_cache_config())
+        TPUConnector(cfg, KVConnectorRole.WORKER, _make_test_kv_cache_config())
 
         mock_sched_cls.assert_called_once_with(cfg)
         mock_worker_cls.assert_called_once_with(cfg)
@@ -197,8 +207,9 @@ class TestTPUConnector:
             "use_raiden_connector": True,
         }
 
-        TPUConnector(cfg, KVConnectorRole.SCHEDULER)
-        TPUConnector(cfg, KVConnectorRole.WORKER)
+        TPUConnector(cfg, KVConnectorRole.SCHEDULER,
+                     _make_test_kv_cache_config())
+        TPUConnector(cfg, KVConnectorRole.WORKER, _make_test_kv_cache_config())
 
         mock_raiden_sched_cls.assert_called_once_with(cfg)
         mock_raiden_worker_cls.assert_called_once_with(cfg)
@@ -214,8 +225,10 @@ class TestTPUConnector:
             mock_raiden_worker_cls):
         cfg = _make_vllm_config()
 
-        TPURaidenConnector(cfg, KVConnectorRole.SCHEDULER)
-        TPURaidenConnector(cfg, KVConnectorRole.WORKER)
+        TPURaidenConnector(cfg, KVConnectorRole.SCHEDULER,
+                           _make_test_kv_cache_config())
+        TPURaidenConnector(cfg, KVConnectorRole.WORKER,
+                           _make_test_kv_cache_config())
 
         mock_raiden_sched_cls.assert_called_once_with(cfg)
         mock_raiden_worker_cls.assert_called_once_with(cfg)
