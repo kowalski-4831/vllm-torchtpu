@@ -20,10 +20,30 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
+from vllm_torchtpu.layers.common.fused_moe_gmm import (fused_moe_func,
+                                                       unpack_fp4_to_e2m1)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, Optional[int]], Callable] = {}
+_load_kmajor_fp4_op = None
+
+
+def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
+    """One-time NVFP4 load transform: packed uint8 ``[..., N, K//2]`` -> native
+    fp4 ``torch.float4_e2m1fn_x2`` ``[..., K, N]`` (K-major).
+
+    Unpacks (bitcast uint8 -> float4_e2m1fn) and transposes the contracting axis
+    to gmm_v2's K-major layout ONCE at load. The result is stored as a native-fp4
+    Parameter, so the forward hands it straight to gmm_v2 with no per-forward
+    unpack or transpose (which keeps the 480B HBM footprint bounded). Requires
+    torch_tpu's native ``torch.float4_e2m1fn_x2`` dtype
+    (google-pytorch/torch_tpu#1560).
+    """
+    global _load_kmajor_fp4_op
+    if _load_kmajor_fp4_op is None:
+        _load_kmajor_fp4_op = pallas.jax_op("pallas::nvfp4_load_kmajor",
+                                            unpack_fp4_to_e2m1)
+    return _load_kmajor_fp4_op(w_u8)
 
 
 def _allocate_kernel_instance_id() -> int:

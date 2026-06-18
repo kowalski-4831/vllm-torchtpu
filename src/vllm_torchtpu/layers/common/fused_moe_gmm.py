@@ -42,6 +42,18 @@ else:
     ragged_gather_reduce = ragged_gather_reduce_v2
 
 
+def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
+    """Unpack a uint8-packed E2M1 weight (2 fp4 per byte along the last axis)
+    into ``float4_e2m1fn`` and move the contracting axis into GMM layout. Input
+    is the checkpoint layout ``[..., N, K/2]`` (output-major, packed contracting
+    dim last); output is ``[..., K, N]`` to match the ``[size_group, size_k,
+    size_n]`` rhs gmm_v2 expects. Run this once at weight load so the forward
+    pass hands native fp4 straight to the kernel with no per-forward unpack."""
+    fp4 = jax.lax.bitcast_convert_type(w_packed, jnp.float4_e2m1fn)
+    fp4 = fp4.reshape(*w_packed.shape[:-1], -1)  # [..., N, K]
+    return jnp.swapaxes(fp4, -1, -2)  # [..., K, N]
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -245,6 +257,10 @@ def fused_moe_func(
     SparseCore ragged gather/gather-reduce (vs the pre-#193 plain-JAX path).
     """
     num_tokens, hidden_size = hidden_states.shape
+
+    # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
+    # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
+    # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
     _, padded_hidden_size, _ = w1.shape
 
     assert topk_weights.shape == (num_tokens, topk)

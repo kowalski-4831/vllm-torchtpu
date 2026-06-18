@@ -36,6 +36,7 @@ from vllm_torchtpu.layers.common import quant_methods
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4Config
+from vllm_torchtpu.layers.vllm.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.vllm.quantization.unquantized import \
     VllmUnquantizedConfig
 from vllm_torchtpu.logger import init_logger
@@ -67,6 +68,7 @@ def get_tpu_quantization_config(
         None: VllmUnquantizedConfig,
         quant_methods.FP8: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,
+        quant_methods.NVFP4: VllmNvfp4Config,
         # TODO: Add more quantization methods as needed
         # quant_methods.AWQ: VllmAWQConfig,
         # quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,
