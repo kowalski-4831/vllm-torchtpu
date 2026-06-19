@@ -84,11 +84,6 @@ class TPUWorker(WorkerBase):
             self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype]
 
-        if self.model_config.trust_remote_code:
-            # Lazy import to avoid importing torch before initializing.
-            from vllm.utils.import_utils import init_cached_hf_modules
-            init_cached_hf_modules()
-
         # TPU profiler: only on rank 0 single-host, or every PP worker.
         self.profile_dir: str | None = None
         self.profile_context = None
