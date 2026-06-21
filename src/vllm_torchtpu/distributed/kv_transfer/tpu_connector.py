@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
@@ -46,8 +47,6 @@ import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm_hma import (
     HostKVShmPoolHMA, PoolSpecHMA)
-from vllm_torchtpu.distributed.kv_transfer.raiden_transfer_engine import \
-    RaidenTransferEngine
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
@@ -601,7 +600,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
         params = request.kv_transfer_params
         if num_external_tokens > 0:
-            local_block_ids = blocks.get_unhashed_block_ids()
+            # D must pull the WHOLE prefill payload: P publishes it under one
+            # uuid with no partial-pull, so load into every allocated block.
+            local_block_ids = blocks.get_block_ids()[0]
             if not local_block_ids:
                 self.reqs_to_load[request.request_id] = LoadMeta(
                     uuid=params["uuid"],
@@ -666,11 +667,16 @@ class TPURaidenConnectorWorker:
         self.tp_size = get_tensor_model_parallel_world_size()
         self.host_ip = dist_utils.get_host_ip()
         self.kv_transfer_port = int(dist_utils.get_kv_transfer_port())
-        self._raiden_transfer_engine: Optional[RaidenTransferEngine] = None
+        self._raiden_transfer_engine: Optional["KVCacheManager"] = None
         self._done_sending: set[str] = set()
         self._done_recving: set[str] = set()
         self._failed_recving: set[str] = set()
         self._suppress_done_recving: set[str] = set()
+        # Report each req's recv-completion to the scheduler at most once. vLLM's
+        # _update_from_kv_xfer_finished asserts a finished_recving req is still
+        # WAITING_FOR_REMOTE_KVS (or finished); a duplicate/late report (after
+        # the req was admitted -> RUNNING) trips that assert.
+        self._reported_recving: set[str] = set()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
             "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d",
@@ -691,9 +697,9 @@ class TPURaidenConnectorWorker:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
             for req_id, req_meta in metadata.reqs_to_send.items():
-                engine.register_send(req_id, req_meta.uuid,
+                engine.register_read(req_id, req_meta.uuid,
                                      req_meta.local_block_ids)
-                logger.info(
+                logger.debug(
                     "TPURaidenConnectorWorker rank%d --> registered send "
                     "req_id=%s uuid=%s blocks=%d", self.tp_rank, req_id,
                     req_meta.uuid, len(req_meta.local_block_ids))
@@ -704,8 +710,8 @@ class TPURaidenConnectorWorker:
             endpoint = self._resolve_remote_endpoint(req_meta)
             if (req_meta.remote_block_ids is None
                     and req_meta.local_block_ids is None):
-                engine.submit_load(req_id, req_meta.uuid, endpoint, [], [])
-                logger.info(
+                engine.start_read(req_id, req_meta.uuid, endpoint, [], [])
+                logger.debug(
                     "TPURaidenConnectorWorker rank%d --> released remote "
                     "send req_id=%s uuid=%s endpoint=%s", self.tp_rank, req_id,
                     req_meta.uuid, endpoint)
@@ -718,9 +724,9 @@ class TPURaidenConnectorWorker:
 
             remote_blocks = req_meta.remote_block_ids
             local_blocks = req_meta.local_block_ids
-            engine.submit_load(req_id, req_meta.uuid, endpoint, remote_blocks,
-                               local_blocks)
-            logger.info(
+            engine.start_read(req_id, req_meta.uuid, endpoint, remote_blocks,
+                              local_blocks)
+            logger.debug(
                 "TPURaidenConnectorWorker rank%d --> submitted load "
                 "req_id=%s uuid=%s endpoint=%s remote_blocks=%d "
                 "local_blocks=%d", self.tp_rank, req_id, req_meta.uuid,
@@ -735,14 +741,20 @@ class TPURaidenConnectorWorker:
         engine = self._ensure_raiden_transfer_engine()
         self._poll_finished(engine)
         done_sending = self._done_sending
-        done_recving = self._done_recving - self._suppress_done_recving
+        done_recving = (self._done_recving - self._suppress_done_recving -
+                        self._reported_recving)
         self._suppress_done_recving.difference_update(self._done_recving)
+        self._reported_recving.update(done_recving)
+        if done_recving:
+            logger.debug(
+                "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
+                self.tp_rank, done_recving)
         self._done_sending = set()
         self._done_recving = set()
         return done_sending, done_recving
 
-    def _poll_finished(self, engine: RaidenTransferEngine) -> None:
-        done_sending, done_recving, failed_recving = engine.poll_finished()
+    def _poll_finished(self, engine: "KVCacheManager") -> None:
+        done_sending, done_recving, failed_recving = engine.poll_stats()
         self._done_sending.update(done_sending)
         self._done_recving.update(done_recving)
         self._failed_recving.update(failed_recving)
@@ -774,7 +786,7 @@ class TPURaidenConnectorWorker:
                 return
             time.sleep(0.001)
 
-    def _ensure_raiden_transfer_engine(self) -> RaidenTransferEngine:
+    def _ensure_raiden_transfer_engine(self) -> "KVCacheManager":
         if self._raiden_transfer_engine is not None:
             return self._raiden_transfer_engine
         if self.runner is None:
@@ -783,9 +795,10 @@ class TPURaidenConnectorWorker:
         max_blocks = self._max_request_blocks()
         num_slots = self._num_raiden_slots(max_blocks)
         local_control_port = self._rank_control_port(self.kv_transfer_port)
-        engine = RaidenTransferEngine(
+        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+        engine = KVCacheManager(
             kv_caches=list(self.runner.kv_caches),
-            tp_rank=self.tp_rank,
+            node_id=self.tp_rank,
             local_control_port=local_control_port,
             max_blocks=max_blocks,
             num_slots=num_slots,

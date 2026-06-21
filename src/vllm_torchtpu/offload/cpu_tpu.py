@@ -85,6 +85,7 @@ from __future__ import annotations
 import os
 import queue as _queue
 import threading
+import time
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -204,8 +205,16 @@ def _install_flush_pending_scatters_hook() -> None:
         start_kv_transfers_with_flush)
 
 
-_install_scheduler_scatter_now_hook()
-_install_flush_pending_scatters_hook()
+# These hooks reshape the OffloadingConnector's store/load dispatch into the
+# torch handler's deferred-scatter + lockstep flow (flush_pending_scatters,
+# _unsubmitted_store_jobs). The raiden handler does direct D2h/H2d + poll-based
+# get_finished and uses the STOCK connector dispatch/completion path, so
+# installing these would replace start_kv_transfers with a flow it doesn't
+# participate in -- leaving the scheduler's store-completion/block-free gate
+# unsatisfied and the engine busy-spinning. Only install for the torch path.
+if os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN", "0") != "1":
+    _install_scheduler_scatter_now_hook()
+    _install_flush_pending_scatters_hook()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -899,6 +908,122 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
 
 # ---------------------------------------------------------------------------
+# Raiden-backed offloading handler
+# ---------------------------------------------------------------------------
+
+# When set, KV offload uses raiden's KVCacheManager.D2h/H2d — direct PJRT
+# raw-buffer DMA between the device KV cache and raiden's DmaMapped host pool —
+# instead of the torch Pallas-gather + copy_ + scatter path. No device staging
+# buffer, no cpu_pool tensor, no scatter-now gate (the DMA writes kv_cache
+# directly; there is no scatter HLO to dispatch in lockstep).
+_USE_RAIDEN_OFFLOAD = os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN", "0") == "1"
+
+
+class _RaidenOffloadingHandler(OffloadingHandler):
+    """One-direction (D2H or H2D) KV offload via raiden's direct DMA.
+
+    `transfer_async` issues `mgr.D2h`/`mgr.H2d` (kernel-block granular) and
+    tracks the returned `RaidenFuture`; `get_finished` polls it. The host pool
+    lives inside raiden (DmaMapped), so there is no `cpu_pool` tensor here.
+    """
+
+    def __init__(self, mgr, tpu_to_cpu: bool, src_block_size_factor: int,
+                 dst_block_size_factor: int, bytes_per_kernel_block: int):
+        self._mgr = mgr
+        self.tpu_to_cpu = tpu_to_cpu
+        self.src_block_size_factor = src_block_size_factor
+        self.dst_block_size_factor = dst_block_size_factor
+        self._bytes_per_kernel_block = bytes_per_kernel_block
+        self.transfer_type = ("GPU", "CPU") if tpu_to_cpu else ("CPU", "GPU")
+        self._pending: dict[int, tuple] = {}
+
+    def _expand_kernel_ids(
+            self,
+            transfer_spec: TransferSpec) -> tuple[np.ndarray, np.ndarray]:
+        """Expand (src, dst) scheduler block IDs to kernel-block IDs.
+
+        Mirrors SingleDirectionOffloadingHandler.transfer_async so D2H/H2D
+        granularity matches the torch path exactly.
+        """
+        src_spec, dst_spec = transfer_spec
+        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
+        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+        src_blocks = src_spec.block_ids
+        dst_blocks = dst_spec.block_ids
+        assert src_blocks.ndim == 1 and dst_blocks.ndim == 1
+
+        src_sub_count = src_blocks.size * self.src_block_size_factor
+        dst_sub_count = dst_blocks.size * self.dst_block_size_factor
+        src_skip = -dst_blocks.size % self.src_block_size_factor
+        assert dst_sub_count == src_sub_count - src_skip
+
+        src_expanded = np.empty(src_sub_count, dtype=np.int64)
+        dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
+        expand_block_ids(src_blocks,
+                         self.src_block_size_factor,
+                         src_expanded,
+                         skip_count=src_skip)
+        expand_block_ids(dst_blocks, self.dst_block_size_factor, dst_expanded)
+        return src_expanded[src_skip:], dst_expanded
+
+    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
+        # src/dst are kernel-block IDs. D2H: src=device blocks, dst=host slots;
+        # H2D: src=host slots, dst=device blocks — matching D2h/H2d's
+        # (src_offsets_major_dim, dst_offsets_major_dim) contract.
+        src_ids, dst_ids = self._expand_kernel_ids(transfer_spec)
+        n = len(dst_ids)
+        sizes = [1] * n  # one major-dim slice (= one kernel block) per segment
+        if self.tpu_to_cpu:
+            fut = self._mgr.D2h(src_ids.tolist(), dst_ids.tolist(), sizes)
+        else:
+            fut = self._mgr.H2d(src_ids.tolist(), dst_ids.tolist(), sizes)
+        self._pending[job_id] = (fut, n * self._bytes_per_kernel_block)
+        return True
+
+    def get_finished(self) -> list[TransferResult]:
+        results: list[TransferResult] = []
+        for job_id in list(self._pending.keys()):
+            fut, num_bytes = self._pending[job_id]
+            if not fut.is_ready():
+                continue
+            # Poll-only completion: is_ready() True means the DMA finished. Do
+            # NOT call fut.wait()/Await here -- PJRT_Event_Await (and the
+            # xla::Future BlockUntilReady it also drains) can deadlock against
+            # the concurrently-executing model. The disagg connector likewise
+            # reports completion by polling (complete_read) and never blocks.
+            results.append(
+                TransferResult(
+                    job_id=job_id,
+                    success=True,
+                    transfer_size=num_bytes,
+                    transfer_time=1e-9,
+                    transfer_type=self.transfer_type,
+                ))
+            # Completed: drop the future (its keep-alives release the buffers).
+            del self._pending[job_id]
+        return results
+
+    def wait(self, job_ids: set[int]) -> None:
+        """Block until the named transfers complete (flush primitive).
+
+        Mirrors SingleDirectionOffloadingHandler.wait: cleanup (popping
+        `_pending`, emitting TransferResults) is left to the next
+        `get_finished()`, which the scheduler relies on to mark jobs done.
+        """
+        # Flush by POLLING is_ready (never the blocking Await, which can
+        # deadlock against the live model -- see get_finished). Mirrors the
+        # disagg poll pattern.
+        remaining = {jid for jid in job_ids if jid in self._pending}
+        while remaining:
+            for jid in list(remaining):
+                entry = self._pending.get(jid)
+                if entry is None or entry[0].is_ready():
+                    remaining.discard(jid)
+            if remaining:
+                time.sleep(0.0005)
+
+
+# ---------------------------------------------------------------------------
 # Factory: allocates CPU pinned tensors, creates bidirectional handlers
 # ---------------------------------------------------------------------------
 
@@ -976,14 +1101,56 @@ class CpuTpuOffloadingHandlers:
             # gather/scatter step copies between cpu_pool and that pinned
             # staging buffer. Pinning the full cpu_pool would lock hundreds
             # of GB and starve the libtpu premap region.
-            cpu_tensor = torch.zeros(
-                cpu_shape,
-                dtype=kv_dtype,
-                device="cpu",
-            )
-            total_bytes += cpu_tensor.element_size() * cpu_tensor.numel()
             tpu_tensors.append(tpu_tensor)
-            cpu_tensors.append(cpu_tensor)
+            if not _USE_RAIDEN_OFFLOAD:
+                cpu_tensor = torch.zeros(
+                    cpu_shape,
+                    dtype=kv_dtype,
+                    device="cpu",
+                )
+                total_bytes += cpu_tensor.element_size() * cpu_tensor.numel()
+                cpu_tensors.append(cpu_tensor)
+
+        if _USE_RAIDEN_OFFLOAD:
+            # raiden owns a DmaMapped host pool (no cpu_pool tensor). Build one
+            # KVCacheManager over the device KV-cache views; two direct-DMA
+            # handlers share it. host_blocks_to_allocate matches the scheduler's
+            # CPU pool sized in kernel blocks, so CPU block IDs map 1:1 to
+            # raiden host slots after expand_block_ids.
+            from tpu_raiden.api.torch import kv_cache_manager as _kcm
+            device_tensors = [[t] for t in tpu_tensors]
+            # raiden holds raw pointers / PJRT aliases to these device buffers
+            # for its lifetime. Keep the tensors (and thus the underlying
+            # buffers) alive on the factory, or they get GC'd after __init__
+            # and raiden's D2h/H2d dereferences freed buffers (segfault).
+            self._raiden_device_tensors = device_tensors
+            self._raiden_mgr = _kcm._impl.KVCacheManager(
+                device_tensors,
+                host_blocks_to_allocate=num_cpu_kernel_blocks,
+                unsafe_skip_buffer_lock=True,
+            )
+            bytes_per_kernel_block = (
+                int(np.prod(per_block_shape)) *
+                torch.empty(0, dtype=kv_dtype).element_size())
+            self.gpu_to_cpu_handler = _RaidenOffloadingHandler(
+                self._raiden_mgr,
+                tpu_to_cpu=True,
+                src_block_size_factor=gpu_block_size_factor,
+                dst_block_size_factor=cpu_block_size_factor,
+                bytes_per_kernel_block=bytes_per_kernel_block,
+            )
+            self.cpu_to_gpu_handler = _RaidenOffloadingHandler(
+                self._raiden_mgr,
+                tpu_to_cpu=False,
+                src_block_size_factor=cpu_block_size_factor,
+                dst_block_size_factor=gpu_block_size_factor,
+                bytes_per_kernel_block=bytes_per_kernel_block,
+            )
+            logger.info(
+                "[kv-offload] RAIDEN direct-DMA offload: %d host kernel blocks",
+                num_cpu_kernel_blocks,
+            )
+            return
 
         logger.debug(
             "[kv-offload] Allocated %.2f GiB unpinned CPU pool",

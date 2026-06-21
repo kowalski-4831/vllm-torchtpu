@@ -573,7 +573,7 @@ class TestTPURaidenConnectorScheduler:
             "remote_port": 9200,
         }
         blocks = MagicMock()
-        blocks.get_unhashed_block_ids.return_value = [1, 2]
+        blocks.get_block_ids.return_value = ([1, 2], )
 
         self.consumer.update_state_after_alloc(req, blocks, 32)
 
@@ -583,7 +583,7 @@ class TestTPURaidenConnectorScheduler:
         assert meta.remote_block_ids == [10, 11]
         assert meta.remote_host == "2.2.2.2"
         assert meta.remote_port == 9200
-        blocks.get_block_ids.assert_not_called()
+        blocks.get_unhashed_block_ids.assert_not_called()
 
     def test_update_consumer_partial_prefix_hit_loads_only_suffix(self):
         req = MagicMock()
@@ -595,7 +595,7 @@ class TestTPURaidenConnectorScheduler:
             "remote_port": 9200,
         }
         blocks = MagicMock()
-        blocks.get_unhashed_block_ids.return_value = [4]
+        blocks.get_block_ids.return_value = ([4], )
 
         self.consumer.update_state_after_alloc(req, blocks, 16)
 
@@ -613,7 +613,7 @@ class TestTPURaidenConnectorScheduler:
             "remote_port": 9200,
         }
         blocks = MagicMock()
-        blocks.get_unhashed_block_ids.return_value = []
+        blocks.get_block_ids.return_value = ([], )
 
         self.consumer.update_state_after_alloc(req, blocks, 16)
 
@@ -631,17 +631,17 @@ class _FakeRaidenEngine:
         self.calls = []
         self.poll_results = [(["sent"], ["recv"], [])]
 
-    def register_send(self, req_id, uuid, block_ids):
-        self.calls.append(("register_send", req_id, uuid, block_ids))
+    def register_read(self, req_id, uuid, block_ids):
+        self.calls.append(("register_read", req_id, uuid, block_ids))
         return 1
 
-    def submit_load(self, req_id, uuid, endpoint, remote_blocks, local_blocks):
-        self.calls.append(("submit_load", req_id, uuid, endpoint,
-                           remote_blocks, local_blocks))
+    def start_read(self, req_id, uuid, endpoint, remote_blocks, local_blocks):
+        self.calls.append(("start_read", req_id, uuid, endpoint, remote_blocks,
+                           local_blocks))
         return 2
 
-    def poll_finished(self):
-        self.calls.append(("poll_finished", ))
+    def poll_stats(self):
+        self.calls.append(("poll_stats", ))
         if self.poll_results:
             return self.poll_results.pop(0)
         return [], [], []
@@ -660,7 +660,7 @@ class TestTPURaidenConnectorWorker:
 
         self.worker.process_send_load(meta)
 
-        assert self.engine.calls == [("register_send", "req", 123, [7, 8])]
+        assert self.engine.calls == [("register_read", "req", 123, [7, 8])]
 
     def test_consumer_submits_loads_to_rank_endpoint(self):
         worker = _make_raiden_worker(is_producer=False)
@@ -674,7 +674,7 @@ class TestTPURaidenConnectorWorker:
 
         worker.process_send_load(meta)
 
-        assert self.engine.calls == [("submit_load", "req", 5, "10.1.2.3:9202",
+        assert self.engine.calls == [("start_read", "req", 5, "10.1.2.3:9202",
                                       [9], [1])]
 
     def test_consumer_releases_cleared_remote_metadata(self):
@@ -689,12 +689,12 @@ class TestTPURaidenConnectorWorker:
 
         worker.process_send_load(meta)
 
-        assert self.engine.calls == [("submit_load", "req", 5, "10.1.2.3:9202",
+        assert self.engine.calls == [("start_read", "req", 5, "10.1.2.3:9202",
                                       [], [])]
 
     def test_get_finished_returns_engine_sets(self):
         assert self.worker.get_finished() == ({"sent"}, {"recv"})
-        assert self.engine.calls == [("poll_finished", )]
+        assert self.engine.calls == [("poll_stats", )]
 
     def test_consumer_waits_for_submitted_load_completion(self):
         worker = _make_raiden_worker(is_producer=False)
@@ -711,9 +711,9 @@ class TestTPURaidenConnectorWorker:
         worker.process_send_load(meta, wait_for_completion=True)
 
         assert engine.calls == [
-            ("submit_load", "req", 5, "10.1.2.3:9202", [9], [1]),
-            ("poll_finished", ),
-            ("poll_finished", ),
+            ("start_read", "req", 5, "10.1.2.3:9202", [9], [1]),
+            ("poll_stats", ),
+            ("poll_stats", ),
         ]
         assert worker.get_finished() == (set(), {"req"})
 
