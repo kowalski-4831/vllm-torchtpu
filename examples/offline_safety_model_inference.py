@@ -24,8 +24,6 @@ import vllm.envs as vllm_envs
 from vllm import LLM, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_torchtpu.core import disagg_utils
-
 
 def get_llama_guard_4_config():
     """Configuration specific to the Llama Guard 4 model."""
@@ -225,15 +223,4 @@ if __name__ == "__main__":
     parser = create_parser()
     args: dict = vars(parser.parse_args())
 
-    # The disagg_utils logic is kept for consistency with the original script.
-    if not disagg_utils.is_disagg_enabled():
-        main(args)
-    else:
-        from unittest.mock import patch
-
-        from vllm_torchtpu.core.core_tpu import (DisaggEngineCore,
-                                                 DisaggEngineCoreProc)
-
-        with patch("vllm.v1.engine.core.EngineCore", DisaggEngineCore), patch(
-                "vllm.v1.engine.core.EngineCoreProc", DisaggEngineCoreProc):
-            main(args)
+    main(args)

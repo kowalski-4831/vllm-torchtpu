@@ -6,15 +6,11 @@ in MODEL_CONFIG_MAP. It dynamically loads the full AILuminate dataset,
 applies the model's specific chat template, and asserts the final classification
 accuracy against the CI's required minimum threshold.
 """
-from unittest.mock import patch
-
 import pandas as pd
 import pytest
 from vllm import LLM
 from vllm.inputs import TokensPrompt
 from vllm.platforms import current_platform
-
-from vllm_torchtpu.core import disagg_utils
 
 # --- HAZARD MAPPING ---
 # This mapping is based on the MLCommons taxonomy and is needed for the data loader.
@@ -203,16 +199,8 @@ def test_safety_model_accuracy_check(
         "dtype": "bfloat16"
     }
 
-    # 3. Initialize LLM (Mocking the disagg path if necessary)
-    if disagg_utils.is_disagg_enabled():
-        # NOTE: This assumes the required Disagg classes are accessible/mocked by the runner
-        from vllm_torchtpu.core.core_tpu import (DisaggEngineCore,
-                                                 DisaggEngineCoreProc)
-        with patch("vllm.v1.engine.core.EngineCore", DisaggEngineCore), patch(
-                "vllm.v1.engine.core.EngineCoreProc", DisaggEngineCoreProc):
-            llm = LLM(**llm_args)
-    else:
-        llm = LLM(**llm_args)
+    # 3. Initialize LLM
+    llm = LLM(**llm_args)
 
     # 4. Prepare Prompts (Tokenization)
     tokenizer = llm.llm_engine.tokenizer

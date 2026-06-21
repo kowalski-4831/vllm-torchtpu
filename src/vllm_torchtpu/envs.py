@@ -12,8 +12,6 @@ if TYPE_CHECKING:
     TPU_NAME: str | None = None
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
-    PREFILL_SLICES: str = ""
-    DECODE_SLICES: str = ""
     SKIP_JAX_PRECOMPILE: bool = False
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     MODEL_IMPL_TYPE: str = "vllm"
@@ -118,12 +116,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Backend for multi-host communication on TPU
     "TPU_MULTIHOST_BACKEND":
     env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray"]),
-    # Slice configuration for disaggregated prefill workers
-    "PREFILL_SLICES":
-    lambda: os.getenv("PREFILL_SLICES", ""),
-    # Slice configuration for disaggregated decode workers
-    "DECODE_SLICES":
-    lambda: os.getenv("DECODE_SLICES", ""),
     # Skip JAX precompilation step during initialization
     "SKIP_JAX_PRECOMPILE":
     lambda: bool(int(os.getenv("SKIP_JAX_PRECOMPILE") or "0")),

@@ -7,7 +7,6 @@ import os
 from vllm import LLM, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_torchtpu.core import disagg_utils
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -143,14 +142,4 @@ if __name__ == "__main__":
     parser = create_parser()
     args: dict = vars(parser.parse_args())
 
-    if not disagg_utils.is_disagg_enabled():
-        main(args)
-    else:
-        from unittest.mock import patch
-
-        from vllm_torchtpu.core.core_tpu import (DisaggEngineCore,
-                                                 DisaggEngineCoreProc)
-
-        with patch("vllm.v1.engine.core.EngineCore", DisaggEngineCore), patch(
-                "vllm.v1.engine.core.EngineCoreProc", DisaggEngineCoreProc):
-            main(args)
+    main(args)
