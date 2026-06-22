@@ -266,7 +266,7 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
                                  rhs_scale=rhs_scale,
                                  rhs_bias=rhs_bias,
                                  group_offset=group_offset)
-    expected = apply_act_fn(raw_expected.astype(jnp.float32), final_out_size,
+    expected = apply_act_fn(raw_expected.astype(jnp.float32),
                             fuse_act).astype(lhs.dtype)
 
     actual = gmm_v2(

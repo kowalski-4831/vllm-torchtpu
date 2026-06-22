@@ -35,7 +35,6 @@ def _reference_fused_moe(hidden_states, w1, w2, w1_bias, w2_bias, topk_weights,
                          topk_ids, activation):
     num_tokens, hidden_size = hidden_states.shape
     padded_hidden_size = w1.shape[1]
-    intermediate_size = w2.shape[1]
 
     hidden_states = jnp.pad(hidden_states,
                             ((0, 0), (0, padded_hidden_size - hidden_size)))
@@ -53,8 +52,7 @@ def _reference_fused_moe(hidden_states, w1, w2, w1_bias, w2_bias, topk_weights,
             if w1_bias is not None:
                 gate_up = gate_up + w1_bias[expert_id, 0].astype(jnp.float32)
 
-            activated = apply_act_fn(gate_up[None], intermediate_size,
-                                     activation)[0]
+            activated = apply_act_fn(gate_up[None], activation)[0]
             proj = jnp.matmul(activated.astype(jnp.float32),
                               w2[expert_id].astype(jnp.float32))
             if w2_bias is not None:
