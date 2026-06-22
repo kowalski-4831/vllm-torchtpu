@@ -88,6 +88,8 @@ def _pallas_rpa_kernel_impl(
     rpa_func,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
+    shard: bool = True,
+    kv_block_cap: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -112,6 +114,8 @@ def _pallas_rpa_kernel_impl(
         rpa_func=rpa_func,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
+        shard=shard,
+        kv_block_cap=kv_block_cap,
     )
     return new_kv_cache, outputs
 
@@ -158,6 +162,62 @@ def _pallas_rpa_kernel_default(
         rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
+    )
+
+
+# KV-fetch block cap (tokens) for the tp=1 eagle3 draft's local RPA kernel.
+# Capping bkv shrinks the dominant KV scratch tile; the flash kernel loops over more KV chunks.
+# 1024 was validated on Llama-3.1-8B (TP=2) and Qwen3-Coder-480b(TP=8). Models with
+# many KV heads or longer sequences may need a smaller value to avoid VMEM OOM.
+_DRAFT_KV_BLOCK_CAP = 1024
+
+
+def _pallas_rpa_kernel_local(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
+
+    Identical to `_pallas_rpa_kernel_default` but invokes the kernel WITHOUT
+    shard_map (`shard=False`), so the output lands on the worker's own device
+    instead of a global chip-0 partition. Also caps the KV-fetch block via
+    `kv_block_cap` for speculative decoding draft model.
+    """
+    return _pallas_rpa_kernel_impl(
+        kv_cache,
+        query,
+        key,
+        value,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sinks,
+        q_scale,
+        k_scale,
+        v_scale,
+        mesh=mesh,
+        sliding_window=sliding_window,
+        rpa_func=ragged_paged_attention,
+        sm_scale=sm_scale,
+        soft_cap=soft_cap,
+        shard=False,
+        kv_block_cap=_DRAFT_KV_BLOCK_CAP,
     )
 
 

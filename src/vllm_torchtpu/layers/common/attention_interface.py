@@ -297,6 +297,8 @@ def sharded_ragged_paged_attention(
     v_scale: float | None = None,
     rpa_func: Callable = ragged_paged_attention,
     soft_cap: float | None = None,
+    shard: bool = True,
+    kv_block_cap: int | None = None,
 ):
     """Shards along KV heads."""
 
@@ -334,6 +336,37 @@ def sharded_ragged_paged_attention(
         in_specs += (P(ShardingAxisName.ATTN_HEAD), )
         args += (attention_sink, )
 
+    # Speculative decoding draft-only VMEM relief: cap the KV-fetch block on the local path.
+    block_kwargs: dict[str, Any] = {}
+    if not shard and kv_block_cap is not None and not use_hd64:
+        page_size = kv_cache.shape[1]
+        max_num_seqs = kv_lens.shape[0]
+        pages_per_seq = page_indices.shape[0] // max_num_seqs
+        cap_tokens = max(page_size, (kv_block_cap // page_size) * page_size)
+
+        def _capped(case):
+            bs = rpa_default.get_default_block_sizes(
+                q.dtype,
+                kv_cache.dtype,
+                q.shape[1],  # actual_num_q_heads
+                k.shape[1],  # actual_num_kv_heads
+                q.shape[2],  # head_dim
+                page_size,
+                q.shape[0],  # max_num_tokens
+                max_num_seqs,
+                pages_per_seq,
+                case=case,
+            )
+            bkv = min(bs["bkv_sz"], cap_tokens)
+            bkv_csz = min(bs["bkv_csz"], bkv)
+            return (bs["bq_sz"], bkv, bs["bq_csz"], bkv_csz)
+
+        block_kwargs["d_block_sizes"] = _capped(rpa_default.RpaCase.DECODE)
+        block_kwargs["m_block_sizes"] = _capped(rpa_default.RpaCase.MIXED)
+        if attention_chunk_size is not None:
+            block_kwargs["p_block_sizes"] = _capped(
+                rpa_default.RpaCase.PREFILL)
+
     def _ragged_paged_attention(*args):
         return func(
             *args,
@@ -343,7 +376,12 @@ def sharded_ragged_paged_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             soft_cap=soft_cap,
+            **block_kwargs,
         )
+
+    if not shard:
+        # Local per-worker path: run the kernel directly on the worker's device.
+        return _ragged_paged_attention(*args)
 
     return shard_map.shard_map(
         _ragged_paged_attention,
@@ -370,6 +408,8 @@ def attention(
     rpa_func: Callable = ragged_paged_attention,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
+    shard: bool = True,
+    kv_block_cap: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -410,6 +450,8 @@ def attention(
         v_scale=v_scale,
         rpa_func=rpa_func,
         soft_cap=soft_cap,
+        shard=shard,
+        kv_block_cap=kv_block_cap,
     )
 
     return kv_cache, output

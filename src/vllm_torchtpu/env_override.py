@@ -8,6 +8,15 @@ import os
 # The issue was introduced by vllm-project/vllm#26440
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
+# Disable forced graph breaks for functional collectives by default.
+# torch_tpu commit 477f611f made the collective-ops graph-break guardrail
+# active by default on module import in non-absl environments, causing a
+# Dynamo Unsupported crash during vLLM startup (fullgraph=True). Setting
+# this to false allows functional collectives to compile under SPMD, which
+# is safe and required for Tensor Parallelism.
+os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+                      "false")
+
 # Map VLLM_XLA_CACHE_PATH to TorchTPU compilation cache environment variables
 vllm_xla_cache_path = os.getenv("VLLM_XLA_CACHE_PATH")
 if vllm_xla_cache_path:

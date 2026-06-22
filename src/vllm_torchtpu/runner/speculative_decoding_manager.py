@@ -1,17 +1,5 @@
-# Copyright 2025 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,6 +9,8 @@ import numpy as np
 import torch
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -61,18 +51,36 @@ class SpeculativeDecodingManager:
     def propose_draft_token_ids(
         self,
         sampled_token_ids: list[list[int]],
+        discard_sampled_tokens_req_indices: list[int] | None = None,
+        num_rejected_tokens_np: np.ndarray | None = None,
+        scheduler_output=None,
     ) -> None:
         """Proposes draft token IDs based on the speculative decoding method.
 
     Args:
       sampled_token_ids: The token IDs sampled in the previous step.
+      discard_sampled_tokens_req_indices: Request indices whose sampled
+        tokens should be discarded (partial-prefill case).
+      num_rejected_tokens_np: Per-request count of draft tokens rejected
+        this step.
+      scheduler_output: vLLM SchedulerOutput; needed by eagle3 for partial
+        prefill next-token lookup.
     """
+        num_reqs = self.runner.input_batch.num_reqs
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             self._draft_token_ids = self.runner.drafter.propose(
-                sampled_token_ids[:self.runner.input_batch.num_reqs],
+                sampled_token_ids[:num_reqs],
                 self.runner.input_batch.num_tokens_no_spec,
                 self.runner.input_batch.token_ids_cpu,
+            )
+        elif self.runner.speculative_config.method == "eagle3":
+            assert isinstance(self.runner.drafter, Eagle3Proposer)
+            self._draft_token_ids = self.runner.drafter.propose(
+                sampled_token_ids[:num_reqs],
+                discard_sampled_tokens_req_indices or [],
+                num_rejected_tokens_np,
+                scheduler_output,
             )
         else:
             raise NotImplementedError(
