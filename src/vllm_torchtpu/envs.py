@@ -29,9 +29,8 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
-    SC_KERNEL_THRESHOLD: int = 16777216
-    SC_KERNEL_COL_CHUNK_SIZE: int = 3072
     USE_MOE_SPARSE_CORE: bool = False
+    ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
 
 
 def env_with_choices(
@@ -174,21 +173,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ref", "chunked_jax_pd", "chunked_kernel_pd", "chunked_kernel_p_jax_d",
         "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd"
     ]),
-    # SparseCore gather-reduce knobs. Threshold is compared with routed
-    # row count; this path is disabled until its numeric issue is fixed.
-    # Column chunk size is in output columns and must divide the output
-    # hidden size before sc_gather_reduce is re-enabled.
-    "SC_KERNEL_THRESHOLD":
-    lambda: int(os.getenv("SC_KERNEL_THRESHOLD") or "16777216"),
-    "SC_KERNEL_COL_CHUNK_SIZE":
-    lambda: int(os.getenv("SC_KERNEL_COL_CHUNK_SIZE") or "3072"),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
-    # gather/scatter and sc_gather_reduce fall back to the pre-#193 plain-JAX
+    # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors
     # upstream vLLM's VLLM_USE_FLASHINFER_MOE_* style of env-gated MoE kernel
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "0")),
+    # Use Onehot+Matmul for permute and unpermute before and after moe
+    # when the batch size <= this threshold. When set to 0, this feature
+    # is effectively disabled.
+    "ONEHOT_MOE_PERMUTE_THRESHOLD":
+    lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD") or "0"),
 }
 
 

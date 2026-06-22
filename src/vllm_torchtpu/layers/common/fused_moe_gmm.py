@@ -17,11 +17,10 @@ import functools
 import jax
 from jax import numpy as jnp
 
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.sparse_core import gather_reduce as gather_reduce_sc
 from vllm_torchtpu.kernels.sparse_core.ragged_gather import ragged_gather
-from vllm_torchtpu.kernels.sparse_core.ragged_scatter import ragged_scatter
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
+    ragged_gather_reduce
 
 
 def gmm_wrapper(lhs,
@@ -55,6 +54,7 @@ def prepare_routed_gmm_inputs(
     topk: int,
     use_ep: bool,
     use_sparse_core: bool,
+    onehot_moe_permute_threshold: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -84,16 +84,24 @@ def prepare_routed_gmm_inputs(
     group_sizes_local = group_sizes_local.sum(axis=0)
 
     if use_ep and use_sparse_core:
-        # Match uLLM/reference EP routing: materialize the valid local
-        # expert prefix through SparseCore ragged_gather. Invalid
-        # non-local rows are sorted after the valid prefix.
-        valid_count = group_sizes_local.sum(dtype=jnp.int32)
-        x = ragged_gather(
-            hidden_states_local,
-            token_indices_sorted,
-            jnp.array([0], dtype=jnp.int32),
-            valid_count[None],
-        )
+        if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
+            # Use one-hot matmul for permutation, which can be faster
+            # for small batch size
+            onehot = jax.nn.one_hot(token_indices_sorted,
+                                    num_tokens_local,
+                                    dtype=hidden_states_local.dtype)
+            x = onehot @ hidden_states_local
+        else:
+            # Match uLLM/reference EP routing: materialize the valid local
+            # expert prefix through SparseCore ragged_gather. Invalid
+            # non-local rows are sorted after the valid prefix.
+            valid_count = group_sizes_local.sum(dtype=jnp.int32)
+            x = ragged_gather(
+                hidden_states_local,
+                token_indices_sorted,
+                jnp.array([0], dtype=jnp.int32),
+                valid_count[None],
+            )
     else:
         x = hidden_states_local[token_indices_sorted]
     return (x, group_sizes_local, argsort_revert_indices, topk_weights_flat,
@@ -118,12 +126,13 @@ def moe_gmm(
     topk: int,
     use_ep: bool,
     use_sparse_core: bool,
+    onehot_moe_permute_threshold: int = 0,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
-    EP uses uLLM/reference SparseCore ragged gather/scatter for token movement.
+    EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
@@ -142,27 +151,6 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    if (use_sparse_core and topk_weights_flat.size % 128 == 0
-            and gather_reduce_sc.is_supported_by_sc_gather_reduce(
-                gmm1_res.shape[0], envs.SC_KERNEL_THRESHOLD)):
-        gmm2_res = gmm_wrapper(gmm1_res,
-                               w2,
-                               w2_scale,
-                               w2_bias,
-                               group_sizes,
-                               group_offset,
-                               zero_initialize=True,
-                               preferred_element_type=jnp.float32)
-        topk_weights_sc = jnp.where(valid_mask_flat, topk_weights_flat,
-                                    0).astype(x.dtype).reshape(-1, 128)
-        return gather_reduce_sc.sc_gather_reduce(
-            op=gmm2_res,
-            idx=argsort_revert_indices,
-            reduce_group_size=topk,
-            topk_weights=topk_weights_sc,
-            col_chunk_size=envs.SC_KERNEL_COL_CHUNK_SIZE,
-        ).astype(x.dtype)
-
     gmm2_res = gmm_wrapper(gmm1_res,
                            w2,
                            w2_scale,
@@ -173,16 +161,25 @@ def moe_gmm(
                            preferred_element_type=x.dtype)
 
     if use_ep and use_sparse_core:
-        valid_count = group_sizes.sum(dtype=jnp.int32)
-        token_hidden = ragged_scatter(
+        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
+            # Use onehot + matmul for unpermutation, which can be faster
+            # for small batch size.
+            revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
+            onehot = jax.nn.one_hot(revert_indices,
+                                    argsort_revert_indices.size,
+                                    dtype=gmm2_res.dtype)
+            combine = (onehot * topk_weights[..., None] *
+                       valid_mask[..., None]).sum(axis=1)
+            return (combine @ gmm2_res).astype(x.dtype)
+        return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
-            jnp.array([0], dtype=jnp.int32),
-            valid_count[None],
-        )
-    else:
-        token_hidden = gmm2_res[argsort_revert_indices]
+            topk_weights_flat,
+            valid_mask_flat,
+            reduce_group_size=topk,
+        ).astype(x.dtype)
 
+    token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape(
         (num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights,
@@ -199,6 +196,7 @@ def moe_gmm(
         "activation",
         "use_ep",
         "use_sparse_core",
+        "onehot_moe_permute_threshold",
     ),
 )
 def fused_moe_func(
@@ -216,6 +214,7 @@ def fused_moe_func(
     activation: str = "silu",
     use_ep: bool = False,
     use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -224,7 +223,7 @@ def fused_moe_func(
     torch bridge. The kernel remaps global ids to local ids with an elementwise
     subtract and masks non-local experts. ``use_ep`` is a static flag enabling
     EP routing; ``use_sparse_core`` is a static flag selecting the #193
-    SparseCore ragged gather/scatter (vs the pre-#193 plain-JAX path).
+    SparseCore ragged gather/gather-reduce (vs the pre-#193 plain-JAX path).
     """
     num_tokens, hidden_size = hidden_states.shape
     _, padded_hidden_size, _ = w1.shape
@@ -253,6 +252,7 @@ def fused_moe_func(
          topk=topk,
          use_ep=use_ep,
          use_sparse_core=use_sparse_core,
+         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
      )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
@@ -272,5 +272,6 @@ def fused_moe_func(
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
     )
     return x[:num_tokens, :hidden_size]
