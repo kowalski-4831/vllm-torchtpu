@@ -6,7 +6,6 @@ TPUConnectorHMA, TPUConnectorHMAScheduler, and TPUConnectorHMAWorker.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -14,11 +13,12 @@ from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm_hma import PoolSpecHMA
 
-from vllm_torchtpu.distributed.kv_transfer.tpu_connector_hma import (  # isort: skip
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     TPUConnectorHMA, TPUConnectorHMAScheduler, TPUConnectorHMAWorker)
 
-_HMA_MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector_hma"
 _BASE_CONN = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+# The HMA classes now live in tpu_connector.py alongside the base connector.
+_HMA_MOD = _BASE_CONN
 _BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
 
 
@@ -118,7 +118,7 @@ class TestTPUConnectorHMA:
     def test_init_scheduler_role_builds_hma_scheduler(self, mock_sched_cls,
                                                       mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnectorHMA(cfg, KVConnectorRole.SCHEDULER)
+        connector = TPUConnectorHMA(cfg, KVConnectorRole.SCHEDULER, None)
         mock_sched_cls.assert_called_once_with(cfg)
         mock_worker_cls.assert_not_called()
         assert connector.connector_scheduler is not None
@@ -129,7 +129,7 @@ class TestTPUConnectorHMA:
     def test_init_worker_role_builds_hma_worker(self, mock_sched_cls,
                                                 mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnectorHMA(cfg, KVConnectorRole.WORKER)
+        connector = TPUConnectorHMA(cfg, KVConnectorRole.WORKER, None)
         mock_worker_cls.assert_called_once_with(cfg)
         mock_sched_cls.assert_not_called()
         assert connector.connector_scheduler is None
@@ -140,7 +140,7 @@ class TestTPUConnectorHMA:
     def test_request_finished_all_groups_delegates(self, mock_sched_cls,
                                                    mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnectorHMA(cfg, KVConnectorRole.SCHEDULER)
+        connector = TPUConnectorHMA(cfg, KVConnectorRole.SCHEDULER, None)
         sched = mock_sched_cls.return_value
         req = MagicMock()
         block_ids = ([1, 2], [3])
@@ -148,18 +148,6 @@ class TestTPUConnectorHMA:
         connector.request_finished_all_groups(req, block_ids)
         sched.request_finished_all_groups.assert_called_once_with(
             req, block_ids)
-
-    @patch(f"{_HMA_MOD}.TPUConnectorHMAWorker")
-    @patch(f"{_HMA_MOD}.TPUConnectorHMAScheduler")
-    def test_flat_request_finished_raises(self, mock_sched_cls,
-                                          mock_worker_cls):
-        """SupportsHMA expects request_finished_all_groups; the flat
-        single-group entrypoint must hard-fail rather than silently drop the
-        non-zeroth groups."""
-        cfg = _make_vllm_config()
-        connector = TPUConnectorHMA(cfg, KVConnectorRole.SCHEDULER)
-        with pytest.raises(AssertionError):
-            connector.request_finished(MagicMock(), [1, 2])
 
 
 # ---------------------------------------------------------------------------

@@ -258,6 +258,45 @@ class TestTPUConnector:
         mock_sched_cls.assert_not_called()
         mock_worker_cls.assert_not_called()
 
+    @patch(f"{_MOD}.TPUConnectorHMAWorker")
+    @patch(f"{_MOD}.TPUConnectorHMAScheduler")
+    @patch(f"{_MOD}.TPUConnectorWorker")
+    @patch(f"{_MOD}.TPUConnectorScheduler")
+    def test_init_uses_hma_backend_when_flag_enabled(self, mock_sched_cls,
+                                                     mock_worker_cls,
+                                                     mock_hma_sched_cls,
+                                                     mock_hma_worker_cls):
+        cfg = _make_vllm_config()
+        cfg.kv_transfer_config.kv_connector_extra_config = {
+            "use_hma_connector": True,
+        }
+
+        TPUConnector(cfg, KVConnectorRole.SCHEDULER,
+                     _make_test_kv_cache_config())
+        TPUConnector(cfg, KVConnectorRole.WORKER, _make_test_kv_cache_config())
+
+        mock_hma_sched_cls.assert_called_once_with(cfg)
+        mock_hma_worker_cls.assert_called_once_with(cfg)
+        mock_sched_cls.assert_not_called()
+        mock_worker_cls.assert_not_called()
+
+    @patch(f"{_MOD}.TPUConnectorWorker")
+    @patch(f"{_MOD}.TPUConnectorScheduler")
+    def test_request_finished_all_groups_routes_to_flat_in_non_hma(
+            self, mock_sched_cls, mock_worker_cls):
+        """vLLM routes every SupportsHMA connector through
+        request_finished_all_groups. The default (non-HMA) connector must
+        translate the single-group tuple back to the flat request_finished."""
+        cfg = _make_vllm_config()
+        connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER,
+                                 _make_test_kv_cache_config())
+        sched = mock_sched_cls.return_value
+        req = MagicMock()
+
+        connector.request_finished_all_groups(req, ([1, 2, 3], ))
+        sched.request_finished.assert_called_once_with(req, [1, 2, 3])
+        sched.request_finished_all_groups.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # TestTPUConnectorScheduler — arithmetic and state-transition logic
