@@ -469,7 +469,9 @@ class ZmqShmKvConnectorBase:
         assert self.runner is not None
         kv_caches = self.runner.kv_caches
         old_cache = kv_caches[layer_idx]
-        kv_caches[layer_idx] = new_cache
+        for idx, cache in enumerate(kv_caches):
+            if cache is old_cache:
+                kv_caches[idx] = new_cache
 
         compilation_config = getattr(self.vllm_config, "compilation_config",
                                      None)

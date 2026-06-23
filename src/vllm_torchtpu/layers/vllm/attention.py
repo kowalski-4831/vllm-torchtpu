@@ -85,6 +85,7 @@ def _pallas_rpa_kernel_impl(
     *,
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
+    skip_kv_update: bool,
     rpa_func,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
@@ -111,6 +112,7 @@ def _pallas_rpa_kernel_impl(
         v_scale=v_scale,
         sinks=sinks,
         attention_chunk_size=sliding_window,
+        skip_kv_update=skip_kv_update,
         rpa_func=rpa_func,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
@@ -138,6 +140,7 @@ def _pallas_rpa_kernel_default(
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
+    skip_kv_update: bool,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -159,6 +162,7 @@ def _pallas_rpa_kernel_default(
         v_scale,
         mesh=mesh,
         sliding_window=sliding_window,
+        skip_kv_update=skip_kv_update,
         rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
@@ -190,6 +194,7 @@ def _pallas_rpa_kernel_local(
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
+    skip_kv_update: bool,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -213,6 +218,7 @@ def _pallas_rpa_kernel_local(
         v_scale,
         mesh=mesh,
         sliding_window=sliding_window,
+        skip_kv_update=skip_kv_update,
         rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
@@ -239,6 +245,7 @@ def _pallas_rpa_kernel_batched(
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
+    skip_kv_update: bool,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -256,6 +263,7 @@ def _pallas_rpa_kernel_batched(
         v_scale,
         mesh=mesh,
         sliding_window=sliding_window,
+        skip_kv_update=skip_kv_update,
         rpa_func=ragged_paged_attention_batched,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
@@ -488,15 +496,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
         q_scale: float | None,
         k_scale: float | None,
         v_scale: float | None,
+        skip_kv_update: bool = False,
     ):
         # Reuse an existing custom op if one with the same config already exists.
         # `_kernel_op_prefix` is included so subclasses (e.g. the batched RPA
         # variant) don't collide with the base impl in the shared registry.
+        # `skip_kv_update` is part of the key so KV-sharing (read-only) layers
+        # get their own kernel variant and never share an op with KV-owning
+        # layers of an otherwise-identical config.
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
         registry_key = (self._kernel_op_prefix,
                         self.sliding_window, self.scale, self.logits_soft_cap,
-                        id(mesh), q_scale, k_scale, v_scale)
+                        id(mesh), q_scale, k_scale, v_scale, skip_kv_update)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             return existing
@@ -514,6 +526,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            skip_kv_update=skip_kv_update,
         )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -552,7 +565,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if k_scale_value != 0.0 and v_scale_value != 0.0:
                 k_scale = k_scale_value
                 v_scale = v_scale_value
-        self.rpa_kernel = self._build_rpa_kernel(q_scale, k_scale, v_scale)
+        # KV-sharing (cross-layer) layers reuse the target layer's K/V already
+        # written into the shared cache, so their kernel must attend without
+        # writing. See `PallasAttentionBackendImpl.__init__` and the runner's
+        # cache aliasing for how the shared cache tensor is set up.
+        skip_kv_update = self.kv_sharing_target_layer_name is not None
+        self.rpa_kernel = self._build_rpa_kernel(q_scale,
+                                                 k_scale,
+                                                 v_scale,
+                                                 skip_kv_update=skip_kv_update)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""

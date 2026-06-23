@@ -295,6 +295,7 @@ def sharded_ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    skip_kv_update: bool = False,
     rpa_func: Callable = ragged_paged_attention,
     soft_cap: float | None = None,
     shard: bool = True,
@@ -376,6 +377,7 @@ def sharded_ragged_paged_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             soft_cap=soft_cap,
+            skip_kv_update=skip_kv_update,
             **block_kwargs,
         )
 
@@ -405,6 +407,7 @@ def attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
+    skip_kv_update: bool = False,
     rpa_func: Callable = ragged_paged_attention,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
@@ -448,6 +451,7 @@ def attention(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        skip_kv_update=skip_kv_update,
         rpa_func=rpa_func,
         soft_cap=soft_cap,
         shard=shard,

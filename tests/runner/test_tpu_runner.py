@@ -16,6 +16,7 @@ import contextlib
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, VllmConfig)
@@ -99,13 +100,15 @@ class TestTPURunner:
         self.runner.use_spmd = False
         self.runner.vllm_config = vllm_config
         self.runner.cache_config = vllm_config.cache_config
+        self.runner.scheduler_config = vllm_config.scheduler_config
         self.runner._hybrid_uniform_page_size_bytes = None
         self.runner.max_num_reqs = 16
         self.runner.max_model_len = 1024
         self.runner.max_num_tokens = 2048
         self.runner.pin_memory = False
         self.runner.model_config = vllm_config.model_config
-        self.runner.shared_kv_cache_layers = None
+        self.runner.shared_kv_cache_layers = {}
+        self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
 
@@ -125,6 +128,13 @@ class TestTPURunner:
             self.runner)
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
             self.runner)
+        self.runner._validate_shared_kv_cache_layout = (
+            TPUModelRunner._validate_shared_kv_cache_layout)
+        self.runner._maybe_add_kv_sharing_layers_to_kv_cache_groups = (
+            TPUModelRunner._maybe_add_kv_sharing_layers_to_kv_cache_groups.
+            __get__(self.runner))
+        self.runner._add_shared_kv_cache_aliases = (
+            TPUModelRunner._add_shared_kv_cache_aliases.__get__(self.runner))
 
     @patch('vllm_torchtpu.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
     @patch(
@@ -394,6 +404,259 @@ class TestTPURunner:
                           '_update_mamba_page_size_padded') as mock_update:
             self.runner.get_kv_cache_spec()
             mock_update.assert_not_called()
+
+    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        return_value=4096)
+    def test_get_kv_cache_spec_records_shared_layers(self, mock_get_page_size,
+                                                     mock_get_layers):
+        owner = MagicMock(spec=Attention)
+        owner.attn_type = AttentionType.DECODER
+        owner.num_kv_heads = 2
+        owner.head_size = 128
+        owner.kv_sharing_target_layer_name = None
+        owner.sliding_window = None
+
+        shared = MagicMock(spec=Attention)
+        shared.attn_type = AttentionType.DECODER
+        shared.num_kv_heads = 2
+        shared.head_size = 128
+        shared.kv_sharing_target_layer_name = "layer.0"
+        shared.sliding_window = None
+
+        mock_get_layers.return_value = {
+            "layer.0": owner,
+            "layer.1": shared,
+        }
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+
+        assert set(kv_cache_specs) == {"layer.0"}
+        assert self.runner.shared_kv_cache_layers == {"layer.1": "layer.0"}
+
+    def _make_shared_pair(self, attn_window, target_window):
+        attn = MagicMock(spec=Attention)
+        attn.attn_type = AttentionType.DECODER
+        attn.num_kv_heads = 2
+        attn.head_size = 128
+        attn.sliding_window = attn_window
+        attn.impl = None
+
+        target = MagicMock(spec=Attention)
+        target.attn_type = AttentionType.DECODER
+        target.num_kv_heads = 2
+        target.head_size = 128
+        target.sliding_window = target_window
+        target.impl = None
+        return attn, target
+
+    def test_validate_shared_layout_skips_sliding_window_when_hma_disabled(
+            self):
+        # HMA disabled: specs are unified to full attention, so a window
+        # mismatch is harmless and must not raise.
+        attn, target = self._make_shared_pair(attn_window=512,
+                                              target_window=None)
+        TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
+                                                        attn,
+                                                        "layer.0",
+                                                        target,
+                                                        hma_enabled=False)
+
+    def test_validate_shared_layout_enforces_sliding_window_when_hma_enabled(
+            self):
+        # HMA enabled: sliding-window layers keep a smaller window-sized cache,
+        # so a window mismatch means the layers disagree on storage -> raise.
+        attn, target = self._make_shared_pair(attn_window=512,
+                                              target_window=None)
+        with pytest.raises(ValueError, match="sliding_window"):
+            TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
+                                                            attn,
+                                                            "layer.0",
+                                                            target,
+                                                            hma_enabled=True)
+
+    def test_validate_shared_layout_matching_window_ok_when_hma_enabled(self):
+        # HMA enabled but windows match: no mismatch, no raise.
+        attn, target = self._make_shared_pair(attn_window=512,
+                                              target_window=512)
+        TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
+                                                        attn,
+                                                        "layer.0",
+                                                        target,
+                                                        hma_enabled=True)
+
+    def _make_fp8_shared_pair(self,
+                              attn_quant,
+                              target_quant,
+                              attn_scale=1.0,
+                              target_scale=1.0):
+        attn = MagicMock(spec=Attention)
+        attn.attn_type = AttentionType.DECODER
+        attn.num_kv_heads = 2
+        attn.head_size = 128
+        attn.sliding_window = None
+        attn._k_scale_float = attn_scale
+        attn._v_scale_float = attn_scale
+        attn.impl = MagicMock(kv_cache_quantized_dtype=attn_quant)
+
+        target = MagicMock(spec=Attention)
+        target.attn_type = AttentionType.DECODER
+        target.num_kv_heads = 2
+        target.head_size = 128
+        target.sliding_window = None
+        target._k_scale_float = target_scale
+        target._v_scale_float = target_scale
+        target.impl = MagicMock(kv_cache_quantized_dtype=target_quant)
+        return attn, target
+
+    def test_validate_shared_layout_fp8_matching_ok(self):
+        # Both sides fp8 with matching scales/dtype: no raise.
+        attn, target = self._make_fp8_shared_pair("fp8_e4m3", "fp8_e4m3")
+        TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
+                                                        attn,
+                                                        "layer.0",
+                                                        target,
+                                                        hma_enabled=False)
+
+    def test_validate_shared_layout_fp8_mismatched_scales_raises(self):
+        # Both fp8 but scales differ: dequantizing with the wrong scales
+        # corrupts attention -> raise.
+        attn, target = self._make_fp8_shared_pair("fp8_e4m3",
+                                                  "fp8_e4m3",
+                                                  attn_scale=1.0,
+                                                  target_scale=2.0)
+        with pytest.raises(ValueError, match="k/v scales"):
+            TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
+                                                            attn,
+                                                            "layer.0",
+                                                            target,
+                                                            hma_enabled=False)
+
+    def test_validate_shared_layout_fp8_target_only_raises(self):
+        # Asymmetric: target is fp8, shared layer is not. The shared layer would
+        # read the target's packed fp8 bytes as bf16 -> silent garbage. Must
+        # raise instead of being skipped.
+        attn, target = self._make_fp8_shared_pair(None, "fp8_e4m3")
+        with pytest.raises(ValueError, match="kv cache"):
+            TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
+                                                            attn,
+                                                            "layer.0",
+                                                            target,
+                                                            hma_enabled=False)
+
+    def test_validate_shared_layout_fp8_attn_only_raises(self):
+        # Asymmetric the other way: shared layer is fp8, target is not.
+        attn, target = self._make_fp8_shared_pair("fp8_e4m3", None)
+        with pytest.raises(ValueError, match="kv cache"):
+            TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
+                                                            attn,
+                                                            "layer.0",
+                                                            target,
+                                                            hma_enabled=False)
+
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+        return_value=(100, 16, 2, 1, 128))
+    @patch('vllm_torchtpu.runner.tpu_runner.bind_kv_cache')
+    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+           return_value=False)
+    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
+    def test_initialize_kv_cache_binds_shared_layer_to_target_cache(
+            self, mock_input_batch, mock_has_kv_transfer, mock_bind_kv_cache,
+            mock_get_shape):
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=16384)
+        kv_cache_config = KVCacheConfig(
+            num_blocks=100,
+            kv_cache_tensors=[
+                KVCacheTensor(size=16384 * 100, shared_by=["layer.0"])
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["layer.0"],
+                                 kv_cache_spec=attn_spec)
+            ],
+        )
+
+        self.runner.shared_kv_cache_layers = {"layer.1": "layer.0"}
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.kv_caches = []
+        mock_bt = MagicMock()
+        mock_bt.max_num_blocks_per_req = 1
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1),
+                                                          dtype=torch.int32)
+        mock_input_batch.return_value.block_table = [mock_bt]
+        self.runner.input_batch = mock_input_batch.return_value
+
+        self.runner.initialize_kv_cache(kv_cache_config)
+
+        created_caches = mock_bind_kv_cache.call_args[0][0]
+        assert set(created_caches) == {"layer.0", "layer.1"}
+        assert created_caches["layer.1"] is created_caches["layer.0"]
+        group_names = self.runner.kv_cache_config.kv_cache_groups[
+            0].layer_names
+        assert group_names == ["layer.0", "layer.1"]
+        assert self.runner.attn_groups[0][0].layer_names == [
+            "layer.0", "layer.1"
+        ]
+        assert kv_cache_config.kv_cache_groups[0].layer_names == ["layer.0"]
+
+    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+           return_value=False)
+    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
+    def test_initialize_kv_cache_rejects_missing_shared_target(
+            self, mock_input_batch, mock_has_kv_transfer):
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=16384)
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[
+                KVCacheTensor(size=16384, shared_by=["layer.0"])
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["layer.0"],
+                                 kv_cache_spec=attn_spec)
+            ],
+        )
+        self.runner.shared_kv_cache_layers = {"layer.1": "missing.layer"}
+
+        with pytest.raises(ValueError, match="target layer is missing"):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+           return_value=False)
+    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
+    def test_initialize_kv_cache_rejects_duplicate_shared_allocation(
+            self, mock_input_batch, mock_has_kv_transfer):
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=16384)
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[
+                KVCacheTensor(size=16384, shared_by=["layer.0"]),
+                KVCacheTensor(size=16384, shared_by=["layer.1"]),
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["layer.0"],
+                                 kv_cache_spec=attn_spec),
+                KVCacheGroupSpec(layer_names=["layer.1"],
+                                 kv_cache_spec=attn_spec),
+            ],
+        )
+        self.runner.shared_kv_cache_layers = {"layer.1": "layer.0"}
+
+        with pytest.raises(ValueError, match="independent KV cache"):
+            self.runner.initialize_kv_cache(kv_cache_config)
 
     def test_mrope_positions_buffer_is_int32(self):
         """Run the real TPUModelRunner.__init__ (with parent's __init__ and

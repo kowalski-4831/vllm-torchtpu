@@ -330,6 +330,7 @@ def calculate_block_sizes(
         "debug_mode",
         "out_dtype",
         "use_causal_mask",
+        "skip_kv_update",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -357,6 +358,7 @@ def ragged_paged_attention(
     debug_mode: bool = False,
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
+    skip_kv_update: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -393,6 +395,11 @@ def ragged_paged_attention(
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
         use_causal_mask: Not used.
+        skip_kv_update: Cross-layer KV cache sharing. When True, this (shared)
+            layer reads its entire K/V span from the cache slot written by its
+            target layer earlier in the same forward pass, ignores its own k/v
+            inputs, and does not write the cache back. Inverse of upstream
+            tpu-inference's `update_kv_cache`.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -484,6 +491,7 @@ def ragged_paged_attention(
             kv_lens,
             distribution,
             cfgs=cfgs,
+            skip_kv_update=skip_kv_update,
         )
         return kernel.rpa_kernel(
             cu_q_lens,

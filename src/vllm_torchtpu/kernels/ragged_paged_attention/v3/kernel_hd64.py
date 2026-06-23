@@ -44,6 +44,7 @@ def ref_ragged_paged_attention_hd64(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    skip_kv_update: bool = False,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -108,10 +109,14 @@ def ref_ragged_paged_attention_hd64(
         gathered_kv = kv_cache[indices]
         gathered_shape = gathered_kv.shape
         gathered_kv = gathered_kv.reshape(-1, *gathered_shape[-3:])
-        gathered_kv = gathered_kv.at[kv_len - q_len:kv_len].set(
-            merged_kv[q_start:q_end])
-        kv_cache = kv_cache.at[indices].set(
-            gathered_kv.reshape(gathered_shape))
+        if not skip_kv_update:
+            # KV-sharing (cross-layer) layers reuse the target layer's K/V that
+            # is already present in the (shared) cache, so they must neither
+            # insert their own K/V nor write the cache back.
+            gathered_kv = gathered_kv.at[kv_len - q_len:kv_len].set(
+                merged_kv[q_start:q_end])
+            kv_cache = kv_cache.at[indices].set(
+                gathered_kv.reshape(gathered_shape))
 
         kv = gathered_kv.reshape(
             -1, padded_actual_num_kv_heads,
@@ -273,6 +278,7 @@ def _ragged_paged_attention_kernel(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    skip_kv_update: bool = False,
     chunk_prefill_size: int | None = None,
     bkv_p,
     bq_sz,
@@ -471,7 +477,14 @@ def _ragged_paged_attention_kernel(
         q_len = q_end - q_start
 
         kv_left = kv_len - kv_len_start
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        if skip_kv_update:
+            # KV-sharing layer: the target layer already wrote all kv (including
+            # the current step's tokens) into the shared cache, so fetch every
+            # token from the cache and write nothing back (bkv_sz_frm_new == 0,
+            # so update_sz == 0 and start_update_kv_cache is never triggered).
+            kv_left_frm_cache = kv_left
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = kv_left - kv_left_frm_cache
         bkv_p_frm_cache = jnp.minimum(cdiv(kv_left_frm_cache, page_size),
                                       bkv_p)
@@ -1317,6 +1330,7 @@ def static_validate_inputs(
         "q_scale",
         "k_scale",
         "v_scale",
+        "skip_kv_update",
         "chunk_prefill_size",
         "num_kv_pages_per_block",
         "num_queries_per_block",
@@ -1355,6 +1369,7 @@ def ragged_paged_attention_hd64(
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
+    skip_kv_update: bool = False,
 ):
     """A variant of ragged paged attention for head_dim=64.
 
@@ -1530,6 +1545,7 @@ def ragged_paged_attention_hd64(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                skip_kv_update=skip_kv_update,
                 chunk_prefill_size=chunk_prefill_size,
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,

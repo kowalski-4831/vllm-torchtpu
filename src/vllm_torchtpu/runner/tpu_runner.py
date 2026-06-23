@@ -49,7 +49,9 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
-from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
+from vllm.v1.worker.utils import (AttentionGroup,
+                                  add_kv_sharing_layers_to_kv_cache_groups,
+                                  bind_kv_cache)
 
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -556,7 +558,6 @@ class TPUModelRunner(GPUModelRunner):
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
-
         layers = get_layers_from_vllm_config(
             self.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
@@ -569,6 +570,9 @@ class TPUModelRunner(GPUModelRunner):
         if has_attention and has_mamba:
             self._update_mamba_page_size_padded(layers)
 
+        hma_enabled = (
+            not self.scheduler_config.disable_hybrid_kv_cache_manager)
+
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         for layer_name, attn_module in layers.items():
             # Linear Attention path
@@ -580,6 +584,23 @@ class TPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, Attention):
                 if (kv_tgt_layer :=
                         attn_module.kv_sharing_target_layer_name) is not None:
+                    if kv_tgt_layer not in layers:
+                        raise ValueError(
+                            f"Layer {layer_name} reuses KV cache from missing "
+                            f"target layer {kv_tgt_layer}.")
+                    target_module = layers[kv_tgt_layer]
+                    if not isinstance(target_module, Attention):
+                        raise ValueError(
+                            f"Layer {layer_name} reuses KV cache from "
+                            f"non-attention target layer {kv_tgt_layer}.")
+                    if target_module.kv_sharing_target_layer_name is not None:
+                        raise ValueError(
+                            f"Layer {layer_name} reuses KV cache from "
+                            f"{kv_tgt_layer}, which is itself a shared KV "
+                            "layer.")
+                    self._validate_shared_kv_cache_layout(
+                        layer_name, attn_module, kv_tgt_layer, target_module,
+                        hma_enabled)
                     # The layer doesn't need its own KV cache and will use that of
                     # the target layer. We skip creating a KVCacheSpec for it, so
                     # that KV cache management logic will act as this layer does
@@ -657,7 +678,127 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 continue
 
+        # Note: that each shared layer's target actually owns a KV cache (and
+        # that the shared layer was not itself allocated one) is enforced later
+        # against the concrete KVCacheConfig in
+        # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
         return kv_cache_spec
+
+    @staticmethod
+    def _validate_shared_kv_cache_layout(
+        layer_name: str,
+        attn_module: Attention,
+        target_layer_name: str,
+        target_module: Attention,
+        hma_enabled: bool,
+    ) -> None:
+        # When the hybrid KV cache manager is disabled, all specs are unified to
+        # full attention: we store the full KV cache and apply each layer's own
+        # window mask on read, so sliding_window doesn't affect storage and need
+        # not match between the shared layer and its target. When the hybrid
+        # manager is enabled (e.g. a mamba + sliding window + full attn model),
+        # sliding-window layers get a smaller, window-sized cache, so a window
+        # mismatch would mean the layers genuinely disagree on storage and the
+        # share is unsafe -- enforce sliding_window in that case.
+        fields = ["attn_type", "num_kv_heads", "head_size"]
+        if hma_enabled:
+            fields.append("sliding_window")
+        mismatches = []
+        for field_name in fields:
+            if getattr(attn_module, field_name,
+                       None) != getattr(target_module, field_name, None):
+                mismatches.append(field_name)
+        if mismatches:
+            raise ValueError(f"Layer {layer_name} cannot reuse KV cache from "
+                             f"{target_layer_name}: incompatible "
+                             f"{', '.join(mismatches)}.")
+
+        # With fp8 KV cache the shared layer reads the target's cached K/V and
+        # dequantizes with its OWN scales, so mismatched scales/dtype would
+        # silently corrupt attention.
+        attn_impl = getattr(attn_module, "impl", None)
+        target_impl = getattr(target_module, "impl", None)
+        attn_quant = getattr(attn_impl, "kv_cache_quantized_dtype", None)
+        target_quant = getattr(target_impl, "kv_cache_quantized_dtype", None)
+        # Trigger the check if EITHER side is fp8: the asymmetric case (only one
+        # side quantized) is just as unsafe -- e.g. the shared layer reads the
+        # target's packed fp8 bytes as bf16 -- and must error rather than
+        # silently corrupt, so None != "fp8_e4m3" correctly fails below.
+        if attn_quant or target_quant:
+            attn_kv_layout = (
+                getattr(attn_module, "_k_scale_float", None),
+                getattr(attn_module, "_v_scale_float", None),
+                attn_quant,
+            )
+            target_kv_layout = (
+                getattr(target_module, "_k_scale_float", None),
+                getattr(target_module, "_v_scale_float", None),
+                target_quant,
+            )
+            if attn_kv_layout != target_kv_layout:
+                raise ValueError(
+                    f"Layer {layer_name} reuses the KV cache of "
+                    f"{target_layer_name} but their kv cache dtype or k/v "
+                    f"scales differ (shared={attn_kv_layout}, "
+                    f"target={target_kv_layout}); the shared layer would "
+                    "read/dequantize the target's cached K/V incorrectly. "
+                    "Cross-layer KV sharing requires a matching kv cache dtype "
+                    "and matching k/v scales.")
+
+    def _maybe_add_kv_sharing_layers_to_kv_cache_groups(
+            self, kv_cache_config: KVCacheConfig) -> None:
+        if not self.shared_kv_cache_layers:
+            return
+        group_layer_names = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+        }
+        allocated_layer_names = {
+            layer_name
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors
+            for layer_name in kv_cache_tensor.shared_by
+        }
+        for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
+        ):
+            if target_layer_name not in group_layer_names:
+                raise ValueError(
+                    f"Layer {layer_name} reuses KV cache from "
+                    f"{target_layer_name}, but the target layer is missing "
+                    "from KV cache groups.")
+            if (layer_name in group_layer_names
+                    or layer_name in allocated_layer_names):
+                raise ValueError(
+                    f"Shared KV layer {layer_name} must not have an "
+                    "independent KV cache allocation.")
+        runner_only_attn_layers = getattr(self, "runner_only_attn_layers",
+                                          None)
+        add_kv_sharing_layers_to_kv_cache_groups(
+            self.shared_kv_cache_layers,
+            kv_cache_config.kv_cache_groups,
+            runner_only_attn_layers,
+        )
+
+    def _add_shared_kv_cache_aliases(
+            self, kv_caches: dict[str, torch.Tensor]) -> None:
+        if not self.shared_kv_cache_layers:
+            return
+        for layer_name in self.shared_kv_cache_layers:
+            if layer_name in kv_caches:
+                raise ValueError(
+                    f"Shared KV layer {layer_name} was allocated its own KV "
+                    "cache.")
+        # `get_kv_cache_spec` already rejects a target that is itself a shared
+        # layer, so the mapping is a flat shared -> owner relation (no chains or
+        # cycles) and can be aliased directly.
+        for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
+        ):
+            if target_layer_name not in kv_caches:
+                raise ValueError(
+                    f"Layer {layer_name} reuses KV cache from "
+                    f"{target_layer_name}, but the target cache was not "
+                    "allocated.")
+            kv_caches[layer_name] = kv_caches[target_layer_name]
 
     def _update_mamba_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
@@ -2409,9 +2550,11 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        kv_cache_config = copy.deepcopy(kv_cache_config)
         # Mirror GPUModelRunner.initialize_kv_cache: needed by inherited
         # _update_states -> _may_reorder_batch which reads kv_cache_config.
         self.kv_cache_config = kv_cache_config
+        self._maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
 
         # Dummy slot mapping, not used anywhere in the TPU code flow. But needed
         #  for upstream `_build_attention_metadata` call.
@@ -2481,6 +2624,8 @@ class TPUModelRunner(GPUModelRunner):
         layer_name_to_spec = {}
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
+                if layer_name in self.shared_kv_cache_layers:
+                    continue
                 if hasattr(group.kv_cache_spec, "kv_cache_specs"):
                     layer_name_to_spec[
                         layer_name] = group.kv_cache_spec.kv_cache_specs[
@@ -2586,10 +2731,7 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     raise NotImplementedError
 
-        # Cross-layer KV cache sharing: shared_kv_cache_layers is populated
-        # by get_kv_cache_spec but not yet wired through here. This is a TODO
-        # to call GPU's maybe_add_kv_sharing_layers_to_kv_cache_groups once
-        # we verify the signature + invariants line up on TPU.
+        self._add_shared_kv_cache_aliases(kv_caches)
 
         # Mark KV cache buffers as donation candidates outside torch.compile
         # regions to avoid Dynamo tracing through pybind calls.

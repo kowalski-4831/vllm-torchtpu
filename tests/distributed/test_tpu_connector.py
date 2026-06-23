@@ -787,7 +787,7 @@ class TestKVCacheReplacement:
         new_cache0 = torch.ones(1)
 
         runner = MagicMock()
-        runner.kv_caches = [old_cache0, old_cache1]
+        runner.kv_caches = [old_cache0, old_cache0, old_cache1]
         worker.runner = runner
 
         layer0 = MagicMock()
@@ -806,9 +806,10 @@ class TestKVCacheReplacement:
         worker._replace_runner_kv_cache(0, new_cache0)
 
         assert runner.kv_caches[0] is new_cache0
+        assert runner.kv_caches[1] is new_cache0
         assert layer0.kv_cache is new_cache0
         assert shared_layer0.kv_cache is new_cache0
-        assert runner.kv_caches[1] is old_cache1
+        assert runner.kv_caches[2] is old_cache1
         assert layer1.kv_cache is old_cache1
 
 
