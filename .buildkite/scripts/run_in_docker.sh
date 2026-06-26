@@ -31,22 +31,14 @@ docker pull "${IMAGE_TAG}"
 # Ensure cache directory exists on the host
 mkdir -p /mnt/disks/persist/models/hub
 
-# Clean and recreate results directory on the host's /tmp (always writable)
-rm -rf /tmp/perf_eval_results
-mkdir -p /tmp/perf_eval_results
-chmod 777 /tmp/perf_eval_results
-
-# Ensure a clean results folder exists in the workspace
-rm -rf perf_eval_results
+# Ensure results directory exists on the host
 mkdir -p perf_eval_results
-
-# Disable exit on error temporarily to ensure we copy results even if docker command fails
-set +e
+chmod 777 perf_eval_results 2>/dev/null || true
 
 echo "--- Running command in Docker container"
 docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \
   -v /mnt/disks/persist/models:/local_hf_cache \
-  -v /tmp/perf_eval_results:/perf_eval_results \
+  -v "$(pwd)/perf_eval_results:/perf_eval_results" \
   -e HF_HOME=/local_hf_cache \
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
@@ -59,14 +51,8 @@ docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \
   -e EVALPLUS_PARALLEL="${EVALPLUS_PARALLEL:-}" \
   "${IMAGE_TAG}" \
   bash -c "
+    umask 000
     mkdir -p /tmp/torch_tpu_cache
     ln -sfn /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
     $*
   "
-DOCKER_EXIT_CODE=$?
-set -e
-
-echo "--- Copying test results back to workspace for artifact upload"
-cp -r /tmp/perf_eval_results/* perf_eval_results/ 2>/dev/null || true
-
-exit $DOCKER_EXIT_CODE
