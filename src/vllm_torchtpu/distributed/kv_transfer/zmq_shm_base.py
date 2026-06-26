@@ -578,7 +578,12 @@ class ZmqShmKvConnectorBase:
         return host, int(port), side_channel_port
 
     # ---- Polled by the runner each step --------------------------------
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(
+            self,
+            finished_req_ids: set[str] | None = None
+    ) -> tuple[set[str], set[str]]:
+        # finished_req_ids is accepted for signature parity with the worker
+        # interface; the coordinator path tracks completion internally.
         return self._coord_get_finished()
 
     # ====================================================================

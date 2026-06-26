@@ -270,7 +270,15 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self,
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
-        return self.connector_worker.get_finished()
+        return self.connector_worker.get_finished(finished_req_ids)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        # Surface KV-load failures so the scheduler recomputes the affected
+        # blocks instead of running with absent KV. Only the Raiden worker
+        # tracks these; other backends fall back to the base (no errors).
+        worker = self.connector_worker
+        fn = getattr(worker, "get_block_ids_with_load_errors", None)
+        return fn() if fn is not None else set()
 
 
 class TPURaidenConnector(TPUConnector):
@@ -568,6 +576,19 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
 class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     """Scheduler half for the opt-in Raiden transfer backend."""
 
+    def __init__(self, vllm_config: "VllmConfig"):
+        super().__init__(vllm_config)
+        # Get DP rank and TP size from config and stagger kv_port and side_channel_port
+        dp_rank = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
+        tp_size = vllm_config.parallel_config.tensor_parallel_size if vllm_config.parallel_config else 1
+        port_base = dist_utils.get_kv_ports()
+        if isinstance(port_base, list):
+            self.kv_port = [int(p) + 2 * dp_rank * tp_size for p in port_base]
+        else:
+            self.kv_port = int(port_base) + 2 * dp_rank * tp_size
+        logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
+                    self.kv_ip, self.kv_port)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -665,8 +686,10 @@ class TPURaidenConnectorWorker:
         self.node_id = dist_utils.get_node_id()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.dp_rank: int = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
         self.host_ip = dist_utils.get_host_ip()
-        self.kv_transfer_port = int(dist_utils.get_kv_transfer_port())
+        self.kv_transfer_port = int(dist_utils.get_kv_transfer_port()) + (
+            2 * self.dp_rank * self.tp_size)
         self._raiden_transfer_engine: Optional["KVCacheManager"] = None
         self._done_sending: set[str] = set()
         self._done_recving: set[str] = set()
@@ -677,11 +700,17 @@ class TPURaidenConnectorWorker:
         # WAITING_FOR_REMOTE_KVS (or finished); a duplicate/late report (after
         # the req was admitted -> RUNNING) trips that assert.
         self._reported_recving: set[str] = set()
+        # req_id -> local (device) block ids, retained while a load is in flight
+        # so a failed recv can surface the affected blocks for recompute. Pruned
+        # once the request finishes generating (see get_finished).
+        self._load_block_ids: dict[str, list[int]] = {}
+        # Block ids of failed loads, drained by get_block_ids_with_load_errors().
+        self._failed_block_ids: set[int] = set()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
-            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d",
+            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
             self.host_ip, self.kv_transfer_port, self.is_producer,
-            self.node_id, self.tp_rank, self.tp_size)
+            self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         return None
@@ -732,23 +761,40 @@ class TPURaidenConnectorWorker:
                 "local_blocks=%d", self.tp_rank, req_id, req_meta.uuid,
                 endpoint, len(remote_blocks), len(local_blocks))
             submitted_loads.add(req_id)
+            self._load_block_ids[req_id] = list(local_blocks)
         if wait_for_completion:
             self._wait_for_recving(submitted_loads)
             if not report_completion:
                 self._suppress_done_recving.update(submitted_loads)
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(
+            self,
+            finished_req_ids: set[str] | None = None
+    ) -> tuple[set[str], set[str]]:
         engine = self._ensure_raiden_transfer_engine()
         self._poll_finished(engine)
         done_sending = self._done_sending
-        done_recving = (self._done_recving - self._suppress_done_recving -
+        # Report failed recvs as finished too, so the scheduler stops waiting in
+        # WAITING_FOR_REMOTE_KVS until the API timeout; the affected blocks are
+        # surfaced via get_block_ids_with_load_errors() in the same pass so vLLM
+        # recomputes them rather than running with absent KV.
+        recv_finished = self._done_recving | self._failed_recving
+        done_recving = (recv_finished - self._suppress_done_recving -
                         self._reported_recving)
-        self._suppress_done_recving.difference_update(self._done_recving)
+        self._suppress_done_recving.difference_update(recv_finished)
         self._reported_recving.update(done_recving)
         if done_recving:
             logger.debug(
                 "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
                 self.tp_rank, done_recving)
+        # Bound the bookkeeping: once a request has finished generating it can no
+        # longer be re-reported, so drop its dedup / failure / block-id state
+        # (without this these sets grow for the lifetime of the process).
+        if finished_req_ids:
+            self._reported_recving -= finished_req_ids
+            self._failed_recving -= finished_req_ids
+            for req_id in finished_req_ids:
+                self._load_block_ids.pop(req_id, None)
         self._done_sending = set()
         self._done_recving = set()
         return done_sending, done_recving
@@ -757,11 +803,25 @@ class TPURaidenConnectorWorker:
         done_sending, done_recving, failed_recving = engine.poll_stats()
         self._done_sending.update(done_sending)
         self._done_recving.update(done_recving)
+        newly_failed = set(failed_recving) - self._failed_recving
         self._failed_recving.update(failed_recving)
+        # Stage the affected device blocks so get_block_ids_with_load_errors()
+        # can report them no later than the pass that reports the req finished.
+        for req_id in newly_failed:
+            blocks = self._load_block_ids.get(req_id)
+            if blocks:
+                self._failed_block_ids.update(blocks)
         if failed_recving:
             logger.error(
                 "TPURaidenConnectorWorker rank%d --> failed_recving=%s",
                 self.tp_rank, failed_recving)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        # Drain the failed-load block ids for the scheduler to recompute. Paired
+        # with reporting the req as finished in get_finished() in the same pass.
+        failed = self._failed_block_ids
+        self._failed_block_ids = set()
+        return failed
 
     def _wait_for_recving(self, req_ids: set[str]) -> None:
         if not req_ids:
@@ -918,6 +978,8 @@ class TPUConnectorHMAScheduler(TPUConnectorScheduler):
                 remote_block_ids=params["remote_block_ids"],
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                remote_side_channel_port=params.get(
+                    "remote_side_channel_port"),
             )
         else:
             self.reqs_to_load[request.request_id] = LoadMeta(
@@ -926,6 +988,8 @@ class TPUConnectorHMAScheduler(TPUConnectorScheduler):
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                remote_side_channel_port=params.get(
+                    "remote_side_channel_port"),
             )
         load_meta = self.reqs_to_load[request.request_id]
         logger.info(
@@ -961,10 +1025,12 @@ class TPUConnectorHMAScheduler(TPUConnectorScheduler):
                 uuid=uuid,
                 local_block_ids=computed_per_group,
                 expiration_time=expiration_time)
-            kv_transfer_params = dict(uuid=uuid,
-                                      remote_block_ids=computed_per_group,
-                                      remote_host=self.kv_ip,
-                                      remote_port=self.kv_port)
+            kv_transfer_params = dict(
+                uuid=uuid,
+                remote_block_ids=computed_per_group,
+                remote_host=self.kv_ip,
+                remote_port=self.kv_port,
+                remote_side_channel_port=self.side_channel_port)
             logger.info(
                 "TPUConnectorHMAScheduler Prefill --> send queued | "
                 "req_id=%s | uuid=%s | num_prompt_tokens=%d | "
