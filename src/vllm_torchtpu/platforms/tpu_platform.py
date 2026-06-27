@@ -39,6 +39,11 @@ else:
 
 logger = init_logger(__name__)
 
+# TODO(ranlihao): add more flexible topology map
+TPU_MULTIHOST_TOPOLOGY_MAP = {
+    16: "2,2,2,2",
+}
+
 # ---------------------------------------------------------------------------
 # Modules/attrs whose @torch.compile(dynamic=True) wrappers must be removed.
 # Each entry is (module_path, function_name).
@@ -434,11 +439,22 @@ class TpuPlatform(Platform):
                     TpuMultiprocExecutor
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            from vllm_torchtpu.executors.ray_distributed_executor import \
-                RayDistributedExecutor
-            parallel_config.distributed_executor_backend = RayDistributedExecutor
-            logger.info(
-                "Force using RayDistributedExecutor for TPU on multihost.")
+            # TODO(ranlihao): Use the vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND to determine which executor to use.
+            # use_ray_v2 = vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+            use_ray_v2 = False
+            if use_ray_v2:
+                from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
+                    RayDistributedExecutorV2
+                parallel_config.distributed_executor_backend = RayDistributedExecutorV2
+                logger.info(
+                    "Force using RayDistributedExecutorV2 for TPU on multihost."
+                )
+            else:
+                from vllm_torchtpu.executors.ray_distributed_executor import \
+                    RayDistributedExecutor
+                parallel_config.distributed_executor_backend = RayDistributedExecutor
+                logger.info(
+                    "Force using RayDistributedExecutor for TPU on multihost.")
         else:
             logger.warning(
                 f"Unknown TPU multihost backend: {multihost_backend}. "
