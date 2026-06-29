@@ -62,7 +62,8 @@ from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  load_kmajor_fp4,
-                                                 prebuild_fused_moe_kernel)
+                                                 prebuild_fused_moe_kernel,
+                                                 requant_load_kmajor_fp4)
 from vllm_torchtpu.layers.vllm.linear_common import quantized_matmul_fp4
 from vllm_torchtpu.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
@@ -251,12 +252,29 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         # fp4xfp8 matmul instead of in-kernel dequant -- fixing W4A16's decode
         # cost. Unset -> W4A16 (weights stay packed block-16, dequant in kernel).
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
+        already_kmajor = False
         if requant_block:
             requant_block = int(requant_block)
-            w13, w13_scale_4d, w2, w2_scale_4d = _requant_moe_w4a8(
-                layer.w13_weight.data, w13_scale_f, layer.w2_weight.data,
-                w2_scale_f, requant_block)
-            mode = f"W4A8 (requant block-{requant_block} + fp8 act)"
+            hidden = layer.w13_weight.data.shape[-1] * 2  # w13 contracting (H)
+            inter = layer.w2_weight.data.shape[-1] * 2  # w2 contracting (I)
+            if hidden % requant_block == 0 and inter % requant_block == 0:
+                # W4A8: dequant block-16 -> requant block-`requant_block` ->
+                # K-major native fp4, all in JAX (matches tpu-inference's
+                # process_quantized_moe_weights). Returns native fp4 + kernel
+                # scale directly, so no separate load_kmajor_fp4 below.
+                w13, w13_scale_4d = requant_load_kmajor_fp4(
+                    _fresh(layer.w13_weight.data), w13_scale_f, requant_block)
+                w2, w2_scale_4d = requant_load_kmajor_fp4(
+                    _fresh(layer.w2_weight.data), w2_scale_f, requant_block)
+                already_kmajor = True
+                mode = f"W4A8 (jax requant block-{requant_block} + fp8 act)"
+            else:
+                # Contracting dim not divisible by the block (e.g. Qwen3-30B w2
+                # I=768): pad + requant in torch.
+                w13, w13_scale_4d, w2, w2_scale_4d = _requant_moe_w4a8(
+                    layer.w13_weight.data, w13_scale_f, layer.w2_weight.data,
+                    w2_scale_f, requant_block)
+                mode = f"W4A8 (torch requant block-{requant_block} + fp8 act)"
         else:
             # Lay block-16 scales out for gmm_v2: [E, num_blocks_over_K, 1, N]
             # (already K-major-aligned). Weights are the checkpoint-layout packed
@@ -274,12 +292,13 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 delattr(layer, attr)
 
         # Store the weights as native fp4 (torch.float4_e2m1fn_x2) in gmm_v2's
-        # K-major [E, K, N] layout: unpack (bitcast uint8 -> float4_e2m1fn) and
-        # transpose the contracting axis ONCE here at load, so the forward hands
-        # the weight straight to gmm_v2 with no per-forward unpack or transpose
-        # (which keeps the 480B HBM footprint bounded).
-        w13 = load_kmajor_fp4(w13)  # [E, N, K/2] uint8 -> fp4 [E, K, N]
-        w2 = load_kmajor_fp4(w2)
+        # K-major [E, K, N] layout. The W4A8 jax-requant path already returns
+        # native fp4 K-major; the W4A16 (and torch-requant) paths unpack +
+        # transpose the packed uint8 here, ONCE at load, so the forward hands
+        # the weight straight to gmm_v2 with no per-forward unpack or transpose.
+        if not already_kmajor:
+            w13 = load_kmajor_fp4(w13)  # [E, N, K/2] uint8 -> fp4 [E, K, N]
+            w2 = load_kmajor_fp4(w2)
 
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)

@@ -54,6 +54,34 @@ def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
     return jnp.swapaxes(fp4, -1, -2)  # [..., K, N]
 
 
+def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
+                          block: int) -> tuple[jax.Array, jax.Array]:
+    """W4A8 requantization in JAX: unpack the checkpoint block-16 fp4 weight,
+    dequantize with its fused scale, requantize to ``block`` fp4, and lay out
+    K-major for gmm_v2. Input is checkpoint layout ``[..., N, K/2]`` packed
+    uint8 with fused fp32 block-16 ``scale_f`` ``[..., N, K/16]``; output is
+    native fp4 ``[..., K, N]`` plus the fp32 kernel scale ``[..., K/block, 1,
+    N]``. Requantizing in JAX (not torch) keeps the dequantized weight off the
+    host and rounds to fp4 with the cast the kernel expects."""
+    fp4 = jax.lax.bitcast_convert_type(w_packed, jnp.float4_e2m1fn)
+    fp4 = fp4.reshape(*w_packed.shape[:-1], -1)  # [..., N, K]
+    size_k = fp4.shape[-1]
+    num_in_blocks = scale_f.shape[-1]
+    dequant = (fp4.astype(jnp.float32).reshape(*fp4.shape[:-1], num_in_blocks,
+                                               size_k // num_in_blocks) *
+               scale_f[..., None]).reshape(*fp4.shape[:-1], size_k)
+    fp4_max = float(jnp.finfo(jnp.float4_e2m1fn).max)
+    blocked = dequant.reshape(*dequant.shape[:-1], size_k // block, block)
+    scale = jnp.max(jnp.abs(blocked), axis=-1, keepdims=True) * (1.0 / fp4_max)
+    scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
+    requant = jnp.clip(blocked * scale_inv, -fp4_max,
+                       fp4_max).astype(jnp.float4_e2m1fn)
+    requant = requant.reshape(*dequant.shape[:-1], size_k)  # [..., N, K]
+    scale = scale.squeeze(-1).astype(jnp.float32)  # [..., N, K/block]
+    return (jnp.swapaxes(requant, -1,
+                         -2), jnp.expand_dims(jnp.swapaxes(scale, -1, -2), -2))
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,

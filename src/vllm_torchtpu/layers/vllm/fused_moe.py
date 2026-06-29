@@ -21,11 +21,13 @@ from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.fused_moe_gmm import (fused_moe_func,
+                                                       requant_unpack_kmajor,
                                                        unpack_fp4_to_e2m1)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, Optional[int]], Callable] = {}
 _load_kmajor_fp4_op = None
+_requant_kmajor_fp4_ops: dict[int, Callable] = {}
 
 
 def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
@@ -44,6 +46,24 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
         _load_kmajor_fp4_op = pallas.jax_op("pallas::nvfp4_load_kmajor",
                                             unpack_fp4_to_e2m1)
     return _load_kmajor_fp4_op(w_u8)
+
+
+def requant_load_kmajor_fp4(w_u8: torch.Tensor, scale_f: torch.Tensor,
+                            block: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """W4A8 requant + K-major load in one JAX op (matches tpu-inference). Takes
+    the packed uint8 weight ``[..., N, K//2]`` + its fused fp32 block-16 scale
+    ``[..., N, K//16]``; returns native-fp4 ``torch.float4_e2m1fn_x2`` ``[...,
+    K, N]`` requantized to ``block`` plus the fp32 kernel scale ``[...,
+    K//block, 1, N]``. Doing the dequant+requant in JAX (vs torch) avoids
+    materializing the dequantized weight on the host and rounds to fp4 with the
+    same cast the kernel reads."""
+    op = _requant_kmajor_fp4_ops.get(block)
+    if op is None:
+        op = pallas.jax_op(
+            f"pallas::nvfp4_requant_kmajor_b{block}",
+            functools.partial(requant_unpack_kmajor, block=block))
+        _requant_kmajor_fp4_ops[block] = op
+    return op(w_u8, scale_f)
 
 
 def _allocate_kernel_instance_id() -> int:
