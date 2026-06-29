@@ -35,6 +35,7 @@ from vllm.v1.executor.ray_utils import (WORKER_SPECIFIC_ENV_VARS,
                                         get_bundles_sorted_by_node)
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
@@ -294,6 +295,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         self.start_worker_monitor()
         self.output_rank = self._get_output_rank()
+
+        # KV connector setup
+        self.has_connector = self.vllm_config.kv_transfer_config is not None
+        if self.has_connector:
+            ip_port = self.collective_rpc("get_node_kv_ip_port")
+            for item in ip_port:
+                set_node_kv_ip_port(item)
 
     def _initialize_ray_cluster(self) -> None:
         """Initialize the distributed cluster with Ray.
