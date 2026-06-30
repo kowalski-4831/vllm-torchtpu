@@ -40,6 +40,16 @@ chmod 777 /mnt/disks/persist/perf_eval_results 2>/dev/null || true
 rm -rf perf_eval_results
 mkdir -p perf_eval_results
 
+# Set HF_TOKEN from GCP Secret Manager if not already in /etc/environment
+if ! grep -q "^HF_TOKEN=" /etc/environment 2>/dev/null; then
+  gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet | \
+  sudo tee -a /etc/environment > /dev/null <<< "HF_TOKEN=$(cat)" || true
+fi
+if [ -f /etc/environment ]; then
+  # shellcheck disable=SC1091
+  source /etc/environment || true
+fi
+
 # Disable exit on error temporarily to copy results back even if the test fails
 set +e
 
@@ -48,6 +58,7 @@ docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
   -e HF_HOME=/local_hf_cache \
+  -e HF_TOKEN="${HF_TOKEN:-}" \
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e FORCE_COLOR="1" \
