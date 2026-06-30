@@ -36,6 +36,11 @@ def _get_tensor_parallel_size():
     return 1
 
 
+@pytest.fixture(autouse=True)
+def set_spawn_method(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+
 def get_ngram_test_prompts():
     num_prompts = 10
     prompts = []
