@@ -91,6 +91,13 @@ def gmm_wrapper(lhs,
                 zero_initialize=False,
                 fuse_act=None,
                 preferred_element_type=None):
+    # NVFP4 (float4 weight): keep bf16 activations. An fp8 activation collapses
+    # accuracy for fp4 weights (its error compounds across MoE layers) with no
+    # decode speedup -- decode is weight-HBM-bound, so the 4-bit weight load
+    # dominates and the fp8xfp4 matmul is never the bottleneck. fp8/int4 weights
+    # keep fp8 activations (the default). See PR #306.
+    is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
+                     and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -101,6 +108,7 @@ def gmm_wrapper(lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
+        maybe_quantize_lhs=not is_fp4_weight,
     )
 
 

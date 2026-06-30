@@ -247,10 +247,13 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         g2 = layer.w2_weight_scale_2.data.to(torch.float32)  # [E]
         w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
-        # MOE_REQUANTIZE_BLOCK_SIZE (e.g. 512) selects W4A8: requantize the
-        # block-16 fp4 weights to that block (>= MXU) so the GMM runs a native
-        # fp4xfp8 matmul instead of in-kernel dequant -- fixing W4A16's decode
-        # cost. Unset -> W4A16 (weights stay packed block-16, dequant in kernel).
+        # MOE_REQUANTIZE_BLOCK_SIZE (e.g. 512) requantizes the block-16 fp4
+        # weights to that block (>= MXU). This cuts the scale data ~32x and skips
+        # the in-kernel dequant, ~halving decode TPOT vs the block-16 default
+        # (480B-Coder: 54.7ms -> 29.6ms) at equal accuracy. Activations stay
+        # bf16 (the gmm keeps fp8 activations off for fp4 weights -- fp8xfp4
+        # collapses accuracy with no decode gain; see fused_moe_gmm.gmm_wrapper).
+        # Unset -> packed block-16 weights, dequant in kernel. See PR #306.
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
         already_kmajor = False
         if requant_block:
@@ -258,8 +261,8 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             hidden = layer.w13_weight.data.shape[-1] * 2  # w13 contracting (H)
             inter = layer.w2_weight.data.shape[-1] * 2  # w2 contracting (I)
             if hidden % requant_block == 0 and inter % requant_block == 0:
-                # W4A8: dequant block-16 -> requant block-`requant_block` ->
-                # K-major native fp4, all in JAX (matches tpu-inference's
+                # Dequant block-16 -> requant block-`requant_block` -> K-major
+                # native fp4, all in JAX (matches tpu-inference's
                 # process_quantized_moe_weights). Returns native fp4 + kernel
                 # scale directly, so no separate load_kmajor_fp4 below.
                 w13, w13_scale_4d = requant_load_kmajor_fp4(
@@ -267,14 +270,14 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 w2, w2_scale_4d = requant_load_kmajor_fp4(
                     _fresh(layer.w2_weight.data), w2_scale_f, requant_block)
                 already_kmajor = True
-                mode = f"W4A8 (jax requant block-{requant_block} + fp8 act)"
+                mode = f"W4 (jax requant block-{requant_block} + bf16 act)"
             else:
                 # Contracting dim not divisible by the block (e.g. Qwen3-30B w2
                 # I=768): pad + requant in torch.
                 w13, w13_scale_4d, w2, w2_scale_4d = _requant_moe_w4a8(
                     layer.w13_weight.data, w13_scale_f, layer.w2_weight.data,
                     w2_scale_f, requant_block)
-                mode = f"W4A8 (torch requant block-{requant_block} + fp8 act)"
+                mode = f"W4 (torch requant block-{requant_block} + bf16 act)"
         else:
             # Lay block-16 scales out for gmm_v2: [E, num_blocks_over_K, 1, N]
             # (already K-major-aligned). Weights are the checkpoint-layout packed
