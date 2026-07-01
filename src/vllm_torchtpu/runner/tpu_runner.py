@@ -1623,6 +1623,22 @@ class TPUModelRunner(GPUModelRunner):
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
 
+            # _gather_mm_embeddings returns is_mm_embed sized to the number
+            # of scheduled tokens, but TPU pads input_ids to a fixed bucket.
+            # Pad the multimodal mask (False for pad positions) and move it
+            # to the input device so the masked_scatter in embed_input_ids
+            # aligns with the padded inputs_embeds.
+            if is_mm_embed is not None:
+                n = input_ids.shape[0]
+                if is_mm_embed.shape[0] < n:
+                    pad = torch.zeros(
+                        n - is_mm_embed.shape[0],
+                        dtype=is_mm_embed.dtype,
+                        device=is_mm_embed.device,
+                    )
+                    is_mm_embed = torch.cat([is_mm_embed, pad])
+                is_mm_embed = is_mm_embed.to(input_ids.device)
+
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
@@ -1740,10 +1756,41 @@ class TPUModelRunner(GPUModelRunner):
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
 
-        mm_embed_inputs = self.mm_embed_inputs
-        self.mm_embed_inputs = None
+        # Run the multimodal (vision) encoder. vLLM's base
+        # GPUModelRunner.execute_model does this; our override must do it
+        # explicitly, otherwise the encoder never runs, image placeholder
+        # tokens get plain text embeddings, and the model produces garbage.
+        if self.supports_mm_inputs:
+            self._execute_mm_encoder(scheduler_output)
 
         num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
+
+        # Gather mm embeddings AFTER reordering so the mask order matches the
+        # request order used by the chunk loop below. is_mm_embed_full spans
+        # all scheduled tokens (req order); mm_embeds_flat is the concatenated
+        # image embeddings. We slice both per request-chunk inside the loop.
+        mm_embeds_flat = None
+        is_mm_embed_full = None
+        mm_tok_cumsum = None
+        mm_cumsum_np = None
+        if self.supports_mm_inputs:
+            mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
+                scheduler_output)
+            if mm_embeds_list:
+                mm_embeds_flat = torch.cat(mm_embeds_list)
+            req_tok = np.array([
+                scheduler_output.num_scheduled_tokens[r]
+                for r in self.input_batch.req_ids
+            ],
+                               dtype=np.int64)
+            mm_tok_cumsum = np.concatenate([[0], np.cumsum(req_tok)])
+            # Per-token MM offsets on the host so the chunk loop can slice
+            # mm_embeds without any device syncs -- mirrors the GPU runner,
+            # which passes the full mask to embed_input_ids and lets
+            # masked_scatter place the embeds (no manual counting).
+            if mm_embeds_flat is not None:
+                mm_cumsum_np = np.concatenate(
+                    [[0], np.cumsum(is_mm_embed_full.cpu().numpy())])
 
         local_num_chunks = self._count_input_chunks(scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
@@ -1787,12 +1834,33 @@ class TPUModelRunner(GPUModelRunner):
                 self.input_ids, cur_input_indices, pre_next_tokens_indices)
             draft_input_ids_src = input_ids
 
+            # Slice the per-chunk multimodal mask/embeddings (the chunk
+            # covers requests [start_index, end_index) in req order). Offsets
+            # come from the host-side cumsum, so no per-chunk device sync.
+            chunk_mm_inputs = None
+            if is_mm_embed_full is not None:
+                tok_start = int(mm_tok_cumsum[start_index])
+                tok_end = int(mm_tok_cumsum[end_index])
+                is_mm_chunk = is_mm_embed_full[tok_start:tok_end]
+                if mm_cumsum_np is not None:
+                    mm_start = int(mm_cumsum_np[tok_start])
+                    mm_cnt = int(mm_cumsum_np[tok_end]) - mm_start
+                    chunk_embeds = (
+                        [mm_embeds_flat[mm_start:mm_start +
+                                        mm_cnt]] if mm_cnt > 0 else [])
+                else:
+                    chunk_embeds = []
+                chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
+
             input_ids, inputs_embeds = self._get_model_inputs(
-                input_ids, mm_embed_inputs)
+                input_ids, chunk_mm_inputs)
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
-            num_tokens_padded = input_ids.shape[0]
+            # For multimodal models _get_model_inputs returns input_ids=None
+            # and packs the tokens into inputs_embeds; use whichever exists.
+            num_tokens_padded = (input_ids if input_ids is not None else
+                                 inputs_embeds).shape[0]
             with set_forward_context(
                     attn_metadata,
                     self.vllm_config,
