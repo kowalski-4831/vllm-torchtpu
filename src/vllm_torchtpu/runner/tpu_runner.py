@@ -90,6 +90,7 @@ if TYPE_CHECKING:
 class ExecuteModelState:
     scheduler_output: "SchedulerOutput"
     logits_list: list[torch.Tensor]
+    pooler_output_list: list[Any]
     num_reqs_list: list[int]
     spec_decode_metadata_list: list["SpecDecodeMetadata | None"]
     # Per-chunk draft inputs (token ids, positions, attn ctx, aux
@@ -244,6 +245,31 @@ class TPUModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()
+        self.is_pooling_model = (self.model_config is not None and
+                                 self.model_config.runner_type == "pooling")
+
+        if self.is_pooling_model:
+            from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+            from vllm.v1.worker.tpu_input_batch import InputBatch
+
+            def get_pooling_metadata(batch):
+                reqs = batch.requests[:batch.num_reqs]
+                pooling_params = [r.pooling_params for r in reqs]
+                pooling_states = [
+                    PoolingStates(r.req_id, r.num_computed_tokens)
+                    for r in reqs
+                ]
+                prompt_lens = torch.tensor(
+                    [r.prompt_token_ids_len for r in reqs], dtype=torch.int32)
+                return PoolingMetadata(
+                    prompt_lens=prompt_lens,
+                    prompt_token_ids=None,
+                    prompt_token_ids_cpu=None,
+                    pooling_params=pooling_params,
+                    pooling_states=pooling_states,
+                )
+
+            InputBatch.get_pooling_metadata = get_pooling_metadata
 
         # Parent already set: vllm_config, *_config, device, pin_memory, dtype,
         # max_model_len, max_num_reqs, max_num_tokens, num_query_heads,
@@ -2088,6 +2114,7 @@ class TPUModelRunner(GPUModelRunner):
         start_index = 0
         chunk_index = 0
         logits_list = []
+        pooler_output_list = []
         num_reqs_list = []
         spec_decode_metadata_list = []
         draft_chunks: list[DraftChunkInputs] = []
@@ -2195,6 +2222,29 @@ class TPUModelRunner(GPUModelRunner):
                 logits = self.compute_logits_from_hidden_states(
                     sample_hidden_states)
 
+            if self.is_pooling_model:
+                pooling_metadata = self.input_batch.get_pooling_metadata()
+                # num_scheduled_tokens_np, seq_lens_cpu for this chunk
+                req_ids = self.input_batch.req_ids[start_index:start_index +
+                                                   num_reqs]
+                num_scheduled_tokens_np = np.array([
+                    scheduler_output.num_scheduled_tokens[req_id]
+                    for req_id in req_ids
+                ],
+                                                   dtype=np.int32)
+                seq_lens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
+                    start_index:start_index + num_reqs]
+                pooling_metadata.build_pooling_cursor(
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    seq_lens_cpu=seq_lens_cpu,
+                    device=self.device,
+                )
+                pooler_output = self.model.pooler(
+                    hidden_states=hidden_states,
+                    pooling_metadata=pooling_metadata,
+                )
+                pooler_output_list.append(pooler_output)
+
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
@@ -2223,10 +2273,15 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=logits_list,
+            pooler_output_list=pooler_output_list,
             num_reqs_list=num_reqs_list,
             spec_decode_metadata_list=spec_decode_metadata_list,
             draft_chunks=draft_chunks,
         )
+
+        if self.is_pooling_model:
+            return self.sample_tokens(None)
+
         return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2293,7 +2348,11 @@ class TPUModelRunner(GPUModelRunner):
 
         use_spec = any(md is not None
                        for md in state.spec_decode_metadata_list)
-        if use_spec:
+        if self.is_pooling_model:
+            req_ids = cast(
+                list[str],
+                self.input_batch.req_ids[:self.input_batch.num_reqs])
+        elif use_spec:
             if needs_logprobs:
                 raise NotImplementedError(
                     "Logprobs are not supported with speculative decoding on "
@@ -2628,9 +2687,11 @@ class TPUModelRunner(GPUModelRunner):
                         eagle3_drafts, combined_selected_tokens,
                         combined_selected_tokens_real_lens,
                         next_tokens_tpu_chunks, next_token_indices))
-            req_id_to_index_copy = self._update_placeholder(
-                discard_sampled_tokens_req_indices, request_seq_lens,
-                next_token_indices, num_draft_per_req)
+            req_id_to_index_copy = {}
+            if not self.is_pooling_model:
+                req_id_to_index_copy = self._update_placeholder(
+                    discard_sampled_tokens_req_indices, request_seq_lens,
+                    next_token_indices, num_draft_per_req)
             if next_tokens_tpu_chunks:
                 if len(next_tokens_tpu_chunks) == 1:
                     next_tokens_tpu = next_tokens_tpu_chunks[0]
@@ -2665,6 +2726,15 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 self._pre_async_results = None
 
+        pooler_output = []
+        if self.is_pooling_model:
+            for out in state.pooler_output_list:
+                # Move to CPU as expected by vLLM
+                if isinstance(out, torch.Tensor):
+                    pooler_output.extend(list(out.cpu().unbind(dim=0)))
+                else:
+                    pooler_output.extend(out)
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
             # Snapshot of the req_id_to_index for the VLLM scheduler.
@@ -2674,7 +2744,7 @@ class TPUModelRunner(GPUModelRunner):
             logprobs=logprobs,
             prompt_logprobs_dict={req_id: None
                                   for req_id in req_ids},
-            pooler_output=[],
+            pooler_output=pooler_output,
             kv_connector_output=kv_connector_output,
         )
 
@@ -2686,22 +2756,24 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self.scheduler_config.async_scheduling:
             final_output = async_output.get_output()
-            for i, req_state, seq_len, req_id in request_seq_lens:
-                if i in discard_sampled_tokens_req_indices:
-                    continue
-                valid_tokens = final_output.sampled_token_ids[i]
-                if not valid_tokens:
-                    continue
-                req_idx = self.input_batch.req_id_to_index[req_id]
+            if not self.is_pooling_model:
+                for i, req_state, seq_len, req_id in request_seq_lens:
+                    if i in discard_sampled_tokens_req_indices:
+                        continue
+                    valid_tokens = final_output.sampled_token_ids[i]
+                    if not valid_tokens:
+                        continue
+                    req_idx = self.input_batch.req_id_to_index[req_id]
 
-                # Update the persistent batch.
-                start_tok_idx = self.input_batch.num_tokens_no_spec[req_idx]
-                end_tok_idx = start_tok_idx + len(valid_tokens)
-                self.input_batch.token_ids_cpu[
-                    req_idx, start_tok_idx:end_tok_idx] = valid_tokens
-                self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
+                    # Update the persistent batch.
+                    start_tok_idx = self.input_batch.num_tokens_no_spec[
+                        req_idx]
+                    end_tok_idx = start_tok_idx + len(valid_tokens)
+                    self.input_batch.token_ids_cpu[
+                        req_idx, start_tok_idx:end_tok_idx] = valid_tokens
+                    self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
 
-                req_state.output_token_ids.extend(valid_tokens)
+                    req_state.output_token_ids.extend(valid_tokens)
 
             if (self.speculative_config
                     and self.speculative_config.method == "ngram"):
@@ -4045,6 +4117,8 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_logits(
             self, hidden_states: torch.Tensor,
             indices_do_sample: torch.Tensor) -> torch.Tensor:
+        if self.is_pooling_model:
+            return torch.empty((0, ), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
 

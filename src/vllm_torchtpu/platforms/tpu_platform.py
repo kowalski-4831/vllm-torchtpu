@@ -61,6 +61,7 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
+_tpu_patches_applied = False
 
 
 def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
@@ -240,6 +241,11 @@ def apply_tpu_patches() -> None:
     module-level state is re-initialized on import in spawned processes.
     All patches are idempotent.
     """
+    global _tpu_patches_applied
+    if _tpu_patches_applied:
+        return
+    _tpu_patches_applied = True
+
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_no_ep_tp_scope,
@@ -265,6 +271,185 @@ def apply_tpu_patches() -> None:
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
     _patch_api_server_kernel_reload_endpoint()
+
+    # Model-specific patches (applied only if relevant modules are present)
+    _apply_model_specific_patches()
+
+
+def _apply_model_specific_patches() -> None:
+    # Patch Qwen3VLModel to handle 1D video_grid_thw in get_rope_index
+    try:
+        import transformers.models.qwen3_vl.modeling_qwen3_vl as modeling
+        _orig_get_rope_index = modeling.Qwen3VLModel.get_rope_index
+
+        def patched_get_rope_index(self, *args, **kwargs):
+
+            def fix_grid(g):
+                if g is not None and isinstance(g, torch.Tensor):
+                    if g.numel() == 0:
+                        return None
+                    if g.dim() == 1:
+                        return g.unsqueeze(0)
+                return g
+
+            target_device = None
+
+            def to_cpu(t):
+                nonlocal target_device
+                if isinstance(t, torch.Tensor):
+                    if target_device is None:
+                        target_device = t.device
+                    return t.cpu()
+                return t
+
+            new_args = [to_cpu(a) for a in args]
+            new_kwargs = {k: to_cpu(v) for k, v in kwargs.items()}
+
+            if 'image_grid_thw' in new_kwargs:
+                new_kwargs['image_grid_thw'] = fix_grid(
+                    new_kwargs['image_grid_thw'])
+            if 'video_grid_thw' in new_kwargs:
+                new_kwargs['video_grid_thw'] = fix_grid(
+                    new_kwargs['video_grid_thw'])
+            if len(new_args) > 2:
+                new_args[2] = fix_grid(new_args[2])
+            if len(new_args) > 3:
+                new_args[3] = fix_grid(new_args[3])
+
+            if ('input_ids' not in new_kwargs or new_kwargs['input_ids'] is None) and \
+                len(new_args) == 0:
+                new_kwargs['input_ids'] = torch.zeros((1, 1),
+                                                      dtype=torch.long,
+                                                      device='cpu')
+
+            res = _orig_get_rope_index(self, *new_args, **new_kwargs)
+            if target_device is not None:
+
+                def to_device(r):
+                    if isinstance(r, torch.Tensor):
+                        return r.to(target_device)
+                    if isinstance(r, (tuple, list)):
+                        return type(r)(to_device(x) for x in r)
+                    return r
+
+                res = to_device(res)
+            return res
+
+        modeling.Qwen3VLModel.get_rope_index = patched_get_rope_index
+        logger.info("Applied TPU patch: Qwen3VLModel.get_rope_index.")
+
+        _orig_vision_attn_forward = modeling.Qwen3VLVisionAttention.forward
+
+        def patched_vision_attn_forward(self, hidden_states, cu_seqlens, *args,
+                                        **kwargs):
+            if isinstance(cu_seqlens, torch.Tensor):
+                try:
+                    cu_seqlens = cu_seqlens.cpu()
+                except Exception:
+                    cu_seqlens = torch.tensor([0, hidden_states.shape[0]],
+                                              dtype=torch.int32)
+            return _orig_vision_attn_forward(self, hidden_states, cu_seqlens,
+                                             *args, **kwargs)
+
+        modeling.Qwen3VLVisionAttention.forward = patched_vision_attn_forward
+        logger.info("Applied TPU patch: Qwen3VLVisionAttention.forward.")
+
+        orig_masked_scatter_ = torch.Tensor.masked_scatter_
+
+        def patched_masked_scatter_(self, mask, source):
+            if self.device.type == "tpu":
+                mask_bool = mask.bool()
+                if isinstance(source,
+                              torch.Tensor) and source.shape == self.shape:
+                    res = torch.where(mask_bool, source, self)
+                    self.copy_(res)
+                    return self
+                flat_self = self.reshape(-1)
+                flat_mask = mask_bool.reshape(-1)
+                flat_source = source.reshape(-1)
+                indices = torch.nonzero(flat_mask, as_tuple=True)[0]
+                res = flat_self.clone()
+                res[indices] = flat_source[:indices.numel()].to(
+                    dtype=self.dtype)
+                self.copy_(res.reshape(self.shape))
+                return self
+            return orig_masked_scatter_(self, mask, source)
+
+        torch.Tensor.masked_scatter_ = patched_masked_scatter_
+
+        orig_masked_scatter = torch.masked_scatter
+
+        def patched_masked_scatter(input, mask, source):
+            if isinstance(input, torch.Tensor) and input.device.type == "tpu":
+                mask_bool = mask.bool()
+                if isinstance(source,
+                              torch.Tensor) and source.shape == input.shape:
+                    return torch.where(mask_bool, source, input)
+                flat_input = input.reshape(-1)
+                flat_mask = mask_bool.reshape(-1)
+                flat_source = source.reshape(-1)
+                indices = torch.nonzero(flat_mask, as_tuple=True)[0]
+                res = flat_input.clone()
+                res[indices] = flat_source[:indices.numel()].to(
+                    dtype=input.dtype)
+                return res.reshape(input.shape)
+            return orig_masked_scatter(input, mask, source)
+
+        torch.Tensor.masked_scatter = patched_masked_scatter
+        torch.masked_scatter = patched_masked_scatter
+
+        try:
+            torch._C._TensorBase.masked_scatter_ = patched_masked_scatter_
+            torch._C._TensorBase.masked_scatter = patched_masked_scatter
+        except Exception:
+            pass
+        logger.info(
+            "Applied TPU patch: torch.masked_scatter and masked_scatter_.")
+
+        orig_repeat_interleave = torch.repeat_interleave
+
+        def patched_repeat_interleave(input,
+                                      repeats,
+                                      dim=None,
+                                      output_size=None):
+            if isinstance(input, torch.Tensor) and input.device.type == "tpu":
+                input_cpu = input.cpu()
+                repeats_cpu = repeats.cpu() if isinstance(
+                    repeats, torch.Tensor) else repeats
+                return orig_repeat_interleave(input_cpu,
+                                              repeats_cpu,
+                                              dim=dim,
+                                              output_size=output_size)
+            return orig_repeat_interleave(input,
+                                          repeats,
+                                          dim=dim,
+                                          output_size=output_size)
+
+        torch.repeat_interleave = patched_repeat_interleave
+        logger.info("Applied TPU patch: torch.repeat_interleave.")
+
+        orig_cumsum = torch.cumsum
+
+        def patched_cumsum(input, *args, **kwargs):
+            if isinstance(input, torch.Tensor) and input.device.type == "tpu":
+                return orig_cumsum(input.cpu(), *args,
+                                   **kwargs).to(input.device)
+            return orig_cumsum(input, *args, **kwargs)
+
+        torch.cumsum = patched_cumsum
+
+        orig_tensor_cumsum = torch.Tensor.cumsum
+
+        def patched_tensor_cumsum(self, *args, **kwargs):
+            if self.device.type == "tpu":
+                return orig_tensor_cumsum(self.cpu(), *args,
+                                          **kwargs).to(self.device)
+            return orig_tensor_cumsum(self, *args, **kwargs)
+
+        torch.Tensor.cumsum = patched_tensor_cumsum
+        logger.info("Applied TPU patch: torch.cumsum.")
+    except Exception:
+        pass
 
 
 class TpuPlatform(Platform):
@@ -596,6 +781,21 @@ class TpuPlatform(Platform):
         scheduler_config = vllm_config.scheduler_config
         parallel_config.worker_cls = \
                         "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+
+        # Force static shapes for multi-modal models to avoid XLA lowering gaps.
+        if scheduler_config.is_multimodal_model:
+            torch._dynamo.config.assume_static_by_default = True
+
+            # Patch torch.compile to prevent dynamic=True from leaking in
+            _orig_compile = torch.compile
+
+            def patched_compile(*args, **kwargs):
+                kwargs['dynamic'] = False
+                return _orig_compile(*args, **kwargs)
+
+            torch.compile = patched_compile
+            logger.info(
+                "Forced static shapes for TPU multi-modal model stability.")
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if not multihost_backend:  # Single host
