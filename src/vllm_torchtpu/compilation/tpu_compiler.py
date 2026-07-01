@@ -40,6 +40,12 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/common/attention_interface.py",
     "vllm_torchtpu/kernels/ragged_paged_attention/v3",
     "vllm_torchtpu/kernels/experimental/batched_rpa",
+    "vllm_torchtpu/layers/vllm/custom_ops/gdn_attention_op.py",
+    "vllm_torchtpu/layers/common/gdn_attention.py",
+    "vllm_torchtpu/layers/common/ragged_gated_delta_rule_wrapper.py",
+    "vllm_torchtpu/layers/common/ragged_gated_delta_rule_ref.py",
+    "vllm_torchtpu/kernels/gdn",
+    "vllm_torchtpu/kernels/causal_conv1d",
 )
 
 
