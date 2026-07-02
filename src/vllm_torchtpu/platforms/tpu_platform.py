@@ -20,6 +20,8 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.platforms.tpu_block_size_utils import \
+    update_tpu_block_size_and_slot_config
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -59,6 +61,13 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 _dynamic_compile_unwrapped = False
 
 
+def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
+    multimodal_config = model_config.multimodal_config
+    if multimodal_config is None:
+        return False
+    return bool(multimodal_config.language_model_only)
+
+
 def _configure_torchtpu_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
     previous_mode = execution_mode.eager_mode
@@ -91,6 +100,76 @@ def _unwrap_dynamic_compile_fns() -> None:
             setattr(mod, fn_name, fn.__wrapped__)
             logger.debug("Unwrapped @torch.compile(dynamic=True) from %s.%s",
                          module_path, fn_name)
+
+
+def _patch_scheduler_mamba_external_kv() -> None:
+    """Allow vLLM's mamba-align scheduler path to coexist with TPU PD loads.
+
+    vLLM 0.22.1 asserts when `num_external_computed_tokens > 0` reaches
+    `_mamba_block_aligned_split`, and then calls that split even for async KV
+    load scheduling where `num_new_tokens == 0`. TPU PD decode uses external
+    computed tokens for producer-restored KV, so mirror the local vLLM patch:
+    count those tokens in the split boundary and skip the split while
+    `load_kv_async` is scheduling the remote load.
+    """
+    import inspect
+    import textwrap
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler, "_tpu_mamba_external_kv_patch", False):
+        return
+
+    def _mamba_block_aligned_split(
+        self,
+        request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        num_computed_tokens = (request.num_computed_tokens +
+                               num_new_local_computed_tokens +
+                               num_external_computed_tokens)
+        if num_computed_tokens < max(request.num_prompt_tokens,
+                                     request.num_tokens - 1):
+            block_size = self.cache_config.block_size
+            last_cache_position = (request.num_tokens -
+                                   request.num_tokens % block_size)
+            if self.use_eagle:
+                last_cache_position = max(last_cache_position - block_size, 0)
+            num_computed_tokens_after_sched = (num_computed_tokens +
+                                               num_new_tokens)
+            if num_computed_tokens_after_sched < last_cache_position:
+                num_new_tokens = num_new_tokens // block_size * block_size
+            elif (num_computed_tokens < last_cache_position <
+                  num_computed_tokens_after_sched):
+                num_new_tokens = last_cache_position - num_computed_tokens
+        return num_new_tokens
+
+    schedule_source = inspect.getsource(Scheduler.schedule)
+    old_guard = "                if self.need_mamba_block_aligned_split:\n"
+    new_guard = ("                if self.need_mamba_block_aligned_split "
+                 "and not load_kv_async:\n")
+    if old_guard in schedule_source:
+        schedule_source = schedule_source.replace(old_guard, new_guard, 1)
+        patched_namespace = {}
+        exec(
+            compile(
+                textwrap.dedent(schedule_source),
+                inspect.getsourcefile(Scheduler.schedule)
+                or "<vllm_scheduler_patch>", "exec"),
+            Scheduler.schedule.__globals__,
+            patched_namespace,
+        )
+        Scheduler.schedule = patched_namespace["schedule"]
+    elif new_guard not in schedule_source:
+        raise RuntimeError(
+            "Unsupported vLLM Scheduler.schedule mamba split guard")
+
+    Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
+    Scheduler._tpu_mamba_external_kv_patch = True
+    logger.info(
+        "Applied TPU patch: allow mamba-align scheduler with external KV.")
 
 
 def apply_tpu_patches() -> None:
@@ -383,6 +462,8 @@ class TpuPlatform(Platform):
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]
                 backend_cls.get_preferred_block_size(default))
+        if envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:
+            update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
         min_page_size = backend_cls.get_min_page_size(vllm_config)
         if min_page_size > cache_config.block_size:
@@ -462,8 +543,9 @@ class TpuPlatform(Platform):
                 "Using uniproc_executor.")
             parallel_config.distributed_executor_backend = "uni"
 
-        if scheduler_config.is_multimodal_model and not \
-            scheduler_config.disable_chunked_mm_input:
+        if (scheduler_config.is_multimodal_model
+                and not _is_language_model_only_config(model_config)
+                and not scheduler_config.disable_chunked_mm_input):
             logger.warning("TPU does not support running Multimodal models"\
             " without setting `--disable_chunked_mm_input`. " \
             "Forcing --disable_chunked_mm_input.")
@@ -473,6 +555,7 @@ class TpuPlatform(Platform):
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
+                "TPUConnectorV2",
                 "TPURaidenConnector",
                 "TPUConnectorHMA",
                 "OffloadingConnector",
@@ -483,6 +566,12 @@ class TpuPlatform(Platform):
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
+            if (kv_transfer_config.kv_connector == "TPUConnectorV2"
+                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                raise ValueError("TPUConnectorV2 requires "
+                                 "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
+            if kv_transfer_config.kv_connector == "TPUConnectorV2":
+                _patch_scheduler_mamba_external_kv()
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

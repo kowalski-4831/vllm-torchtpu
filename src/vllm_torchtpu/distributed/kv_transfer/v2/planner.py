@@ -21,6 +21,8 @@ class BlockSelection:
     source_blocks: tuple[int, ...]
     destination_blocks: tuple[int, ...]
     num_tokens: int
+    source_token_offset: int = 0
+    destination_token_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -408,7 +410,7 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             )
             if source_region.head_segments:
                 head_mappings = self._head_mappings_from_segments(
-                    source_region.head_segments)
+                    source_region.head_segments, destination_region)
             if not head_mappings:
                 continue
 
@@ -419,6 +421,9 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
                     destination_block_size=destination_region.
                     lowering_units_per_block,
                     num_tokens=block_selection.num_tokens,
+                    source_token_offset=block_selection.source_token_offset,
+                    destination_token_offset=(
+                        block_selection.destination_token_offset),
             ):
                 source_block, source_token, dest_block, dest_token, count = (
                     token_range)
@@ -460,14 +465,17 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             destination_blocks = destination.mamba_block_ids
             source_num_tokens = metadata.mamba_num_tokens
             destination_num_tokens = destination.mamba_num_tokens
+            source_token_offset = 0
+            destination_token_offset = 0
 
-            if source_region.block_id_index is not None:
-                if destination_region.block_id_index != source_region.block_id_index:
+            if source_region.block_id_group_index is not None:
+                if (destination_region.block_id_group_index
+                        != source_region.block_id_group_index):
                     raise ValueError(
-                        "source and destination block_id_index must match, got "
-                        f"{source_region.block_id_index} and "
-                        f"{destination_region.block_id_index}")
-                block_id_index = source_region.block_id_index
+                        "source and destination block_id_group_index must "
+                        f"match, got {source_region.block_id_group_index} "
+                        f"and {destination_region.block_id_group_index}")
+                block_id_index = source_region.block_id_group_index
                 if block_id_index >= len(source_blocks):
                     raise ValueError(
                         f"source mamba_block_ids has no index {block_id_index}"
@@ -486,6 +494,8 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             destination_blocks = destination.fa_block_ids
             source_num_tokens = metadata.fa_num_tokens
             destination_num_tokens = destination.fa_num_tokens
+            source_token_offset = metadata.fa_token_offset
+            destination_token_offset = destination.fa_token_offset
 
         if source_num_tokens is None:
             source_num_tokens = (len(source_blocks) *
@@ -500,6 +510,8 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             source_blocks=source_blocks,
             destination_blocks=destination_blocks,
             num_tokens=source_num_tokens,
+            source_token_offset=source_token_offset,
+            destination_token_offset=destination_token_offset,
         )
 
     @staticmethod
@@ -514,10 +526,15 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
 
     @staticmethod
     def _head_mappings_from_segments(
-        segments: tuple[HeadSegment, ...], ) -> tuple[HeadMapping, ...]:
+        segments: tuple[HeadSegment, ...],
+        destination_region: KVCacheRegion,
+    ) -> tuple[HeadMapping, ...]:
         mappings: list[HeadMapping] = []
         for segment in segments:
             for head in segment.global_heads:
+                if (ContiguousHeadTPTransferPlanner._find_head_segment(
+                        destination_region, head, segment.name) is None):
+                    continue
                 mappings.append(
                     HeadMapping(
                         global_head=head,
@@ -534,24 +551,31 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
         destination_blocks: tuple[int, ...],
         destination_block_size: int,
         num_tokens: int,
+        source_token_offset: int = 0,
+        destination_token_offset: int = 0,
     ) -> tuple[tuple[int, int, int, int, int], ...]:
         check_positive("source_block_size", source_block_size)
         check_positive("destination_block_size", destination_block_size)
         check_non_negative("num_tokens", num_tokens)
+        check_non_negative("source_token_offset", source_token_offset)
+        check_non_negative("destination_token_offset",
+                           destination_token_offset)
 
         ranges: list[tuple[int, int, int, int, int]] = []
         cursor = 0
         while cursor < num_tokens:
-            source_index = cursor // source_block_size
-            destination_index = cursor // destination_block_size
+            source_cursor = source_token_offset + cursor
+            destination_cursor = destination_token_offset + cursor
+            source_index = source_cursor // source_block_size
+            destination_index = destination_cursor // destination_block_size
             if source_index >= len(source_blocks):
                 raise ValueError("source block ids do not cover num_tokens")
             if destination_index >= len(destination_blocks):
                 raise ValueError(
                     "destination block ids do not cover num_tokens")
 
-            source_token = cursor % source_block_size
-            destination_token = cursor % destination_block_size
+            source_token = source_cursor % source_block_size
+            destination_token = destination_cursor % destination_block_size
             count = min(
                 source_block_size - source_token,
                 destination_block_size - destination_token,
@@ -618,6 +642,8 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             ),
             layer_name=layer_name,
             layer_type=source_region.layer_type,
+            source_region_id=str(source_region.physical_region_id),
+            destination_region_id=str(destination_region.physical_region_id),
             source_base_addr=source_region.base_addr,
             destination_base_addr=destination_region.base_addr,
             global_head=head_mapping.global_head,

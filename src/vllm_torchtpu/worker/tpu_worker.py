@@ -14,8 +14,11 @@ import torch
 import torch_tpu  # noqa: F401
 from torch_tpu._internal.profiler import profiler_api
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
+                                          get_kv_transfer_group,
+                                          has_kv_transfer_group)
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
+                                             get_tensor_model_parallel_rank,
                                              init_distributed_environment)
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -29,6 +32,20 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
+
+
+def _get_kv_connector_handshake_metadata_key() -> int:
+    return int(get_tensor_model_parallel_rank())
+
+
+def _debug_tpu_local_rank_offset() -> int:
+    value = os.environ.get(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "0") or "0"
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{DEBUG_TPU_LOCAL_RANK_OFFSET_ENV} must be an int, "
+                         f"got {value!r}") from exc
 
 
 class TPUWorker(WorkerBase):
@@ -185,13 +202,25 @@ class TPUWorker(WorkerBase):
                     "Expected tcp://<host>:<port> distributed_init_method, "
                     f"got: {dist_init_method!r}")
             local_world = os.environ.get("LOCAL_WORLD_SIZE") or pc.world_size
-            local_rank_env = self.local_rank
+            local_rank_env = int(self.local_rank)
+            debug_local_rank_offset = _debug_tpu_local_rank_offset()
+            tpu_local_rank_env = local_rank_env + debug_local_rank_offset
+            tpu_local_world = int(local_world)
+            if debug_local_rank_offset:
+                tpu_local_world = max(tpu_local_world,
+                                      debug_local_rank_offset + pc.world_size)
+                logger.info(
+                    "DEBUG TPU local rank offset applied: rank=%d "
+                    "local_rank=%d %s=%d -> tpu_local_rank=%d "
+                    "tpu_local_world=%d", self.rank, self.local_rank,
+                    DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, debug_local_rank_offset,
+                    tpu_local_rank_env, tpu_local_world)
             init_rank = self.rank
             init_world = pc.world_size
             os.environ["RANK"] = str(self.rank)
-            os.environ["LOCAL_RANK"] = str(self.local_rank)
+            os.environ["LOCAL_RANK"] = str(tpu_local_rank_env)
             os.environ["WORLD_SIZE"] = str(pc.world_size)
-            os.environ["LOCAL_WORLD_SIZE"] = str(local_world)
+            os.environ["LOCAL_WORLD_SIZE"] = str(tpu_local_world)
             os.environ.setdefault("MASTER_ADDR", parsed.hostname)
             os.environ.setdefault("MASTER_PORT", str(parsed.port))
 
@@ -427,7 +456,11 @@ class TPUWorker(WorkerBase):
             reshard_fn=reshard_fn,
         )
 
-    # Ray executor doesn't need handshake metadata — kv_parameters go
-    # through the proxy server.
-    def get_kv_connector_handshake_metadata(self) -> None:
-        pass
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        metadata = connector.get_handshake_metadata()
+        if metadata is None:
+            return None
+        return {_get_kv_connector_handshake_metadata_key(): metadata}

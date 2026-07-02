@@ -51,10 +51,16 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
-                                  bind_kv_cache)
+                                  bind_kv_cache, prepare_kernel_block_sizes)
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.kv_cache_materializer import (
+    build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
+    materialize_kv_cache_tensors)
+from vllm_torchtpu.kv_cache_spec_normalizer import \
+    normalize_kv_cache_specs_for_tpu
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
@@ -251,6 +257,9 @@ class TPUModelRunner(GPUModelRunner):
         # for disagg serving.
         self._uniform_mamba_layout: bool = (self.vllm_config.kv_transfer_config
                                             is not None)
+        self._unified_block_pool: bool = (
+            tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL)
+        self.kv_cache_raw_tensors: list[torch.Tensor] = []
 
         # TPU env-var flags.
         self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
@@ -478,16 +487,17 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self.speculative_config.method}")
 
     def _create_mesh_for_parallelism(self) -> Mesh:
-        # Per-worker JAX mesh is always single-chip; vLLM native multiprocess
-        # handles TP>1.
+        local_devices = list(jax.local_devices())
+        if not local_devices:
+            raise ValueError("No TPU devices are visible to create JAX mesh.")
+
+        # Per-worker JAX mesh is normally single-chip; vLLM native multiprocess
+        # handles TP>1 outside this JAX SPMD path.
         if self.parallel_config.world_size == 1 and \
                 self.parallel_config.tensor_parallel_size > 1:
             raise ValueError(
                 "Single-process TPU mesh TP>1 is not supported in this path. "
                 "Use vLLM multiprocess mode for --tensor-parallel-size > 1.")
-        local_devices = list(jax.local_devices())
-        if not local_devices:
-            raise ValueError("No TPU devices are visible to create JAX mesh.")
         mesh_devices = np.asarray(local_devices[:1]).reshape((1, ))
         mesh = Mesh(mesh_devices, axis_names=("model", ))
         logger.info("Init mesh | tp_size=1 | device_id=%s",
@@ -567,7 +577,7 @@ class TPUModelRunner(GPUModelRunner):
 
         has_attention = any(isinstance(m, Attention) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
-        if has_attention and has_mamba:
+        if has_attention and has_mamba and not self._unified_block_pool:
             self._update_mamba_page_size_padded(layers)
 
         hma_enabled = (
@@ -682,7 +692,11 @@ class TPUModelRunner(GPUModelRunner):
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
-        return kv_cache_spec
+        return normalize_kv_cache_specs_for_tpu(
+            kv_cache_spec,
+            self.kv_cache_dtype,
+            enable_unified_block_pool=self._unified_block_pool,
+        )
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
@@ -2611,6 +2625,125 @@ class TPUModelRunner(GPUModelRunner):
                 and hasattr(cw.spec, "prewarm_shape")):
             cw.spec.prewarm_shape(p)
 
+    def _resolve_tpu_group_backend(
+        self,
+        layer_names: list[str],
+        kv_cache_spec: KVCacheSpec,
+    ) -> type[Any]:
+        layer_type = cast(type[Any], AttentionLayerBase)
+        layers = get_layers_from_vllm_config(self.vllm_config, layer_type,
+                                             layer_names)
+        if layer_names and layer_names[0] in layers:
+            return cast(type[Any], layers[layer_names[0]].get_attn_backend())
+        if isinstance(kv_cache_spec, (AttentionSpec, MambaSpec)):
+            return cast(type[Any], PallasAttentionBackend)
+        raise NotImplementedError(
+            f"Unsupported KV cache spec: {type(kv_cache_spec)!r}")
+
+    def _initialize_unified_kv_cache(self,
+                                     kv_cache_config: KVCacheConfig) -> None:
+        self.attn_groups = []
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            layer_names = list(group.layer_names)
+            backend = self._resolve_tpu_group_backend(layer_names,
+                                                      group.kv_cache_spec)
+            if isinstance(group.kv_cache_spec,
+                          AttentionSpec) and self.use_spmd:
+                num_kv_heads = group.kv_cache_spec.num_kv_heads
+                assert self.original_parallel_config is not None
+                tp_size = self.original_parallel_config.tensor_parallel_size
+                assert num_kv_heads % tp_size == 0, (
+                    f"num_kv_heads {num_kv_heads} must be divisible by "
+                    f"tp_size {tp_size} under SPMD mode")
+            self.attn_groups.append([
+                AttentionGroup(
+                    backend=backend,
+                    layer_names=layer_names,
+                    kv_cache_spec=group.kv_cache_spec,
+                    kv_cache_group_id=gid,
+                    metadata_builders=[],
+                )
+            ])
+
+        kernel_block_sizes = prepare_kernel_block_sizes(
+            kv_cache_config, self.attn_groups)
+        self._kernel_block_sizes = kernel_block_sizes
+        kernel_block_size_by_gid = build_kernel_block_size_by_group_id(
+            kv_cache_config=kv_cache_config,
+            kernel_block_sizes=kernel_block_sizes,
+        )
+        self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+
+        for group_list in self.attn_groups:
+            for group in group_list:
+                kv_cache_spec = group.kv_cache_spec
+                kernel_block_size = kernel_block_size_by_gid.get(
+                    group.kv_cache_group_id)
+                if (isinstance(kv_cache_spec, AttentionSpec)
+                        and kernel_block_size is not None):
+                    kv_cache_spec = kv_cache_spec.copy_with_new_block_size(
+                        kernel_block_size)
+                builder = AttentionMetadataBuilder(
+                    kv_cache_spec,
+                    group.layer_names,
+                    self.vllm_config,
+                    self.device,
+                    runner=self,
+                    kv_cache_group_id=group.kv_cache_group_id,
+                )
+                group.metadata_builders.append(builder)
+
+        for group_id in range(len(kv_cache_config.kv_cache_groups)):
+            assert (self.block_table_cpu.dtype == self.input_batch.
+                    block_table[group_id].get_cpu_tensor().dtype)
+
+        materialized = materialize_kv_cache_tensors(
+            kv_cache_config=kv_cache_config,
+            attn_groups=self.attn_groups,
+            kernel_block_sizes=kernel_block_sizes,
+            device=self.device,
+            cache_dtype=self.kv_cache_dtype,
+        )
+        kv_caches = materialized.kv_caches
+        self.kv_cache_raw_tensors = materialized.raw_tensors
+        if kv_cache_config.has_mamba_layers:
+            self._update_hybrid_attention_mamba_layout(kv_caches,
+                                                       kernel_block_sizes)
+
+        for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
+        ):
+            logger.debug("%s reuses KV cache of %s", layer_name,
+                         target_layer_name)
+            kv_caches[layer_name] = kv_caches[target_layer_name]
+
+        logger.info(
+            "%s",
+            format_kv_cache_layout_summary(
+                kv_cache_config=kv_cache_config,
+                kv_caches=kv_caches,
+                raw_tensors=self.kv_cache_raw_tensors,
+                attn_groups=self.attn_groups,
+            ),
+        )
+
+        self.kv_caches = []
+        bind_kv_cache(
+            kv_caches,
+            self.vllm_config.compilation_config.static_forward_context,
+            self.kv_caches,
+        )
+
+        if has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            kv_connector.register_kv_caches(kv_caches)
+            if hasattr(kv_connector, "set_host_xfer_buffer_ops"):
+                kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
+            if hasattr(kv_connector, "register_runner"):
+                kv_connector.register_runner(self)
+
+        if not self.enforce_eager:
+            self._precompile_substitute_placeholder_token()
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -2630,6 +2763,9 @@ class TPUModelRunner(GPUModelRunner):
             gid: torch.empty(0, device=self.device)
             for gid in range(len(self.kv_cache_config.kv_cache_groups))
         }
+        if self._unified_block_pool:
+            self._initialize_unified_kv_cache(kv_cache_config)
+            return
 
         attn_block_size = None
         has_attention = False
