@@ -58,6 +58,33 @@ def _patch_default_moe_runner_select_forward() -> None:
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
+def _patch_vllm_disable_compile_ranges() -> None:
+    """Force TPU to compile only fixed bucketed sizes, never dynamic ranges.
+
+    ``VllmConfig._set_compile_ranges()`` always appends
+    ``scheduler_config.max_num_batched_tokens`` to ``compile_ranges_endpoints``,
+    so ``PiecewiseBackend`` builds a dynamic ``Range(1, max)`` and compiles it
+    with backed ``SymInt`` shapes. The torch_tpu backend rejects SymInts ("does
+    not support dynamic shape" / "No shape env"). The TPU runner pads every shape
+    to an exact ``compile_size``, so dynamic ranges are never needed.
+
+    Patch the consumption point: ``CompilationConfig.get_compile_ranges() -> []``.
+    Clearing the field (e.g. in the worker) does not stick --
+    ``_set_compile_ranges`` rewrites it on every config reconstruction
+    (Qwen3-VL ``with_hf_config`` -> ``replace``), and the compile-time
+    compilation_config is not the instance a platform/worker hook can reach --
+    so a class-level override is the robust fix.
+    """
+    from vllm.config.compilation import CompilationConfig
+
+    def get_compile_ranges(self):
+        return []
+
+    CompilationConfig.get_compile_ranges = get_compile_ranges
+    logger.info("Applied TPU patch: disable dynamic compile_ranges (static "
+                "compile_sizes only).")
+
+
 def _patch_disable_sequence_parallel_moe() -> None:
     """Disable vLLM's sequence-parallel MoE on TPU.
 
