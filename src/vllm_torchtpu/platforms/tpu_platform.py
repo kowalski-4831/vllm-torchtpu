@@ -193,6 +193,10 @@ def apply_tpu_patches() -> None:
                                _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+    # Register the out-of-tree TPU vision-attention CustomOp by importing the
+    # module: its @CustomOp.register_oot makes vLLM instantiate our
+    # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
+    import vllm_torchtpu.layers.vllm.vision_attention  # noqa: F401
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
 
