@@ -24,9 +24,12 @@ from vllm_torchtpu.spec_decode.eagle3 import (DraftChunkInputs, Eagle3Proposer,
                                               _maybe_pad_dim0)
 
 
-def _make_proposer(draft_tp: int | None = 1) -> Eagle3Proposer:
+def _make_proposer(draft_tp: int | None = 1,
+                   target_tp: int = 1) -> Eagle3Proposer:
     speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp)
-    vllm_config = SimpleNamespace(speculative_config=speculative_config)
+    parallel_config = SimpleNamespace(tensor_parallel_size=target_tp)
+    vllm_config = SimpleNamespace(speculative_config=speculative_config,
+                                  parallel_config=parallel_config)
     return Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
 
 
@@ -76,17 +79,20 @@ def test_force_draft_tp1_restores_on_exception():
         assert fake_tp.rank_in_group == 2
 
 
-@pytest.mark.parametrize("draft_tp", [8, 2, None])
-def test_draft_tp_coerced_to_one(draft_tp):
-    # vLLM resolves an unset eagle3 draft tp to target_tp (e.g. 8); we always
-    # run the draft replicated, so any non-1 value must be coerced to 1.
-    proposer = _make_proposer(draft_tp=draft_tp)
-    assert proposer.speculative_config.draft_tensor_parallel_size == 1
+def test_draft_tp_defaults_to_target_tp():
+    # vLLM's _verify_and_get_draft_tp already resolves an unset eagle3 draft
+    # tp to target_tp; Eagle3Proposer sets it explicitly too (defensive +
+    # self-documenting).
+    proposer = _make_proposer(draft_tp=None, target_tp=8)
+    assert proposer.speculative_config.draft_tensor_parallel_size == 8
+    assert proposer._draft_replicated is False
 
 
-def test_draft_tp_one_unchanged():
-    proposer = _make_proposer(draft_tp=1)
-    assert proposer.speculative_config.draft_tensor_parallel_size == 1
+@pytest.mark.parametrize("draft_tp", [2, 4])
+def test_draft_tp_invalid_raises(draft_tp):
+    # Only replicated (1) or fully sharded (== target tp) are supported.
+    with pytest.raises(ValueError):
+        _make_proposer(draft_tp=draft_tp, target_tp=8)
 
 
 def _make_chunk(*,

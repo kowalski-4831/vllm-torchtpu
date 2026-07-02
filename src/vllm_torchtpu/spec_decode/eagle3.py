@@ -107,8 +107,9 @@ class Eagle3Proposer:
       a probability distribution, so the rejection sampler cannot perform
       proper non-greedy rejection sampling. Non-greedy requests are rejected
       at add_request time in tpu_platform.py before reaching this proposer.
-    - draft_tensor_parallel_size is always coerced to 1; the eagle3 head runs
-      fully replicated on every TPU worker.
+    - draft_tensor_parallel_size selects the draft's parallelism: 1 runs the
+      eagle3 head fully replicated on every TPU worker; target tp runs it
+      sharded across the TP group.
     """
 
     def __init__(
@@ -120,13 +121,26 @@ class Eagle3Proposer:
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
         assert self.speculative_config is not None
-        # Always run the eagle3 draft fully replicated.
         draft_tp = self.speculative_config.draft_tensor_parallel_size
-        if draft_tp != 1:
-            logger.info(
-                "draft_tensor_parallel_size=%s requested; forcing to 1 "
-                "(TPU runs the eagle3 draft fully replicated).", draft_tp)
-            self.speculative_config.draft_tensor_parallel_size = 1
+        target_tp = self.vllm_config.parallel_config.tensor_parallel_size
+        # Default to (draft_tp == target tp) when unset. vLLM's
+        # _verify_and_get_draft_tp already resolves an unset value to target tp
+        # for eagle3, but set it explicitly here so self-documented.
+        if draft_tp is None:
+            draft_tp = target_tp
+            self.speculative_config.draft_tensor_parallel_size = draft_tp
+        # Only two draft parallelisms are supported: fully REPLICATED (tp=1) or
+        # SHARDED across the whole TP group (draft_tp == target_tp).
+        if draft_tp not in (1, target_tp):
+            raise ValueError(
+                f"eagle3 draft_tensor_parallel_size={draft_tp} is unsupported "
+                f"on TPU: it must be 1 (replicated draft) or {target_tp} "
+                f"(== target tensor_parallel_size, sharded draft).")
+        self._draft_replicated = (draft_tp == 1)
+        logger.info(
+            "eagle3 draft parallelism: %s (draft_tp=%s).",
+            "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
+            draft_tp)
         self.draft_model = None
         # Attention-layer names belonging to the draft model. Populated in
         # load_model by diffing the global attention-layer registry before
@@ -175,15 +189,31 @@ class Eagle3Proposer:
         model_loader = get_model_loader(self.vllm_config.load_config)
         # Tag the draft compile with "eagle_head" so its torch.compile cache
         # lives in a separate prefix from the target's "backbone" prefix.
+        draft_tp1_ctx = (_force_draft_tp1() if self._draft_replicated else
+                         contextlib.nullcontext())
         with set_model_tag("eagle_head"), set_vllm_model_wrapper_context(
                 mesh=self.runner.mesh), set_current_vllm_config(
-                    self.vllm_config), _force_draft_tp1():
+                    self.vllm_config), draft_tp1_ctx:
             self.draft_model = model_loader.load_model(
                 vllm_config=self.vllm_config,
                 model_config=self.speculative_config.draft_model_config,
             )
 
     def _maybe_share_embeddings(self, target_model) -> None:
+        """Give the draft the target's input embedding (eagle3 checkpoints
+        typically ship no embed_tokens of their own). The form depends on the
+        draft's parallelism:
+
+        - REPLICATED (tp=1) draft: needs the FULL vocab on every worker, so
+          host-gather the target's sharded embed shards into a replicated
+          nn.Embedding (_populate_draft_embed_from_target).
+        - SHARDED (draft_tp == target tp) draft: its embed is sharded over the
+          vocab like the target, so share the target's VocabParallelEmbedding
+          module directly — same layout, no gather / no replicated copy.
+
+        Only fires when the draft opts to share (has_own_embed_tokens False or
+        absent); a draft with its own embed keeps it.
+        """
         target_lm = target_model.get_language_model() if hasattr(
             target_model, "get_language_model") else target_model
         target_lm_model = getattr(target_lm, "model", None)
@@ -206,14 +236,20 @@ class Eagle3Proposer:
                     "embed_tokens, but the target model does not expose that "
                     "attribute. Set has_own_embed_tokens=True on the draft "
                     "model to skip sharing.")
-            logger.info(
-                "Populating draft's own embed_tokens with a host-gathered, "
-                "per-worker replicated copy of the target embedding.")
-            self._populate_draft_embed_from_target(target_embed)
+            if self._draft_replicated:
+                logger.info(
+                    "Populating draft's own embed_tokens with a host-gathered, "
+                    "per-worker replicated copy of the target embedding.")
+                self._populate_draft_embed_from_target(target_embed)
+            else:
+                logger.info(
+                    "Sharing the target's sharded embed_tokens with the "
+                    "sharded draft.")
+                self.draft_model.model.embed_tokens = target_embed
 
     def _populate_draft_embed_from_target(self, target_embed) -> None:
-        """Fill the draft's own (tp=1, full-vocab) embed_tokens with the
-        target's embedding, assembled on the host.
+        """Replicated (tp=1) draft only: fill the draft's own full-vocab
+        embed_tokens with the target's embedding, assembled on the host.
 
         Memory note: allocates a full [org_vocab, dim] fp32 tensor on every
         worker's CPU for the all_reduce (e.g. ~2 GB for Llama-3.1-8B:
@@ -269,14 +305,21 @@ class Eagle3Proposer:
     def _maybe_share_lm_head(self, target_model) -> None:
         """Override of LLMBaseProposer._maybe_share_lm_head.
 
-        Upstream conditionally shares the target's lm_head weights with the
-        draft when they are identical or when the draft has no own head. We do
-        not share weights here: the eagle3 draft runs tp=1 with a
-        fully-replicated vocab, so each worker already holds the complete
-        logits. Instead we patch _gather_logits to identity to skip the
-        cross-rank all_gather that the tp>1 target model requires.
+        Upstream conditionally shares the target's lm_head weights; we don't
+        share weights, we align the logits all_gather with the draft's
+        parallelism:
+
+        - REPLICATED (tp=1) draft: the head holds the full vocab on every
+          worker, so each already has the complete logits.
+          otherwise force (it reads the runtime TP group, size = target tp).
+        - SHARDED (draft_tp == target tp) draft: the head is column-parallel
+          over the vocab like the target, so each rank holds only vocab/tp
+          logits and the native _gather_logits all_gather IS required — leave it
+          untouched (early return below).
         """
         del target_model  # unused; kept to match upstream override signature
+        if not self._draft_replicated:
+            return
         lp = getattr(self.draft_model, "logits_processor", None)
         if lp is not None:
             # Fail loudly if upstream renames the attr: a silent no-op here

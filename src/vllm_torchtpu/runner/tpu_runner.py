@@ -2282,7 +2282,11 @@ class TPUModelRunner(GPUModelRunner):
         with set_vllm_model_wrapper_context(mesh=self.mesh):
             for name, attn_layer in layers.items():
                 if isinstance(attn_layer.impl, PallasAttentionBackendImpl):
-                    if name in draft_attn_names:
+                    # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
+                    # (non-shard_map) kernel.
+                    if (name in draft_attn_names and
+                            self.speculative_config.draft_tensor_parallel_size
+                            == 1):
                         # Instance attrs shadow the ClassVars; unique prefix
                         # keeps the local kernel op out of the sharded registry.
                         attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
