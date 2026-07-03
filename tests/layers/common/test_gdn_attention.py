@@ -165,7 +165,8 @@ class GDNAttentionTest(parameterized.TestCase):
         run_jax_gdn_attention_local_jitted = jax.jit(
             run_jax_gdn_attention_local,
             static_argnames=[
-                "n_kq", "n_v", "d_k", "d_v", "kernel_size", "config"
+                "n_kq", "n_v", "d_k", "d_v", "kernel_size", "dp_enabled",
+                "config"
             ],
         )
 
@@ -188,6 +189,7 @@ class GDNAttentionTest(parameterized.TestCase):
             d_k=kq_head_dim,
             d_v=v_head_dim,
             kernel_size=kernel_size,
+            dp_enabled=False,
         )
 
         # Run ref

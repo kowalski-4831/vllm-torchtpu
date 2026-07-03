@@ -1670,15 +1670,11 @@ class TPUModelRunner(GPUModelRunner):
             # then the embedding layer is not included in the CUDA graph.
             return input_ids, None
 
-    def _dp_size(self) -> int:
-        return int(os.environ.get("TORCH_TPU_DP_SIZE", "0")) or int(
-            self.parallel_config.data_parallel_size or 1)
-
     def _dp_lockstep_enabled(self) -> bool:
         # EP combine reduces partial expert outputs across DP engines; those
         # ranks must enter the same collectives with matching token buckets.
         # Non-EP DP engines remain independently schedulable.
-        return (self._dp_size() > 1
+        return (utils.get_dp_size(self.parallel_config) > 1
                 and self.parallel_config.enable_expert_parallel)
 
     def _count_input_chunks(self, scheduler_output: "SchedulerOutput") -> int:
@@ -1741,7 +1737,7 @@ class TPUModelRunner(GPUModelRunner):
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
             return None
-        return torch.full((self._dp_size(), ),
+        return torch.full((utils.get_dp_size(self.parallel_config), ),
                           num_tokens,
                           dtype=torch.int32,
                           device="cpu")

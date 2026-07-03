@@ -247,9 +247,10 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     _orig = WorkerProc.make_worker_process
 
     def _wrapped(vllm_config, local_rank, rank, *args, **kwargs):
+        from vllm_torchtpu.utils import get_dp_size
+
         pc = vllm_config.parallel_config
-        dp_size = int(_os.environ.get("TORCH_TPU_DP_SIZE",
-                                      "0")) or pc.data_parallel_size
+        dp_size = get_dp_size(pc)
         if dp_size > 1:
             dp_rank = getattr(pc, "data_parallel_index", None)
             if dp_rank is None:

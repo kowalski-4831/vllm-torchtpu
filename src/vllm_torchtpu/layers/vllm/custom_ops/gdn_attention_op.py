@@ -18,6 +18,7 @@ import jax
 import torch
 from einops import rearrange
 from torch_tpu._internal import pallas
+from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
@@ -29,6 +30,7 @@ from vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper import \
     RaggedGatedDeltaRuleImpl
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
+from vllm_torchtpu.utils import get_dp_size
 
 
 def gdn_attention_core_tpu(
@@ -53,6 +55,7 @@ def gdn_attention_core_tpu(
     d_v: int,
     kernel_size: int,
     config: GdnAttentionConfig,
+    dp_enabled: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     (new_conv_state, new_recurrent_state), output = run_jax_gdn_attention(
         mixed_qkv,
@@ -74,6 +77,7 @@ def gdn_attention_core_tpu(
         d_v=d_v,
         kernel_size=kernel_size,
         mesh=mesh,
+        dp_enabled=dp_enabled,
         config=config,
     )
 
@@ -93,6 +97,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl(
                 envs.RAGGED_GATED_DELTA_RULE_IMPL))
         local_num_v_heads = self.num_v_heads // self.tp_size
+        dp_enabled = get_dp_size(get_current_vllm_config().parallel_config) > 1
         wrapped_fn = functools.partial(
             gdn_attention_core_tpu,
             mesh=vllm_context.mesh,
@@ -102,6 +107,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             d_v=self.head_v_dim,
             kernel_size=self.conv_kernel_size,
             config=config,
+            dp_enabled=dp_enabled,
         )
 
         op_name = f"pallas::gdn_attention_{self.prefix.replace('.', '_')}"

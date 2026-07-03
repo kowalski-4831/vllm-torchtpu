@@ -59,6 +59,7 @@ def run_jax_gdn_attention_local(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    dp_enabled: bool,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the local JAX GDN attention mechanism with combined QKV tensors.
@@ -146,6 +147,9 @@ def run_jax_gdn_attention_local(
         )
     else:
         wrapper_config = config.ragged_gated_delta_rule_impl.to_config()
+        # DP replicas hold the full-width GDN heads, so the wide (64) scan chunk
+        # overflows VMEM (CompileTimeScopedVmemOom) -- use 32 there.
+        chunk_size = 32 if dp_enabled else 64
         new_recurrent_state, output = ragged_gated_delta_rule_wrapper.ragged_gated_delta_rule_wrapper(
             mixed_qkv=out_mixed_qkv,
             b=b,
@@ -161,7 +165,7 @@ def run_jax_gdn_attention_local(
             d_k=d_k,
             d_v=d_v,
             config=wrapper_config,
-            chunk_size=64,
+            chunk_size=chunk_size,
             has_initial_state=has_initial_state,
         )
 
@@ -188,6 +192,7 @@ def run_jax_gdn_attention(
     d_v: int,
     kernel_size: int,
     mesh: jax.sharding.Mesh,
+    dp_enabled: bool,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
@@ -270,6 +275,7 @@ def run_jax_gdn_attention(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        dp_enabled=dp_enabled,
         config=config,
     )
 

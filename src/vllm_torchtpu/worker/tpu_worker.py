@@ -141,8 +141,7 @@ class TPUWorker(WorkerBase):
         # already inherited from the parent process (set by
         # prepare_tpu_environment() in tpu_platform.py).
         pc = self.parallel_config
-        dp_size = int(os.environ.get("TORCH_TPU_DP_SIZE",
-                                     "0")) or pc.data_parallel_size
+        dp_size = utils.get_dp_size(pc)
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = getattr(pc, "data_parallel_index", None)
