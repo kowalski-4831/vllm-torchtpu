@@ -236,6 +236,20 @@ def test_qwen35_p4d2_launcher_enables_batched_rpa_backend():
     assert "USE_BATCHED_RPA_KERNEL=1" in text
 
 
+def test_qwen35_p4d2_launcher_uses_v3_gdn_by_default():
+    ci_text = CI_SCRIPT.read_text(encoding="utf-8")
+    launcher_text = P4D2_LAUNCHER.read_text(encoding="utf-8")
+
+    assert (
+        'RAGGED_GATED_DELTA_RULE_IMPL="${RAGGED_GATED_DELTA_RULE_IMPL:-chunked_kernel_v3_pd}"'
+        in ci_text)
+    assert (
+        'RAGGED_GATED_DELTA_RULE_IMPL="${RAGGED_GATED_DELTA_RULE_IMPL:-chunked_kernel_v3_pd}"'
+        in launcher_text)
+    assert ('RAGGED_GATED_DELTA_RULE_IMPL="${RAGGED_GATED_DELTA_RULE_IMPL}";'
+            in launcher_text)
+
+
 def test_ci_workflow_warms_hf_cache_from_gcs_before_running():
     text = CI_WORKFLOW.read_text(encoding="utf-8")
 

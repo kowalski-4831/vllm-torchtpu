@@ -25,6 +25,7 @@ from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper as ragged_gated_delta_rule_wrapper
 from vllm_torchtpu.kernels.causal_conv1d import causal_conv1d
+from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.ragged_gated_delta_rule_ref import \
     ragged_gated_delta_rule as ragged_gated_delta_rule_ref
 from vllm_torchtpu.layers.common.sharding import ShardingAxisName
@@ -112,6 +113,28 @@ def run_jax_gdn_attention_local(
     max_reqs = seq_lens.shape[0]
     query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
     has_initial_state = (seq_lens - query_lens) > 0
+
+    if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
+        return gdn_v3_wrapper.fused_conv1d_gdn(
+            mixed_qkv,
+            b,
+            a,
+            conv_state,
+            recurrent_state,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
 
     out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
         mixed_qkv,

@@ -182,7 +182,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "RAGGED_GATED_DELTA_RULE_IMPL":
     env_with_choices("RAGGED_GATED_DELTA_RULE_IMPL", "chunked_jax_pd", [
         "ref", "chunked_jax_pd", "chunked_kernel_pd", "chunked_kernel_p_jax_d",
-        "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd"
+        "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd",
+        "chunked_kernel_v3_pd"
     ]),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
