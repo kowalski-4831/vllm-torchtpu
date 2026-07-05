@@ -46,6 +46,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/common/ragged_gated_delta_rule_ref.py",
     "vllm_torchtpu/kernels/gdn",
     "vllm_torchtpu/kernels/causal_conv1d",
+    "vllm_torchtpu/kernels/experimental/pcp_streaming_rpa",
 )
 
 

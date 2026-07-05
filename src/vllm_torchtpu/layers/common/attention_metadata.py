@@ -9,6 +9,10 @@ from vllm.v1.attention.backend import \
     AttentionMetadataBuilder as BaseAttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_torchtpu.layers.common.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR, DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
+    SequenceLayoutDescriptor, SequenceLayoutKind)
+
 
 @functools.partial(
     jax.tree_util.register_dataclass,
@@ -20,7 +24,11 @@ from vllm.v1.kv_cache_interface import MambaSpec
         "request_distribution",
         "mamba_state_indices",
     ],
-    meta_fields=[],
+    meta_fields=[
+        "sequence_layout_kind",
+        "sequence_layout_protocol",
+        "sequence_layout_version",
+    ],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
 )
 @dataclass
@@ -35,15 +43,16 @@ class AttentionMetadata(object):
     query_start_loc: jax.Array = None
     # (3,)
     request_distribution: jax.Array = None
-    # (max_num_seqs,) int32 — physical slot id (∈ [0, _mamba_num_blocks))
-    # in the mamba kv-cache for the request currently in each persistent-
-    # batch position. Mamba/GDN ops read/write recurrent state through this
-    # instead of `block_tables[:, 0]`, since under compact-mamba sizing the
-    # mamba pool is smaller than the attention pool and vLLM's attention
-    # block IDs no longer index it. None for the attention group / for
-    # non-mamba models (keeps AttentionMetadata byte-identical to the
-    # pre-compact-mamba layout for those).
+    # (max_num_seqs,) int32 - physical slot id in the mamba kv-cache for the
+    # request currently in each persistent-batch position. Mamba/GDN ops
+    # read/write recurrent state through this instead of `block_tables[:, 0]`,
+    # since under compact-mamba sizing the mamba pool is smaller than the
+    # attention pool and vLLM's attention block IDs no longer index it.
+    # None for the attention group / for non-mamba models.
     mamba_state_indices: jax.Array | None = None
+    sequence_layout_kind: str = SequenceLayoutKind.ALL.value
+    sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
+    sequence_layout_version: int = 1
 
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)
@@ -71,6 +80,8 @@ class AttentionMetadataBuilderContext:
     # target_num_reqs). Only the mamba group's builder reads it; None when the
     # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
     mamba_state_indices: torch.Tensor | None = None
+    sequence_layout_descriptor: SequenceLayoutDescriptor = (
+        DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
 
 
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
@@ -114,7 +125,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         source_block_tables = None
         if ctx.position_ids_override is not None:
             block_tables_dev = torch.zeros(
-                (ctx.num_reqs * target_num_blocks, ),
+                (target_num_reqs * target_num_blocks, ),
                 dtype=torch.int32).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
@@ -171,4 +182,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             query_start_loc=ctx.query_start_loc,
             request_distribution=ctx.request_distribution,
             mamba_state_indices=mamba_state_indices,
+            sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
+            sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
+            sequence_layout_version=ctx.sequence_layout_descriptor.version,
         )

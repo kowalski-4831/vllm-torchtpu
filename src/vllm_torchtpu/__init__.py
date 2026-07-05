@@ -242,38 +242,38 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
     from vllm.v1.executor.multiproc_executor import WorkerProc
 
+    from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
+
     if getattr(WorkerProc, "_tpu_global_rank_env_patch", False):
         return
     _orig = WorkerProc.make_worker_process
 
     def _wrapped(vllm_config, local_rank, rank, *args, **kwargs):
-        from vllm_torchtpu.utils import get_dp_size
-
         pc = vllm_config.parallel_config
-        dp_size = get_dp_size(pc)
-        if dp_size > 1:
-            dp_rank = getattr(pc, "data_parallel_index", None)
-            if dp_rank is None:
-                dp_rank = pc.data_parallel_rank or 0
-            lw = pc.world_size
-            global_rank = lw * dp_rank + rank
-            chip_rank = lw * dp_rank + local_rank
-            global_world = lw * dp_size
-            _os.environ["RANK"] = str(global_rank)
-            # Single-host TorchTPU indexes chips in the unified DP*TP slice.
-            _os.environ["LOCAL_RANK"] = str(chip_rank)
-            _os.environ["WORLD_SIZE"] = str(global_world)
-            _os.environ["LOCAL_WORLD_SIZE"] = str(global_world)
+        binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
+        _os.environ.update(binding.as_env())
+        logger.info(
+            "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
+            "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
+            "(rank=%d local_rank=%d dp_rank=%d dp_size=%d offset=%d "
+            "init_local_rank=%d)", binding.rank, binding.local_rank,
+            binding.world_size, binding.local_world_size, rank, local_rank,
+            binding.dp_rank, binding.dp_size, binding.local_rank_offset,
+            binding.init_local_rank)
+        if binding.pcp_local_rank_remap is not None:
             logger.info(
-                "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
-                "WORLD_SIZE=%d (dp_rank=%d rank=%d local_rank=%d)",
-                global_rank, chip_rank, global_world, dp_rank, rank,
-                local_rank)
-        else:
-            _os.environ["RANK"] = str(rank)
-            _os.environ["LOCAL_RANK"] = str(local_rank)
-            _os.environ["WORLD_SIZE"] = str(pc.world_size)
-            _os.environ["LOCAL_WORLD_SIZE"] = str(pc.world_size)
+                "Applied TPU patch: PCP native-rank worker spawn binding "
+                "native_local_rank=%d local_rank_env=%d "
+                "tpu_local_rank_env=%d local_world=%d tpu_local_world=%d "
+                "remap=%s source=%s",
+                binding.native_local_rank,
+                binding.init_local_rank,
+                binding.local_rank,
+                binding.world_size,
+                binding.local_world_size,
+                binding.pcp_local_rank_remap,
+                binding.pcp_remap_source,
+            )
         return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)

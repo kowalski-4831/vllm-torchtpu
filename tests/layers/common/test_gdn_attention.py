@@ -280,6 +280,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 d_k=d_k,
                 d_v=d_v,
                 kernel_size=kernel_size,
+                dp_enabled=False,
                 config=config,
             )
 

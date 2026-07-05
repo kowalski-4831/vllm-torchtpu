@@ -45,7 +45,7 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
 
 def get_dp_size(parallel_config) -> int:
     return int(os.environ.get("TORCH_TPU_DP_SIZE", "0")) or int(
-        parallel_config.data_parallel_size or 1)
+        getattr(parallel_config, "data_parallel_size", 1) or 1)
 
 
 def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:

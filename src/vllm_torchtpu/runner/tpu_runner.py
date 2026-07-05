@@ -64,6 +64,8 @@ from vllm_torchtpu.kv_cache_spec_normalizer import \
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
+from vllm_torchtpu.layers.common.sequence_layout import (
+    SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend)
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
@@ -139,6 +141,14 @@ MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
+def _get_sequence_layout_planner_for_runner(runner: Any):
+    planner = getattr(runner, "sequence_layout_planner", None)
+    if planner is None:
+        planner = create_sequence_layout_planner(runner.vllm_config)
+        runner.sequence_layout_planner = planner
+    return planner
+
+
 def _validate_libtpu_version() -> None:
     """Validate libtpu opportunistically if it is present."""
     libtpu_version = importlib_metadata.version("libtpu")
@@ -210,12 +220,27 @@ class TPUModelRunner(GPUModelRunner):
         device: torch.device,
         original_parallel_config: ParallelConfig | None = None,
     ):
+        sequence_layout_planner = create_sequence_layout_planner(vllm_config)
+        if sequence_layout_planner.requires_backend_preinit:
+            # GPUModelRunner probes torch.cuda.mem_get_info during init. The
+            # TPU shim maps that to torch.accelerator.get_memory_info, which
+            # initializes TorchTPU/PJRT from TORCH_TPU_TOPOLOGY=1,1,1 and would
+            # otherwise leave JAX seeing only one chip. Initialize JAX first
+            # so partial sequence layout backends own the full local device
+            # set.
+            layout_devices = list(jax.local_devices())
+            logger.info(
+                "Pre-initialized JAX backend for partial sequence layout "
+                "| world_size=%d | visible_devices=%d",
+                sequence_layout_planner.backend_preinit_world_size,
+                len(layout_devices))
         # Disable cudagraphs before parent init so its dispatch self-disables.
         # TPU uses AOT bucket precompile (_precompile_* methods) instead.
         vllm_config.compilation_config.cudagraph_capture_sizes = []
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
+        self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()
 
         # Parent already set: vllm_config, *_config, device, pin_memory, dtype,
@@ -1401,6 +1426,10 @@ class TPUModelRunner(GPUModelRunner):
 
         num_reqs = len(num_scheduled_tokens_per_req)
 
+        sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
+        sequence_layout_planner.reserve_host_token_capacity(
+            self, int(total_num_scheduled_tokens))
+
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
 
@@ -1470,30 +1499,49 @@ class TPUModelRunner(GPUModelRunner):
                                                      num_reqs] +
             num_scheduled_tokens_per_req)
 
-        # Do the padding and copy the tensors to the TPU.
-        padded_total_num_scheduled_tokens = _get_padded_token_len(
-            self.num_tokens_paddings, total_num_scheduled_tokens)
-        _dp_bucket = getattr(self, "_dp_target_bucket", None)
-        if _dp_bucket is not None and _dp_bucket > padded_total_num_scheduled_tokens:
-            padded_total_num_scheduled_tokens = _dp_bucket
-        # Zero out to avoid spurious values from prev iteration (last cp chunk)
-        self.input_ids_cpu[
-            total_num_scheduled_tokens:padded_total_num_scheduled_tokens] = 0
-        self.input_ids = self.input_ids_cpu[:
-                                            padded_total_num_scheduled_tokens].to(
-                                                self.device, non_blocking=True)
+        if use_max_model_len:
+            target_num_reqs = self.num_reqs_max_model_len
+        else:
+            assert self.num_reqs_most_model_len is not None
+            target_num_reqs = self.num_reqs_most_model_len
+        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
+            num_reqs, self.max_num_reqs)
+
+        layout_plan = sequence_layout_planner.prepare_real(
+            runner=self,
+            scheduler_output=scheduler_output,
+            start_index=start_index,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
+            total_num_scheduled_tokens=int(total_num_scheduled_tokens),
+            use_max_model_len=use_max_model_len,
+            target_num_reqs=target_num_reqs,
+            padded_num_reqs=padded_num_reqs,
+        )
+        self._last_sequence_layout_plan = layout_plan
+        padded_total_num_scheduled_tokens = (
+            layout_plan.global_padded_num_tokens)
+        local_total_num_scheduled_tokens = layout_plan.local_num_tokens
+        local_padded_total_num_scheduled_tokens = (
+            layout_plan.local_padded_num_tokens)
+        local_token_slice = layout_plan.token_slice
+        if layout_plan.kind is SequenceLayoutKind.ALL:
+            # Zero out to avoid spurious values from prev iteration.
+            self.input_ids_cpu[total_num_scheduled_tokens:
+                               padded_total_num_scheduled_tokens] = 0
+        self.input_ids = self.input_ids_cpu[local_token_slice].to(
+            self.device, non_blocking=True)
         if self.uses_mrope:
-            self.mrope_positions.cpu[:, total_num_scheduled_tokens:
-                                     padded_total_num_scheduled_tokens] = 0
-            self.position_ids = self.mrope_positions.cpu[:, :
-                                                         padded_total_num_scheduled_tokens].to(
+            if layout_plan.kind is SequenceLayoutKind.ALL:
+                self.mrope_positions.cpu[:, total_num_scheduled_tokens:
+                                         padded_total_num_scheduled_tokens] = 0
+            self.position_ids = self.mrope_positions.cpu[:,
+                                                         local_token_slice].to(
                                                              self.device,
                                                              non_blocking=True)
         else:
-            self.position_ids = self.positions_cpu[:
-                                                   padded_total_num_scheduled_tokens].to(
-                                                       self.device,
-                                                       non_blocking=True)
+            self.position_ids = self.positions_cpu[local_token_slice].to(
+                self.device, non_blocking=True)
         if use_max_model_len:
             seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
                 self.device, non_blocking=True)
@@ -1508,9 +1556,12 @@ class TPUModelRunner(GPUModelRunner):
         # query_start_loc, logits_indices, and request_distribution don't
         # change between decode steps for a given (num_reqs, padded_num_reqs).
         is_decode_only = (max_num_scheduled_tokens_all_reqs == 1)
-        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs)
-        decode_cache_key = (num_reqs, padded_num_reqs, use_max_model_len)
+        decode_cache_key = (
+            num_reqs,
+            padded_num_reqs,
+            use_max_model_len,
+            layout_plan.descriptor.cache_key,
+        )
 
         # Speculative decoding metadata.
         spec_decode_metadata = None
@@ -1527,7 +1578,17 @@ class TPUModelRunner(GPUModelRunner):
                     num_draft_tokens, self.query_start_loc_np[1:num_reqs + 1],
                     padded_num_reqs)
 
-        if is_decode_only and decode_cache_key == self._decode_device_cache_key and spec_decode_metadata is None:
+        # Default decode layouts keep logits_indices stable for a fixed
+        # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
+        # explicit rank-major logits indices that can change as q_start crosses
+        # an interleave/rank boundary, so they must not reuse a stale cached
+        # logits_indices tensor.
+        can_cache_decode_metadata = (is_decode_only
+                                     and spec_decode_metadata is None and
+                                     layout_plan.logits_indices_cpu is None)
+
+        if (can_cache_decode_metadata
+                and decode_cache_key == self._decode_device_cache_key):
             # Reuse cached device tensors — skip 3 H2D copies.
             query_start_loc = self._cached_query_start_loc
             logits_indices = self._cached_logits_indices
@@ -1551,6 +1612,9 @@ class TPUModelRunner(GPUModelRunner):
 
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
+            elif layout_plan.logits_indices_cpu is not None:
+                logits_indices = layout_plan.logits_indices_cpu.to(
+                    self.device, non_blocking=True)
             else:
                 # Indices at which we sample (positions of last token in the
                 # sequence). Padded to avoid recompiling when `num_reqs` varies.
@@ -1569,7 +1633,7 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True)
 
-            if is_decode_only and spec_decode_metadata is None:
+            if can_cache_decode_metadata:
                 # Cache for future decode steps.
                 self._decode_device_cache_key = decode_cache_key
                 self._cached_query_start_loc = query_start_loc
@@ -1592,13 +1656,14 @@ class TPUModelRunner(GPUModelRunner):
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
+            sequence_layout_descriptor=layout_plan.descriptor,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
-            num_tokens=total_num_scheduled_tokens,
+            num_tokens=local_total_num_scheduled_tokens,
             num_reqs=target_num_reqs,
             max_query_len=max_num_scheduled_tokens_all_reqs,
-            num_tokens_padded=padded_total_num_scheduled_tokens,
+            num_tokens_padded=local_padded_total_num_scheduled_tokens,
             num_reqs_padded=target_num_reqs,
             slot_mappings=slot_mappings,
         )
@@ -1877,13 +1942,19 @@ class TPUModelRunner(GPUModelRunner):
                     num_tokens=num_tokens_padded,
                     num_tokens_across_dp=self._dp_num_tokens_across_dp(
                         num_tokens_padded),
-            ), set_vllm_model_wrapper_context(mesh=self.mesh):
+            ), set_vllm_model_wrapper_context(mesh=self.mesh,
+                                              vllm_config=self.vllm_config):
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
 
+            hidden_states = _get_sequence_layout_planner_for_runner(
+                self).finalize_hidden_states(
+                    hidden_states,
+                    getattr(self, "_last_sequence_layout_plan", None),
+                )
             logits = self.compute_selected_logits(hidden_states,
                                                   logits_indices)
 
@@ -2243,7 +2314,8 @@ class TPUModelRunner(GPUModelRunner):
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
-        with set_vllm_model_wrapper_context(mesh=self.mesh), \
+        with set_vllm_model_wrapper_context(mesh=self.mesh,
+                                           vllm_config=self.vllm_config), \
              set_current_vllm_config(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
@@ -2275,7 +2347,8 @@ class TPUModelRunner(GPUModelRunner):
 
         layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         initialized_count = 0
-        with set_vllm_model_wrapper_context(mesh=self.mesh):
+        with set_vllm_model_wrapper_context(mesh=self.mesh,
+                                            vllm_config=self.vllm_config):
             for name, attn_layer in layers.items():
                 if isinstance(attn_layer.impl, PallasAttentionBackendImpl):
                     # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
@@ -2304,6 +2377,9 @@ class TPUModelRunner(GPUModelRunner):
                    num_blocks: int,
                    use_max_model_len: bool = True,
                    dp_lockstep: bool = False) -> None:
+        kv_cache_initialized = getattr(self, "kv_cache_config",
+                                       None) is not None
+
         if self.supports_mm_inputs:
             input_ids = None
             inputs_embeds = torch.zeros(
@@ -2334,6 +2410,12 @@ class TPUModelRunner(GPUModelRunner):
         request_distribution = torch.tensor(
             [actual_num_reqs, actual_num_reqs, actual_num_reqs],
             dtype=torch.int32).to(self.device)
+        dummy_layout_plan = _get_sequence_layout_planner_for_runner(
+            self).prepare_dummy(
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                kv_cache_initialized=kv_cache_initialized,
+            )
 
         if getattr(self, "kv_cache_config", None) is not None:
             # Dummy compact-mamba slot ids (all null slot 0): the dummy run
@@ -2352,6 +2434,7 @@ class TPUModelRunner(GPUModelRunner):
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
                 mamba_state_indices=dummy_mamba_state_indices,
+                sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
@@ -2393,7 +2476,8 @@ class TPUModelRunner(GPUModelRunner):
                     num_tokens=num_tokens if dp_lockstep else 0,
                     num_tokens_across_dp=self._dp_num_tokens_across_dp(
                         num_tokens) if dp_lockstep else None),
-                set_vllm_model_wrapper_context(mesh=self.mesh),
+                set_vllm_model_wrapper_context(mesh=self.mesh,
+                                               vllm_config=self.vllm_config),
         ):
             out, _ = self.forward_model(input_ids=input_ids,
                                         positions=position_ids,

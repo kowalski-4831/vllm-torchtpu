@@ -227,6 +227,7 @@ def generate_pcp_streaming_schedule_from_metadata_host(
     q_block_size: int,
     num_lanes: int = 1,
     kv_pages_per_block: int = 1,
+    max_context_tokens: int | None = None,
 ) -> PcpStreamingSchedule:
     """Build the host/oracle PCP streaming schedule from standard metadata.
 
@@ -284,9 +285,16 @@ def generate_pcp_streaming_schedule_from_metadata_host(
         raise ValueError(
             f"kv_lens[{first}] exceeds local KV cache PCP capacity: "
             f"kv_len={int(kv_lens_active[first])} {capacity_tokens=}.")
+    schedule_capacity_tokens = capacity_tokens
+    if max_context_tokens is not None:
+        max_context_tokens = int(max_context_tokens)
+        if max_context_tokens <= 0:
+            raise ValueError("max_context_tokens must be positive.")
+        schedule_capacity_tokens = min(schedule_capacity_tokens,
+                                       max_context_tokens)
     pad_steps_to = estimate_pcp_streaming_metadata_schedule_steps_ub(
         global_bucket_tokens=global_bucket_tokens,
-        capacity_tokens=capacity_tokens,
+        capacity_tokens=schedule_capacity_tokens,
         block_size=page_size,
         pcp_size=pcp_size,
         q_block_size=q_block_size,
@@ -376,6 +384,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     interleave_size: int,
     q_block_size: int,
     max_steps: int | None = None,
+    max_context_tokens: int | None = None,
     num_lanes: int = 1,
     kv_pages_per_block: int = 1,
 ):
@@ -422,12 +431,19 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
                          "pcp_size * q_block_size for PCP lockstep schedules.")
     if local_kv_cache_num_blocks <= 0:
         raise ValueError("local_kv_cache_num_blocks must be positive.")
+    if max_context_tokens is not None:
+        max_context_tokens = int(max_context_tokens)
+        if max_context_tokens <= 0:
+            raise ValueError("max_context_tokens must be positive.")
 
     max_num_seqs = int(np.shape(kv_lens)[0])
     if max_steps is None:
+        capacity_tokens = local_kv_cache_num_blocks * pcp_size * page_size
+        if max_context_tokens is not None:
+            capacity_tokens = min(capacity_tokens, max_context_tokens)
         max_steps = estimate_pcp_streaming_metadata_schedule_steps_ub(
             global_bucket_tokens=global_bucket_tokens,
-            capacity_tokens=local_kv_cache_num_blocks * pcp_size * page_size,
+            capacity_tokens=capacity_tokens,
             block_size=page_size,
             pcp_size=pcp_size,
             q_block_size=q_block_size,

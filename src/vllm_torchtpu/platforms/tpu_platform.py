@@ -20,8 +20,10 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     update_tpu_block_size_and_slot_config
+from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -395,6 +397,16 @@ class TpuPlatform(Platform):
                 "Pathways is not supported by torchtpu-vllm. "
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         cls._initialize_sharding_config(vllm_config)
+        parallel_config = vllm_config.parallel_config
+        scheduler_config = vllm_config.scheduler_config
+        pcp_config = PcpStaticSupportValidator.validate_platform_config(
+            vllm_config,
+            multihost_backend=envs.TPU_MULTIHOST_BACKEND,
+        )
+        pcp_size = pcp_config.pcp_size
+        if pcp_config.enabled:
+            logger.info("Using vLLM native multiprocess PCP world; PCP is not "
+                        "represented as a JAX mesh axis.")
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
@@ -493,6 +505,10 @@ class TpuPlatform(Platform):
         if not multihost_backend:  # Single host
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
+                if pcp_size > 1:
+                    ensure_pcp_local_rank_remap(
+                        parallel_config.world_size_across_dp,
+                        get_topology=cls._get_tpu_topology)
                 # Single-host DP uses one torch_tpu slice across all DP*TP
                 # workers; the worker spawn shim exposes a DP-adjusted chip
                 # ordinal to TorchTPU for physical binding.
@@ -515,16 +531,25 @@ class TpuPlatform(Platform):
                     parallel_config.world_size_across_dp)
             else:
                 os.environ.pop("TORCH_TPU_DP_SIZE", None)
-                cls._prepare_singlehost_tpu_env(parallel_config.world_size)
-            if (parallel_config.data_parallel_size == 1
+                torch_tpu_world_size = parallel_config.world_size
+                if pcp_size > 1:
+                    logger.info(
+                        "Preparing TorchTPU bootstrap env for native PCP "
+                        "multiprocess world_size=%d.", torch_tpu_world_size)
+                    ensure_pcp_local_rank_remap(
+                        torch_tpu_world_size,
+                        get_topology=cls._get_tpu_topology)
+                cls._prepare_singlehost_tpu_env(torch_tpu_world_size)
+            if (pcp_size <= 1 and parallel_config.data_parallel_size == 1
                     and parallel_config.pipeline_parallel_size == 1
                     and parallel_config.tensor_parallel_size == 1):
                 logger.info("Force using UniProcExecutor for TPU on \
                         single host without tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "uni"
             else:
-                logger.info("Force using TpuMultiprocExecutor for TPU on \
-                        single host with tensor/pipeline parallelism.")
+                logger.info(
+                    "Force using TpuMultiprocExecutor for TPU on single host "
+                    "with tensor/pipeline/PCP parallelism.")
                 from vllm_torchtpu.executors.tpu_multiproc_executor import \
                     TpuMultiprocExecutor
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor

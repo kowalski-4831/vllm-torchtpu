@@ -58,6 +58,12 @@ def _consume_scheduled_kv_page(
     k_scale,
     v_scale,
 ):
+    """Consume one scheduled KV page and update online-softmax state.
+
+    The Q tile is compact in rank-local HBM, so this helper reconstructs each
+    row's global query position from the schedule before applying the causal
+    mask against the scheduled global KV page.
+    """
     q = q_vmem_ref[...].astype(jnp.float32)
     if packed_kv_cache and kv_packing == 4:
         k_lane = (kv_head_idx * 2) % kv_packing
@@ -287,158 +293,129 @@ def _load_compact_q_tile_single_head(q_ref, q_vmem_ref, q_load_vmem_ref,
             q_vmem_ref[...] = updated_q
 
 
-def _load_compact_q_tile_multi_head(q_ref, q_vmem_ref, q_load_vmem_ref,
-                                    local_dma_sem, q_hbm_offset, q_tile_size,
-                                    q_block_size):
+def _load_compact_q_tile_multi_head(q_ref, q_vmem_ref, local_dma_sem,
+                                    q_hbm_offset, q_tile_size):
     q_vmem_ref[...] = jnp.zeros_like(q_vmem_ref)
-    aligned_start = _aligned_row_start(q_hbm_offset)
-    num_hbm_tiles = q_block_size // TPU_HBM_ROW_TILE + 1
-    for tile_idx in range(num_hbm_tiles):
-        hbm_start = pl.multiple_of(aligned_start + tile_idx * TPU_HBM_ROW_TILE,
-                                   TPU_HBM_ROW_TILE)
-        hbm_end = hbm_start + TPU_HBM_ROW_TILE
-        tile_active = jnp.logical_and(
-            q_tile_size > 0,
-            jnp.logical_and(hbm_start < q_hbm_offset + q_tile_size, hbm_end
-                            > q_hbm_offset),
-        )
 
-        @pl.when(tile_active)
-        def _load_aligned_q_tile():
-            q_load = pltpu.make_async_copy(
-                src_ref=q_ref.at[
-                    pl.ds(hbm_start, TPU_HBM_ROW_TILE),
-                    :,
-                    :,
-                    :,
-                ],
-                dst_ref=q_load_vmem_ref.at[:, :, :, :],
-                sem=local_dma_sem,
-            )
-            q_load.start()
-            q_load.wait()
-            q_rows = lax.broadcasted_iota(jnp.int32, q_vmem_ref.shape, 0)
-            updated_q = q_vmem_ref[...]
-            for row in range(TPU_HBM_ROW_TILE):
-                dst_row = hbm_start + row - q_hbm_offset
-                row_active = jnp.logical_and(q_rows == dst_row, q_rows
-                                             < q_tile_size)
-                updated_q = jnp.where(
-                    row_active,
-                    q_load_vmem_ref.at[row, :, :, :][...],
-                    updated_q,
-                )
-            q_vmem_ref[...] = updated_q
+    @pl.when(q_tile_size > 0)
+    def _load_q_tile():
+        q_load = pltpu.make_async_copy(
+            src_ref=q_ref.at[
+                pl.ds(q_hbm_offset, q_tile_size),
+                :,
+                :,
+                :,
+            ],
+            dst_ref=q_vmem_ref.at[
+                pl.ds(0, q_tile_size),
+                :,
+                :,
+                :,
+            ],
+            sem=local_dma_sem,
+        )
+        q_load.start()
+        q_load.wait()
 
 
 def _store_compact_output_tile_single_head(o_ref, o_vmem_ref, o_store_vmem_ref,
                                            local_dma_sem, o_hbm_offset,
                                            q_tile_size, q_block_size):
-    aligned_start = _aligned_row_start(o_hbm_offset)
-    num_hbm_tiles = q_block_size // TPU_HBM_ROW_TILE + 1
-    for tile_idx in range(num_hbm_tiles):
-        hbm_start = pl.multiple_of(aligned_start + tile_idx * TPU_HBM_ROW_TILE,
-                                   TPU_HBM_ROW_TILE)
-        hbm_end = hbm_start + TPU_HBM_ROW_TILE
-        tile_active = jnp.logical_and(
-            q_tile_size > 0,
-            jnp.logical_and(hbm_start < o_hbm_offset + q_tile_size, hbm_end
-                            > o_hbm_offset),
+    offset_aligned = lax.rem(o_hbm_offset, TPU_HBM_ROW_TILE) == 0
+    direct_tile = jnp.logical_and(q_tile_size == q_block_size, offset_aligned)
+    staged_tile = jnp.logical_and(q_tile_size > 0,
+                                  jnp.logical_not(direct_tile))
+
+    @pl.when(direct_tile)
+    def _store_output_tile():
+        safe_o_hbm_offset = pl.multiple_of(o_hbm_offset, TPU_HBM_ROW_TILE)
+        store = pltpu.make_async_copy(
+            src_ref=o_vmem_ref.at[
+                pl.ds(0, q_block_size),
+                :,
+            ],
+            dst_ref=o_ref.at[
+                pl.ds(safe_o_hbm_offset, q_block_size),
+                :,
+            ],
+            sem=local_dma_sem,
         )
+        store.start()
+        store.wait()
 
-        @pl.when(tile_active)
-        def _store_aligned_output_tile():
-            load_existing = pltpu.make_async_copy(
-                src_ref=o_ref.at[
-                    pl.ds(hbm_start, TPU_HBM_ROW_TILE),
-                    :,
-                ],
-                dst_ref=o_store_vmem_ref.at[:, :],
-                sem=local_dma_sem,
+    @pl.when(staged_tile)
+    def _store_staged_output_tile():
+        aligned_start = _aligned_row_start(o_hbm_offset)
+        num_hbm_tiles = q_block_size // TPU_HBM_ROW_TILE + 1
+        for tile_idx in range(num_hbm_tiles):
+            hbm_start = pl.multiple_of(
+                aligned_start + tile_idx * TPU_HBM_ROW_TILE, TPU_HBM_ROW_TILE)
+            hbm_end = hbm_start + TPU_HBM_ROW_TILE
+            tile_active = jnp.logical_and(
+                hbm_start < o_hbm_offset + q_tile_size,
+                hbm_end > o_hbm_offset,
             )
-            load_existing.start()
-            load_existing.wait()
-            store_rows = lax.broadcasted_iota(jnp.int32,
-                                              o_store_vmem_ref.shape, 0)
-            updated_store = o_store_vmem_ref[...]
-            for src_row in range(q_block_size):
-                row_active = jnp.logical_and(
-                    hbm_start + store_rows == o_hbm_offset + src_row,
-                    src_row < q_tile_size,
+
+            @pl.when(tile_active)
+            def _store_aligned_output_tile():
+                load_existing = pltpu.make_async_copy(
+                    src_ref=o_ref.at[
+                        pl.ds(hbm_start, TPU_HBM_ROW_TILE),
+                        :,
+                    ],
+                    dst_ref=o_store_vmem_ref.at[:, :],
+                    sem=local_dma_sem,
                 )
-                updated_store = jnp.where(
-                    row_active,
-                    o_vmem_ref.at[src_row, :][...],
-                    updated_store,
+                load_existing.start()
+                load_existing.wait()
+                store_rows = lax.broadcasted_iota(jnp.int32,
+                                                  o_store_vmem_ref.shape, 0)
+                updated_store = o_store_vmem_ref[...]
+                for src_row in range(q_block_size):
+                    row_active = jnp.logical_and(
+                        hbm_start + store_rows == o_hbm_offset + src_row,
+                        src_row < q_tile_size,
+                    )
+                    updated_store = jnp.where(
+                        row_active,
+                        o_vmem_ref.at[src_row, :][...],
+                        updated_store,
+                    )
+                o_store_vmem_ref[...] = updated_store
+                store = pltpu.make_async_copy(
+                    src_ref=o_store_vmem_ref.at[:, :],
+                    dst_ref=o_ref.at[
+                        pl.ds(hbm_start, TPU_HBM_ROW_TILE),
+                        :,
+                    ],
+                    sem=local_dma_sem,
                 )
-            o_store_vmem_ref[...] = updated_store
-            store = pltpu.make_async_copy(
-                src_ref=o_store_vmem_ref.at[:, :],
-                dst_ref=o_ref.at[
-                    pl.ds(hbm_start, TPU_HBM_ROW_TILE),
-                    :,
-                ],
-                sem=local_dma_sem,
-            )
-            store.start()
-            store.wait()
+                store.start()
+                store.wait()
 
 
-def _store_compact_output_tile_multi_head(o_ref, o_vmem_ref, o_store_vmem_ref,
-                                          local_dma_sem, o_hbm_offset,
-                                          q_tile_size, q_block_size):
-    aligned_start = _aligned_row_start(o_hbm_offset)
-    num_hbm_tiles = q_block_size // TPU_HBM_ROW_TILE + 1
-    for tile_idx in range(num_hbm_tiles):
-        hbm_start = pl.multiple_of(aligned_start + tile_idx * TPU_HBM_ROW_TILE,
-                                   TPU_HBM_ROW_TILE)
-        hbm_end = hbm_start + TPU_HBM_ROW_TILE
-        tile_active = jnp.logical_and(
-            q_tile_size > 0,
-            jnp.logical_and(hbm_start < o_hbm_offset + q_tile_size, hbm_end
-                            > o_hbm_offset),
+def _store_compact_output_tile_multi_head(o_ref, o_vmem_ref, local_dma_sem,
+                                          o_hbm_offset, q_tile_size):
+
+    @pl.when(q_tile_size > 0)
+    def _store_output_tile():
+        store = pltpu.make_async_copy(
+            src_ref=o_vmem_ref.at[
+                pl.ds(0, q_tile_size),
+                :,
+                :,
+                :,
+            ],
+            dst_ref=o_ref.at[
+                pl.ds(o_hbm_offset, q_tile_size),
+                :,
+                :,
+                :,
+            ],
+            sem=local_dma_sem,
         )
-
-        @pl.when(tile_active)
-        def _store_aligned_output_tile():
-            load_existing = pltpu.make_async_copy(
-                src_ref=o_ref.at[
-                    pl.ds(hbm_start, TPU_HBM_ROW_TILE),
-                    :,
-                    :,
-                    :,
-                ],
-                dst_ref=o_store_vmem_ref.at[:, :, :, :],
-                sem=local_dma_sem,
-            )
-            load_existing.start()
-            load_existing.wait()
-            store_rows = lax.broadcasted_iota(jnp.int32,
-                                              o_store_vmem_ref.shape, 0)
-            updated_store = o_store_vmem_ref[...]
-            for src_row in range(q_block_size):
-                row_active = jnp.logical_and(
-                    hbm_start + store_rows == o_hbm_offset + src_row,
-                    src_row < q_tile_size,
-                )
-                updated_store = jnp.where(
-                    row_active,
-                    o_vmem_ref.at[src_row, :, :, :][...],
-                    updated_store,
-                )
-            o_store_vmem_ref[...] = updated_store
-            store = pltpu.make_async_copy(
-                src_ref=o_store_vmem_ref.at[:, :, :, :],
-                dst_ref=o_ref.at[
-                    pl.ds(hbm_start, TPU_HBM_ROW_TILE),
-                    :,
-                    :,
-                    :,
-                ],
-                sem=local_dma_sem,
-            )
-            store.start()
-            store.wait()
+        store.start()
+        store.wait()
 
 
 def _source_page_idx_from_staged_schedule(sched_vmem_ref,
@@ -584,6 +561,12 @@ def _pcp_streaming_attention_page_groups_kernel(
     mesh_axis_names,
     pcp_axis_name,
 ):
+    """Single-head Pallas body for ring-streaming PCP attention.
+
+    One program instance runs on every rank in the PCP mesh. Each rank computes
+    output for its local compact Q rows and streams local KV pages to the next
+    PCP rank while receiving pages from the previous rank.
+    """
     my_id = lax.axis_index(pcp_axis_name)
     next_rank = lax.rem(my_id + 1, pcp_size)
     prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
@@ -604,6 +587,9 @@ def _pcp_streaming_attention_page_groups_kernel(
         zero_store.wait()
 
     for lane in range(num_lanes):
+        # Online-softmax state for the current compact Q tile. A schedule row
+        # with IS_FIRST_KV resets these values before consuming the first KV
+        # page for that tile.
         m = jnp.full((q_block_size, 1), -jnp.inf, dtype=jnp.float32)
         l_state = jnp.zeros((q_block_size, 1), dtype=jnp.float32)
         acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]), dtype=jnp.float32)
@@ -612,6 +598,8 @@ def _pcp_streaming_attention_page_groups_kernel(
             m, l_state, acc = carry
             group_start = group_idx * pcp_size
 
+            # Load the first step of the page group to discover this rank's Q
+            # tile and whether this group starts a fresh softmax reduction.
             _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
                                 sched_dma_sem, group_start)
             q_hbm_offset = sched_vmem_ref[my_id, lane,
@@ -624,6 +612,9 @@ def _pcp_streaming_attention_page_groups_kernel(
 
             @pl.when(group_load_q)
             def _load_q_tile():
+                # Q tiles are compact in rank-local HBM, but may not be aligned
+                # to TPU HBM row boundaries. The loader handles aligned HBM
+                # row DMA and scatters valid rows into the compact VMEM tile.
                 _load_compact_q_tile_single_head(
                     q_ref,
                     q_vmem_ref,
@@ -634,6 +625,9 @@ def _pcp_streaming_attention_page_groups_kernel(
                     q_block_size,
                 )
 
+            # Stage this rank's local KV page before the ring starts. The
+            # schedule is replicated, so each rank can find the page it owns by
+            # scanning the staged rows for KV_PAGE_RANK == my_id.
             _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
                                 sched_dma_sem, group_start + my_id)
             local_page_idx = _source_page_idx_from_staged_schedule(
@@ -663,6 +657,9 @@ def _pcp_streaming_attention_page_groups_kernel(
                 next_slot = 1 - curr_slot
                 src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
 
+                # Each ring round consumes the KV page whose schedule row
+                # corresponds to the source rank currently resident in
+                # curr_slot.
                 _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
                                     sched_dma_sem, group_start + src_rank)
                 group_has_last = jnp.logical_or(
@@ -676,6 +673,9 @@ def _pcp_streaming_attention_page_groups_kernel(
                                       wait_count)
 
                 if round_idx < pcp_size - 1:
+                    # Send the current KV slot to the next rank while this
+                    # rank computes against it. The next round consumes the
+                    # slot received from the previous rank.
                     remote_op = pltpu.make_async_remote_copy(
                         src_ref=kv_vmem_ref.at[curr_slot],
                         dst_ref=kv_vmem_ref.at[next_slot],
@@ -778,8 +778,6 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
     q_vmem_ref,
     kv_vmem_ref,
     o_vmem_ref,
-    q_load_vmem_ref,
-    o_store_vmem_ref,
     *,
     pcp_size,
     num_lanes,
@@ -795,6 +793,12 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
     mesh_axis_names,
     pcp_axis_name,
 ):
+    """Multi-head Pallas body for packed-KV ring-streaming PCP attention.
+
+    This follows the same page-group ring as the single-head body, but consumes
+    the packed batched-RPA KV-cache layout and computes all local KV heads from
+    each streamed KV transfer.
+    """
     my_id = lax.axis_index(pcp_axis_name)
     next_rank = lax.rem(my_id + 1, pcp_size)
     prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
@@ -817,6 +821,8 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
         zero_store.wait()
 
     for lane in range(num_lanes):
+        # Keep independent online-softmax state per KV head. q_per_kv rows are
+        # flattened during matmul and restored before returning.
         m_states = tuple(
             jnp.full((q_block_size, q_vmem_ref.shape[2], 1),
                      -jnp.inf,
@@ -852,11 +858,9 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                 _load_compact_q_tile_multi_head(
                     q_ref,
                     q_vmem_ref,
-                    q_load_vmem_ref,
                     local_dma_sem,
                     q_hbm_offset,
                     q_tile_size,
-                    q_block_size,
                 )
 
             _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
@@ -973,11 +977,9 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
             _store_compact_output_tile_multi_head(
                 o_ref,
                 o_vmem_ref,
-                o_store_vmem_ref,
                 local_dma_sem,
                 group_o_hbm_offset,
                 store_q_tile_size,
-                q_block_size,
             )
 
             return m_states, l_states, acc_states
@@ -1171,6 +1173,36 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
         mesh_axis_names: tuple[str, ...] = (AXIS, ),
         pcp_axis_name: str = AXIS,
 ):
+    """Launch the single-head PCP streaming Pallas kernel.
+
+    Args:
+        q_single_head: [local_tokens, head_dim]. Rank-local compact Q rows for
+            one query head.
+        kv_cache_single_head: [1, pages, page_size, kv_heads_or_packed, 2,
+            head_dim] for the current rank. The leading singleton dimension is
+            kept to match the Pallas HBM indexing path.
+        packed_schedule: [steps, pcp_size, num_lanes, 128]. Replicated schedule
+            generated by `schedule.py`; `steps` must be padded to a multiple of
+            `pcp_size`.
+        active_page_groups: Optional scalar or [1] int32 array limiting how
+            many page groups are executed at runtime.
+        pcp_size: Number of ranks in the PCP ring.
+        q_block_size: Static Q tile size consumed per page group.
+        sm_scale: Softmax scale applied to QK scores.
+        collective_id: Pallas collective id used for remote-copy semaphores.
+            `None` is useful in tests that do not require explicit ids.
+        kv_head_idx: KV head index when reading from a packed KV-cache layout.
+        kv_packing: Number of packed K/V lanes in the cache dtype layout.
+        packed_kv_cache: Whether `kv_cache_single_head` uses the batched-RPA
+            packed KV-cache layout.
+        k_scale: Optional dequantization scale for K.
+        v_scale: Optional dequantization scale for V.
+        mesh_axis_names: Names of the active JAX mesh axes.
+        pcp_axis_name: Mesh axis used as the PCP ring axis.
+
+    Returns:
+        [local_tokens, head_dim] output for this rank and head.
+    """
     page_size = kv_cache_single_head.shape[2]
     head_dim = q_single_head.shape[-1]
     num_page_groups = packed_schedule.shape[0] // pcp_size
@@ -1258,6 +1290,33 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
         mesh_axis_names: tuple[str, ...] = (AXIS, ),
         pcp_axis_name: str = AXIS,
 ):
+    """Launch the packed-KV multi-head PCP streaming Pallas kernel.
+
+    Args:
+        q_multi_head: [local_tokens, kv_heads, q_per_kv, head_dim].
+            Rank-local compact Q rows.
+        kv_cache_local: [1, pages, page_size, packed_kv_heads_x2,
+            kv_packing, head_dim]. Packed local KV-cache shard. The leading
+            singleton dimension matches the Pallas HBM indexing path.
+        packed_schedule: [steps, pcp_size, num_lanes, 128]. Replicated
+            ring-grouped schedule.
+        active_page_groups: Optional scalar or [1] int32 array limiting the
+            number of page groups executed at runtime.
+        pcp_size: Number of ranks in the PCP ring.
+        q_block_size: Static Q tile size consumed per page group.
+        sm_scale: Softmax scale applied to QK scores.
+        collective_id: Pallas collective id used for remote-copy semaphores.
+        kv_packing: Number of packed K/V lanes in the cache dtype layout.
+        kv_pages_per_block: Number of consecutive local pages loaded per ring
+            step. The production metadata path currently uses 1.
+        k_scale: Optional dequantization scale for K.
+        v_scale: Optional dequantization scale for V.
+        mesh_axis_names: Names of the active JAX mesh axes.
+        pcp_axis_name: Mesh axis used as the PCP ring axis.
+
+    Returns:
+        [local_tokens, kv_heads, q_per_kv, head_dim] local output.
+    """
     page_size = kv_cache_local.shape[2]
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
@@ -1318,10 +1377,6 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
                     kv_cache_local.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            q_multi_head.dtype),
-                pltpu.VMEM((TPU_HBM_ROW_TILE, kv_heads, q_per_kv, head_dim),
-                           q_multi_head.dtype),
-                pltpu.VMEM((TPU_HBM_ROW_TILE, kv_heads, q_per_kv, head_dim),
-                           q_multi_head.dtype),
             ),
             grid=(1, ),
         ),
@@ -1352,7 +1407,16 @@ def pcp_streaming_attention_page_groups_local(
     Args:
         q_local: [local_tokens, kv_heads, q_per_kv, head_dim] for one PCP rank.
         kv_cache_local: [pages, page_size, kv_heads, 2, head_dim] for one rank.
-        packed_schedule: Replicated [steps, pcp, lanes, 128] schedule.
+        packed_schedule: Replicated [steps, pcp_size, lanes, 128] schedule.
+        active_page_groups: Optional scalar or [1] int32 runtime limit for
+            page groups. When omitted, all schedule groups are executed.
+        pcp_size: Number of ranks in the PCP ring.
+        q_block_size: Static local Q tile size consumed by the Pallas kernel.
+        sm_scale: Softmax scale applied to QK scores.
+        collective_id: Base Pallas collective id. Per-head calls offset this
+            id so each head pair gets a distinct semaphore namespace.
+        mesh_axis_names: Names of the active JAX mesh axes.
+        pcp_axis_name: Mesh axis used as the PCP ring axis.
 
     Returns:
         Local rank output with the same shape as q_local.
@@ -1413,7 +1477,21 @@ def pcp_streaming_attention_page_groups_packed_local(
         q_local: [local_tokens, kv_heads, q_per_kv, head_dim] for one PCP rank.
         kv_cache_local: [pages, page_size, packed_kv_heads_x2, kv_packing,
             head_dim] for one rank.
-        packed_schedule: Replicated [steps, pcp, lanes, 128] schedule.
+        packed_schedule: Replicated [steps, pcp_size, lanes, 128] schedule.
+        active_page_groups: Optional scalar or [1] int32 runtime limit for
+            page groups. When omitted, all schedule groups are executed.
+        pcp_size: Number of ranks in the PCP ring.
+        q_block_size: Static local Q tile size consumed by the Pallas kernel.
+        sm_scale: Softmax scale applied to QK scores.
+        collective_id: Base Pallas collective id. Per-head fallback calls
+            offset this id so each head pair gets a distinct semaphore
+            namespace.
+        kv_pages_per_block: Number of consecutive local pages loaded per ring
+            step. The production metadata path currently uses 1.
+        k_scale: Optional dequantization scale for K.
+        v_scale: Optional dequantization scale for V.
+        mesh_axis_names: Names of the active JAX mesh axes.
+        pcp_axis_name: Mesh axis used as the PCP ring axis.
 
     Returns:
         Local rank output with the same shape as q_local.
@@ -1488,6 +1566,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
         sm_scale: float,
         collective_id: int | None = 13,
+        max_context_tokens: int | None = None,
         num_lanes: int = 1,
         kv_pages_per_block: int = 1,
         k_scale: float | None = None,
@@ -1499,7 +1578,43 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
 
     This wrapper keeps the old schedule-taking API as the execution path. The
     runtime schedule shape is derived from the local compile bucket
-    ``q_local.shape[0] * pcp_size`` and the local KV cache block count.
+    ``q_local.shape[0] * pcp_size`` and, when provided, max_context_tokens
+    instead of the full KV cache capacity.
+
+    Args:
+        q_local: [local_tokens, kv_heads, q_per_kv, head_dim] compact Q rows
+            for the current PCP rank.
+        kv_cache_local: [pages, page_size, packed_kv_heads_x2, kv_packing,
+            head_dim] local packed KV-cache shard.
+        kv_lens: [max_num_seqs]. Total KV length for each request, including
+            the query tokens in the current prefill chunk.
+        page_indices: Flattened or 2D vLLM block table. Entries are reduced
+            modulo the local KV-cache block count before local page loads.
+        cu_q_lens: [max_num_seqs + 1]. Cumulative query-token offsets for the
+            current batch.
+        distribution: [3] vLLM request distribution metadata. The third entry
+            is the number of active requests considered by the schedule.
+        pcp_size: Number of ranks in the PCP ring.
+        interleave_size: Number of consecutive global tokens assigned to one
+            rank before rotating to the next PCP rank. The production path
+            requires this to match `page_size`.
+        q_block_size: Static local Q tile size used by the Pallas kernel.
+        sm_scale: Softmax scale applied to QK scores.
+        collective_id: Base Pallas collective id for ring remote-copy
+            semaphores.
+        max_context_tokens: Optional cap used when estimating the static
+            schedule shape.
+        num_lanes: Number of independent schedule lanes. The metadata path
+            currently supports one lane.
+        kv_pages_per_block: Number of consecutive local pages loaded per ring
+            step. The metadata path currently supports one page.
+        k_scale: Optional dequantization scale for K.
+        v_scale: Optional dequantization scale for V.
+        mesh_axis_names: Names of the active JAX mesh axes.
+        pcp_axis_name: Mesh axis used as the PCP ring axis.
+
+    Returns:
+        [local_tokens, kv_heads, q_per_kv, head_dim] local attention output.
     """
     page_size = kv_cache_local.shape[1]
     packed_schedule, active_page_groups = (
@@ -1514,6 +1629,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             q_block_size=q_block_size,
+            max_context_tokens=max_context_tokens,
             num_lanes=num_lanes,
             kv_pages_per_block=kv_pages_per_block,
         ))
@@ -1613,6 +1729,26 @@ def pcp_streaming_attention_page_groups(
 
     This wrapper supports multiple KV heads and Q heads per KV head by invoking
     the single-head Pallas kernel for each head pair.
+
+    Args:
+        q_by_rank: [pcp_size, local_tokens, kv_heads, q_per_kv, head_dim].
+            Rank-major query tensor with an explicit leading PCP dimension.
+        kv_cache_by_rank: [pcp_size, pages, page_size, kv_heads, 2, head_dim].
+            Unpacked KV-cache shards for all PCP ranks.
+        packed_schedule: [steps, pcp_size, lanes, 128] replicated
+            ring-grouped schedule.
+        active_page_groups: Optional scalar or [1] int32 runtime limit for
+            page groups. When omitted, all schedule groups are executed.
+        pcp_size: Number of ranks in the PCP ring.
+        q_block_size: Static local Q tile size consumed by the Pallas kernel.
+        sm_scale: Softmax scale applied to QK scores.
+        collective_id: Base Pallas collective id. Per-head calls offset this
+            id so each head pair gets a distinct semaphore namespace.
+        mesh_axis_names: Names of the active JAX mesh axes.
+        pcp_axis_name: Mesh axis used as the PCP ring axis.
+
+    Returns:
+        Rank-major output with the same shape as q_by_rank.
     """
     _validate_common_page_group_inputs(q_by_rank, kv_cache_by_rank,
                                        packed_schedule, pcp_size, q_block_size)
@@ -1672,7 +1808,22 @@ def pcp_streaming_attention_single_page_group(
         mesh_axis_names: tuple[str, ...] = (AXIS, ),
         pcp_axis_name: str = AXIS,
 ):
-    """Run one RingAttention-style PCP page group."""
+    """Run one RingAttention-style PCP page group.
+
+    Args:
+        q_by_rank: [pcp_size, local_tokens, kv_heads, q_per_kv, head_dim].
+        kv_cache_by_rank: [pcp_size, pages, page_size, kv_heads, 2, head_dim].
+        packed_schedule: [pcp_size, pcp_size, lanes, 128]. Exactly one
+            ring-group worth of schedule rows.
+        pcp_size: Number of ranks in the PCP ring.
+        sm_scale: Softmax scale applied to QK scores.
+        collective_id: Base Pallas collective id.
+        mesh_axis_names: Names of the active JAX mesh axes.
+        pcp_axis_name: Mesh axis used as the PCP ring axis.
+
+    Returns:
+        Rank-major output with the same shape as q_by_rank.
+    """
     if packed_schedule.shape[0] != pcp_size:
         raise NotImplementedError(
             "single-page-group wrapper requires exactly pcp_size schedule "

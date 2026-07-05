@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -39,12 +40,13 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
     pcp_streaming_attention_single_page_group)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import \
     execute_pcp_streaming_reference
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import \
-    PcpStreamingSchedule
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
+    PcpStreamingSchedule, build_pcp_streaming_active_page_groups)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import \
     generate_pcp_streaming_schedule as generate_production_pcp_schedule
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import \
-    pack_pcp_streaming_schedule_fields
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
+    generate_pcp_streaming_schedule_from_metadata_host,
+    pack_pcp_streaming_schedule_fields)
 
 PCP_SIZE = 4
 Q_TILE = 16
@@ -371,6 +373,51 @@ def _quantize_native_kv_cache_fp8(kv_cache, *, k_scale, v_scale):
         axis=-2,
     )
     return quantized, np.asarray(jax.device_get(dequantized))
+
+
+def _make_tail_partial_metadata_schedule():
+    pcp_size = 8
+    page_size = 256
+    q_block_size = 256
+    q_len = 1025
+    kv_len = 5121
+    local_kv_cache_num_blocks = 3
+    schedule = generate_pcp_streaming_schedule_from_metadata_host(
+        kv_lens=np.array([kv_len], dtype=np.int32),
+        page_indices=np.arange(local_kv_cache_num_blocks,
+                               dtype=np.int32)[None, :],
+        cu_q_lens=np.array([0, q_len], dtype=np.int32),
+        distribution=np.array([0, 0, 1], dtype=np.int32),
+        global_bucket_tokens=pcp_size * q_block_size,
+        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=page_size,
+        q_block_size=q_block_size,
+        num_lanes=1,
+        kv_pages_per_block=1,
+    )
+    active_page_groups = build_pcp_streaming_active_page_groups(schedule)
+    return schedule, active_page_groups
+
+
+def _assert_tail_partial_metadata_schedule(schedule, active_page_groups):
+    np.testing.assert_array_equal(active_page_groups,
+                                  np.array([3], dtype=np.int32))
+    np.testing.assert_array_equal(schedule.global_actual_steps,
+                                  np.array([24], dtype=np.int32))
+    np.testing.assert_array_equal(
+        schedule.q_tile_size[:, 16, 0],
+        np.array([256, 256, 256, 256, 1, 0, 0, 0], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        schedule.req_id[:, 16, 0],
+        np.array([0, 0, 0, 0, 0, -1, -1, -1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        schedule.req_id[:, 21:24, 0],
+        np.full((8, 3), -1, dtype=np.int32),
+    )
 
 
 def _make_delayed_second_group_rank3_schedule_loader(original_load):
@@ -982,6 +1029,89 @@ def test_page_group_packed_local_kernel_consumes_fp8_kv_packing4_layout():
                                                schedule,
                                                sm_scale=sm_scale)
     expected = expected.reshape(PCP_SIZE * Q_TILE, 2, 2, HEAD_DIM)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=2e-2,
+                               atol=2e-2)
+
+
+def test_page_group_packed_local_kernel_tail_partial_metadata_schedule_shape():
+    schedule, active_page_groups = _make_tail_partial_metadata_schedule()
+    _assert_tail_partial_metadata_schedule(schedule, active_page_groups)
+
+
+def test_page_group_packed_local_kernel_reproduces_tail_partial_pcp8_fp8():
+    if os.environ.get("VLLM_TPU_RUN_PCP_TAIL_REPRO") != "1":
+        pytest.skip("Set VLLM_TPU_RUN_PCP_TAIL_REPRO=1 to run this "
+                    "expected PCP8 tail-partial core-halt reproducer.")
+    if jax.local_device_count() < 8:
+        pytest.skip("PCP8 tail-partial reproducer requires 8 devices.")
+
+    pcp_size = 8
+    q_tile = 256
+    page_size = 256
+    kv_heads = 2
+    q_per_kv = 2
+    local_q_len = q_tile
+    local_kv_cache_num_blocks = 3
+    rng = np.random.default_rng(397081)
+    q_by_rank = rng.normal(size=(pcp_size, local_q_len, kv_heads, q_per_kv,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    q_global = q_by_rank.reshape(pcp_size * local_q_len, kv_heads, q_per_kv,
+                                 HEAD_DIM)
+    native_kv_np = rng.normal(size=(pcp_size, local_kv_cache_num_blocks,
+                                    page_size, kv_heads, 2, HEAD_DIM)).astype(
+                                        np.float32) * 0.1
+    k_scale = 0.125
+    v_scale = 0.25
+    native_kv_q, native_kv_dequant = _quantize_native_kv_cache_fp8(
+        native_kv_np, k_scale=k_scale, v_scale=v_scale)
+    native_kv_q_host = np.asarray(jax.device_get(native_kv_q))
+    packed_kv = jnp.asarray(_pack_native_kv_cache(native_kv_q_host, 4),
+                            dtype=jnp.float8_e4m3fn)
+    schedule, active_page_groups = _make_tail_partial_metadata_schedule()
+    _assert_tail_partial_metadata_schedule(schedule, active_page_groups)
+
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    mesh = jax.sharding.Mesh(jax.local_devices()[:pcp_size], (AXIS, ))
+
+    def _call(q_local, kv_cache_local, packed_schedule, active_groups):
+        return pcp_streaming_attention_page_groups_packed_local(
+            q_local,
+            kv_cache_local[0],
+            packed_schedule,
+            active_groups,
+            pcp_size=pcp_size,
+            q_block_size=q_tile,
+            sm_scale=sm_scale,
+            collective_id=34,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    fn = jax.jit(
+        jax.shard_map(
+            _call,
+            mesh=mesh,
+            in_specs=(
+                P(AXIS, None, None, None),
+                P(AXIS, None, None, None, None, None),
+                P(None, None, None, None),
+                P(None),
+            ),
+            out_specs=P(AXIS, None, None, None),
+            check_vma=False,
+        ))
+    out = fn(jnp.asarray(q_global, dtype=jnp.bfloat16), packed_kv,
+             jnp.asarray(schedule.packed_schedule),
+             jnp.asarray(active_page_groups))
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               native_kv_dequant,
+                                               schedule,
+                                               sm_scale=sm_scale)
+    expected = expected.reshape(q_global.shape)
     np.testing.assert_allclose(np.asarray(jax.device_get(out)),
                                expected,
                                rtol=2e-2,
