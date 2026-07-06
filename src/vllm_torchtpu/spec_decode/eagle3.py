@@ -59,8 +59,12 @@ class DraftChunkInputs:
     # Real (unpadded) request count in the chunk.
     num_reqs: int
     # Per-layer aux hidden states from the target forward; each is
-    # [padded_chunk_tokens, aux_hidden].
+    # [padded_chunk_tokens, aux_hidden]. Only consumed when the draft
+    # checkpoint wants them.
     aux_hidden_states: list[torch.Tensor]
+    # Plain target hidden state for the chunk,[padded_chunk_tokens, hidden_size].
+    # Used directly -- bypassing the aux-hidden-state concatenation.
+    hidden_states: torch.Tensor | None = None
 
 
 @contextlib.contextmanager
@@ -374,9 +378,19 @@ class Eagle3Proposer:
         hidden_carry_per_chunk = []
         positions_carry_per_chunk = []
         rejected_per_chunk = []
+        uses_aux_hidden_state = self._draft_uses_aux_hidden_state()
         for chunk in chunks:
+            if uses_aux_hidden_state:
+                combine_input = torch.cat(chunk.aux_hidden_states, dim=-1)
+            else:
+                assert chunk.hidden_states is not None, (
+                    "DraftChunkInputs.hidden_states is required when the "
+                    "eagle3 draft does not use aux hidden states "
+                    "(eagle_config.use_aux_hidden_state=False), but no plain "
+                    "hidden state was captured for this chunk.")
+                combine_input = chunk.hidden_states
             target_hidden_states = self.draft_model.combine_hidden_states(
-                torch.cat(chunk.aux_hidden_states, dim=-1))
+                combine_input)
             (input_ids, positions, last_token_indices,
              num_rejected_np) = self._prepare_draft_inputs(
                  chunk,
@@ -741,16 +755,23 @@ class Eagle3Proposer:
     def _draft_hidden_size(self) -> int:
         return self.draft_model.config.hidden_size
 
+    def _draft_uses_aux_hidden_state(self) -> bool:
+        """Whether this draft checkpoint feeds combine_hidden_states the
+        concatenation of several target aux hidden-state layers.
+        """
+        return bool(
+            getattr(self.draft_model.model, "use_aux_hidden_state", True))
+
     def _draft_combine_input_size(self) -> int:
         """Width of the per-token tensor that combine_hidden_states consumes.
 
-        Eagle3 spec: target_hidden_size * 3 if exposed by config, else
-        hidden_size * 3 (the standard 3 aux layers).
+        When the draft uses aux hidden states, this is the draft's own
+        `fc_input_size`. Otherwise combine_hidden_states is an identity over the plain hidden_size-wide
+        target hidden state, so the input width is just hidden_size.
         """
-        cfg = self.draft_model.config
-        if hasattr(cfg, "target_hidden_size"):
-            return cfg.target_hidden_size * 3
-        return cfg.hidden_size * 3
+        if self._draft_uses_aux_hidden_state():
+            return self.draft_model.model.fc_input_size
+        return self._draft_hidden_size()
 
     def _precompile_combine_hidden_states(self) -> None:
         runner = self.runner

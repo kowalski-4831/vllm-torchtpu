@@ -1973,6 +1973,7 @@ class TPUModelRunner(GPUModelRunner):
                         start_index=start_index,
                         num_reqs=num_reqs,
                         aux_hidden_states=aux_hidden_states,
+                        hidden_states=hidden_states,
                     ))
 
             start_index = end_index
