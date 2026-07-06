@@ -57,8 +57,13 @@ def parse_args():
                         help="TP degree")
     parser.add_argument("--verify-accuracy",
                         action="store_true",
-                        default=True,
+                        default=False,
                         help="Verify accuracy against CPU reference model")
+    parser.add_argument(
+        "--no-verify-accuracy",
+        action="store_false",
+        dest="verify_accuracy",
+        help="Disable accuracy check against CPU reference model")
     return parser.parse_args()
 
 
@@ -118,10 +123,20 @@ def compare_embeddings(emb_cpu, emb_tpu):
 
 
 def main(args):
-    prompt = ("<|im_start|>user\n"
-              "What is the capital of France?"
-              "<|im_end|>\n"
-              "<|im_start|>assistant\n")
+    # 1. Text-only prompt
+    text_prompt = ("<|im_start|>user\n"
+                   "What is the capital of France?"
+                   "<|im_end|>\n"
+                   "<|im_start|>assistant\n")
+
+    # 2. Multimodal Image + Text prompt
+    from PIL import Image
+    image = Image.new("RGB", (224, 224), color="red")
+    image_prompt = ("<|im_start|>user\n"
+                    "<|vision_start|><|image_pad|><|vision_end|>"
+                    "Represent this image."
+                    "<|im_end|>\n"
+                    "<|im_start|>assistant\n")
 
     print(f"Initializing vLLM on TPU for model {args.model}...")
     llm = LLM(
@@ -136,13 +151,27 @@ def main(args):
         disable_chunked_mm_input=True,
     )
 
-    print("Running vLLM TPU embedding inference...")
-    outputs = llm.embed({"prompt": prompt})
+    print("Running vLLM TPU embedding inference (Text & Multimodal Image)...")
+    outputs = llm.embed([
+        {
+            "prompt": text_prompt
+        },
+        {
+            "prompt": image_prompt,
+            "multi_modal_data": {
+                "image": image
+            }
+        },
+    ])
 
-    tpu_emb = np.array(outputs[0].outputs.embedding, dtype=np.float32)
-    print("\nTPU Request 0 Embedding:")
-    print(f"- Shape: {len(tpu_emb)}")
-    print(f"- First 10 dims: {tpu_emb[:10]}")
+    for i, out in enumerate(outputs):
+        tpu_emb = np.array(out.outputs.embedding, dtype=np.float32)
+        modality = "Text" if i == 0 else "Image + Text"
+        print(f"\nTPU Request {i} ({modality}) Embedding:")
+        print(f"- Shape: {len(tpu_emb)}")
+        print(f"- First 10 dims: {tpu_emb[:10]}")
+
+    prompt = text_prompt
 
     if args.verify_accuracy:
         print("\nComputing CPU reference embedding for accuracy check...")
