@@ -27,7 +27,6 @@ class VllmModelWrapperContext:
     mesh: Mesh
     kv_caches: Optional[List[torch.Tensor]] = None
     layer_name_to_kvcache_index: Optional[Dict[str, int]] = None
-    vllm_config: Optional[object] = None
 
 
 _vllm_model_wrapper_context: Optional[VllmModelWrapperContext] = None
@@ -47,7 +46,6 @@ def set_vllm_model_wrapper_context(
     kv_caches: Optional[List[torch.Tensor]] = None,
     mesh: Mesh,
     layer_name_to_kvcache_index: Optional[Dict[str, int]] = None,
-    vllm_config: Optional[object] = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -55,7 +53,6 @@ def set_vllm_model_wrapper_context(
         kv_caches=kv_caches,
         mesh=mesh,
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
-        vllm_config=vllm_config,
     )
 
     try:
