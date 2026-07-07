@@ -630,23 +630,42 @@ def check_planner_logs(run_dir: str, offsets: dict[Path, int]) -> int:
     log_text = new_log_text(offsets)
     failures = 0
     required = [
-        "TPUConnectorV2 pull meta built",
-        "TPUConnectorV2 lowering summary",
+        "TPUConnectorV2 logical pull meta built",
+        "TPUConnectorV2 physical lowering summary",
         "d_tp_rank=0 | p_ranks=(0, 1)",
         "d_tp_rank=1 | p_ranks=(2, 3)",
         "fa_heads_by_rank={0: (0,)}",
         "fa_heads_by_rank={2: (1,)}",
+        "mamba_state0_q_key_heads_by_rank=",
+        "mamba_state0_k_key_heads_by_rank=",
+        "mamba_state0_v_value_heads_by_rank=",
+        "mamba_state1_value_heads_by_rank=",
+        "mamba_state0_q_ops_by_key_head=",
+        "mamba_state0_k_ops_by_key_head=",
+        "mamba_state0_v_ops_by_value_head=",
+        "mamba_state1_ops_by_value_head=",
     ]
     for marker in required:
         if marker not in log_text:
             failures += 1
             print(f"PLANNER_LOG_MISSING {marker}")
+    if "mamba_ops_by_head=" in log_text:
+        failures += 1
+        print("PLANNER_LOG_LEGACY_MAMBA_OPS_BY_HEAD_PRESENT")
+    for legacy_marker in (
+            "TPUConnectorV2 pull meta built |",
+            "TPUConnectorV2 lowering summary |",
+            "mamba_value_heads_by_rank=",
+    ):
+        if legacy_marker in log_text:
+            failures += 1
+            print(f"PLANNER_LOG_LEGACY_MARKER_PRESENT {legacy_marker}")
 
-    summary_re = re.compile(
-        r"TPUConnectorV2 lowering summary .*?d_tp_rank=(?P<d_tp_rank>\d+)"
-        r" \| p_ranks=\((?P<p_ranks>[^)]*)\)"
-        r" \| total_ops=(?P<total_ops>\d+)"
-        r" \| ops_by_p_rank=\{(?P<ops_by_p_rank>[^}]*)\}")
+    summary_re = re.compile(r"TPUConnectorV2 physical lowering summary "
+                            r".*?d_tp_rank=(?P<d_tp_rank>\d+)"
+                            r" \| p_ranks=\((?P<p_ranks>[^)]*)\)"
+                            r" \| total_ops=(?P<total_ops>\d+)"
+                            r" \| ops_by_p_rank=\{(?P<ops_by_p_rank>[^}]*)\}")
     expected_p_ranks = {
         "0": ("0", "1"),
         "1": ("2", "3"),

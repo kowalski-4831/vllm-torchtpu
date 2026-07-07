@@ -935,6 +935,7 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
         block_size=c["dest_block_size"],
         tp_rank=decode_tp_rank,
         total_num_kv_heads=c["total_kv_heads"],
+        total_num_mamba_key_heads=c["linear_num_key_heads"],
         total_num_mamba_heads=c["linear_num_value_heads"],
     )
     destination = mod.LocalDecodeAllocation(

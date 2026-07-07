@@ -167,16 +167,36 @@ def test_planner_log_check_accepts_current_positive_total_ops(
     decode_log = log_dir / "decode.log"
     decode_log.write_text(
         "\n".join([
-            ("TPUConnectorV2 pull meta built | req_id=1 | d_tp_rank=0 | "
-             "p_ranks=(0, 1) | fa_heads_by_rank={0: (0,)}"),
-            ("TPUConnectorV2 pull meta built | req_id=1 | d_tp_rank=1 | "
-             "p_ranks=(2, 3) | fa_heads_by_rank={2: (1,)}"),
-            ("TPUConnectorV2 lowering summary | req_id=1 | d_rank=0 | "
+            ("TPUConnectorV2 logical pull meta built | req_id=1 | "
+             "d_tp_rank=0 | "
+             "p_ranks=(0, 1) | fa_heads_by_rank={0: (0,)} | "
+             "mamba_state0_q_key_heads_by_rank={0: (0,)} | "
+             "mamba_state0_k_key_heads_by_rank={0: (0,)} | "
+             "mamba_state0_v_value_heads_by_rank={0: (0,)} | "
+             "mamba_state1_value_heads_by_rank={0: (0,)}"),
+            ("TPUConnectorV2 logical pull meta built | req_id=1 | "
+             "d_tp_rank=1 | "
+             "p_ranks=(2, 3) | fa_heads_by_rank={2: (1,)} | "
+             "mamba_state0_q_key_heads_by_rank={2: (1,)} | "
+             "mamba_state0_k_key_heads_by_rank={2: (1,)} | "
+             "mamba_state0_v_value_heads_by_rank={2: (1,)} | "
+             "mamba_state1_value_heads_by_rank={2: (1,)}"),
+            ("TPUConnectorV2 physical lowering summary | req_id=1 | "
+             "d_rank=0 | "
              "d_tp_rank=0 | p_ranks=(0, 1) | total_ops=4330 | "
-             "ops_by_p_rank={0: 2170, 1: 2160}"),
-            ("TPUConnectorV2 lowering summary | req_id=1 | d_rank=1 | "
+             "ops_by_p_rank={0: 2170, 1: 2160} | "
+             "mamba_state0_q_ops_by_key_head={0: 30} | "
+             "mamba_state0_k_ops_by_key_head={0: 30} | "
+             "mamba_state0_v_ops_by_value_head={0: 30} | "
+             "mamba_state1_ops_by_value_head={0: 30}"),
+            ("TPUConnectorV2 physical lowering summary | req_id=1 | "
+             "d_rank=1 | "
              "d_tp_rank=1 | p_ranks=(2, 3) | total_ops=4330 | "
-             "ops_by_p_rank={2: 2170, 3: 2160}"),
+             "ops_by_p_rank={2: 2170, 3: 2160} | "
+             "mamba_state0_q_ops_by_key_head={1: 30} | "
+             "mamba_state0_k_ops_by_key_head={1: 30} | "
+             "mamba_state0_v_ops_by_value_head={1: 30} | "
+             "mamba_state1_ops_by_value_head={1: 30}"),
             "TPUConnectorV2Worker(0) rank0 <-- START registered",
             "TPUConnectorV2Scheduler --> START planned",
             "TPUConnectorV2Scheduler --> START dispatched",

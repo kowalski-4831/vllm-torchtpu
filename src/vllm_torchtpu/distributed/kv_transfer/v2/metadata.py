@@ -220,12 +220,15 @@ class TpKVTopology:
     block_size: int
     tp_rank: int
     total_num_kv_heads: int
+    total_num_mamba_key_heads: int
     total_num_mamba_heads: int
 
     def __post_init__(self) -> None:
         check_positive("block_size", self.block_size)
         check_non_negative("tp_rank", self.tp_rank)
         check_non_negative("total_num_kv_heads", self.total_num_kv_heads)
+        check_non_negative("total_num_mamba_key_heads",
+                           self.total_num_mamba_key_heads)
         check_non_negative("total_num_mamba_heads", self.total_num_mamba_heads)
 
     @property
@@ -243,6 +246,7 @@ class TpKVTopology:
             block_size=int(data["block_size"]),
             tp_rank=int(data["tp_rank"]),
             total_num_kv_heads=int(data["total_num_kv_heads"]),
+            total_num_mamba_key_heads=int(data["total_num_mamba_key_heads"]),
             total_num_mamba_heads=int(data["total_num_mamba_heads"]),
         )
 
@@ -281,9 +285,11 @@ class PullMeta:
     req_id: int
     p_ranks: tuple[int, ...]
     fa_heads_by_rank: dict[int, tuple[int, ...]]
-    mamba_heads_by_rank: dict[int, tuple[int, ...]]
+    mamba_key_heads_by_rank: dict[int, tuple[int, ...]]
+    mamba_value_heads_by_rank: dict[int, tuple[int, ...]]
     fa_head_mappings_by_rank: dict[int, tuple[HeadMapping, ...]]
-    mamba_head_mappings_by_rank: dict[int, tuple[HeadMapping, ...]]
+    mamba_key_head_mappings_by_rank: dict[int, tuple[HeadMapping, ...]]
+    mamba_value_head_mappings_by_rank: dict[int, tuple[HeadMapping, ...]]
     fa_source_block_ids: tuple[int, ...]
     mamba_source_block_ids: tuple[int, ...]
     fa_block_refs_by_rank: dict[int, tuple[SourceBlockRef, ...]]

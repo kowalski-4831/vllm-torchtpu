@@ -223,15 +223,17 @@ def manual_pull_meta(
 
     fa_head_mappings_by_rank = build_head_mappings(mod,
                                                    fa_mapping_rows_by_rank)
-    mamba_head_mappings_by_rank = build_head_mappings(
+    mamba_value_head_mappings_by_rank = build_head_mappings(
         mod, mamba_mapping_rows_by_rank)
     return mod.PullMeta(
         req_id=req_id,
         p_ranks=p_ranks,
         fa_heads_by_rank=heads_by_rank(fa_mapping_rows_by_rank),
-        mamba_heads_by_rank=heads_by_rank(mamba_mapping_rows_by_rank),
+        mamba_key_heads_by_rank=heads_by_rank(mamba_mapping_rows_by_rank),
+        mamba_value_heads_by_rank=heads_by_rank(mamba_mapping_rows_by_rank),
         fa_head_mappings_by_rank=fa_head_mappings_by_rank,
-        mamba_head_mappings_by_rank=mamba_head_mappings_by_rank,
+        mamba_key_head_mappings_by_rank=mamba_value_head_mappings_by_rank,
+        mamba_value_head_mappings_by_rank=mamba_value_head_mappings_by_rank,
         fa_source_block_ids=fa_source_block_ids,
         mamba_source_block_ids=mamba_source_block_ids,
         fa_block_refs_by_rank={
@@ -348,6 +350,7 @@ def build_block_size_case(
         block_size=destination_block_size,
         tp_rank=0,
         total_num_kv_heads=1,
+        total_num_mamba_key_heads=0,
         total_num_mamba_heads=0,
     )
     destination = mod.LocalDecodeAllocation(
@@ -425,6 +428,7 @@ def build_fa_pcp_case(
         block_size=destination_block_size,
         tp_rank=destination_tp_rank,
         total_num_kv_heads=total_num_kv_heads,
+        total_num_mamba_key_heads=0,
         total_num_mamba_heads=0,
     )
     return metadata, topology, destination

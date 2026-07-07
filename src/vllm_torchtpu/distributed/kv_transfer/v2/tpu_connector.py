@@ -1761,6 +1761,7 @@ class TPUConnectorV2Worker:
             block_size=self._local_full_attention_block_size(),
             tp_rank=self._local_tp_rank(),
             total_num_kv_heads=self._total_num_kv_heads(),
+            total_num_mamba_key_heads=self._linear_num_key_heads(),
             total_num_mamba_heads=self._total_num_mamba_heads(),
         )
 

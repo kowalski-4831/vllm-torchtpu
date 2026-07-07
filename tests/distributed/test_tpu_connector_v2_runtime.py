@@ -1695,6 +1695,7 @@ def _single_layer_topology(mod):
         block_size=4,
         tp_rank=0,
         total_num_kv_heads=1,
+        total_num_mamba_key_heads=0,
         total_num_mamba_heads=0,
     )
 
@@ -1954,6 +1955,7 @@ def _two_tp_decode_handshake(mod, tp_rank):
                                   block_size=4,
                                   tp_rank=tp_rank,
                                   total_num_kv_heads=2,
+                                  total_num_mamba_key_heads=0,
                                   total_num_mamba_heads=0),
         fa_group_indices=(0, ),
         mamba_group_indices=(),

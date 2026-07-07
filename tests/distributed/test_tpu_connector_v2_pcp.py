@@ -25,7 +25,8 @@ def test_full_attention_4pcp_to_2tp_builds_pull_meta():
         2: (1, ),
         3: (1, ),
     }
-    assert pull_meta.mamba_heads_by_rank == {}
+    assert pull_meta.mamba_key_heads_by_rank == {}
+    assert pull_meta.mamba_value_heads_by_rank == {}
     # Mapping tuple is:
     #   (global_head, source_head, destination_head, segment_name)
     # Global head 1 is source head 1 on each PCP rank, and becomes local head
@@ -239,6 +240,7 @@ def test_rejects_invalid_fa_pcp_layout(
         block_size=topology.block_size,
         tp_rank=0,
         total_num_kv_heads=topology.total_num_kv_heads,
+        total_num_mamba_key_heads=topology.total_num_mamba_key_heads,
         total_num_mamba_heads=topology.total_num_mamba_heads,
     )
 
