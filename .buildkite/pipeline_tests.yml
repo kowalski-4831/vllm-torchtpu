@@ -20,7 +20,7 @@ steps:
         key: "unit_tests_pr"
         if: 'build.env("NIGHTLY") != "1"'
         agents:
-          queue: "tpu_v7x_2_queue"
+          queue: "tpu_v7x_8_queue"
         env:
           MODEL_IMPL_TYPE: "vllm"
         commands:
@@ -30,7 +30,7 @@ steps:
         key: "unit_tests_nightly"
         if: 'build.env("NIGHTLY") == "1"'
         agents:
-          queue: "tpu_v7x_2_queue"
+          queue: "tpu_v7x_8_queue"
         env:
           MODEL_IMPL_TYPE: "vllm"
         commands:
