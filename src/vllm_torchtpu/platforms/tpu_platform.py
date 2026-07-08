@@ -277,7 +277,27 @@ def apply_tpu_patches() -> None:
 
 
 def _apply_model_specific_patches() -> None:
-    # Patch Qwen3VLModel to handle 1D video_grid_thw in get_rope_index
+    """Apply model-specific and PyTorch XLA op-level patches for Qwen3-VL on TPU.
+
+    This function applies the following critical hardware and framework patches:
+    1. Qwen3VLModel.get_rope_index:
+       - Grid Metadata Fix (`fix_grid`): Unsqueezes 1D `image_grid_thw`/`video_grid_thw`
+         tensors (shape [3] -> [1, 3]). HF's `get_rope_index` assumes 2D grid tensors
+         and attempts `grid[:, 0]`, which raises a fatal IndexError on 1D inputs.
+       - CPU RoPE Evaluation (`to_cpu`): Evaluates 3D RoPE (Time, Height, Width) position
+         ID calculation on host CPU and returns results back to TPU, preventing XLA
+         lowering and device sync errors during 3D RoPE index construction.
+    2. Qwen3VLVisionAttention.forward:
+       - Moves `cu_seqlens` (cumulative visual patch sequence lengths) to CPU to avoid
+         device mismatch in vision attention kernels.
+    3. torch.masked_scatter / masked_scatter_:
+       - Replaces native TPU `masked_scatter` with a 1D `torch.where` and `index_put_`
+         decomposition, eliminating unlowered XLA `scan` HLO nodes that cause
+         NotImplementedError during Device-to-Host (DtoH) memory transfers.
+    4. torch.repeat_interleave & torch.cumsum:
+       - Evaluates `repeat_interleave` and `cumsum` on CPU for TPU tensors to avoid
+         generating XLA `scan` HLO nodes on integer/boolean tensors.
+    """
     try:
         import transformers.models.qwen3_vl.modeling_qwen3_vl as modeling
         _orig_get_rope_index = modeling.Qwen3VLModel.get_rope_index
