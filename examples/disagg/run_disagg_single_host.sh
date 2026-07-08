@@ -104,7 +104,7 @@ DECODE_HOSTS=()
 DECODE_PORTS=()
 
 # Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
-TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
+TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | grep -o '/dev/vfio/[0-9]\+'))
 
 LOG_DIR=$HOME/logs
 
