@@ -113,6 +113,13 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
   -e EVALPLUS_DATASETS="${EVALPLUS_DATASETS:-}" \
   -e EVALPLUS_PARALLEL="${EVALPLUS_PARALLEL:-}" \
+  ${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:+-e TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}"} \
+  ${RUN_ROOT:+-e RUN_ROOT="${RUN_ROOT}"} \
+  ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"} \
+  ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"} \
+  ${P4D2_BIND_HOST:+-e P4D2_BIND_HOST="${P4D2_BIND_HOST}"} \
+  ${PROXY_PORT:+-e PROXY_PORT="${PROXY_PORT}"} \
+  ${RAGGED_GATED_DELTA_RULE_IMPL:+-e RAGGED_GATED_DELTA_RULE_IMPL="${RAGGED_GATED_DELTA_RULE_IMPL}"} \
   "${IMAGE_TAG}" \
   bash -c "
     umask 000
@@ -124,6 +131,8 @@ set -e
 
 echo "--- Copying test results back to workspace for artifact upload"
 cp -r /mnt/disks/persist/perf_eval_results/* perf_eval_results/ 2>/dev/null || true
+# Clean up any broken symlinks on the host to prevent buildkite-agent upload failures
+find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 
 echo "[INFO] Docker finished with exit code ${DOCKER_EXIT_CODE}."
 # Use Docker (running as root) to fix permissions without requiring sudo on the host

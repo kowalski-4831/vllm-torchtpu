@@ -56,6 +56,12 @@ if [[ "${NIGHTLY:-0}" == "1" ]]; then
   PERF_PRIORITY="$PRIORITY_NIGHTLY"
 fi
 
+# Integration jobs should use PRIORITY_INTEGRATION (unless it is a nightly run).
+INTEGRATION_PRIORITY="$PRIORITY_INTEGRATION"
+if [[ "${NIGHTLY:-0}" == "1" ]]; then
+  INTEGRATION_PRIORITY="$PRIORITY_NIGHTLY"
+fi
+
 echo "--- Starting Buildkite Bootstrap"
 
 # Since Buildkite prepends uploaded steps (inserts in reverse order),
@@ -64,6 +70,9 @@ echo "--- Starting Buildkite Bootstrap"
 
 echo "Uploading Perf and Eval Pipeline"
 upload_with_priority .buildkite/pipeline_perf.yml "$PERF_PRIORITY"
+
+echo "Uploading Integration Tests Pipeline"
+upload_with_priority .buildkite/pipeline_integration.yml "$INTEGRATION_PRIORITY"
 
 echo "Uploading Unit Tests Pipeline"
 upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
