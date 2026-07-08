@@ -15,14 +15,6 @@ import multiprocessing as mp
 
 import numpy as np
 import torch
-
-# --- BOOTSTRAP ---
-# Satisfaction of transformers' torchvision dependency is handled via stubs
-# if real torchvision is missing.
-from vllm_torchtpu.utils import bootstrap_torchvision_stubs
-
-bootstrap_torchvision_stubs()
-
 # --- TPU MODEL REGISTRATION ---
 from vllm.model_executor.models.registry import ModelRegistry  # noqa: E402
 
