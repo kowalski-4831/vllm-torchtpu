@@ -782,21 +782,6 @@ class TpuPlatform(Platform):
         parallel_config.worker_cls = \
                         "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
-        # Force static shapes for multi-modal models to avoid XLA lowering gaps.
-        if scheduler_config.is_multimodal_model:
-            torch._dynamo.config.assume_static_by_default = True
-
-            # Patch torch.compile to prevent dynamic=True from leaking in
-            _orig_compile = torch.compile
-
-            def patched_compile(*args, **kwargs):
-                kwargs['dynamic'] = False
-                return _orig_compile(*args, **kwargs)
-
-            torch.compile = patched_compile
-            logger.info(
-                "Forced static shapes for TPU multi-modal model stability.")
-
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if not multihost_backend:  # Single host
             dp_size = parallel_config.data_parallel_size

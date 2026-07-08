@@ -99,20 +99,20 @@ def _run_cpu_reference(model_name, prompt, return_dict):
 
 def compare_embeddings(emb_cpu, emb_tpu):
     print("\n--- Accuracy Verification Results (CPU vs TPU vLLM) ---")
-    print(f"CPU First 10 dims: {emb_cpu[:10]}")
-    print(f"TPU First 10 dims: {emb_tpu[:10]}")
-
-    dot_product = np.dot(emb_cpu, emb_tpu)
     norm_cpu = np.linalg.norm(emb_cpu)
     norm_tpu = np.linalg.norm(emb_tpu)
-    cosine_sim = dot_product / (norm_cpu * norm_tpu)
 
-    l2_dist = np.linalg.norm(emb_cpu - emb_tpu)
-    rel_l2_dist = l2_dist / norm_cpu
+    emb_cpu_norm = emb_cpu / norm_cpu if norm_cpu > 0 else emb_cpu
+    emb_tpu_norm = emb_tpu / norm_tpu if norm_tpu > 0 else emb_tpu
+
+    print(f"CPU (Norm) First 10 dims: {emb_cpu_norm[:10]}")
+    print(f"TPU (Norm) First 10 dims: {emb_tpu_norm[:10]}")
+
+    cosine_sim = np.dot(emb_cpu_norm, emb_tpu_norm)
+    l2_dist = np.linalg.norm(emb_cpu_norm - emb_tpu_norm)
 
     print(f"Cosine Similarity: {cosine_sim:.6f}")
-    print(f"L2 Distance (Abs): {l2_dist:.6f}")
-    print(f"L2 Distance (Rel): {rel_l2_dist:.6f}")
+    print(f"L2 Distance (Norm): {l2_dist:.6f}")
 
     if cosine_sim > 0.99:
         print(
@@ -164,8 +164,10 @@ def main(args):
         },
     ])
 
+    tpu_embs = []
     for i, out in enumerate(outputs):
         tpu_emb = np.array(out.outputs.embedding, dtype=np.float32)
+        tpu_embs.append(tpu_emb)
         modality = "Text" if i == 0 else "Image + Text"
         print(f"\nTPU Request {i} ({modality}) Embedding:")
         print(f"- Shape: {len(tpu_emb)}")
@@ -185,7 +187,7 @@ def main(args):
         p_cpu.join()
 
         if "cpu_emb" in return_dict:
-            compare_embeddings(return_dict["cpu_emb"], tpu_emb)
+            compare_embeddings(return_dict["cpu_emb"], tpu_embs[0])
         else:
             print("Could not retrieve CPU reference embedding.")
 
