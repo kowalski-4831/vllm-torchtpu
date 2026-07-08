@@ -279,7 +279,7 @@ def apply_tpu_patches() -> None:
 def _apply_model_specific_patches() -> None:
     """Apply model-specific and PyTorch XLA op-level patches for Qwen3-VL on TPU.
 
-    This function applies the following critical hardware and framework patches:
+    This function applies the following patches:
     1. Qwen3VLModel.get_rope_index:
        - Grid Metadata Fix (`fix_grid`): Unsqueezes 1D `image_grid_thw`/`video_grid_thw`
          tensors (shape [3] -> [1, 3]). HF's `get_rope_index` assumes 2D grid tensors
