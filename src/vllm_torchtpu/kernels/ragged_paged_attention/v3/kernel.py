@@ -1539,6 +1539,9 @@ def get_default_block_sizes(
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
+    # The query compute block should never exceed the query fetch block.
+    bq_csz = min(bq_csz, bq_sz)
+
     return {
         "bq_sz": max(1, bq_sz),
         "bkv_sz": align_to(bkv_sz, page_size),
