@@ -16,9 +16,11 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import torch
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
 def test_speculative_decoding_manager_metadata_indices(device):
@@ -90,3 +92,124 @@ def test_speculative_decoding_manager_metadata_indices(device):
                                           dtype=torch.int32,
                                           device=device)
     assert torch.equal(metadata.group_indices, expected_group_indices)
+
+
+def _make_manager_with_eagle3_drafter(num_reqs=2):
+    mock_runner = MagicMock()
+    mock_runner.input_batch.num_reqs = num_reqs
+    mock_runner.speculative_config.method = "eagle3"
+    mock_drafter = MagicMock(spec=Eagle3Proposer)
+    mock_runner.drafter = mock_drafter
+    manager = SpeculativeDecodingManager(mock_runner)
+    return manager, mock_runner, mock_drafter
+
+
+def test_propose_draft_token_ids_sync_truncates_and_caches():
+    manager, _, mock_drafter = _make_manager_with_eagle3_drafter(num_reqs=2)
+    mock_drafter.propose.return_value = [[1, 2], [3, 4]]
+    num_rejected = np.array([0, 1], dtype=np.int32)
+
+    result = manager.propose_draft_token_ids(
+        sampled_token_ids=[[10], [20], [30]],
+        discard_sampled_tokens_req_indices=[1],
+        num_rejected_tokens_np=num_rejected,
+        scheduler_output="SO",
+    )
+
+    assert result is None
+    assert manager._draft_token_ids == [[1, 2], [3, 4]]
+    args, kwargs = mock_drafter.propose.call_args
+    assert args[0] == [[10], [20]]  # truncated to num_reqs
+    assert args[1] == [1]
+    assert np.array_equal(args[2], num_rejected)
+    assert args[3] == "SO"
+    assert kwargs == {
+        "return_device": False,
+        "next_tokens_per_chunk": None,
+        "device_seed": None,
+    }
+
+
+def test_propose_draft_token_ids_sync_device_seeded_caches_host_list():
+    manager, _, mock_drafter = _make_manager_with_eagle3_drafter(num_reqs=2)
+    mock_drafter.propose.return_value = [[1, 2], [3, 4]]
+
+    result = manager.propose_draft_token_ids(
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output="SO",
+        return_device=False,
+        next_tokens_per_chunk=["chunk0"],
+    )
+
+    assert result is None
+    assert manager._draft_token_ids == [[1, 2], [3, 4]]
+    args, kwargs = mock_drafter.propose.call_args
+    assert args[0] is None
+    assert kwargs["return_device"] is False
+    assert kwargs["next_tokens_per_chunk"] == ["chunk0"]
+
+
+def test_propose_draft_token_ids_async_spec_returns_device_tensor():
+    manager, _, mock_drafter = _make_manager_with_eagle3_drafter(num_reqs=3)
+    device_tensor = torch.zeros((3, 4))
+    mock_drafter.propose.return_value = device_tensor
+
+    result = manager.propose_draft_token_ids(
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[0],
+        num_rejected_tokens_np=None,
+        scheduler_output="SO",
+        return_device=True,
+        next_tokens_per_chunk=["chunk0"],
+    )
+
+    assert result is device_tensor
+    assert manager._draft_token_ids is None  # not cached on the async path
+    args, kwargs = mock_drafter.propose.call_args
+    assert args[0] is None
+    assert kwargs["return_device"] is True
+    assert kwargs["next_tokens_per_chunk"] == ["chunk0"]
+    assert kwargs["device_seed"] is None
+
+
+def test_propose_draft_token_ids_async_bootstrap_returns_device_tensor():
+    manager, _, mock_drafter = _make_manager_with_eagle3_drafter(num_reqs=1)
+    device_tensor = torch.ones((1, 2))
+    mock_drafter.propose.return_value = device_tensor
+    seed = torch.tensor([7])
+
+    result = manager.propose_draft_token_ids(
+        sampled_token_ids=[],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output="SO",
+        return_device=True,
+        device_seed=seed,
+    )
+
+    assert result is device_tensor
+    assert manager._draft_token_ids is None
+    args, kwargs = mock_drafter.propose.call_args
+    assert args[0] == []
+    assert kwargs["next_tokens_per_chunk"] is None
+    assert kwargs["device_seed"] is seed
+
+
+def test_propose_draft_token_ids_ngram_dispatches_correctly():
+    mock_runner = MagicMock()
+    mock_runner.input_batch.num_reqs = 2
+    mock_runner.speculative_config.method = "ngram"
+    mock_drafter = MagicMock(spec=NgramProposer)
+    mock_drafter.propose.return_value = [[5], [6]]
+    mock_runner.drafter = mock_drafter
+    mock_runner.input_batch.num_tokens_no_spec = "NTS"
+    mock_runner.input_batch.token_ids_cpu = "TIDS"
+    manager = SpeculativeDecodingManager(mock_runner)
+
+    result = manager.propose_draft_token_ids(sampled_token_ids=[[1], [2], [3]])
+
+    assert result is None
+    assert manager._draft_token_ids == [[5], [6]]
+    mock_drafter.propose.assert_called_once_with([[1], [2]], "NTS", "TIDS")

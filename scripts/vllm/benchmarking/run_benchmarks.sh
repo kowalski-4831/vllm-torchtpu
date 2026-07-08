@@ -40,6 +40,9 @@ CONFIG_NAME="qwen3-coder-480b-fp8-tp8-ep"
 DRY_RUN=0
 RESULTS_DIR_OVERRIDE="${RESULTS_DIR:-}"
 KEEP_ALIVE=0
+HOST=""
+PORT="${PORT:-8000}"
+START_SERVER=1
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -60,13 +63,26 @@ while [[ $# -gt 0 ]]; do
             KEEP_ALIVE=1
             shift
             ;;
+        --host)
+            HOST="$2"
+            START_SERVER=0
+            shift 2
+            ;;
+        --port)
+            PORT="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--config CONFIG_NAME] [--results-dir DIR] [--dry-run] [--keep-alive]"
+            echo "Usage: $0 [--config CONFIG_NAME] [--results-dir DIR] [--dry-run] [--keep-alive] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
 done
+
+if [ -z "$HOST" ]; then
+    HOST="localhost"
+fi
 
 # =============================================================================
 # Load config
@@ -196,6 +212,11 @@ start_vllm_server() {
         return
     fi
 
+    if curl -s -o /dev/null --connect-timeout 1 "http://localhost:$PORT/health" 2>/dev/null; then
+        echo "WARNING: Port $PORT is already occupied! Running cleanup_server.sh before launching new server..."
+        bash "$SCRIPT_DIR/cleanup_server.sh"
+    fi
+
     $server_cmd >> "$RESULTS_DIR/server.log" 2>&1 &
     SERVER_PID=$!
     echo "Server started (pid=$SERVER_PID)"
@@ -266,7 +287,7 @@ run_benchmark_once() {
     vllm bench serve \
         --backend vllm \
         --model "$MODEL" \
-        --host localhost \
+        --host "$HOST" \
         --port "$PORT" \
         --dataset-name random \
         --random-input-len "$input_len" \
@@ -352,8 +373,10 @@ echo "================================================"
 # Use uniform random MoE routing for consistent benchmarking
 export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
 
-trap stop_vllm_server EXIT
-start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
+if [ "$START_SERVER" = "1" ]; then
+    trap stop_vllm_server EXIT INT TERM
+    start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
+fi
 
 exit_code=0
 
@@ -397,7 +420,7 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
             if [ "$warmup_exit" -ne 0 ]; then
                 echo "    WARMUP FAILED (exit $warmup_exit)"
                 exit_code=$warmup_exit
-                if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                if [ "$START_SERVER" = "1" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
                     echo "ERROR: Server died during benchmark warmup"
                     tail -50 "$RESULTS_DIR/server.log"
                     break 3
@@ -421,7 +444,7 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
         else
             echo "    FAILED (exit $bench_exit)"
             exit_code=$bench_exit
-            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            if [ "$START_SERVER" = "1" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
                 echo "ERROR: Server died during benchmark"
                 tail -50 "$RESULTS_DIR/server.log"
                 break 2

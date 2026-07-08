@@ -20,13 +20,23 @@ if TYPE_CHECKING:
 class SpecDecodeMetadata:
     """Metadata for speculative decoding on Torch/TPU, containing all necessary indices."""
 
+    # [padded_logits_length] draft token id validated at each target_logits_indices slot.
     draft_token_ids: torch.Tensor
+    # [padded_num_reqs] per-request draft-token count (device copy).
     draft_lengths: torch.Tensor
+    # [num_reqs] per-request draft-token count (host copy, unpadded).
     draft_lengths_cpu: np.ndarray
+    # [padded_logits_length] row into this step's logits/hidden-states for each draft token being validated.
     target_logits_indices: torch.Tensor
+    # [padded_num_reqs] row into this step's logits/hidden-states for each request's bonus (last sampled) token.
     bonus_logits_indices: torch.Tensor
+    # [padded_logits_length] row into the input batch for every draft + bonus
+    # position the target model forward needs logits for.
     final_logits_indices: torch.Tensor
+    # [padded_logits_length] request index each position belongs to; padding
+    # uses the out-of-range sentinel num_reqs (not 0).
     segment_ids: torch.Tensor
+    # [padded_logits_length] within-request draft-slot index of each position.
     group_indices: torch.Tensor
 
 
@@ -50,38 +60,83 @@ class SpeculativeDecodingManager:
 
     def propose_draft_token_ids(
         self,
-        sampled_token_ids: list[list[int]],
+        sampled_token_ids: list[list[int]] | None,
         discard_sampled_tokens_req_indices: list[int] | None = None,
         num_rejected_tokens_np: np.ndarray | None = None,
         scheduler_output=None,
-    ) -> None:
+        return_device: bool = False,
+        next_tokens_per_chunk: list[torch.Tensor] | None = None,
+        device_seed: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         """Proposes draft token IDs based on the speculative decoding method.
 
+    The single dispatch point for all draft proposing. eagle3 is called
+    once per step from ``sample_tokens`` (sync AND async), seeded on-device
+    from either ``next_tokens_per_chunk`` (spec verify step) or
+    ``device_seed`` (prefill / non-spec step); ``return_device`` — the
+    scheduling mode — only selects the return form (async: raw device
+    tensor for the substitution assemblers; sync: host list cached for
+    ``take_draft_token_ids``). ngram has no device path and passes
+    host-materialized ``sampled_token_ids`` from the sync block instead.
+    See ``Eagle3Proposer.propose`` for what each seed kwarg means.
+
     Args:
-      sampled_token_ids: The token IDs sampled in the previous step.
+      sampled_token_ids: Host token IDs sampled in the previous step
+        (ngram, and the eagle3 host-seed path kept for standalone/unit-test
+        use); None/[] when seeding from device via
+        next_tokens_per_chunk/device_seed.
       discard_sampled_tokens_req_indices: Request indices whose sampled
         tokens should be discarded (partial-prefill case).
       num_rejected_tokens_np: Per-request count of draft tokens rejected
-        this step.
+        this step (host-seed path only; the device paths derive this
+        on-device).
       scheduler_output: vLLM SchedulerOutput; needed by eagle3 for partial
         prefill next-token lookup.
+      return_device: return the raw ``[num_reqs, K]`` device tensor
+        instead of caching a host list for take_draft_token_ids.
+      next_tokens_per_chunk: on-device rejection-sampler output (spec
+        verify step).
+      device_seed: on-device just-sampled tokens (prefill / non-spec
+        step).
+
+    Returns:
+      The raw device tensor when return_device=True; otherwise None (the
+      host list is cached in self._draft_token_ids).
     """
         num_reqs = self.runner.input_batch.num_reqs
+        # Device-seeded / device-returning draft proposing is eagle3-only
+        # (mirrors the tpu-inference reference's
+        # `if async_scheduling: assert use_eagle()` guard; vLLM's config
+        # validation also rejects ngram+async at engine construction).
+        if (return_device or next_tokens_per_chunk is not None
+                or device_seed is not None):
+            assert self.runner.speculative_config.method == "eagle3", (
+                "device-seeded draft proposing is only supported with eagle3")
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
+            assert sampled_token_ids is not None
             self._draft_token_ids = self.runner.drafter.propose(
                 sampled_token_ids[:num_reqs],
                 self.runner.input_batch.num_tokens_no_spec,
                 self.runner.input_batch.token_ids_cpu,
             )
+            return None
         elif self.runner.speculative_config.method == "eagle3":
             assert isinstance(self.runner.drafter, Eagle3Proposer)
-            self._draft_token_ids = self.runner.drafter.propose(
-                sampled_token_ids[:num_reqs],
+            result = self.runner.drafter.propose(
+                sampled_token_ids[:num_reqs]
+                if sampled_token_ids else sampled_token_ids,
                 discard_sampled_tokens_req_indices or [],
                 num_rejected_tokens_np,
                 scheduler_output,
+                return_device=return_device,
+                next_tokens_per_chunk=next_tokens_per_chunk,
+                device_seed=device_seed,
             )
+            if return_device:
+                return result
+            self._draft_token_ids = result
+            return None
         else:
             raise NotImplementedError(
                 "Speculative decoding method "
@@ -133,6 +188,14 @@ class SpeculativeDecodingManager:
             [arange_cpu_np[:n] for n in num_draft_tokens])
         target_logits_indices += arange_draft
 
+        # The host indexing just below and the async device path both read
+        # logits_indices[target_logits_indices + 1], the bonus slot must stay
+        # within the verified tokens.
+        assert target_logits_indices.size == 0 or \
+            int(target_logits_indices.max()) + 1 < logits_indices.shape[0], (
+                f"draft bonus index {int(target_logits_indices.max()) + 1} >= "
+                f"logits_indices length {logits_indices.shape[0]}")
+
         # Compute the draft token ids for validation.
         all_token_ids = self.runner.input_ids_cpu.numpy()
         draft_token_ids = all_token_ids[logits_indices[target_logits_indices +
@@ -182,16 +245,19 @@ class SpeculativeDecodingManager:
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
-                device),
-            draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(device),
+                device, non_blocking=True),
+            draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
+                device, non_blocking=True),
             draft_lengths_cpu=num_draft_tokens,
             target_logits_indices=torch.from_numpy(
-                padded_target_logits_indices).to(device),
+                padded_target_logits_indices).to(device, non_blocking=True),
             bonus_logits_indices=torch.from_numpy(
-                padded_bonus_logits_indices).to(device),
+                padded_bonus_logits_indices).to(device, non_blocking=True),
             final_logits_indices=torch.from_numpy(padded_logits_indices).to(
-                device),
-            segment_ids=torch.from_numpy(padded_segment_ids).to(device),
-            group_indices=torch.from_numpy(padded_group_indices).to(device),
+                device, non_blocking=True),
+            segment_ids=torch.from_numpy(padded_segment_ids).to(
+                device, non_blocking=True),
+            group_indices=torch.from_numpy(padded_group_indices).to(
+                device, non_blocking=True),
         )
         return metadata

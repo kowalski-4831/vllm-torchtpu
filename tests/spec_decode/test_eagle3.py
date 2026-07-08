@@ -24,9 +24,12 @@ from vllm_torchtpu.spec_decode.eagle3 import (DraftChunkInputs, Eagle3Proposer,
                                               _maybe_pad_dim0)
 
 
-def _make_proposer(draft_tp: int | None = 1) -> Eagle3Proposer:
+def _make_proposer(draft_tp: int | None = 1,
+                   target_tp: int = 1) -> Eagle3Proposer:
     speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp)
-    vllm_config = SimpleNamespace(speculative_config=speculative_config)
+    parallel_config = SimpleNamespace(tensor_parallel_size=target_tp)
+    vllm_config = SimpleNamespace(speculative_config=speculative_config,
+                                  parallel_config=parallel_config)
     return Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
 
 
@@ -76,17 +79,20 @@ def test_force_draft_tp1_restores_on_exception():
         assert fake_tp.rank_in_group == 2
 
 
-@pytest.mark.parametrize("draft_tp", [8, 2, None])
-def test_draft_tp_coerced_to_one(draft_tp):
-    # vLLM resolves an unset eagle3 draft tp to target_tp (e.g. 8); we always
-    # run the draft replicated, so any non-1 value must be coerced to 1.
-    proposer = _make_proposer(draft_tp=draft_tp)
-    assert proposer.speculative_config.draft_tensor_parallel_size == 1
+def test_draft_tp_defaults_to_target_tp():
+    # vLLM's _verify_and_get_draft_tp already resolves an unset eagle3 draft
+    # tp to target_tp; Eagle3Proposer sets it explicitly too (defensive +
+    # self-documenting).
+    proposer = _make_proposer(draft_tp=None, target_tp=8)
+    assert proposer.speculative_config.draft_tensor_parallel_size == 8
+    assert proposer._draft_replicated is False
 
 
-def test_draft_tp_one_unchanged():
-    proposer = _make_proposer(draft_tp=1)
-    assert proposer.speculative_config.draft_tensor_parallel_size == 1
+@pytest.mark.parametrize("draft_tp", [2, 4])
+def test_draft_tp_invalid_raises(draft_tp):
+    # Only replicated (1) or fully sharded (== target tp) are supported.
+    with pytest.raises(ValueError):
+        _make_proposer(draft_tp=draft_tp, target_tp=8)
 
 
 def _make_chunk(*,
@@ -98,7 +104,9 @@ def _make_chunk(*,
                 hidden=8,
                 device,
                 padded_tokens=None,
-                attn_ctx=None):
+                attn_ctx=None,
+                hidden_states=None,
+                draft_lengths=None):
     """Build a DraftChunkInputs for tests. aux/attn_ctx are only needed by
     paths that consume them; _prepare_draft_inputs does not touch attn_ctx, so
     it defaults to an inert placeholder. Pass a real attn_ctx for the propose
@@ -111,9 +119,15 @@ def _make_chunk(*,
         attn_ctx=attn_ctx,
         start_index=start_index,
         num_reqs=num_reqs,
+        # Eagle3 always exposes exactly 3 aux hidden states (the draft combine
+        # consumes 3 * hidden); the compiled _draft_combine_hidden_states wrapper
+        # takes them positionally, so provide 3.
         aux_hidden_states=[
             torch.zeros((padded_tokens, hidden), device=device)
+            for _ in range(3)
         ],
+        hidden_states=hidden_states,
+        draft_lengths=draft_lengths,
     )
 
 
@@ -123,6 +137,7 @@ def test_prepare_draft_inputs(device):
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
+        num_tokens_paddings=[16, 32, 64, 128],
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -149,7 +164,9 @@ def test_prepare_draft_inputs(device):
     # Rejection counts clamp to per-request lengths-1 [3, 6] -> [1, 3].
     assert np.array_equal(num_rejected_np, np.array([1, 3]))
     # Accepted-prefix ends: qsl[1:]-1-rejected = [3,10]-[1,3] = [2, 7].
-    assert torch.equal(last_token_indices.cpu(),
+    # The returned gather index is bucket-padded (tail repeats the last real
+    # entry); check the real [:num_reqs] prefix.
+    assert torch.equal(last_token_indices.cpu()[:2],
                        torch.tensor([2, 7], dtype=torch.int64))
 
     # input_ids [0..10]; left shift -> [1,2,...,10,10]; then patch the last
@@ -168,6 +185,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
         input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2", "r3"]),
         device=device,
         requests={},
+        num_tokens_paddings=[16, 32, 64, 128],
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={})
 
@@ -194,8 +212,9 @@ def test_prepare_draft_inputs_chunk_offset(device):
 
     # Chunk slice of rejections [1, 0], clamped to lengths-1 [2, 1] -> [1, 0].
     assert np.array_equal(num_rejected_np, np.array([1, 0]))
-    # qsl[1:]-1-rejected = [2,4]-[1,0] = [1, 4].
-    assert torch.equal(last_token_indices.cpu(),
+    # qsl[1:]-1-rejected = [2,4]-[1,0] = [1, 4]. Returned gather index is
+    # bucket-padded; check the real [:num_reqs] prefix.
+    assert torch.equal(last_token_indices.cpu()[:2],
                        torch.tensor([1, 4], dtype=torch.int64))
     # [0..4] left shift -> [1,2,3,4,4]; patch [1,4] with batch tokens [201,202].
     expected_ids = torch.tensor([1, 201, 3, 4, 202],
@@ -204,9 +223,81 @@ def test_prepare_draft_inputs_chunk_offset(device):
     assert torch.equal(draft_input_ids, expected_ids)
 
 
+def test_prepare_draft_inputs_async_device(device):
+    """Async device path derives the seed token, the seed *position*
+    (last_token_indices) and the rejected count from the on-device rejection
+    output — matching the host path fed the equivalent num_rejected."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16, 32, 64, 128],
+    )
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={})
+
+    def make_chunk():
+        # K=3 verify spans of 4 tokens each (qsl [0, 4, 8]); input_ids 0..7.
+        # The async path reads num_draft on-device from chunk.draft_lengths and
+        # qsl_end from chunk.attn_ctx.query_start_loc (mirroring production), so
+        # both must be supplied. K=3 drafts per req here.
+        return _make_chunk(
+            input_ids=torch.arange(8, dtype=torch.int32, device=device),
+            position_ids=torch.arange(8, dtype=torch.int32, device=device),
+            query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+            start_index=0,
+            num_reqs=2,
+            device=device,
+            draft_lengths=torch.tensor([3, 3],
+                                       dtype=torch.int32,
+                                       device=device),
+            attn_ctx=SimpleNamespace(query_start_loc=torch.tensor(
+                [0, 4, 8], dtype=torch.int32, device=device)),
+        )
+
+    # Device rejection output: req0 has 3 valid (bonus 201, 1 draft rejected),
+    # req1 has 1 valid (bonus 202, 3 rejected) -> num_rejected = orig - num_valid
+    # = [4, 4] - [3, 1] = [1, 3]; seeds (bonus) = [201, 202].
+    next_tokens = torch.tensor([[91, 92, 201, -1], [202, -1, -1, -1]],
+                               dtype=torch.int32,
+                               device=device)
+    dev_ids, _, dev_last, dev_rej = proposer._prepare_draft_inputs(
+        make_chunk(),
+        sampled_token_ids=None,  # async path ignores the host count/list
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=scheduler_output,
+        next_tokens_device=next_tokens,
+    )
+
+    # Host path fed the equivalent num_rejected=[1,3] and bonus seeds.
+    host_ids, _, host_last, host_rej = proposer._prepare_draft_inputs(
+        make_chunk(),
+        sampled_token_ids=[[201], [202]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=np.array([1, 3], dtype=np.int32),
+        scheduler_output=scheduler_output,
+    )
+
+    assert torch.equal(dev_ids, host_ids)
+    # Gather-index real prefix matches (seed positions [2, 4]); the padded tail
+    # differs by pad convention (async zero-pads, sync repeats the last entry)
+    # and is sliced off by propose(), so compare only [:num_reqs].
+    assert torch.equal(dev_last.cpu()[:2], host_last.cpu()[:2])
+    assert dev_rej.cpu().tolist() == host_rej.tolist() == [1, 3]
+
+
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 8])
 @pytest.mark.parametrize("chunk_sizes", [[2], [2, 2], [3, 1]])
-def test_propose(num_speculative_tokens, chunk_sizes, device):
+@pytest.mark.parametrize("return_device", [False, True])
+def test_propose(num_speculative_tokens, chunk_sizes, return_device, device):
+    # Each variant exercises the @torch.compile draft wrappers at distinct
+    # shapes; across the full parametrize sweep they otherwise accumulate past
+    # dynamo's recompile_limit (8) in one process (FailOnRecompileLimitHit).
+    # Reset dynamo so each variant starts fresh. (Production hits only a bounded
+    # bucketed set after warmup, so this is a test-only concern.)
+    import torch._dynamo
+    torch._dynamo.reset()
     hidden_size = 8
     vocab_size = 128
     num_reqs = sum(chunk_sizes)
@@ -241,26 +332,50 @@ def test_propose(num_speculative_tokens, chunk_sizes, device):
         start += nr
     proposer.draft_chunks = chunks
 
-    draft_model = mock.MagicMock()
-    draft_model.combine_hidden_states.side_effect = lambda x: x
+    # A traceable stub (not a MagicMock): propose() now calls
+    # combine_hidden_states / compute_logits inside @torch.compile regions
+    # (_draft_combine_hidden_states / _draft_propose_token), and torch.compile
+    # with fullgraph=True cannot trace a MagicMock. combine is identity; the
+    # argmax of the one-hot logits recovers round(hidden[:, 0]) as the token.
+    class _StubDraftModel:
 
-    def _compute_logits(hidden):
-        tokens = hidden[:, 0].round().clamp(min=0).to(torch.int64)
-        return torch.nn.functional.one_hot(tokens,
-                                           vocab_size).to(torch.float32)
+        # Mirrors the real draft's `.model.use_aux_hidden_state`, read by
+        # _draft_uses_aux_hidden_state() to pick the combine path.
+        model = SimpleNamespace(use_aux_hidden_state=True)
 
-    draft_model.compute_logits.side_effect = _compute_logits
-    proposer.draft_model = draft_model
+        def combine_hidden_states(self, x):
+            return x
+
+        def compute_logits(self, hidden):
+            tokens = hidden[:, 0].round().clamp(min=0).to(torch.int64)
+            return torch.nn.functional.one_hot(tokens,
+                                               vocab_size).to(torch.float32)
+
+    proposer.draft_model = _StubDraftModel()
+
+    # Per-chunk next_tokens sentinels to verify propose threads the right one
+    # to each chunk's _prepare_draft_inputs.
+    nt_per_chunk = [
+        torch.full((nr, num_speculative_tokens + 1),
+                   700 + ci,
+                   dtype=torch.int32,
+                   device=device) for ci, nr in enumerate(chunk_sizes)
+    ]
+    received_next_tokens = []
 
     # Per-chunk: accepted-prefix slots are the first `num_reqs` rows.
     def _prepare(chunk, *_args, **_kwargs):
+        received_next_tokens.append(_kwargs.get("next_tokens_device"))
         padded = 16
         local_idx = torch.arange(chunk.num_reqs, device=device)
+        # num_rejected: the async (is_async, return_device) path consumes this
+        # via _maybe_pad_dim0, so it must be a device tensor (mirroring the real
+        # async _prepare_draft_inputs, which derives it on-device), not numpy.
         return (
             torch.zeros(padded, dtype=torch.int32, device=device),
             torch.zeros(padded, dtype=torch.int32, device=device),
             local_idx,
-            np.ones(chunk.num_reqs, dtype=np.int32),
+            torch.ones(chunk.num_reqs, dtype=torch.int32, device=device),
         )
 
     proposer._prepare_draft_inputs = _prepare
@@ -287,12 +402,123 @@ def test_propose(num_speculative_tokens, chunk_sizes, device):
         discard_sampled_tokens_req_indices=[],
         num_rejected_tokens_np=None,
         scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+        return_device=return_device,
+        next_tokens_per_chunk=nt_per_chunk,
     )
+
+    # propose threads each chunk's next_tokens to its _prepare_draft_inputs.
+    assert len(received_next_tokens) == len(chunk_sizes)
+    for ci in range(len(chunk_sizes)):
+        assert received_next_tokens[ci] is nt_per_chunk[ci]
 
     expected = [[
         base_token_ids[i] + step for step in range(num_speculative_tokens)
     ] for i in range(num_reqs)]
-    assert result == expected
+    if return_device:
+        # Async path: raw [num_reqs, K] device tensor, same values.
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (num_reqs, num_speculative_tokens)
+        assert result.device.type == device.type
+        assert result.cpu().tolist() == expected
+    else:
+        assert result == expected
+
+
+def test_draft_combine_input_size_no_aux_hidden_state():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8192),
+        model=SimpleNamespace(use_aux_hidden_state=False),
+    )
+    assert proposer._draft_uses_aux_hidden_state() is False
+    assert proposer._draft_combine_input_size() == 8192
+
+
+def test_draft_combine_input_size_with_aux_hidden_state():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8192),
+        model=SimpleNamespace(use_aux_hidden_state=True, fc_input_size=24576),
+    )
+    assert proposer._draft_uses_aux_hidden_state() is True
+    assert proposer._draft_combine_input_size() == 24576
+
+
+def test_propose_without_aux_hidden_state(device):
+    hidden_size = 8
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 1
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1),
+        max_num_reqs=16,
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=16,
+        num_tokens_paddings=[16],
+        device=device,
+    )
+
+    aux = torch.full((16, hidden_size), 111.0, device=device)
+    plain_hidden = torch.full((16, hidden_size), 222.0, device=device)
+    chunk = _make_chunk(
+        input_ids=torch.zeros(16, dtype=torch.int32, device=device),
+        position_ids=torch.zeros(16, dtype=torch.int32, device=device),
+        query_start_loc_np=np.arange(2, dtype=np.int32),
+        start_index=0,
+        num_reqs=1,
+        hidden=hidden_size,
+        device=device,
+        attn_ctx=SimpleNamespace(use_max_model_len=True),
+        hidden_states=plain_hidden,
+    )
+    chunk.aux_hidden_states = [aux]
+    proposer.draft_chunks = [chunk]
+
+    # Plain stub, not a MagicMock: compute_logits runs inside the
+    # @torch.compile(fullgraph=True) _draft_propose_token wrapper, which
+    # cannot trace mocks (same reason test_propose uses _StubDraftModel).
+    combine_calls = []
+
+    class _StubNoAuxDraftModel:
+
+        model = SimpleNamespace(use_aux_hidden_state=False)
+
+        def combine_hidden_states(self, x):
+            combine_calls.append(x)
+            return x
+
+        def compute_logits(self, hidden):
+            return torch.zeros((hidden.shape[0], 4), device=device)
+
+    proposer.draft_model = _StubNoAuxDraftModel()
+
+    def _prepare(chunk, *_args, **_kwargs):
+        return (
+            torch.zeros(16, dtype=torch.int32, device=device),
+            torch.zeros(16, dtype=torch.int32, device=device),
+            torch.arange(chunk.num_reqs, device=device),
+            np.zeros(chunk.num_reqs, dtype=np.int32),
+        )
+
+    proposer._prepare_draft_inputs = _prepare
+
+    def _forward_draft(*, input_ids, **_kwargs):
+        n = input_ids.shape[0]
+        last_hidden = torch.zeros((n, hidden_size), device=device)
+        return last_hidden, last_hidden
+
+    proposer._forward_draft = _forward_draft
+
+    proposer.propose(
+        sampled_token_ids=[[0]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+
+    # combine_hidden_states must see the plain hidden_states tensor, not the
+    # (single-element, but distinct-valued) aux_hidden_states concatenation.
+    assert len(combine_calls) == 1
+    assert torch.equal(combine_calls[0], plain_hidden)
 
 
 def test_propose_empty_batch():

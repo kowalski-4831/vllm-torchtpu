@@ -21,6 +21,20 @@ os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", "disabled")
 # Keep TP collectives compiled in-graph (no graph break) for fullgraph TP.
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
                       "false")
+os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+
+# Forking after TorchTPU/JAX/PyTorch background threads have started can
+# deadlock vLLM engine or worker subprocess startup. Set this before test
+# modules import vLLM so every LLM test uses a clean spawned process.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+# Disable vLLM's AOT compile cache in tests (auto-ON for torch >= 2.10).
+# Its artifacts bake in the resolved KV-cache num_blocks, but its cache key
+# misses the TPU KV-budget factors, so on CI's persistent cache mount a
+# stale artifact from an earlier run loads and crashes engine init with
+# "RuntimeProgramInputMismatch" (test_eagle3_sharded_draft). The piecewise
+# cache (TpuCompilerAdaptor, correctly keyed) already provides reuse.
+os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
 
 import pytest
 import torch

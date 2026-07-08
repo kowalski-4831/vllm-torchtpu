@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -33,6 +34,50 @@ from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
+    """Run _prepare_async_token_substitution_indices with a minimal fake self.
+    req_id_to_index_copy holds each request's *position*; with spec_k set the
+    builder uses a `1+spec_k` source stride. Returns (cur, source) index lists."""
+    fake = SimpleNamespace(
+        _pre_async_results=SimpleNamespace(
+            req_id_to_index_copy=req_id_to_index_copy,
+            spec_decode_num_rejected_tokens=(None
+                                             if spec_k is None else object())),
+        speculative_config=(None if spec_k is None else SimpleNamespace(
+            num_speculative_tokens=spec_k)),
+        input_batch=SimpleNamespace(req_ids=req_ids))
+    cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
+        fake,
+        start_index=0,
+        num_reqs=len(req_ids),
+        num_scheduled_tokens_per_req=np.array(num_scheduled, dtype=np.int32))
+    return cur.tolist(), src.tolist()
+
+
+def test_async_sub_indices_non_spec():
+    # num_scheduled == 1 per request → one placeholder slot each (the original
+    # single-token decode behaviour, unchanged).
+    cur, src = _sub_indices({"r0": 0, "r1": 1}, ["r0", "r1"], [1, 1])
+    assert cur == [0, 1]
+    assert src == [0, 1]
+
+
+def test_async_sub_indices_spec_1plusk():
+    # K=3 → stride 4. Positions r0=0, r1=1 → source spans at 0*4 and 1*4; each
+    # request occupies 4 input slots ([bonus, draft_1..3]).
+    cur, src = _sub_indices({"r0": 0, "r1": 1}, ["r0", "r1"], [4, 4], spec_k=3)
+    assert cur == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert src == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_async_sub_indices_skips_new_req():
+    # r0 is new (no source span) → skipped, but its scheduled tokens still
+    # advance the running input offset for r1. K=3 → stride 4, r1 position 0.
+    cur, src = _sub_indices({"r1": 0}, ["r0", "r1"], [3, 4], spec_k=3)
+    assert cur == [3, 4, 5, 6]
+    assert src == [0, 1, 2, 3]
 
 
 class DummyMamba(MambaBase):
@@ -124,6 +169,8 @@ class TestTPURunner:
         self.runner._mamba_num_blocks = None
         self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
                                              is not None)
+        self.runner._unified_block_pool = False
+        self.runner.kv_cache_raw_tensors = []
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
             self.runner)
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
@@ -893,6 +940,7 @@ class TestAttentionMetadataBuilder:
         runner.block_size = 16
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
+        runner._unified_block_pool = False
         runner.position_ids = torch.full((8, ), 42, dtype=torch.int32)
 
         block_tables = []
@@ -908,12 +956,13 @@ class TestAttentionMetadataBuilder:
         runner.input_batch.block_table = block_tables
         return runner
 
-    def _make_builder(self, runner, kv_cache_group_id=0):
-        spec = FullAttentionSpec(block_size=16,
-                                 num_kv_heads=2,
-                                 head_size=128,
-                                 dtype=torch.bfloat16,
-                                 page_size_padded=16384)
+    def _make_builder(self, runner, kv_cache_group_id=0, spec=None):
+        if spec is None:
+            spec = FullAttentionSpec(block_size=16,
+                                     num_kv_heads=2,
+                                     head_size=128,
+                                     dtype=torch.bfloat16,
+                                     page_size_padded=16384)
         return AttentionMetadataBuilder(
             kv_cache_spec=spec,
             layer_names=["attn.0"],
@@ -1028,6 +1077,32 @@ class TestAttentionMetadataBuilder:
 
         # cdiv(32, 16) = 2; flattened length = target_num_reqs * 2 = 8.
         assert meta.block_tables.shape == (4 * 2, )
+
+    def test_unified_mamba_state_indices_derive_from_block_table(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_block_pool = True
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(2, 8)],
+            dtypes=[torch.bfloat16],
+            page_size_padded=256,
+        )
+        builder = self._make_builder(runner, spec=mamba_spec)
+
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 33, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert torch.equal(meta.mamba_state_indices,
+                           torch.tensor([0, 6, 8, 12], dtype=torch.int32))
 
 
 class TestCompactMambaSlotPool:
