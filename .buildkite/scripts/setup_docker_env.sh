@@ -15,6 +15,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "--- Cleaning up old Docker images and cache"
+bash "${SCRIPT_DIR}/cleanup_docker.sh"
+
 IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
 IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
@@ -26,5 +30,8 @@ echo "--- Building Docker Image: ${IMAGE_TAG}"
 echo "--- Pushing Docker Image to Registry"
 gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 docker push "${IMAGE_TAG}"
+
+echo "--- Cleaning up local built image"
+docker rmi "${IMAGE_TAG}" || true
 
 echo "--- Done setup_docker_env.sh"

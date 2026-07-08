@@ -36,6 +36,10 @@ IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
 IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "--- Cleaning up old Docker images and cache"
+bash "${SCRIPT_DIR}/cleanup_docker.sh"
+
 echo "--- Pulling Docker Image: ${IMAGE_TAG}"
 gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 docker pull "${IMAGE_TAG}"
@@ -150,5 +154,8 @@ if [ $DOCKER_EXIT_CODE -eq 0 ]; then
 else
   echo "[WARN] Docker exited with non-zero code ${DOCKER_EXIT_CODE}. Skipping syncing local TorchTPU Cache back to GCS to avoid potential cache corruption."
 fi
+
+echo "--- Cleaning up pulled Docker image"
+docker rmi "${IMAGE_TAG}" || true
 
 exit $DOCKER_EXIT_CODE
