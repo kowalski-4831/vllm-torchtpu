@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -33,6 +34,50 @@ from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
+    """Run _prepare_async_token_substitution_indices with a minimal fake self.
+    req_id_to_index_copy holds each request's *position*; with spec_k set the
+    builder uses a `1+spec_k` source stride. Returns (cur, source) index lists."""
+    fake = SimpleNamespace(
+        _pre_async_results=SimpleNamespace(
+            req_id_to_index_copy=req_id_to_index_copy,
+            spec_decode_num_rejected_tokens=(None
+                                             if spec_k is None else object())),
+        speculative_config=(None if spec_k is None else SimpleNamespace(
+            num_speculative_tokens=spec_k)),
+        input_batch=SimpleNamespace(req_ids=req_ids))
+    cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
+        fake,
+        start_index=0,
+        num_reqs=len(req_ids),
+        num_scheduled_tokens_per_req=np.array(num_scheduled, dtype=np.int32))
+    return cur.tolist(), src.tolist()
+
+
+def test_async_sub_indices_non_spec():
+    # num_scheduled == 1 per request → one placeholder slot each (the original
+    # single-token decode behaviour, unchanged).
+    cur, src = _sub_indices({"r0": 0, "r1": 1}, ["r0", "r1"], [1, 1])
+    assert cur == [0, 1]
+    assert src == [0, 1]
+
+
+def test_async_sub_indices_spec_1plusk():
+    # K=3 → stride 4. Positions r0=0, r1=1 → source spans at 0*4 and 1*4; each
+    # request occupies 4 input slots ([bonus, draft_1..3]).
+    cur, src = _sub_indices({"r0": 0, "r1": 1}, ["r0", "r1"], [4, 4], spec_k=3)
+    assert cur == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert src == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_async_sub_indices_skips_new_req():
+    # r0 is new (no source span) → skipped, but its scheduled tokens still
+    # advance the running input offset for r1. K=3 → stride 4, r1 position 0.
+    cur, src = _sub_indices({"r1": 0}, ["r0", "r1"], [3, 4], spec_k=3)
+    assert cur == [3, 4, 5, 6]
+    assert src == [0, 1, 2, 3]
 
 
 class DummyMamba(MambaBase):

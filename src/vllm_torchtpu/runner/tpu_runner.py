@@ -1245,16 +1245,31 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
 
+        # 1+K for spec — `[bonus, draft_1..K]`), so a request's source span
+        # starts at `position * stride`.
+        stride = 1
+        if (self.speculative_config is not None
+                and self._pre_async_results.spec_decode_num_rejected_tokens
+                is not None):
+            stride = 1 + self.speculative_config.num_speculative_tokens
+
         for i in range(num_reqs):
             req_id = self.input_batch.req_ids[start_index + i]
-            acc_cur_len += num_scheduled_tokens_per_req[i]
+            n_sched = int(num_scheduled_tokens_per_req[i])
+            acc_cur_len += n_sched
             assert req_id is not None
             if req_id not in self._pre_async_results.req_id_to_index_copy:
                 continue
 
-            token_in_tpu_cur_input_indices_list.append(acc_cur_len - 1)
-            token_in_tpu_pre_next_tokens_indices_list.append(
-                self._pre_async_results.req_id_to_index_copy[req_id])
+            # Map this request's last `n_sched` input slots to its source span
+            # `[position*stride .. +n_sched-1]`. Non-spec (stride 1, n_sched 1)
+            # reduces to the original single-slot mapping.
+            src_start = (self._pre_async_results.req_id_to_index_copy[req_id] *
+                         stride)
+            for j in range(n_sched):
+                token_in_tpu_cur_input_indices_list.append(acc_cur_len -
+                                                           n_sched + j)
+                token_in_tpu_pre_next_tokens_indices_list.append(src_start + j)
 
         if len(token_in_tpu_cur_input_indices_list) > 0:
             return (np.array(token_in_tpu_cur_input_indices_list,
@@ -1274,10 +1289,14 @@ class TPUModelRunner(GPUModelRunner):
 
         idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
 
-        # Pad according to the instructions written inside _substitute_placeholder_token
-        full_range = np.arange(0, len(input_ids), dtype=np.int32)
-        missing_values = np.setdiff1d(full_range,
-                                      token_in_tpu_cur_input_indices)
+        # Pad according to the instructions written inside
+        # _substitute_placeholder_token: missing = the complement of
+        # cur_input_indices over [0, len(input_ids)). O(n) boolean mask instead
+        # of np.setdiff1d's O(n log n) sort; flatnonzero returns the same
+        # ascending order setdiff1d did over the (sorted, unique) full range.
+        _missing_mask = np.ones(len(input_ids), dtype=bool)
+        _missing_mask[token_in_tpu_cur_input_indices] = False
+        missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
         padded_token_in_tpu_cur_input_indices = np.concatenate(
             (token_in_tpu_cur_input_indices, missing_values))
 
@@ -1308,6 +1327,14 @@ class TPUModelRunner(GPUModelRunner):
         self._modify_prev_results()
         self._pre_async_results = None
 
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
+        # Disable vLLM's native GPU async spec-decode num_computed_tokens
+        # correction. The TPU runner does its own async rejection correction,
+        # so letting the base also correct would double-count.
+        for req_state in self.requests.values():
+            req_state.prev_num_draft_len = 0
+        return super()._update_states(scheduler_output)
+
     def _modify_prev_results(self):
         if self._pre_async_results is None:
             return
@@ -1315,6 +1342,10 @@ class TPUModelRunner(GPUModelRunner):
         pre_req_ids = self._pre_async_results.req_ids
         pre_request_seq_lens = self._pre_async_results.request_seq_lens
         pre_discard_sampled_tokens_req_indices = self._pre_async_results.discard_sampled_tokens_req_indices
+        # Per-request draft count from the previous step (keyed by the
+        # request_seq_lens index); sizes the optimistic-placeholder rollback
+        # below. None/absent -> 0 drafts (non-spec or a non-spec mixed chunk).
+        pre_num_draft_per_req = self._pre_async_results.num_draft_per_req
 
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
@@ -1340,41 +1371,163 @@ class TPUModelRunner(GPUModelRunner):
             if not sampled_ids:
                 continue
 
-            # Replace the 0 placeholder we appended in the previous step
-            req_state.output_token_ids[-1] = sampled_ids[0]
-            if len(sampled_ids) > 1:
-                req_state.output_token_ids.extend(sampled_ids[1:])
+            # The previous step optimistically appended (1 + num_draft)
+            # placeholder tokens to output_token_ids, assuming every draft was
+            # accepted. Now that the true acceptance is known, drop the entire
+            # optimistic guess and append the actual sampled tokens.
+            n_placeholder = 1 + (pre_num_draft_per_req.get(pre_req_idx, 0)
+                                 if pre_num_draft_per_req else 0)
+            # At most (1 bonus + num_draft) tokens can commit this step, so the
+            # optimistic placeholder count must cover the real sampled count.
+            # num_sampled_tokens <= pre_num_placeholder_tokens guard.
+            assert len(sampled_ids) <= n_placeholder, (
+                f"req {req_id}: sampled {len(sampled_ids)} tokens > "
+                f"{n_placeholder} optimistic placeholders -- output_token_ids "
+                "rollback would drop the wrong elements")
+            del req_state.output_token_ids[-n_placeholder:]
+            req_state.output_token_ids.extend(sampled_ids)
 
             if req_id not in self.input_batch.req_id_to_index:
                 continue
 
             req_idx = self.input_batch.req_id_to_index[req_id]
 
-            if len(sampled_ids) > 1:
-                self.input_batch.num_tokens_no_spec[req_idx] += len(
-                    sampled_ids) - 1
+            # num_tokens_no_spec was advanced to (seq_len + n_placeholder)
+            # optimistically; roll back the over-count (= num_rejected) so it
+            # reflects the real committed length (start_idx + len(sampled_ids)).
+            end_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            start_idx = end_idx - n_placeholder
+            self.input_batch.num_tokens_no_spec[req_idx] = (start_idx +
+                                                            len(sampled_ids))
 
             target_slice = slice(seq_len - len(sampled_ids) + 1, seq_len + 1)
+            # The committed tokens must fit within token_ids_cpu
+            # ([num_reqs, max_model_len]); writing past the end is a sizing bug.
+            assert seq_len + 1 <= self.input_batch.token_ids_cpu.shape[1], (
+                f"req {req_id}: write end {seq_len + 1} exceeds max_model_len "
+                f"{self.input_batch.token_ids_cpu.shape[1]}")
             self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
 
-    def _update_placeholder(self, discard_sampled_tokens_req_indices,
-                            request_seq_lens, next_token_indices: dict[int,
-                                                                       int]):
+    def _update_placeholder(self,
+                            discard_sampled_tokens_req_indices,
+                            request_seq_lens,
+                            next_token_indices: dict[int, int],
+                            num_draft_per_req: dict[int, int] | None = None):
         placeholder_req_id_to_index: dict[str, int] = {}
         discard_set = set(discard_sampled_tokens_req_indices)
         for req_idx, req_state, seq_len, req_id in request_seq_lens:
             if req_idx in discard_set:
                 continue
 
-            end_idx = seq_len + 1
+            # Async spec: optimistically advance by 1 (bonus) + num_draft;
+            # the over-count is corrected on-device next step by subtract_num_rejected_tokens.
+            n_new = 1 + (num_draft_per_req.get(req_idx, 0)
+                         if num_draft_per_req else 0)
+            end_idx = seq_len + n_new
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
-            req_state.output_token_ids.append(0)
+            req_state.output_token_ids.extend([0] * n_new)
 
             next_token_index = next_token_indices[req_idx]
             placeholder_req_id_to_index[req_state.req_id] = next_token_index
 
         return placeholder_req_id_to_index
+
+    def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk,
+                                          state, next_tokens_tpu_chunks,
+                                          next_token_indices):
+        """Async-spec substitution assembler.
+
+        From the already-proposed on-device ``drafts`` (the unified eagle3
+        propose call in ``sample_tokens``), builds the per-request
+        ``[bonus, draft_1..K]`` substitution source (appended to
+        ``next_tokens_tpu_chunks``) and the stride-``1+K``
+        ``next_token_indices``, and computes the per-request rejected count.
+        Returns ``(spec_decode_num_rejected_tokens, num_draft_per_req)``.
+        """
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            assemble_spec_next_tokens, compute_num_rejected)
+        assert drafts is not None, (
+            "async spec substitution requires the eagle3 drafts proposed "
+            "earlier in sample_tokens")
+        K = self.speculative_config.num_speculative_tokens
+        num_rejected_chunks: list[torch.Tensor] = []
+        num_draft_per_req: dict[int, int] = {}
+        req_offset = 0
+        # Uniform `1+K` source span per request: req position `p` maps to source
+        # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
+        # index builder multiplies by the stride). Mixed-batch non-spec chunks
+        # pad their single token to the same `1+K` width.
+        for nt_chunk, num_reqs, md in zip(next_tokens_per_chunk,
+                                          state.num_reqs_list,
+                                          state.spec_decode_metadata_list):
+            if md is not None:
+                drafts_chunk = drafts[req_offset:req_offset + num_reqs]
+                src = assemble_spec_next_tokens(nt_chunk, drafts_chunk,
+                                                num_reqs)  # [num_reqs*(1+K)]
+                num_rejected_chunks.append(
+                    compute_num_rejected(nt_chunk,
+                                         md.draft_lengths[:num_reqs]))
+                for r in range(num_reqs):
+                    num_draft_per_req[req_offset + r] = int(
+                        md.draft_lengths_cpu[r])
+            else:
+                # Mixed-batch non-spec chunk: pad the single sampled token to the
+                # uniform 1+K span (token at slot 0, rest INVALID).
+                token = nt_chunk[:num_reqs, 0]
+                src = torch.full((num_reqs, 1 + K),
+                                 INVALID_TOKEN_ID,
+                                 dtype=token.dtype,
+                                 device=token.device)
+                src[:, 0] = token
+                src = src.reshape(-1)  # [num_reqs*(1+K)]
+                num_rejected_chunks.append(
+                    torch.zeros(num_reqs,
+                                dtype=torch.int32,
+                                device=token.device))
+            next_tokens_tpu_chunks.append(src)
+            for r in range(num_reqs):
+                next_token_indices[req_offset + r] = req_offset + r
+            req_offset += num_reqs
+        spec_num_rejected = (torch.cat(num_rejected_chunks)
+                             if num_rejected_chunks else None)
+        return spec_num_rejected, num_draft_per_req
+
+    def _assemble_async_prefill_bootstrap(self, drafts,
+                                          combined_selected_tokens,
+                                          combined_real_lens,
+                                          next_tokens_tpu_chunks,
+                                          next_token_indices):
+        """Async eagle3 bootstrap assembler for the prefill / pure-non-spec step.
+
+        From the already-proposed prompt-context ``drafts`` (the unified eagle3
+        propose call in ``sample_tokens``, device_seed path), parks a
+        stride-(1+K) `[bonus, draft_1..K]` source so the NEXT step substitutes
+        REAL prompt-context drafts. Returns (spec_num_rejected=zeros,
+        num_draft_per_req).
+        """
+        assert drafts is not None, (
+            "async prefill bootstrap requires the eagle3 drafts proposed "
+            "earlier in sample_tokens")
+        K = self.speculative_config.num_speculative_tokens
+        num_rejected_chunks: list[torch.Tensor] = []
+        num_draft_per_req: dict[int, int] = {}
+        req_offset = 0
+        for sel, n in zip(combined_selected_tokens, combined_real_lens):
+            bonus = sel.view(-1)[:n].unsqueeze(1)  # [n, 1]
+            drafts_chunk = drafts[req_offset:req_offset + n]  # [n, K]
+            src = torch.cat([bonus.to(drafts_chunk.dtype), drafts_chunk],
+                            dim=1)  # [n, 1+K] = [bonus, draft_1..K]
+            next_tokens_tpu_chunks.append(src.reshape(-1))
+            num_rejected_chunks.append(
+                torch.zeros(n, dtype=torch.int32, device=src.device))
+            for r in range(n):
+                next_token_indices[req_offset + r] = req_offset + r
+                num_draft_per_req[req_offset + r] = K
+            req_offset += n
+        spec_num_rejected = (torch.cat(num_rejected_chunks)
+                             if num_rejected_chunks else None)
+        return spec_num_rejected, num_draft_per_req
 
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput",
                         start_index: int, num_decode_reqs: int):
@@ -1551,6 +1704,36 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
                 self.device, non_blocking=True)
             target_num_reqs = self.num_reqs_most_model_len
+
+        # Async spec: seq_lens/positions were advanced optimistically (every
+        # draft from the previous step assumed accepted). Subtract the real
+        # per-request rejected count on-device, keyed by req position.
+        if (self.scheduler_config.async_scheduling and self.speculative_config
+                and self._pre_async_results is not None
+                and self._pre_async_results.spec_decode_num_rejected_tokens
+                is not None):
+            from vllm_torchtpu.runner.tpu_runner_async_output import \
+                subtract_num_rejected_tokens
+            seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
+            pos_idx_np = np.full(padded_total_num_scheduled_tokens,
+                                 -1,
+                                 dtype=np.int32)
+            acc = 0
+            for i in range(num_reqs):
+                req_id = self.input_batch.req_ids[start_index + i]
+                n_sched = int(num_scheduled_tokens_per_req[i])
+                pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
+                if pos is not None:
+                    seq_idx_np[i] = pos
+                    pos_idx_np[acc:acc + n_sched] = pos
+                acc += n_sched
+            seq_lens, self.position_ids = subtract_num_rejected_tokens(
+                seq_lens, self.position_ids,
+                self._pre_async_results.spec_decode_num_rejected_tokens,
+                torch.from_numpy(seq_idx_np).to(self.device,
+                                                non_blocking=True),
+                torch.from_numpy(pos_idx_np).to(self.device,
+                                                non_blocking=True))
 
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
@@ -1907,6 +2090,17 @@ class TPUModelRunner(GPUModelRunner):
 
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices)
+            # Async spec: the drafts the target verifies live in the substituted
+            # input_ids (host input_ids_cpu holds placeholders), so re-source the
+            # rejection sampler's draft_token_ids from the device.
+            if (self.scheduler_config.async_scheduling
+                    and spec_decode_metadata is not None
+                    and len(cur_input_indices) > 0):
+                from vllm_torchtpu.runner.tpu_runner_async_output import \
+                    extract_draft_token_ids
+                spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
+                    input_ids, spec_decode_metadata.final_logits_indices,
+                    spec_decode_metadata.target_logits_indices)
             draft_input_ids_src = input_ids
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
@@ -1974,6 +2168,9 @@ class TPUModelRunner(GPUModelRunner):
                         num_reqs=num_reqs,
                         aux_hidden_states=aux_hidden_states,
                         hidden_states=hidden_states,
+                        draft_lengths=(spec_decode_metadata.draft_lengths
+                                       if spec_decode_metadata is not None else
+                                       None),
                     ))
 
             start_index = end_index
@@ -1992,31 +2189,6 @@ class TPUModelRunner(GPUModelRunner):
         if self.spec_decode_manager is None:
             return None
         return self.spec_decode_manager.take_draft_token_ids()
-
-    def _assemble_num_rejected_per_request(
-            self, state, final_output, use_spec: bool) -> np.ndarray | None:
-        """Per-request count of draft tokens rejected this step (eagle3).
-
-        Verify produced n+1 slots per request (n drafts + 1 bonus), so the
-        trimmed sampled length is accepted_drafts + 1 and
-        rejected = max(0, n + 1 - len(sampled)). Returns None when not
-        applicable (non-eagle3 method or no spec decode this step).
-        """
-        if not (self.speculative_config
-                and self.speculative_config.method == "eagle3" and use_spec):
-            return None
-        num_rejected = np.zeros(self.input_batch.num_reqs, dtype=np.int32)
-        # Walk per chunk and use each request's actual draft count.
-        i = 0
-        for num_reqs_chunk, md in zip(state.num_reqs_list,
-                                      state.spec_decode_metadata_list):
-            for j in range(num_reqs_chunk):
-                n = int(md.draft_lengths_cpu[j]) if md is not None else 0
-                toks = final_output.sampled_token_ids[i]
-                if n > 0 and toks:
-                    num_rejected[i] = max(0, n + 1 - len(toks))
-                i += 1
-        return num_rejected
 
     @torch.no_grad()
     def sample_tokens(
@@ -2061,17 +2233,24 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Logprobs are not supported with speculative decoding on "
                     "TPU yet.")
+            # Per-chunk device rejection outputs, kept for the async-spec
+            # producer below.
+            next_tokens_per_chunk: list[torch.Tensor] = []
             for logits, num_reqs, md in zip(state.logits_list,
                                             state.num_reqs_list,
                                             state.spec_decode_metadata_list):
                 if md is not None:
-                    # Extract bonus tokens from the target model logits.
-                    bonus_token_ids = torch.argmax(
-                        logits[md.bonus_logits_indices], dim=-1)
+                    # Extract bonus tokens + gather target_logits from the target
+                    # model logits in one compiled region (bonus argmax + the two
+                    # gathers) so they don't eager-fuse per context.
+                    bonus_token_ids, target_logits = (
+                        self.spec_bonus_and_target_logits(
+                            logits, md.bonus_logits_indices,
+                            md.target_logits_indices))
                     next_tokens = self.rejection_sampler(
                         draft_token_ids=md.draft_token_ids,
                         num_draft_tokens=md.draft_lengths,
-                        target_logits=logits[md.target_logits_indices],
+                        target_logits=target_logits,
                         bonus_token_ids=bonus_token_ids,
                         segment_ids=md.segment_ids,
                         group_indices=md.group_indices,
@@ -2080,6 +2259,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
+                    next_tokens_per_chunk.append(next_tokens)
                 else:
                     dummy = torch.empty((1, 1),
                                         dtype=logits.dtype,
@@ -2097,6 +2277,8 @@ class TPUModelRunner(GPUModelRunner):
                     padded[:, 0] = selected.view(-1)
                     combined_selected_tokens.append(padded)
                     combined_selected_tokens_real_lens.append(num_reqs)
+                    next_tokens_per_chunk.append(padded)
+                self._update_num_xla_graphs("spec_step")
         else:
             cur_start_idx = 0
             req_ids = cast(
@@ -2224,14 +2406,101 @@ class TPUModelRunner(GPUModelRunner):
 
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
+
+        # Unified eagle3 draft propose -- ONE call serving both sync and async
+        # (mirrors the tpu-inference reference, where a single
+        # propose_draft_token_ids call runs every step and an async bool only
+        # picks the return form). Seeds on-device from this step's rejection
+        # output (spec step) or the just-sampled tokens (non-spec / prefill
+        # step), so neither mode waits on a host copy of the sampled tokens.
+        # Async gets the raw [num_reqs, K] device tensor back (consumed by the
+        # substitution assemblers below); sync caches the host list in the
+        # manager for take_draft_token_ids(). ngram has no device path and
+        # keeps proposing from the host-materialized output in the sync block
+        # below.
+        is_async = self.scheduler_config.async_scheduling
+        eagle3_drafts = None
+        if (self.speculative_config
+                and self.speculative_config.method == "eagle3"
+                and combined_selected_tokens):
+            if use_spec:
+                eagle3_drafts = (
+                    self.spec_decode_manager.propose_draft_token_ids(
+                        sampled_token_ids=None,
+                        discard_sampled_tokens_req_indices=
+                        discard_sampled_tokens_req_indices,
+                        num_rejected_tokens_np=None,
+                        scheduler_output=scheduler_output,
+                        return_device=is_async,
+                        next_tokens_per_chunk=next_tokens_per_chunk))
+            else:
+                # Seed = the just-sampled tokens, kept on-device (no D2H):
+                # propose takes the sync seed path but reads the seed from
+                # `device_seed`.
+                device_seed = torch.cat([
+                    sel.view(-1)[:n]
+                    for sel, n in zip(combined_selected_tokens,
+                                      combined_selected_tokens_real_lens)
+                ])
+                eagle3_drafts = (
+                    self.spec_decode_manager.propose_draft_token_ids(
+                        sampled_token_ids=[],
+                        discard_sampled_tokens_req_indices=
+                        discard_sampled_tokens_req_indices,
+                        num_rejected_tokens_np=None,
+                        scheduler_output=scheduler_output,
+                        return_device=is_async,
+                        device_seed=device_seed))
+
+        if self.scheduler_config.async_scheduling:
+            # Build the async substitution source from the drafts proposed
+            # above: the [bonus, draft_1..K] source + 1+K next_token_indices,
+            # and the per-request rejected count to park.
+            spec_num_rejected = None
+            num_draft_per_req = None
+            if use_spec:
+                spec_num_rejected, num_draft_per_req = (
+                    self._assemble_async_spec_substitution(
+                        eagle3_drafts, next_tokens_per_chunk, state,
+                        next_tokens_tpu_chunks, next_token_indices))
+            elif (self.speculative_config
+                  and self.speculative_config.method == "eagle3"
+                  and next_tokens_tpu_chunks):
+                # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
+                # branch parked a stride-1 source (sampled token only). Rebuild
+                # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
+                # prompt-context drafts so the NEXT step's verify gets real
+                # drafts instead of placeholders.
+                next_tokens_tpu_chunks.clear()
+                next_token_indices.clear()
+                spec_num_rejected, num_draft_per_req = (
+                    self._assemble_async_prefill_bootstrap(
+                        eagle3_drafts, combined_selected_tokens,
+                        combined_selected_tokens_real_lens,
+                        next_tokens_tpu_chunks, next_token_indices))
             req_id_to_index_copy = self._update_placeholder(
                 discard_sampled_tokens_req_indices, request_seq_lens,
-                next_token_indices)
+                next_token_indices, num_draft_per_req)
             if next_tokens_tpu_chunks:
                 if len(next_tokens_tpu_chunks) == 1:
                     next_tokens_tpu = next_tokens_tpu_chunks[0]
                 else:
                     next_tokens_tpu = torch.cat(next_tokens_tpu_chunks, dim=0)
+                # Bound the async-spec source length so the torch.compiled
+                # _substitute_placeholder_token (next step) sees a fixed shape
+                # instead of recompiling per real num_reqs. Append-pad to the
+                # max stride-(1+K) span: the substitution only reads
+                # [position*stride .. +n_sched-1] for real reqs (positions <
+                # num_reqs), so the appended tail is never indexed -- real
+                # positions are unchanged. Spec only (stride 1+K); pure-non-spec
+                # async keeps its stride-1 source + existing precompile.
+                if spec_num_rejected is not None:
+                    bound = self.max_num_reqs * (
+                        1 + self.speculative_config.num_speculative_tokens)
+                    if next_tokens_tpu.shape[0] < bound:
+                        next_tokens_tpu = torch.nn.functional.pad(
+                            next_tokens_tpu,
+                            (0, bound - next_tokens_tpu.shape[0]))
                 self._pre_async_results = AsyncPreResults(
                     req_ids=req_ids,
                     next_tokens_tpu=next_tokens_tpu,
@@ -2240,6 +2509,8 @@ class TPUModelRunner(GPUModelRunner):
                     discard_sampled_tokens_req_indices,
                     req_id_to_index_copy=req_id_to_index_copy,
                     copy_state=copy_state,
+                    spec_decode_num_rejected_tokens=spec_num_rejected,
+                    num_draft_per_req=num_draft_per_req,
                 )
             else:
                 self._pre_async_results = None
@@ -2282,14 +2553,15 @@ class TPUModelRunner(GPUModelRunner):
 
                 req_state.output_token_ids.extend(valid_tokens)
 
-            if self.speculative_config:
-                num_rejected_tokens_np = self._assemble_num_rejected_per_request(
-                    state, final_output, use_spec)
+            if (self.speculative_config
+                    and self.speculative_config.method == "ngram"):
+                # ngram drafts on the host from the committed token ids, so it
+                # must run after materialization; eagle3 was already proposed
+                # from device state by the unified call above.
                 self.spec_decode_manager.propose_draft_token_ids(
                     final_output.sampled_token_ids,
                     discard_sampled_tokens_req_indices=
                     discard_sampled_tokens_req_indices,
-                    num_rejected_tokens_np=num_rejected_tokens_np,
                     scheduler_output=scheduler_output,
                 )
 
@@ -2338,7 +2610,8 @@ class TPUModelRunner(GPUModelRunner):
         if self._attention_kernels_initialized:
             return
         from vllm_torchtpu.layers.vllm.attention import (
-            PallasAttentionBackendImpl, _pallas_rpa_kernel_local)
+            _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
+            _pallas_rpa_kernel_local)
 
         # Only Eagle3Proposer exposes _draft_attn_layer_names; NgramProposer
         # (or no drafter) has no draft attention layers to relocate.
@@ -2363,8 +2636,9 @@ class TPUModelRunner(GPUModelRunner):
                         attn_layer.impl._kernel_op_prefix = (
                             "pallas::rpa_kernel_local")
                         logger.info(
-                            "Draft attn %s -> LOCAL (non-shard_map) RPA kernel.",
-                            name)
+                            "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
+                            " | DRAFT_KV_BLOCK_CAP=%d", name,
+                            _DRAFT_KV_BLOCK_CAP)
                     attn_layer.impl.initialize_kernel(attn_layer)
                     initialized_count += 1
         logger.info("Pre-built RPA kernels for %d attention layers.",
@@ -2570,6 +2844,16 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
+        # next_tokens source lengths the runtime produces: stride-1 num_reqs
+        # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
+        # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
+        # substitute doesn't recompile per real num_reqs.
+        next_lens = list(self.num_reqs_paddings)
+        if (self.speculative_config is not None
+                and self.speculative_config.method == "eagle3"):
+            next_lens.append(
+                self.max_num_reqs *
+                (1 + self.speculative_config.num_speculative_tokens))
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens,
@@ -2584,16 +2868,87 @@ class TPUModelRunner(GPUModelRunner):
                                                      -1,
                                                      dtype=torch.int32,
                                                      device=self.device)
-                for num_reqs in self.num_reqs_paddings:
-                    next_tokens = torch.zeros(num_reqs,
+                for nlen in next_lens:
+                    next_tokens = torch.zeros(nlen,
                                               dtype=torch.int64,
                                               device=self.device)
                     out = _substitute_placeholder_token(
                         input_ids, cur_input_indices, pre_next_tokens_indices,
                         next_tokens)
                     sync.synchronize(out, wait=True)
-                    logger.info("  -- num_tokens: %d, num_seqs: %d",
+                    logger.info("  -- num_tokens: %d, next_len: %d",
+                                num_tokens, nlen)
+
+    def _precompile_rejection_sampler(self) -> None:
+        """Warm the spec-decode verify path so it doesn't recompile at runtime.
+
+        The rejection sampler (``_greedy_rejection_sample_with_segment``) is
+        ``@torch.compile(backend="tpu", dynamic=False)`` -> a fresh graph per
+        input shape, and the ``logits[...]`` gathers + bonus ``argmax`` around
+        it are eager. None are covered by ``_precompile_sampling_subgraphs``
+        (non-spec sampling only) or ``drafter.precompile()`` (draft forward
+        only), so they recompile every time the verify length
+        (``padded_logits_length``) lands in a new num-tokens bucket as requests
+        finish and the batch shrinks. Replay the verify inner body (the
+        ``use_spec`` branch in ``sample_tokens``) at every
+        ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
+        produce so the real call is a cache hit. Shared sync + async.
+        """
+        if not (self.speculative_config is not None
+                and self.speculative_config.method == "eagle3"):
+            return
+        k = self.speculative_config.num_speculative_tokens
+        # The verify chunk samples at most num_reqs*(K+1) positions; bound the
+        # padded_logits_length sweep to the bucket that covers the full batch.
+        max_logits_len = _get_padded_token_len(self.num_tokens_paddings,
+                                               self.max_num_reqs * (k + 1))
+        with self._precompile_timed("rejection_sampler"):
+            for num_tokens in self.num_tokens_paddings:
+                if num_tokens > max_logits_len:
+                    break
+                # padded_logits_length-shaped inputs; dtypes mirror
+                # get_spec_decode_metadata so the graph is byte-identical.
+                dummy_logits = torch.zeros((num_tokens, self.vocab_size),
+                                           device=self.device,
+                                           dtype=self._hidden_states_dtype)
+                draft_token_ids = torch.zeros(num_tokens,
+                                              dtype=torch.int32,
+                                              device=self.device)
+                target_logits_indices = torch.zeros(num_tokens,
+                                                    dtype=torch.int32,
+                                                    device=self.device)
+                segment_ids = torch.zeros(num_tokens,
+                                          dtype=torch.int64,
+                                          device=self.device)
+                group_indices = torch.zeros(num_tokens,
+                                            dtype=torch.int32,
+                                            device=self.device)
+                for num_reqs in self.num_reqs_paddings:
+                    # padded_num_reqs-shaped inputs.
+                    draft_lengths = torch.zeros(num_reqs,
+                                                dtype=torch.int32,
+                                                device=self.device)
+                    bonus_logits_indices = torch.zeros(num_reqs,
+                                                       dtype=torch.int32,
+                                                       device=self.device)
+                    bonus_token_ids, target_logits_warm = (
+                        self.spec_bonus_and_target_logits(
+                            dummy_logits, bonus_logits_indices,
+                            target_logits_indices))
+                    out = self.rejection_sampler(
+                        draft_token_ids=draft_token_ids,
+                        num_draft_tokens=draft_lengths,
+                        target_logits=target_logits_warm,
+                        bonus_token_ids=bonus_token_ids,
+                        segment_ids=segment_ids,
+                        group_indices=group_indices,
+                        max_draft_tokens=k,
+                    )
+                    sync.synchronize(out, wait=True)
+                    logger.info("  -- padded_logits_length: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
 
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
@@ -2628,6 +2983,312 @@ class TPUModelRunner(GPUModelRunner):
             if (self.speculative_config
                     and self.speculative_config.method == "eagle3"):
                 self.drafter.precompile()
+                self._precompile_rejection_sampler()
+                # The isolated precompile above emits standalone fused programs;
+                # the real per-step propose+verify+sampling dispatch fuses them
+                # differently, so the first real request would otherwise compile
+                # a handful of new graphs. Warm those by running the REAL
+                # two-phase spec-decode path once on a synthetic request.
+                self._warmup_spec_decode()
+
+    def _warmup_spec_decode(self) -> None:
+        """Warm the real spec-decode dispatch so the first request doesn't recompile.
+
+        The isolated AOT precompile (``drafter.precompile`` /
+        ``_precompile_rejection_sampler``) emits *standalone* fused programs, but
+        torch-tpu's DEFER_AND_FUSE fuses the per-step propose + verify + sampling
+        ops into *combined* programs that depend on the live dispatch sequence —
+        which an isolated precompile cannot reproduce. The only way to emit those
+        exact fused programs is to run the real two-phase execute path once. We
+        do that here on a synthetic greedy request, then fully tear the request
+        down so serving starts from a clean batch. execute_model / sample_tokens
+        branch internally on async_scheduling, so this same body warms whichever
+        mode the process is configured for: in async it auto-routes through the
+        real async dispatch (the unified device-seeded propose,
+        _assemble_async_spec_substitution, cross-step subtract/extract), which
+        an isolated precompile likewise can't
+        reproduce. The contiguous prefill + >=2 decode steps form the async
+        cross-step chain (step N reads the AsyncPreResults parked by step N-1).
+
+        Bounded + value-insensitive: only shapes matter, so token/position VALUES
+        are irrelevant. Wrapped so any failure degrades to "no warmup" (the first
+        request just pays the bounded recompiles, as before) rather than breaking
+        serving.
+        """
+        if os.environ.get("SPEC_WARMUP", "1") == "0":
+            return  # escape hatch / A-B toggle
+        if self.enforce_eager:
+            return
+        if not (self.speculative_config
+                and self.speculative_config.method == "eagle3"):
+            return
+        if self.input_batch.num_reqs != 0:
+            logger.warning("skip spec-decode warmup: input_batch not empty")
+            return
+
+        n0 = self.num_xla_graphs
+        with self._precompile_timed("spec-decode real warmup"):
+            # (1) First-pass / first-decode shapes depend on the prompt length:
+            # sweep one synthetic request per prompt-token bucket at nr=1. Each
+            # runs the REAL two-phase propose+verify+sampling dispatch, so
+            # torch-tpu emits the same fused programs serving will hit.
+            for i, P in enumerate(self.num_tokens_paddings):
+                # A single request's prompt can't exceed max_model_len; skip
+                # token buckets above it (they only arise as batched totals,
+                # covered by the num_reqs sweep below). Without this, a P >
+                # max_model_len synthetic prompt overflows token_ids_cpu
+                # (shape [.., max_model_len]) when max_num_batched_tokens >
+                # max_model_len, e.g. small max_model_len configs.
+                if int(P) > self.max_model_len:
+                    continue
+                if not self._warmup_one_spec_request(int(P), idx=i,
+                                                     quiet=True):
+                    # First attempt cold-compiles the draft forward; a SymInt
+                    # from that cold compile can leak into the dynamic=False
+                    # gather wrapper on the first bucket. Retry once now that the
+                    # forward is compiled and returns concrete-shaped tensors
+                    # (this attempt logs loudly if it also fails).
+                    self._warmup_one_spec_request(int(P), idx=i)
+            # (2) The propose+verify+sampling fusions are also keyed on the
+            # decode batch size (num_reqs). Only relevant when serving actually
+            # batches (>1 concurrent request); sweep real multi-request batches
+            # so nr>1 serving steps are cached too.
+            if self.scheduler_config.max_num_seqs > 1:
+                P_small = int(self.num_tokens_paddings[0])
+                for R in self.num_reqs_paddings:
+                    if int(R) > 1:
+                        self._warmup_spec_batch(int(R), P_small)
+        logger.info("spec-decode warmup compiled %d graphs",
+                    self.num_xla_graphs - n0)
+
+    def _warmup_spec_batch(self, R: int, P: int) -> None:
+        """Warm an nr=R decode batch: prefill R synthetic requests then decode
+        them together so the multi-request fused programs are compiled."""
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.sched.output import (CachedRequestData,
+                                               NewRequestData, SchedulerOutput)
+
+        K = self.speculative_config.num_speculative_tokens
+        bs = self.block_size
+        ng = len(self.kv_cache_config.kv_cache_groups)
+        room = self.max_model_len - P
+        n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
+        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        nblk = min((max_pos + bs - 1) // bs, self.max_num_blocks_per_req)
+        top = int(self.kv_cache_config.num_blocks)
+        if top <= R * nblk + 1:
+            logger.warning(
+                "skip spec-decode warmup R=%d: not enough kv blocks", R)
+            return
+        rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
+        sp = SamplingParams(temperature=0.0)
+        try:
+            # ---- batched prefill of R requests (disjoint top-of-pool blocks) --
+            new_reqs = []
+            for j, rid in enumerate(rids):
+                lo = top - (j + 1) * nblk
+                blk = list(range(lo, lo + nblk))
+                new_reqs.append(
+                    NewRequestData(req_id=rid,
+                                   prompt_token_ids=[0] * P,
+                                   mm_features=[],
+                                   sampling_params=sp,
+                                   pooling_params=None,
+                                   block_ids=tuple(
+                                       list(blk) for _ in range(ng)),
+                                   num_computed_tokens=0,
+                                   lora_request=None))
+            # Prefill in chunks that respect the pre-allocated host token buffers.
+            # A single R*P prefill overflows positions_np ([max_num_tokens]) when
+            # Decode below schedules R*(1+K) <= max_num_tokens, so only
+            # the prefill needs chunking; the nr=R decode shape is unchanged.
+            reqs_per_chunk = max(1, self.max_num_tokens // P)
+            for c0 in range(0, R, reqs_per_chunk):
+                chunk = new_reqs[c0:c0 + reqs_per_chunk]
+                so = SchedulerOutput.make_empty()
+                so.scheduled_new_reqs = chunk
+                so.num_scheduled_tokens = {r.req_id: P for r in chunk}
+                so.total_num_scheduled_tokens = len(chunk) * P
+                assert self.execute_model(so) is None
+                self.sample_tokens(None)
+                self.take_draft_token_ids()
+            # ---- decode all R together: real nr=R propose + verify + sample ---
+            nct = [P] * R
+            for t in range(n_decode):
+                creq = CachedRequestData(req_ids=list(rids),
+                                         resumed_req_ids=set(),
+                                         new_token_ids=[],
+                                         all_token_ids={},
+                                         new_block_ids=[None] * R,
+                                         num_computed_tokens=list(nct),
+                                         num_output_tokens=[t + 1] * R)
+                so = SchedulerOutput.make_empty()
+                so.scheduled_cached_reqs = creq
+                so.num_scheduled_tokens = {rid: 1 + K for rid in rids}
+                so.total_num_scheduled_tokens = R * (1 + K)
+                so.scheduled_spec_decode_tokens = {
+                    rid: [0] * K
+                    for rid in rids
+                }
+                assert self.execute_model(so) is None
+                self.sample_tokens(None)
+                self.take_draft_token_ids()
+                nct = [x + 1 for x in nct]
+        except Exception:
+            logger.exception("spec-decode warmup R=%d failed; continuing", R)
+        finally:
+            self._warmup_spec_decode_cleanup(rids)
+
+    def _warmup_one_spec_request(self,
+                                 P: int,
+                                 idx: int,
+                                 quiet: bool = False) -> bool:
+        """Run one synthetic spec-decode request (prefill P + decodes).
+
+        Returns True on success, False if the warmup raised (and was caught).
+        The caller retries a failed bucket once: the first attempt cold-compiles
+        the draft forward, and a SymInt from that cold compile can leak into the
+        dynamic=False gather wrapper on the very first bucket; the retry runs with
+        the forward already compiled (returning concrete-shaped tensors).
+        """
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.sched.output import (CachedRequestData,
+                                               NewRequestData, SchedulerOutput)
+
+        rid = f"__spec_warmup_{idx}__"
+        K = self.speculative_config.num_speculative_tokens
+        bs = self.block_size
+        ng = len(self.kv_cache_config.kv_cache_groups)
+        # The contexts (num_computed_tokens) to run decode steps at: a short walk
+        # near the prefill.
+        room = self.max_model_len - P
+        n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
+        decode_ncts = [P + t for t in range(n_dec)]
+        # Blocks from the TOP of the pool so the first real allocations (low ids)
+        # don't collide. Page CONTENTS are value-insensitive and KV writes use
+        # empty_slot_mappings, so stale pages are safe; each request is fully torn
+        # down before the next. Cover the highest context this request reaches.
+        max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
+        nblk = min((max_pos + bs - 1) // bs, self.max_num_blocks_per_req)
+        top = int(self.kv_cache_config.num_blocks)
+        if top <= nblk + 1:
+            logger.warning(
+                "skip spec-decode warmup P=%d: not enough kv blocks", P)
+            return
+        blk = list(range(top - nblk, top))
+        block_ids = tuple(list(blk) for _ in range(ng))
+        sp = SamplingParams(temperature=0.0)  # greedy -> exercises reject path
+        try:
+            # ---- prefill ----
+            new_req = NewRequestData(req_id=rid,
+                                     prompt_token_ids=[0] * P,
+                                     mm_features=[],
+                                     sampling_params=sp,
+                                     pooling_params=None,
+                                     block_ids=block_ids,
+                                     num_computed_tokens=0,
+                                     lora_request=None)
+            so = SchedulerOutput.make_empty()
+            so.scheduled_new_reqs = [new_req]
+            so.num_scheduled_tokens = {rid: P}
+            so.total_num_scheduled_tokens = P
+            assert self.execute_model(so) is None
+            self.sample_tokens(None)
+            d = self.take_draft_token_ids()
+            cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
+            # ---- decode steps (real propose + verify + sampling) ----
+            for t, nct in enumerate(decode_ncts):
+                creq = CachedRequestData(req_ids=[rid],
+                                         resumed_req_ids=set(),
+                                         new_token_ids=[],
+                                         all_token_ids={},
+                                         new_block_ids=[None],
+                                         num_computed_tokens=[nct],
+                                         num_output_tokens=[t + 1])
+                so = SchedulerOutput.make_empty()
+                so.scheduled_cached_reqs = creq
+                so.num_scheduled_tokens = {rid: 1 + K}
+                so.total_num_scheduled_tokens = 1 + K
+                so.scheduled_spec_decode_tokens = {
+                    rid: [int(x) for x in list(cur)[:K]]
+                }
+                assert self.execute_model(so) is None
+                self.sample_tokens(None)
+                d = self.take_draft_token_ids()
+                if d and d.draft_token_ids:
+                    cur = d.draft_token_ids[0]
+        except Exception:
+            if quiet:
+                # First attempt: a SymInt from the draft forward's cold compile
+                # can leak into the dynamic=False gather wrapper. The caller
+                # retries once (forward now compiled -> concrete shapes), so log
+                # quietly and let the retry surface a genuine failure.
+                logger.debug(
+                    "spec-decode warmup P=%d first attempt failed; retrying",
+                    P)
+            else:
+                logger.exception("spec-decode warmup P=%d failed; continuing",
+                                 P)
+            return False
+        finally:
+            self._warmup_spec_decode_cleanup(rid)
+        return True
+
+    def _warmup_spec_decode_cleanup(self, rids) -> None:
+        """Tear down the synthetic warmup request(s) so serving starts clean."""
+        from vllm.v1.core.sched.output import SchedulerOutput
+        if isinstance(rids, str):
+            rids = [rids]
+        # Reset the two-phase guard: a half-finished step would otherwise make
+        # the first real execute_model raise the "State error".
+        self.execute_model_state = None
+        # The last async warmup step parks an AsyncPreResults (in-flight D2H copy
+        # + optimistic 1+K placeholders) with no follower step to drain it.
+        # Finish the copy and null it BEFORE the drain below so the drain's
+        # _flush_disjoint_async_results early-returns instead of issuing a stray
+        # D2H / placeholder rollback on the torn-down synthetic request, and no
+        # in-flight copy host buffer is freed mid-transfer (defensive: covers the
+        # `if present:`-skip path). No-op in sync (always None).
+        if getattr(self, "_pre_async_results", None) is not None:
+            try:
+                self._pre_async_results.wait_for_copy()
+            except Exception:
+                pass
+            self._pre_async_results = None
+        try:
+            idx_map = getattr(self.input_batch, "req_id_to_index", {})
+            present = {r for r in rids if r in self.requests or r in idx_map}
+            if present:
+                so = SchedulerOutput.make_empty()
+                so.finished_req_ids = set(present)
+                # total==0 -> _update_states removes + condenses, then early
+                # return (no forward / sample_tokens needed).
+                self.execute_model(so)
+                self.execute_model_state = None
+        except Exception:
+            logger.exception("spec-decode warmup drain failed")
+        # Belt-and-suspenders: drop any synthetic state defensively.
+        for r in rids:
+            try:
+                self.requests.pop(r, None)
+            except Exception:
+                pass
+        for attr in ("_draft_token_ids", ):
+            try:
+                if hasattr(self.spec_decode_manager, attr):
+                    setattr(self.spec_decode_manager, attr, None)
+            except Exception:
+                pass
+        try:
+            if getattr(self, "drafter", None) is not None:
+                self.drafter.draft_chunks = None
+        except Exception:
+            pass
+        self._pre_async_results = None
+        self.mm_embed_inputs = None
+        if self.input_batch.num_reqs != 0:
+            logger.warning("spec-decode warmup left batch non-empty (%d)",
+                           self.input_batch.num_reqs)
 
     @contextmanager
     def _profile_no_cache_writes(self) -> Iterator[None]:
@@ -3101,6 +3762,24 @@ class TPUModelRunner(GPUModelRunner):
             indices_do_sample: torch.Tensor) -> torch.Tensor:
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_bonus_and_target_logits(
+        self, logits: torch.Tensor, bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Spec-decode verify prelude: gather the bonus-token logits + argmax, and
+        # gather the target_logits rows for the rejection sampler, in ONE compiled
+        # region keyed on [num_tokens, num_reqs] shapes. Run raw (the
+        # logits[indices] gathers + argmax at the verify site), these are eager
+        # ops torch-tpu's DEFER_AND_FUSE fuses with the live per-step dispatch
+        # into per-context programs (the cold target-side recompiles). index_select
+        # is value-identical to logits[indices]. Same pattern as the draft wraps.
+        bonus_token_ids = torch.argmax(torch.index_select(
+            logits, 0, bonus_logits_indices),
+                                       dim=-1)
+        target_logits = torch.index_select(logits, 0, target_logits_indices)
+        return bonus_token_ids, target_logits
 
     def _apply_temperature(self, logits: torch.Tensor,
                            temperatures: torch.Tensor) -> torch.Tensor:

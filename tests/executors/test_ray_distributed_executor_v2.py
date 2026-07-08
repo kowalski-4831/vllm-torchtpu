@@ -245,3 +245,5 @@ class TestTpuRayDistributedExecutorV2:
             assert worker_env_w1["NODE_RANK"] == "1"
             assert worker_env_w1["MASTER_ADDR"] == "10.0.0.1"
             assert worker_env_w1["TORCH_TPU_TOPOLOGY"] == "2x2"
+
+            executor.ray_worker_handles = []

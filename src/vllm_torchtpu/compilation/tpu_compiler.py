@@ -166,6 +166,15 @@ class TpuCompilerAdaptor(CompilerInterface):
         hash_obj.update(
             f"num_gpu_blocks_override="
             f"{vllm_config.cache_config.num_gpu_blocks_override}".encode())
+        spec = vllm_config.speculative_config
+        hash_obj.update(f"spec_draft="
+                        f"{getattr(spec, 'model', None)}".encode())
+        hash_obj.update(
+            f"spec_draft_tp="
+            f"{getattr(spec, 'draft_tensor_parallel_size', None)}".encode())
+        hash_obj.update(
+            f"spec_num_tokens="
+            f"{getattr(spec, 'num_speculative_tokens', None)}".encode())
 
         for path in _iter_runtime_cache_key_files(repo_root):
             relpath = path.relative_to(repo_root).as_posix()

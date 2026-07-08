@@ -475,9 +475,12 @@ class TpuPlatform(Platform):
         cls._speculative_enabled = vllm_config.speculative_config is not None
         if cls._speculative_enabled and \
                 vllm_config.scheduler_config.async_scheduling:
-            raise NotImplementedError(
-                "Speculative decoding with async scheduling is not yet "
-                "supported on TPU; run with async_scheduling=False.")
+            method = vllm_config.speculative_config.method
+            if method != "eagle3":
+                # Ngram needs the sampled tokens on the host, which async defers.
+                raise NotImplementedError(
+                    f"Async scheduling with speculative method '{method}' is "
+                    "not supported on TPU; Run with async_scheduling=False.")
         if not is_hybrid and block_size_was_unspecified:
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]

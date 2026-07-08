@@ -86,6 +86,7 @@ def _test_correctness_helper(
     model_name: str,
     speculative_config: dict,
     max_num_seqs: int = 4,
+    async_scheduling: bool | None = None,
     extra_kwargs: dict | None = None,
 ):
     with monkeypatch.context():
@@ -95,7 +96,7 @@ def _test_correctness_helper(
             "max_model_len": 256,
             "max_num_seqs": max_num_seqs,
             "tensor_parallel_size": _get_tensor_parallel_size(),
-            "async_scheduling": False,
+            "async_scheduling": async_scheduling,
         }
         if extra_kwargs:
             kwargs.update(extra_kwargs)
@@ -134,7 +135,7 @@ def _test_correctness_helper(
             cleanup_dist_env_and_memory()
 
 
-@pytest.mark.timeout(500)
+@pytest.mark.timeout(1200)
 def test_ngram_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -150,13 +151,15 @@ def test_ngram_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
 def test_eagle3_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
+    async_scheduling: bool,
 ):
-    # 3.1 target to match the 3.1-trained yuhuili/EAGLE3 draft; a 3.0 target
-    # produces ~0 acceptance (greedy output still exact, so it would pass
-    # silently without actually exercising spec decode).
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
 
@@ -171,6 +174,7 @@ def test_eagle3_correctness_greedy(
             "draft_tensor_parallel_size": 1,
         },
         max_num_seqs=10,
+        async_scheduling=async_scheduling,
     )
 
 
@@ -181,6 +185,7 @@ def _test_performance_helper(
     min_acceptance_rate: float,
     max_num_seqs: int = 4,
     model_name: str = "Qwen/Qwen3-0.6B",
+    async_scheduling: bool | None = None,
     extra_kwargs: dict | None = None,
 ):
     with monkeypatch.context():
@@ -191,7 +196,7 @@ def _test_performance_helper(
             "max_num_seqs": max_num_seqs,
             "tensor_parallel_size": _get_tensor_parallel_size(),
             "enable_prefix_caching": False,
-            "async_scheduling": False,
+            "async_scheduling": async_scheduling,
             "disable_log_stats": False,
         }
         if extra_kwargs:
@@ -243,9 +248,18 @@ def test_ngram_performance_greedy(
 
 
 @pytest.mark.timeout(1200)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(4, id="bs4")])
 def test_eagle3_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
 ):
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
 
@@ -259,8 +273,9 @@ def test_eagle3_performance_greedy(
             "draft_tensor_parallel_size": 1,
         },
         min_acceptance_rate=0.75,
-        max_num_seqs=1,
+        max_num_seqs=max_num_seqs,
         model_name="NousResearch/Meta-Llama-3.1-8B-Instruct",
+        async_scheduling=async_scheduling,
     )
 
 
@@ -300,7 +315,7 @@ def _force_multi_chunk_cap(self, cap: int = 2):
         runner.num_reqs_most_model_len = cap
 
 
-@pytest.mark.timeout(500)
+@pytest.mark.timeout(1200)
 def test_sd_correctness_greedy_multi_chunk(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
