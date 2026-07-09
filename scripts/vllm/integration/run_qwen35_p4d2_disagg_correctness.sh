@@ -70,6 +70,7 @@ export P4D2_LONG_SHARED_ROUNDS="${P4D2_LONG_SHARED_ROUNDS:-2}"
 export P4D2_MIXED_LINES="${P4D2_MIXED_LINES:-72}"
 export P4D2_MIXED_ROUNDS="${P4D2_MIXED_ROUNDS:-2}"
 export P4D2_CONCURRENT_REQUESTS="${P4D2_CONCURRENT_REQUESTS:-1}"
+export RUN_PREFIX_CACHE_E2E_DIVERGENCE="${RUN_PREFIX_CACHE_E2E_DIVERGENCE:-1}"
 
 cd "${repo_root}"
 
@@ -82,3 +83,13 @@ python examples/disagg/smoke_qwen35_p4d2_v2_prefix_cache_correctness.py \
   --model "${SERVED_MODEL_NAME}" \
   --run-dir "${RUN_DIR}" \
   2>&1 | tee "${RUN_DIR}/logs/correctness.log"
+
+if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
+  python examples/disagg/smoke_qwen35_p4d2_prefix_cache_e2e_divergence.py \
+    --host "${P4D2_BIND_HOST}" \
+    --port "${PROXY_PORT}" \
+    --model "${SERVED_MODEL_NAME}" \
+    2>&1 | tee "${RUN_DIR}/logs/prefix_cache_e2e_divergence.log"
+else
+  echo "RUN_PREFIX_CACHE_E2E_DIVERGENCE=${RUN_PREFIX_CACHE_E2E_DIVERGENCE}; skip prefix-cache E2E divergence smoke"
+fi

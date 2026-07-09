@@ -70,12 +70,15 @@ class TestTpuPlatform:
         vllm_config.model_config.is_hybrid = False
         vllm_config.cache_config = MagicMock(spec=CacheConfig)
         vllm_config.cache_config.block_size = None
+        vllm_config.cache_config.enable_prefix_caching = False
+        vllm_config.cache_config.mamba_cache_mode = None
         vllm_config.compilation_config = MagicMock()
         vllm_config.compilation_config.mode = MagicMock()
         vllm_config.compilation_config.compile_sizes = [16, 32]
         vllm_config.scheduler_config = MagicMock()
         vllm_config.scheduler_config.max_num_batched_tokens = 2048
         vllm_config.scheduler_config.is_multimodal_model = False
+        vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
         vllm_config.parallel_config = MagicMock()
         vllm_config.parallel_config.world_size = 1
@@ -123,6 +126,47 @@ class TestTpuPlatform:
         assert vllm_config.cache_config.block_size == 123
         # And get_page_size shouldn't even be called because is_hybrid is True
         mock_pallas.get_page_size.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("mamba_cache_mode", "speculative_config", "async_scheduling",
+         "message"),
+        [
+            ("all", None, False, "mamba_cache_mode='align'"),
+            ("align", MagicMock(), False, "Speculative decoding"),
+            ("align", None, True, "Async scheduling"),
+        ],
+    )
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
+    )
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
+    def test_check_and_update_config_rejects_incomplete_mamba_apc_modes(
+            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
+            mock_apply_patches, vllm_config, mamba_cache_mode,
+            speculative_config, async_scheduling, message):
+        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.cache_config.block_size = 256
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+        vllm_config.speculative_config = speculative_config
+        vllm_config.scheduler_config.async_scheduling = async_scheduling
+
+        mock_pallas = MagicMock()
+        mock_pallas.get_page_size.return_value = 256
+        mock_pallas.get_min_page_size.return_value = 16
+
+        with patch.dict(
+                'sys.modules', {
+                    'vllm_torchtpu.layers.vllm.attention':
+                    MagicMock(PallasAttentionBackend=mock_pallas)
+                }):
+            with pytest.raises(NotImplementedError, match=message):
+                TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize("connector_name",
                              ["TPUConnector", "TPURaidenConnector"])

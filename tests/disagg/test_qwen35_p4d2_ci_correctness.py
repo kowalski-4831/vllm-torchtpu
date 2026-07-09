@@ -5,6 +5,8 @@ from types import SimpleNamespace
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SMOKE_PATH = (REPO_ROOT / "examples" / "disagg" /
               "smoke_qwen35_p4d2_v2_prefix_cache_correctness.py")
+DIVERGENCE_SMOKE_PATH = (REPO_ROOT / "examples" / "disagg" /
+                         "smoke_qwen35_p4d2_prefix_cache_e2e_divergence.py")
 CI_SCRIPT = (REPO_ROOT / "scripts" / "vllm" / "integration" /
              "run_qwen35_p4d2_disagg_correctness.sh")
 CI_WORKFLOW = (REPO_ROOT / ".github" / "workflows" /
@@ -21,6 +23,143 @@ def _load_smoke_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _load_divergence_smoke_module():
+    spec = importlib.util.spec_from_file_location("qwen35_p4d2_divergence",
+                                                  DIVERGENCE_SMOKE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_prefix_cache_divergence_smoke_detects_logprob_drift():
+    smoke = _load_divergence_smoke_module()
+
+    diff = smoke.output_diff(
+        {
+            "text": "5",
+            "logprobs": [{
+                "token": "5",
+                "logprob": 0.0,
+            }],
+        },
+        {
+            "text": "5",
+            "logprobs": [{
+                "token": "5",
+                "logprob": -0.375,
+            }],
+        },
+        logprob_atol=1e-5,
+    )
+
+    assert diff["text_equal"]
+    assert diff["tokens_equal"]
+    assert diff["has_logprobs"]
+    assert diff["max_logprob_absdiff"] == 0.375
+    assert not diff["logprob_equal"]
+    assert diff["first_divergent_index"] is None
+
+
+def test_prefix_cache_divergence_smoke_baseline_all_equal():
+    smoke = _load_divergence_smoke_module()
+
+    logprobs = [{"token": "5", "logprob": 0.0}]
+    diff = smoke.output_diff(
+        {
+            "text": "5",
+            "logprobs": logprobs
+        },
+        {
+            "text": "5",
+            "logprobs": logprobs
+        },
+        logprob_atol=1e-5,
+    )
+
+    assert diff["text_equal"]
+    assert diff["tokens_equal"]
+    assert diff["has_logprobs"]
+    assert diff["max_logprob_absdiff"] == 0.0
+    assert diff["logprob_equal"]
+    assert diff["first_divergent_index"] is None
+
+
+def test_prefix_cache_divergence_smoke_reports_first_mismatched_token():
+    smoke = _load_divergence_smoke_module()
+
+    cold = {
+        "text":
+        "abc",
+        "logprobs": [
+            {
+                "token": "a",
+                "logprob": -0.1
+            },
+            {
+                "token": "b",
+                "logprob": -0.2
+            },
+            {
+                "token": "c",
+                "logprob": -0.3
+            },
+        ],
+    }
+    warm = {
+        "text":
+        "abz",
+        "logprobs": [
+            {
+                "token": "a",
+                "logprob": -0.10001
+            },
+            {
+                "token": "b",
+                "logprob": -0.2
+            },
+            {
+                "token": "z",
+                "logprob": -9.0
+            },
+        ],
+    }
+    diff = smoke.output_diff(cold, warm, logprob_atol=1e-3)
+
+    assert not diff["text_equal"]
+    assert not diff["tokens_equal"]
+    assert diff["has_logprobs"]
+    # matching-position max is < atol...
+    assert diff["max_logprob_absdiff"] < 1e-3
+    assert diff["logprob_equal"]
+    # ...but first_divergent_* surfaces the real magnitude at the divergence
+    # point.
+    assert diff["first_divergent_index"] == 2
+    assert abs(diff["first_divergent_logprob_absdiff"] - 8.7) < 1e-9
+
+
+def test_prefix_cache_divergence_smoke_handles_empty_logprobs():
+    smoke = _load_divergence_smoke_module()
+
+    diff = smoke.output_diff(
+        {
+            "text": "",
+            "logprobs": []
+        },
+        {
+            "text": "",
+            "logprobs": []
+        },
+        logprob_atol=1e-3,
+    )
+
+    assert diff["text_equal"]
+    assert diff["tokens_equal"]
+    assert not diff["has_logprobs"]
+    assert diff["max_logprob_absdiff"] == float("inf")
+    assert not diff["logprob_equal"]
 
 
 def test_mixed_query_suite_interleaves_short_and_long_prompts(monkeypatch):
@@ -233,6 +372,8 @@ def test_ci_wrapper_uses_hugging_face_model_and_existing_p4d2_launcher():
     assert "Qwen/Qwen3.5-35B-A3B-FP8" in text
     assert "launch_qwen35_p4d2_v2_baseline.sh" in text
     assert "smoke_qwen35_p4d2_v2_prefix_cache_correctness.py" in text
+    assert "smoke_qwen35_p4d2_prefix_cache_e2e_divergence.py" in text
+    assert "prefix_cache_e2e_divergence.log" in text
     assert "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL" in text
     assert "gsutil" not in text
     assert "gcloud storage cp" not in text
