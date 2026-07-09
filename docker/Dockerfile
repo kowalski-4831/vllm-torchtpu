@@ -66,6 +66,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -n "$VLLM_SOURCE" ]; then \
       sed -i 's/vllm==[^"]*/vllm/' pyproject.toml && \
       VLLM_TARGET_DEVICE="tpu" uv pip install --system \
+        --torch-backend cpu \
         -e /root/torchtpu-vllm/vllm ; \
     fi
 
