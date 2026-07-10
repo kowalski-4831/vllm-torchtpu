@@ -50,6 +50,21 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
+def _align_block_to_backend(block_size: int, supported) -> int:
+    """Smallest manager block >= block_size the backend can serve.
+
+    A fixed int entry means the kernel runs that exact block size, so the
+    manager block must be a multiple of it (vLLM's kernel-block machinery
+    splits manager blocks into kernel blocks); a MultipleOf(b) entry accepts
+    any multiple of b directly."""
+    from vllm.v1.attention.backend import MultipleOf
+    candidates = []
+    for entry in supported:
+        base = entry.base if isinstance(entry, MultipleOf) else int(entry)
+        candidates.append(_round_up_to_multiple(block_size, base))
+    return min(candidates) if candidates else block_size
+
+
 def _resolve_tpu_cache_dtype(vllm_config: VllmConfig) -> torch.dtype:
     cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
@@ -138,7 +153,11 @@ def _derive_tpu_block_slot_config(
         # Fit-size block (non-pow2 pages are RPA-supported): the attention
         # page contains the whole mamba slot with <1% padding, so mamba
         # state addresses whole token rows of an ordinary attention page.
-        final_block_size = mamba_fit_block_size
+        # Backends with a fixed kernel block (batched RPA: 256) get the fit
+        # size rounded up to a splittable multiple; the extra padding only
+        # exists inside state blocks, a small fraction of the pool.
+        final_block_size = _align_block_to_backend(mamba_fit_block_size,
+                                                   supported)
         block_size_source = "mamba_state_fit"
 
     fa_physical_slot_bytes = _tpu_attention_slot_size_bytes(

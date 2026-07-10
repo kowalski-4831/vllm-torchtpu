@@ -714,8 +714,71 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 # ---------------------------------------------------------------
 
 
+def _pool_region_pieces(tok0: int, ntok: int,
+                        kernel_bs: int) -> list[tuple[int, int, int]]:
+    """Manager-block token range -> (kernel block offset, local tok0, ntok)
+    pieces. A manager block is `split` consecutive kernel blocks (upstream
+    map_to_kernel_blocks), so a region decomposes into whole- and
+    partial-kernel-block pieces; every piece must satisfy the adapters'
+    tok0 % ntok == 0 layout rule."""
+    pieces = []
+    t = tok0
+    while t < tok0 + ntok:
+        kb, local0 = divmod(t, kernel_bs)
+        n = min(kernel_bs - local0, tok0 + ntok - t)
+        assert local0 % n == 0, (tok0, ntok, kernel_bs)
+        pieces.append((kb, local0, n))
+        t += n
+    return pieces
+
+
+def _pool_gather(pool,
+                 mgr_indices,
+                 *,
+                 tok0,
+                 ntok,
+                 split,
+                 out_dtype,
+                 out_lanes=None):
+    """gather_region over a manager-block token range of a pool born at
+    kernel granularity. Piece results concatenate token-major, identical
+    to a single-block gather; only the small gathered arrays are ever
+    reshaped, never the pool."""
+    kernel_bs = pool.shape[1]
+    outs = []
+    for kb, local0, n in _pool_region_pieces(tok0, ntok, kernel_bs):
+        idx = mgr_indices * split + kb if split > 1 else mgr_indices
+        outs.append(
+            pool_adapters.gather_region(pool,
+                                        idx,
+                                        tok0=local0,
+                                        ntok=n,
+                                        out_dtype=out_dtype,
+                                        out_lanes=out_lanes))
+    return outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=1)
+
+
+def _pool_scatter(pool, vals, mgr_indices, *, tok0, ntok, split):
+    kernel_bs = pool.shape[1]
+    pieces = _pool_region_pieces(tok0, ntok, kernel_bs)
+    rows_per_tok = vals.shape[1] // ntok
+    assert rows_per_tok * ntok == vals.shape[1], (vals.shape, ntok)
+    off = 0
+    for kb, local0, n in pieces:
+        idx = mgr_indices * split + kb if split > 1 else mgr_indices
+        piece = vals if len(pieces) == 1 else vals[:, off:off +
+                                                   n * rows_per_tok, :]
+        pool = pool_adapters.scatter_region(pool,
+                                            piece,
+                                            idx,
+                                            tok0=local0,
+                                            ntok=n)
+        off += n * rows_per_tok
+    return pool
+
+
 @functools.lru_cache(maxsize=None)
-def _pool_state_ops(ssm_ntok: int, n_v: int, d_k: int, d_v: int):
+def _pool_state_ops(ssm_ntok: int, n_v: int, d_k: int, d_v: int, split: int):
     """StateOps reading/writing the ssm f32 token-range of the pool.
     Cached per geometry so the delta-rule jit sees one stable static
     instance across steps."""
@@ -724,22 +787,24 @@ def _pool_state_ops(ssm_ntok: int, n_v: int, d_k: int, d_v: int):
         # out_lanes=d_v: the kernel splits pool lanes in place, so this
         # reshape is lane-preserving (free) instead of a lane-crossing
         # relayout of the whole gathered state.
-        gathered = pool_adapters.gather_region(pool,
-                                               idx,
-                                               tok0=0,
-                                               ntok=ssm_ntok,
-                                               out_dtype=jnp.float32,
-                                               out_lanes=d_v)
+        gathered = _pool_gather(pool,
+                                idx,
+                                tok0=0,
+                                ntok=ssm_ntok,
+                                split=split,
+                                out_dtype=jnp.float32,
+                                out_lanes=d_v)
         return gathered.reshape(idx.shape[0], n_v, d_k, d_v)
 
     def _write(pool, states, idx):
         rows = (n_v * d_k * d_v) // d_v
-        return pool_adapters.scatter_region(pool,
-                                            states.astype(jnp.float32).reshape(
-                                                idx.shape[0], rows, d_v),
-                                            idx,
-                                            tok0=0,
-                                            ntok=ssm_ntok)
+        return _pool_scatter(pool,
+                             states.astype(jnp.float32).reshape(
+                                 idx.shape[0], rows, d_v),
+                             idx,
+                             tok0=0,
+                             ntok=ssm_ntok,
+                             split=split)
 
     return ragged_gated_delta_rule_wrapper.jax_impl.StateOps(read=_read,
                                                              write=_write)
@@ -763,6 +828,7 @@ def run_jax_gdn_attention_pooled_local(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    pool_block_tokens: int,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
@@ -778,6 +844,17 @@ def run_jax_gdn_attention_pooled_local(
     query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
     has_initial_state = (seq_lens - query_lens) > 0
 
+    # Backends with a fixed kernel block (batched RPA) get the pool born
+    # at kernel granularity; a manager block is `split` consecutive kernel
+    # blocks (upstream map_to_kernel_blocks). State regions address
+    # manager-block token ranges, decomposed into kernel-block pieces by
+    # the _pool_gather/_pool_scatter helpers — the pool itself is never
+    # reshaped (an XLA reshape of the pool materializes as a pool-sized
+    # relayout copy per step).
+    assert pool_block_tokens % recurrent_state.shape[1] == 0, (
+        pool_block_tokens, recurrent_state.shape)
+    split = pool_block_tokens // recurrent_state.shape[1]
+
     conv_dim = conv_weight.shape[0]
     lanes = recurrent_state.shape[-1]
     per_tok_elems = math.prod(recurrent_state.shape[2:])
@@ -786,9 +863,9 @@ def run_jax_gdn_attention_pooled_local(
     conv_bytes = (kernel_size - 1) * conv_dim * 2
     assert ssm_bytes % tok_bytes == 0, (ssm_bytes, tok_bytes)
     ssm_ntok = ssm_bytes // tok_bytes
-    assert ssm_ntok <= recurrent_state.shape[1], (
+    assert ssm_ntok <= pool_block_tokens, (
         "ssm state does not fit the attention page", ssm_ntok,
-        recurrent_state.shape)
+        pool_block_tokens)
     conv_data_rows = conv_bytes // (2 * lanes)
 
     # The conv slot occupies whole tokens right after the ssm region,
@@ -797,17 +874,18 @@ def run_jax_gdn_attention_pooled_local(
     conv_ntok = 1
     while (conv_ntok * tok_bytes < conv_bytes or ssm_ntok % conv_ntok != 0):
         conv_ntok *= 2
-    assert ssm_ntok + conv_ntok <= recurrent_state.shape[1], (
+    assert ssm_ntok + conv_ntok <= pool_block_tokens, (
         "mamba slot exceeds the attention page", ssm_ntok, conv_ntok,
-        recurrent_state.shape)
+        pool_block_tokens)
     conv_pool, conv_tok0 = recurrent_state, ssm_ntok
     conv_slot_rows = (conv_ntok * tok_bytes) // (2 * lanes)
 
-    conv_gathered = pool_adapters.gather_region(conv_pool,
-                                                state_indices,
-                                                tok0=conv_tok0,
-                                                ntok=conv_ntok,
-                                                out_dtype=jnp.bfloat16)
+    conv_gathered = _pool_gather(conv_pool,
+                                 state_indices,
+                                 tok0=conv_tok0,
+                                 ntok=conv_ntok,
+                                 split=split,
+                                 out_dtype=jnp.bfloat16)
     conv_state = conv_gathered[:, :conv_data_rows, :].reshape(
         -1, kernel_size - 1, conv_dim)
     identity_indices = jnp.arange(state_indices.shape[0], dtype=jnp.int32)
@@ -819,13 +897,14 @@ def run_jax_gdn_attention_pooled_local(
         # below, with the ssm region joining the conv region in the round
         # trip. The kernel self-handles fresh slots via seq_lens, so gathered
         # garbage from a newly-allocated block is never read.
-        ssm_gathered = pool_adapters.gather_region(recurrent_state,
-                                                   state_indices,
-                                                   tok0=0,
-                                                   ntok=ssm_ntok,
-                                                   out_dtype=jnp.float32,
-                                                   out_lanes=d_v).reshape(
-                                                       max_reqs, n_v, d_k, d_v)
+        ssm_gathered = _pool_gather(recurrent_state,
+                                    state_indices,
+                                    tok0=0,
+                                    ntok=ssm_ntok,
+                                    split=split,
+                                    out_dtype=jnp.float32,
+                                    out_lanes=d_v).reshape(
+                                        max_reqs, n_v, d_k, d_v)
         (new_conv_state, new_ssm), output = gdn_v3_wrapper.fused_conv1d_gdn(
             mixed_qkv,
             b,
@@ -851,20 +930,22 @@ def run_jax_gdn_attention_pooled_local(
         if conv_pad_rows:
             new_conv_rows = jnp.pad(new_conv_rows,
                                     ((0, 0), (0, conv_pad_rows), (0, 0)))
-        recurrent_state = pool_adapters.scatter_region(
+        recurrent_state = _pool_scatter(
             conv_pool,
             new_conv_rows.astype(jnp.bfloat16),
             state_indices,
             tok0=conv_tok0,
             ntok=conv_ntok,
+            split=split,
         )
         ssm_rows = (n_v * d_k * d_v) // d_v
-        recurrent_state = pool_adapters.scatter_region(
+        recurrent_state = _pool_scatter(
             recurrent_state,
             new_ssm.astype(jnp.float32).reshape(max_reqs, ssm_rows, d_v),
             state_indices,
             tok0=0,
             ntok=ssm_ntok,
+            split=split,
         )
         return recurrent_state, output
 
@@ -884,12 +965,13 @@ def run_jax_gdn_attention_pooled_local(
     pad_rows = conv_slot_rows - conv_data_rows
     if pad_rows:
         new_conv_rows = jnp.pad(new_conv_rows, ((0, 0), (0, pad_rows), (0, 0)))
-    recurrent_state = pool_adapters.scatter_region(
+    recurrent_state = _pool_scatter(
         conv_pool,
         new_conv_rows.astype(jnp.bfloat16),
         state_indices,
         tok0=conv_tok0,
         ntok=conv_ntok,
+        split=split,
     )
 
     if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.REF:
@@ -916,7 +998,7 @@ def run_jax_gdn_attention_pooled_local(
         config=wrapper_config,
         chunk_size=64,
         has_initial_state=has_initial_state,
-        state_ops=_pool_state_ops(ssm_ntok, n_v, d_k, d_v),
+        state_ops=_pool_state_ops(ssm_ntok, n_v, d_k, d_v, split),
     )
 
     return new_recurrent_state, output
@@ -940,6 +1022,7 @@ def run_jax_gdn_attention_pooled(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -1014,6 +1097,7 @@ def run_jax_gdn_attention_pooled(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
         config=config,
     )
     mapped_fn = jax.shard_map(

@@ -91,9 +91,9 @@ def test_hybrid_mamba_state_drives_fit_block_size_and_slot_logs(vllm_config):
         update_tpu_block_size_and_slot_config(vllm_config,
                                               FakeBatchedRPAAttentionBackend)
 
-    assert vllm_config.cache_config.block_size == 1056
-    assert vllm_config.cache_config.mamba_block_size == 1056
-    assert vllm_config.cache_config.mamba_page_size_padded == 1081344
+    assert vllm_config.cache_config.block_size == 1280
+    assert vllm_config.cache_config.mamba_block_size == 1280
+    assert vllm_config.cache_config.mamba_page_size_padded == 1310720
 
     logs = _format_logs(mock_logger_info)
     assert "TPU block_size derivation path" in logs
@@ -106,17 +106,17 @@ def test_hybrid_mamba_state_drives_fit_block_size_and_slot_logs(vllm_config):
             "-> physical=1024)" in logs)
     assert ("-> mamba_fit_block_size=ceil(1073152 / 1024) "
             "rounded_to_16 = 1056" in logs)
-    assert "-> final_block_size=1056" in logs
+    assert "-> final_block_size=1280" in logs
     assert "(source=mamba_state_fit)" in logs
     assert "TPU block_slot derivation path" in logs
-    assert "final_block_size=1056 -> fa_raw_payload_slot_bytes=540672" in logs
-    assert "-> fa_layout_padding_slot_bytes=540672" in logs
-    assert "-> fa_physical_slot_bytes=1081344" in logs
+    assert "final_block_size=1280 -> fa_raw_payload_slot_bytes=655360" in logs
+    assert "-> fa_layout_padding_slot_bytes=655360" in logs
+    assert "-> fa_physical_slot_bytes=1310720" in logs
     assert ("-> slot_base_bytes=max(mamba_raw_state_bytes=1073152, "
-            "fa_physical_slot_bytes=1081344) = 1081344" in logs)
+            "fa_physical_slot_bytes=1310720) = 1310720" in logs)
     assert ("-> slot_alignment_bytes=16 -> "
-            "final_block_slot_bytes=round_up(1081344, 16) = 1081344" in logs)
-    assert "-> mamba_slot_padding_bytes=8192" in logs
+            "final_block_slot_bytes=round_up(1310720, 16) = 1310720" in logs)
+    assert "-> mamba_slot_padding_bytes=237568" in logs
     assert "-> fa_slot_tail_padding_bytes=0" in logs
     assert "kernel_blocks_per_logical_block" not in logs
 
@@ -137,6 +137,6 @@ def test_hybrid_mode_none_still_sizes_the_envelope_slot(vllm_config):
         update_tpu_block_size_and_slot_config(vllm_config,
                                               FakeBatchedRPAAttentionBackend)
 
-    assert vllm_config.cache_config.block_size == 1056
+    assert vllm_config.cache_config.block_size == 1280
     assert vllm_config.cache_config.mamba_block_size == 256
-    assert vllm_config.cache_config.mamba_page_size_padded == 1081344
+    assert vllm_config.cache_config.mamba_page_size_padded == 1310720
