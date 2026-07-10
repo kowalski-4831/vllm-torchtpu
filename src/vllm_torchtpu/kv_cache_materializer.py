@@ -13,6 +13,8 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu import envs as tpu_envs
 
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
 LayerKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
 
 
@@ -102,16 +104,76 @@ def format_kv_cache_layout_summary(
     return "\n".join(lines)
 
 
+def _pool_attention_geometry(
+    kv_cache_config: KVCacheConfig,
+    attn_groups: Sequence[Sequence[AttentionGroup]],
+) -> tuple[AttentionSpec, Any] | None:
+    """(attention spec, backend) of the unified pool, or None when the
+    config has no hybrid attention+mamba sharing."""
+    has_mamba = any(
+        isinstance(group.kv_cache_spec, MambaSpec)
+        for group in kv_cache_config.kv_cache_groups)
+    if not has_mamba:
+        return None
+    for group_list in attn_groups:
+        for group in group_list:
+            spec = group.kv_cache_spec
+            if isinstance(spec, AttentionSpec) and not isinstance(
+                    spec, EncoderOnlyAttentionSpec):
+                return spec, group.backend
+    return None
+
+
 def allocate_raw_kv_cache_tensors(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
+    pool_geometry: tuple[AttentionSpec, Any] | None = None,
+    cache_dtype: str | torch.dtype = "auto",
 ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
     layer_to_raw: dict[str, torch.Tensor] = {}
     raw_tensors: list[torch.Tensor] = []
+    pool_page_bytes = max(group.kv_cache_spec.page_size_bytes
+                          for group in kv_cache_config.kv_cache_groups)
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        raw = torch.zeros(kv_cache_tensor.size,
-                          dtype=torch.int8,
-                          device=device)
+        if pool_geometry is not None:
+            # The unified pool is BORN as the stock attention-shaped KV
+            # cache (one kernel block per vLLM block): attention consumes
+            # it natively and the pool adapters address the mamba byte
+            # regions through it, so the buffer carries the tiled layout
+            # every compiled graph expects and no reshape or relayout
+            # ever touches it.
+            spec, attn_backend = pool_geometry
+            assert kv_cache_tensor.size % pool_page_bytes == 0, (
+                kv_cache_tensor.size, pool_page_bytes)
+            num_blocks = kv_cache_tensor.size // pool_page_bytes
+            shape = attn_backend.get_kv_cache_shape(
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                cache_dtype_str=cache_dtype,
+            )
+            if spec.dtype in _FP8_DTYPES:
+                # fp8 pools are born uninitialized: fp8 cannot zero-fill,
+                # zero-fill of a >HBM/2 buffer needs a 2x transient anyway,
+                # and fp8 cache slots are overwritten before use (same
+                # contract as the typed fp8 cache views).
+                raw = torch.empty(tuple(shape),
+                                  dtype=spec.dtype,
+                                  device=device)
+            else:
+                raw = torch.zeros(tuple(shape),
+                                  dtype=spec.dtype,
+                                  device=device)
+            # Fit-size block sizing guarantees the attention page IS the
+            # pool page (the mamba slot fits inside it).
+            fa_page_bytes = raw.numel() * raw.element_size() // num_blocks
+            assert fa_page_bytes == pool_page_bytes, (fa_page_bytes,
+                                                      pool_page_bytes)
+        else:
+            raw = torch.zeros(kv_cache_tensor.size,
+                              dtype=torch.int8,
+                              device=device)
         raw_tensors.append(raw)
         for layer_name in kv_cache_tensor.shared_by:
             layer_to_raw[layer_name] = raw
@@ -223,24 +285,12 @@ def make_mamba_cache_views(
     spec: MambaSpec,
     num_blocks: int,
 ) -> list[torch.Tensor]:
-    states: list[torch.Tensor] = []
-    storage_offset_bytes = 0
-    for shape, dtype in zip(spec.shapes, spec.dtypes):
-        dtype_size = get_dtype_size(dtype)
-        num_element_per_page = spec.page_size_bytes // dtype_size
-        target_shape = (num_blocks, *shape)
-        dense_stride = torch.empty(target_shape, dtype=dtype).stride()
-        target_stride = (num_element_per_page, *dense_stride[1:])
-        state = _typed_kv_cache_view(
-            raw,
-            dtype,
-            target_shape,
-            stride=target_stride,
-            storage_offset_bytes=storage_offset_bytes,
-        )
-        states.append(state)
-        storage_offset_bytes += dense_stride[0] * dtype_size
-    return states
+    # The mamba "view" IS the attention-shaped pool tensor: the GDN op
+    # gathers/scatters the ssm and conv byte-regions through the pool
+    # adapters, so every layer sharing the buffer holds the same object
+    # and torch.compile dedupes them to a single graph input.
+    del spec, num_blocks
+    return [raw]
 
 
 def _can_allocate_attention_cache_directly(
@@ -336,38 +386,72 @@ def materialize_kv_cache_tensors(
         return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=[])
 
     layer_to_raw, raw_tensors = allocate_raw_kv_cache_tensors(
-        kv_cache_config, device)
+        kv_cache_config,
+        device,
+        pool_geometry=_pool_attention_geometry(kv_cache_config, attn_groups),
+        cache_dtype=cache_dtype)
     kv_caches: dict[str, LayerKVCache] = {}
+    # Unified pool: mamba layers backing the same raw buffer share ONE set of
+    # view objects so torch.compile dedupes them to a single graph input --
+    # otherwise each layer's fresh view is a distinct ~pool-sized parameter
+    # (N mamba layers per buffer -> N copies at compile -> HBM OOM at scale).
+    mamba_view_cache: dict[int, list[torch.Tensor]] = {}
 
-    for group_list in attn_groups:
-        for group in group_list:
-            gid = group.kv_cache_group_id
-            kernel_block_size = kernel_block_size_by_gid.get(gid)
-            if kernel_block_size is None:
-                continue
-            spec = group.kv_cache_spec
-            for layer_name in group.layer_names:
-                raw = layer_to_raw[layer_name]
-                assert raw.numel() % spec.page_size_bytes == 0
-                num_blocks = raw.numel() // spec.page_size_bytes
-                if isinstance(spec, AttentionSpec):
-                    kv_caches[layer_name] = make_attention_cache_view(
-                        raw=raw,
-                        spec=spec,
-                        attn_backend=group.backend,
-                        num_blocks=num_blocks,
-                        kernel_block_size=kernel_block_size,
-                        cache_dtype=cache_dtype,
-                    )
-                elif isinstance(spec, MambaSpec):
-                    kv_caches[layer_name] = make_mamba_cache_views(
-                        raw=raw,
-                        spec=spec,
-                        num_blocks=mamba_num_blocks
-                        if mamba_num_blocks is not None else num_blocks,
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported KV cache spec: {type(spec)!r}")
+    def _iter_groups(spec_type):
+        for group_list in attn_groups:
+            for group in group_list:
+                gid = group.kv_cache_group_id
+                if kernel_block_size_by_gid.get(gid) is None:
+                    continue
+                spec = group.kv_cache_spec
+                if not isinstance(spec, spec_type):
+                    continue
+                yield group, spec
+
+    # Mamba first so the shared raw int8 block exists before the attention
+    # layer that shares the same buffer is materialized.
+    for group, spec in _iter_groups(MambaSpec):
+        for layer_name in group.layer_names:
+            raw = layer_to_raw[layer_name]
+            # The pool is attention-shaped, so blocks are counted by its
+            # leading dim; the flat non-pool buffer is counted by bytes.
+            if raw.dim() > 1:
+                num_blocks = raw.shape[0]
+            else:
+                raw_bytes = raw.numel() * raw.element_size()
+                assert raw_bytes % spec.page_size_bytes == 0
+                num_blocks = raw_bytes // spec.page_size_bytes
+            raw_key = id(raw)
+            if raw_key not in mamba_view_cache:
+                mamba_view_cache[raw_key] = make_mamba_cache_views(
+                    raw=raw,
+                    spec=spec,
+                    num_blocks=mamba_num_blocks
+                    if mamba_num_blocks is not None else num_blocks,
+                )
+            kv_caches[layer_name] = mamba_view_cache[raw_key]
+
+    for group, spec in _iter_groups(AttentionSpec):
+        kernel_block_size = kernel_block_size_by_gid[group.kv_cache_group_id]
+        for layer_name in group.layer_names:
+            raw = layer_to_raw[layer_name]
+            raw_key = id(raw)
+            if raw_key in mamba_view_cache:
+                # Unified pool: the buffer was born attention-shaped, so the
+                # attention layer consumes it directly; sharing the same
+                # object with the GDN layers dedupes to one graph input.
+                kv_caches[layer_name] = mamba_view_cache[raw_key][0]
+            else:
+                raw_bytes = raw.numel() * raw.element_size()
+                assert raw_bytes % spec.page_size_bytes == 0
+                num_blocks = raw_bytes // spec.page_size_bytes
+                kv_caches[layer_name] = make_attention_cache_view(
+                    raw=raw,
+                    spec=spec,
+                    attn_backend=group.backend,
+                    num_blocks=num_blocks,
+                    kernel_block_size=kernel_block_size,
+                    cache_dtype=cache_dtype,
+                )
 
     return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=raw_tensors)
