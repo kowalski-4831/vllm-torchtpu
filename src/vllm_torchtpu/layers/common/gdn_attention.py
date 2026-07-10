@@ -812,6 +812,62 @@ def run_jax_gdn_attention_pooled_local(
         -1, kernel_size - 1, conv_dim)
     identity_indices = jnp.arange(state_indices.shape[0], dtype=jnp.int32)
 
+    if (config.ragged_gated_delta_rule_impl ==
+            RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD):
+        # Fused conv+GDN kernel: gather BOTH state regions around the stock
+        # kernel — the same identity-indexed pattern the conv kernel uses
+        # below, with the ssm region joining the conv region in the round
+        # trip. The kernel self-handles fresh slots via seq_lens, so gathered
+        # garbage from a newly-allocated block is never read.
+        ssm_gathered = pool_adapters.gather_region(recurrent_state,
+                                                   state_indices,
+                                                   tok0=0,
+                                                   ntok=ssm_ntok,
+                                                   out_dtype=jnp.float32,
+                                                   out_lanes=d_v).reshape(
+                                                       max_reqs, n_v, d_k, d_v)
+        (new_conv_state, new_ssm), output = gdn_v3_wrapper.fused_conv1d_gdn(
+            mixed_qkv,
+            b,
+            a,
+            conv_state,
+            ssm_gathered,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            query_start_loc,
+            identity_indices,
+            distribution,
+            seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        new_conv_rows = new_conv_state.reshape(-1, conv_data_rows, lanes)
+        conv_pad_rows = conv_slot_rows - conv_data_rows
+        if conv_pad_rows:
+            new_conv_rows = jnp.pad(new_conv_rows,
+                                    ((0, 0), (0, conv_pad_rows), (0, 0)))
+        recurrent_state = pool_adapters.scatter_region(
+            conv_pool,
+            new_conv_rows.astype(jnp.bfloat16),
+            state_indices,
+            tok0=conv_tok0,
+            ntok=conv_ntok,
+        )
+        ssm_rows = (n_v * d_k * d_v) // d_v
+        recurrent_state = pool_adapters.scatter_region(
+            recurrent_state,
+            new_ssm.astype(jnp.float32).reshape(max_reqs, ssm_rows, d_v),
+            state_indices,
+            tok0=0,
+            ntok=ssm_ntok,
+        )
+        return recurrent_state, output
+
     out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
         mixed_qkv,
         conv_state,
@@ -836,14 +892,11 @@ def run_jax_gdn_attention_pooled_local(
         ntok=conv_ntok,
     )
 
-    if config.ragged_gated_delta_rule_impl in (
-            RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD,
-            RaggedGatedDeltaRuleImpl.REF,
-    ):
+    if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.REF:
         raise NotImplementedError(
-            "the fused GDN V3 kernel and the ref impl read recurrent state "
-            "natively and are not wired to the unified block pool; use "
-            "chunked_jax_pd.")
+            "the ref impl reads recurrent state natively and is not wired "
+            "to the unified block pool; use chunked_jax_pd or "
+            "chunked_kernel_v3_pd.")
 
     wrapper_config = config.ragged_gated_delta_rule_impl.to_config()
     new_recurrent_state, output = ragged_gated_delta_rule_wrapper.ragged_gated_delta_rule_wrapper(
