@@ -21,8 +21,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    update_tpu_block_size_and_slot_config
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    unified_block_pool_enabled, update_tpu_block_size_and_slot_config)
 from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
@@ -804,7 +804,7 @@ class TpuPlatform(Platform):
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]
                 backend_cls.get_preferred_block_size(default))
-        if envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:
+        if unified_block_pool_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
         min_page_size = backend_cls.get_min_page_size(vllm_config)
