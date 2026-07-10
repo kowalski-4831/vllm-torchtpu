@@ -1064,8 +1064,9 @@ class TPUModelRunner(GPUModelRunner):
                 `_maybe_set_num_blocks_override`.
 
         On success: sets `cache_config.num_gpu_blocks_override` (attention
-        block count) and `_mamba_num_blocks`. On any precondition-fail path:
-        leaves both unset so the caller falls back to uniform sizing.
+        block count) and `_mamba_num_blocks`. Raises when the KV budget cannot
+        hold the mamba slots; the remaining precondition-fail paths leave both
+        unset so the caller falls back to uniform sizing.
         """
         if self._uniform_mamba_layout:
             logger.info("Compact mamba sizing skipped.")
@@ -1093,27 +1094,27 @@ class TPUModelRunner(GPUModelRunner):
         avail_per_tensor = avail // group_size
         mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
                             unpadded_mamba_page_size_bytes)
+        # Falling back to the uniform layout here would pad every block to the
+        # mamba page and silently shrink the pool by ~50x, which surfaces as a
+        # throughput collapse rather than a misconfiguration. Fail loudly.
         attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
         if attn_per_tensor_avail <= 0:
-            # Mamba alone saturates the budget — pathological config. Skip the
-            # override and let the uniform fallback run; if the model genuinely
-            # doesn't fit it will OOM there too, and we want that signal.
-            logger.warning(
-                "Compact-mamba sizing skipped: mamba alone (mamba_num_blocks="
-                "%d × num_mamba_groups=%d × mamba_unpadded=%d) exceeds "
-                "per-tensor budget %d. Lower `gpu_memory_utilization` or "
-                "`max_num_seqs`.", mamba_num_blocks, num_mamba_groups,
-                unpadded_mamba_page_size_bytes, avail_per_tensor)
-            return
+            raise ValueError(
+                f"Compact-mamba KV sizing does not fit: mamba slots alone need "
+                f"{mamba_per_tensor} B per KVCacheTensor (mamba_num_blocks="
+                f"{mamba_num_blocks} x num_mamba_groups={num_mamba_groups} x "
+                f"mamba_unpadded={unpadded_mamba_page_size_bytes}), but the "
+                f"per-tensor KV budget is {avail_per_tensor} B. Raise "
+                f"`gpu_memory_utilization` or lower `max_num_seqs`.")
 
         attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
                                                     attn_page_size_bytes)
         if attn_num_blocks <= 0:
-            logger.warning(
-                "Compact-mamba sizing skipped: attn_num_blocks=0 "
-                "(avail_per_tensor=%d, mamba_per_tensor=%d).",
-                avail_per_tensor, mamba_per_tensor)
-            return
+            raise ValueError(
+                f"Compact-mamba KV sizing does not fit: no attention blocks "
+                f"remain (avail_per_tensor={avail_per_tensor} B, "
+                f"mamba_per_tensor={mamba_per_tensor} B). Raise "
+                f"`gpu_memory_utilization` or lower `max_num_seqs`.")
 
         cache_config.num_gpu_blocks_override = int(attn_num_blocks)
         self._mamba_num_blocks = int(mamba_num_blocks)
