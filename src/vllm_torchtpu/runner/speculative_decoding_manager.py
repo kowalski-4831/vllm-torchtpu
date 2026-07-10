@@ -110,8 +110,9 @@ class SpeculativeDecodingManager:
         # validation also rejects ngram+async at engine construction).
         if (return_device or next_tokens_per_chunk is not None
                 or device_seed is not None):
-            assert self.runner.speculative_config.method == "eagle3", (
-                "device-seeded draft proposing is only supported with eagle3")
+            assert self.runner.speculative_config.use_eagle(), (
+                "device-seeded draft proposing is only supported with eagle3/mtp"
+            )
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
@@ -121,7 +122,7 @@ class SpeculativeDecodingManager:
                 self.runner.input_batch.token_ids_cpu,
             )
             return None
-        elif self.runner.speculative_config.method == "eagle3":
+        elif self.runner.speculative_config.use_eagle():
             assert isinstance(self.runner.drafter, Eagle3Proposer)
             result = self.runner.drafter.propose(
                 sampled_token_ids[:num_reqs]

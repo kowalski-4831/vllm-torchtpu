@@ -223,3 +223,28 @@ def time_function(func):
         return result
 
     return wrapper
+
+
+def tpu_bind_kv_cache(
+    kv_caches: dict[str, torch.Tensor],
+    forward_context: dict[str, Any],
+    runner_kv_caches: list[torch.Tensor],
+    num_attn_module: int = 1,
+) -> None:
+    """Bind kv_caches to ModelRunner and forward context."""
+    assert len(runner_kv_caches) == 0
+
+    from collections import defaultdict
+
+    from vllm.v1.worker.utils import extract_layer_index
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name,
+                                       num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        for layer_name in sorted(index2name[layer_index]):
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        forward_context[layer_name].kv_cache = kv_cache

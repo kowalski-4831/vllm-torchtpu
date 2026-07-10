@@ -51,7 +51,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
-                                  bind_kv_cache, prepare_kernel_block_sizes)
+                                  prepare_kernel_block_sizes)
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import utils
@@ -91,9 +91,9 @@ class ExecuteModelState:
     logits_list: list[torch.Tensor]
     num_reqs_list: list[int]
     spec_decode_metadata_list: list["SpecDecodeMetadata | None"]
-    # Per-chunk eagle3 draft inputs (token ids, positions, attn ctx, aux
-    # hidden states) captured during the target verify forward; empty when
-    # eagle3 is disabled.
+    # Per-chunk draft inputs (token ids, positions, attn ctx, aux
+    # hidden states) captured from the target verify pass. None if
+    # spec decode proposer is disabled.
     draft_chunks: list[DraftChunkInputs] = field(default_factory=list)
 
 
@@ -316,7 +316,20 @@ class TPUModelRunner(GPUModelRunner):
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
+        # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
+        # block_table capacity if already created during super().__init__().
+        # This ensures that calculations derived from max_num_blocks_per_req
+        # (such as spec-decode warmup block count `nblk`) strictly respect the
+        # actual BlockTable allocation limits, preventing bounds mismatch errors
+        # (e.g., broadcasting shape (8,) into capacity (5,)).
         self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
+        if (hasattr(self, "input_batch") and self.input_batch is not None
+                and hasattr(self.input_batch, "block_table")):
+            try:
+                self.max_num_blocks_per_req = int(
+                    self.input_batch.block_table[0].get_cpu_tensor().shape[1])
+            except (IndexError, TypeError, AttributeError, KeyError):
+                pass
         self.num_blocks_per_most_len_req = (cdiv(
             self.most_model_len, self.block_size) if self.most_model_len
                                             is not None else None)
@@ -508,7 +521,7 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler = RejectionSampler()
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
-            elif self.speculative_config.method == "eagle3":
+            elif self.speculative_config.use_eagle():
                 self.drafter = Eagle3Proposer(self, self.vllm_config)
             else:
                 raise NotImplementedError(
@@ -985,7 +998,7 @@ class TPUModelRunner(GPUModelRunner):
             num_attn_groups, num_mamba_groups, group_size)
 
         # Fallback (compact sizing skipped, e.g. CPU-only tests or a
-        # user-pinned override): pin vLLM's num_blocks via the two-step
+        # user-pinned num_gpu_blocks_override): pin vLLM's num_blocks via the two-step
         # flooring that keeps peak HBM within `gpu_memory_utilization ×
         # total_hbm` at high utilization. See `_maybe_set_num_blocks_override`
         # for the formula and rationale; the short version is that vLLM's
@@ -2063,8 +2076,8 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs_list = []
         spec_decode_metadata_list = []
         draft_chunks: list[DraftChunkInputs] = []
-        is_eagle3 = (self.speculative_config is not None
-                     and self.speculative_config.method == "eagle3")
+        is_draft_model = (self.speculative_config is not None
+                          and self.speculative_config.use_eagle())
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -2161,7 +2174,7 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
-            if is_eagle3 and aux_hidden_states is not None:
+            if is_draft_model:
                 # Capture this chunk's draft inputs while they are valid.
                 draft_chunks.append(
                     DraftChunkInputs(
@@ -2172,7 +2185,8 @@ class TPUModelRunner(GPUModelRunner):
                         attn_ctx=self._attn_metadata_builder_ctx,
                         start_index=start_index,
                         num_reqs=num_reqs,
-                        aux_hidden_states=aux_hidden_states,
+                        aux_hidden_states=aux_hidden_states
+                        if aux_hidden_states is not None else [],
                         hidden_states=hidden_states,
                         draft_lengths=(spec_decode_metadata.draft_lengths
                                        if spec_decode_metadata is not None else
@@ -2208,8 +2222,8 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
 
-        # Hand the per-chunk draft inputs to the eagle3 proposer.
-        if self.speculative_config and self.speculative_config.method == "eagle3":
+        # Hand the per-chunk draft inputs to the proposer.
+        if self.speculative_config and self.speculative_config.use_eagle():
             self.drafter.draft_chunks = state.draft_chunks
 
         # Prepare inputs, the requests might be split into multiple
@@ -2426,8 +2440,7 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = self.scheduler_config.async_scheduling
         eagle3_drafts = None
-        if (self.speculative_config
-                and self.speculative_config.method == "eagle3"
+        if (self.speculative_config and self.speculative_config.use_eagle()
                 and combined_selected_tokens):
             if use_spec:
                 eagle3_drafts = (
@@ -2470,7 +2483,7 @@ class TPUModelRunner(GPUModelRunner):
                         eagle3_drafts, next_tokens_per_chunk, state,
                         next_tokens_tpu_chunks, next_token_indices))
             elif (self.speculative_config
-                  and self.speculative_config.method == "eagle3"
+                  and self.speculative_config.use_eagle()
                   and next_tokens_tpu_chunks):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
@@ -2600,9 +2613,9 @@ class TPUModelRunner(GPUModelRunner):
                                             model_config=self.model_config)
         self.model = model
 
-        # If using eagle3 speculative decoding, load the draft model and
-        # share embeddings/lm_head with the target.
-        if self.speculative_config and self.speculative_config.method == "eagle3":
+        # If using eagle3/mtp speculative decoding, load the draft model and
+        # share the target's embeddings / LM head (if the draft requires it).
+        if self.speculative_config and self.speculative_config.use_eagle():
             self.drafter.load_model(self.model)
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_attention_kernels()
@@ -2619,8 +2632,8 @@ class TPUModelRunner(GPUModelRunner):
             _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
             _pallas_rpa_kernel_local)
 
-        # Only Eagle3Proposer exposes _draft_attn_layer_names; NgramProposer
-        # (or no drafter) has no draft attention layers to relocate.
+        # Only draft proposers expose _draft_attn_layer_names; NgramProposer
+        # operates purely on token IDs. no draft attention layers to relocate.
         spec_drafter = getattr(self, "drafter", None)
         draft_attn_names = getattr(spec_drafter, "_draft_attn_layer_names",
                                    None) or set()
@@ -2856,7 +2869,7 @@ class TPUModelRunner(GPUModelRunner):
         # substitute doesn't recompile per real num_reqs.
         next_lens = list(self.num_reqs_paddings)
         if (self.speculative_config is not None
-                and self.speculative_config.method == "eagle3"):
+                and self.speculative_config.use_eagle()):
             next_lens.append(
                 self.max_num_reqs *
                 (1 + self.speculative_config.num_speculative_tokens))
@@ -2901,7 +2914,7 @@ class TPUModelRunner(GPUModelRunner):
         produce so the real call is a cache hit. Shared sync + async.
         """
         if not (self.speculative_config is not None
-                and self.speculative_config.method == "eagle3"):
+                and self.speculative_config.use_eagle()):
             return
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
@@ -2987,7 +3000,7 @@ class TPUModelRunner(GPUModelRunner):
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
             if (self.speculative_config
-                    and self.speculative_config.method == "eagle3"):
+                    and self.speculative_config.use_eagle()):
                 self.drafter.precompile()
                 self._precompile_rejection_sampler()
                 # The isolated precompile above emits standalone fused programs;
@@ -3026,7 +3039,7 @@ class TPUModelRunner(GPUModelRunner):
         if self.enforce_eager:
             return
         if not (self.speculative_config
-                and self.speculative_config.method == "eagle3"):
+                and self.speculative_config.use_eagle()):
             return
         if self.input_batch.num_reqs != 0:
             logger.warning("skip spec-decode warmup: input_batch not empty")
@@ -3392,6 +3405,38 @@ class TPUModelRunner(GPUModelRunner):
         raise NotImplementedError(
             f"Unsupported KV cache spec: {type(kv_cache_spec)!r}")
 
+    def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig,
+                                     kernel_block_sizes: list[int]) -> None:
+        """Override to keep TPUModelRunner block accounting in sync with upstream.
+
+        Upstream vLLM's `GPUModelRunner.may_reinitialize_input_batch` may
+        re-create `self.input_batch` (and its internal `BlockTable` instances)
+        if block sizes change or under specific sharding/prefix-caching layouts.
+        When that happens, `max_num_blocks_per_req` inside the underlying
+        `BlockTable` may change (for example, shrinking from 8 to 5 blocks).
+
+        We must immediately sync `TPUModelRunner.max_num_blocks_per_req` and
+        resize `block_table_cpu` so TPU staging and spec-decode warmup block
+        allocations perfectly match the new underlying `BlockTable` capacity.
+        """
+        super().may_reinitialize_input_batch(kv_cache_config,
+                                             kernel_block_sizes)
+        if hasattr(self, "input_batch") and self.input_batch is not None:
+            if hasattr(self.input_batch, "block_table"):
+                try:
+                    self.max_num_blocks_per_req = int(
+                        self.input_batch.block_table[0].get_cpu_tensor(
+                        ).shape[1])
+                    if (self.block_table_cpu.shape[0] != self.max_num_reqs
+                            or self.block_table_cpu.shape[1]
+                            != self.max_num_blocks_per_req):
+                        self.block_table_cpu = torch.zeros(
+                            (self.max_num_reqs, self.max_num_blocks_per_req),
+                            dtype=torch.int32,
+                            device="cpu")
+                except (IndexError, TypeError, AttributeError, KeyError):
+                    pass
+
     def _initialize_unified_kv_cache(self,
                                      kv_cache_config: KVCacheConfig) -> None:
         self.attn_groups = []
@@ -3479,7 +3524,7 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         self.kv_caches = []
-        bind_kv_cache(
+        utils.tpu_bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches,
@@ -3698,12 +3743,12 @@ class TPUModelRunner(GPUModelRunner):
         # for kv_cache in kv_caches.values():
         #     pallas.set_buffer_donor_(kv_cache, True)
 
-        # Reset kv_caches list (bind_kv_cache expects empty list)
+        # Reset kv_caches list (tpu_bind_kv_cache expects empty list)
         self.kv_caches = []
 
-        # Use bind_kv_cache to bind KV caches to attention layers using layer names
+        # Use tpu_bind_kv_cache to bind KV caches to attention layers using layer names
         # This is the native vLLM pattern and avoids the 'layer_id' attribute error
-        bind_kv_cache(
+        utils.tpu_bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches,
@@ -3748,7 +3793,7 @@ class TPUModelRunner(GPUModelRunner):
         # list/tuple; unwrap that first.
         if isinstance(out, (list, tuple)) and len(out) == 1:
             out = out[0]
-        # Eagle3: the target model's forward returns
+        # Draft Models: the target model's forward returns
         # (hidden_states, aux_hidden_states) when aux layers are registered.
         aux_hidden_states = None
         if isinstance(out, (list, tuple)) and len(out) == 2:

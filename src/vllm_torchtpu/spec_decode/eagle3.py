@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,14 @@ def _maybe_pad_dim0(t: torch.Tensor, target_len: int) -> torch.Tensor:
         f"_maybe_pad_dim0: unsupported ndim {t.ndim}, expected 1 or 2")
 
 
+def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Pad the 2nd dimension (dim=1) of a 2D tensor up to target_len."""
+    n = t.shape[1]
+    if target_len <= n:
+        return t
+    return torch.nn.functional.pad(t, (0, target_len - n))
+
+
 @dataclass
 class DraftChunkInputs:
     # Token ids the target consumed (post async-token-substitution).
@@ -80,7 +89,7 @@ class DraftChunkInputs:
 @contextlib.contextmanager
 def _force_draft_tp1():
     """Collapse the TP group to world_size=1 / rank=0 for the duration of draft
-    construction + weight load, so the eagle3 draft loads fully replicated
+    construction + weight load, so the eagle3/mtp draft loads fully replicated
     (tp=1) on every worker instead of TP-sharded.
 
     NOTE: mutates the singleton GroupCoordinator returned by get_tp_group() in
@@ -111,7 +120,7 @@ logger = init_logger(__name__)
 
 
 class Eagle3Proposer:
-    """Eagle3 draft proposer for TPU.
+    """Eagle3/MTP draft proposer for TPU.
 
     This class is responsible for loading the draft model and generating draft
     tokens based on the target model's outputs.
@@ -122,7 +131,7 @@ class Eagle3Proposer:
       proper non-greedy rejection sampling. Non-greedy requests are rejected
       at add_request time in tpu_platform.py before reaching this proposer.
     - draft_tensor_parallel_size selects the draft's parallelism: 1 runs the
-      eagle3 head fully replicated on every TPU worker; target tp runs it
+      eagle3/mtp head fully replicated on every TPU worker; target tp runs it
       sharded across the TP group.
     """
 
@@ -139,7 +148,7 @@ class Eagle3Proposer:
         target_tp = self.vllm_config.parallel_config.tensor_parallel_size
         # Default to (draft_tp == target tp) when unset. vLLM's
         # _verify_and_get_draft_tp already resolves an unset value to target tp
-        # for eagle3, but set it explicitly here so self-documented.
+        # for eagle3/mtp, but set it explicitly here so self-documented.
         if draft_tp is None:
             draft_tp = target_tp
             self.speculative_config.draft_tensor_parallel_size = draft_tp
@@ -147,12 +156,13 @@ class Eagle3Proposer:
         # SHARDED across the whole TP group (draft_tp == target_tp).
         if draft_tp not in (1, target_tp):
             raise ValueError(
-                f"eagle3 draft_tensor_parallel_size={draft_tp} is unsupported "
+                f"{self.speculative_config.method} draft_tensor_parallel_size={draft_tp} is unsupported "
                 f"on TPU: it must be 1 (replicated draft) or {target_tp} "
                 f"(== target tensor_parallel_size, sharded draft).")
         self._draft_replicated = (draft_tp == 1)
         logger.info(
-            "eagle3 draft parallelism: %s (draft_tp=%s).",
+            "%s draft parallelism: %s (draft_tp=%s).",
+            self.speculative_config.method,
             "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
             draft_tp)
         self.draft_model = None
@@ -184,37 +194,49 @@ class Eagle3Proposer:
 
         self._maybe_share_embeddings(target_model)
         self._maybe_share_lm_head(target_model)
-        # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
-        # checkout shouldn't break unrelated TPU runs at import time.
-        try:
-            from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import \
-                set_eagle3_aux_hidden_state_layers
-        except ImportError as e:
-            raise ImportError(
-                "Eagle3 speculative decoding requires a vLLM build with "
-                "vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils; the "
-                "installed vLLM lacks it — check the vLLM version/checkout."
-            ) from e
-        set_eagle3_aux_hidden_state_layers(target_model,
-                                           self.speculative_config)
+        if self.speculative_config.method == "eagle3":
+            # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
+            # checkout shouldn't break unrelated TPU runs at import time.
+            try:
+                from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import \
+                    set_eagle3_aux_hidden_state_layers
+            except ImportError as e:
+                raise ImportError(
+                    "Eagle3 speculative decoding requires a vLLM build with "
+                    "vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils; the "
+                    "installed vLLM lacks it — check the vLLM version/checkout."
+                ) from e
+            set_eagle3_aux_hidden_state_layers(target_model,
+                                               self.speculative_config)
 
     def _load_draft_model(self) -> None:
-        logger.info("Loading Eagle3 draft model...")
+        logger.info(f"Loading {self.speculative_config.method} draft model...")
         model_loader = get_model_loader(self.vllm_config.load_config)
         # Tag the draft compile with "eagle_head" so its torch.compile cache
         # lives in a separate prefix from the target's "backbone" prefix.
         draft_tp1_ctx = (_force_draft_tp1() if self._draft_replicated else
                          contextlib.nullcontext())
+        draft_vllm_config = copy.copy(self.vllm_config)
+        draft_model_config = copy.copy(
+            self.speculative_config.draft_model_config)
+        draft_model_config.runner_type = "draft"
+        draft_compilation_config = copy.copy(
+            self.vllm_config.compilation_config)
+        draft_compilation_config.inductor_compile_config = copy.copy(
+            self.vllm_config.compilation_config.inductor_compile_config)
+        draft_compilation_config.inductor_compile_config[
+            "_vllm_model_tag"] = "eagle_head"
+        draft_vllm_config.compilation_config = draft_compilation_config
         with set_model_tag("eagle_head"), set_vllm_model_wrapper_context(
                 mesh=self.runner.mesh), set_current_vllm_config(
-                    self.vllm_config), draft_tp1_ctx:
+                    draft_vllm_config), draft_tp1_ctx:
             self.draft_model = model_loader.load_model(
-                vllm_config=self.vllm_config,
-                model_config=self.speculative_config.draft_model_config,
+                vllm_config=draft_vllm_config,
+                model_config=draft_model_config,
             )
 
     def _maybe_share_embeddings(self, target_model) -> None:
-        """Give the draft the target's input embedding (eagle3 checkpoints
+        """Give the draft the target's input embedding (eagle3/mtp checkpoints
         typically ship no embed_tokens of their own). The form depends on the
         draft's parallelism:
 
@@ -238,7 +260,7 @@ class Eagle3Proposer:
             share_embed = not self.draft_model.has_own_embed_tokens
         else:
             logger.info(
-                "EAGLE draft model does not declare "
+                "EAGLE/MTP draft model does not declare "
                 "`has_own_embed_tokens`; defaulting to share embed_tokens "
                 "with the target.")
             share_embed = True
@@ -370,8 +392,10 @@ class Eagle3Proposer:
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
         # program. index_select is value-identical to hidden[indices].
-        return (torch.index_select(hidden, 0, indices),
-                torch.index_select(positions, 0, indices),
+        pos_carry = (torch.index_select(positions, 1, indices)
+                     if positions.ndim == 2 else torch.index_select(
+                         positions, 0, indices))
+        return (torch.index_select(hidden, 0, indices), pos_carry,
                 torch.index_select(last_hidden, 0, indices))
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -455,10 +479,10 @@ class Eagle3Proposer:
         chunks = self.draft_chunks
         if not chunks:
             raise RuntimeError(
-                "Eagle3Proposer.propose() called but no draft chunks were "
-                "captured (aux_hidden_states was None for every target chunk). "
-                "Ensure set_eagle3_aux_hidden_state_layers() ran during model "
-                "load.")
+                f"{self.__class__.__name__}.propose() called but no draft chunks were "
+                "captured (aux_hidden_states was None for every target chunk in eagle3, or "
+                "no hidden_states were captured). "
+                "Ensure target verify step correctly recorded state.")
         # First pass, per chunk — mirrors the target's chunked verify forward.
         # _prepare_draft_inputs returns last_token_indices padded to the chunk's
         # loop bucket p, so the per-request gathers/carries below are
@@ -473,18 +497,22 @@ class Eagle3Proposer:
         is_async = next_tokens_per_chunk is not None
         for ci, chunk in enumerate(chunks):
             if uses_aux_hidden_state:
-                target_hidden_states = self._draft_combine_hidden_states(
-                    *chunk.aux_hidden_states)
+                with set_model_tag("eagle_head"):
+                    target_hidden_states = self._draft_combine_hidden_states(
+                        *chunk.aux_hidden_states)
             else:
                 assert chunk.hidden_states is not None, (
                     "DraftChunkInputs.hidden_states is required when the "
-                    "eagle3 draft does not use aux hidden states "
-                    "(eagle_config.use_aux_hidden_state=False), but no plain "
+                    "draft does not use aux hidden states, but no plain "
                     "hidden state was captured for this chunk.")
-                # combine_hidden_states is an identity for non-aux drafts, so
-                # the compiled 3-aux cat+mm wrapper doesn't apply here.
-                target_hidden_states = self.draft_model.combine_hidden_states(
-                    chunk.hidden_states)
+                if self.speculative_config.method == 'eagle3':
+                    with set_model_tag("eagle_head"):
+                        target_hidden_states = self.draft_model.combine_hidden_states(
+                            chunk.hidden_states)
+                else:
+                    # MTP: does not use combine_hidden_states
+                    target_hidden_states = chunk.hidden_states
+
             (input_ids, positions, last_token_indices,
              num_rejected) = self._prepare_draft_inputs(
                  chunk,
@@ -515,8 +543,9 @@ class Eagle3Proposer:
                                            last_token_indices))
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
-            draft_tokens_per_chunk.append(
-                [self._draft_propose_token(last_hidden_carry)])
+            with set_model_tag("eagle_head"):
+                draft_tokens_per_chunk.append(
+                    [self._draft_propose_token(last_hidden_carry)])
 
         if K > 1:
             # Loop steps: uniform decode shape, one query per request. The
@@ -527,8 +556,16 @@ class Eagle3Proposer:
                 _get_padded_token_len(runner.num_tokens_paddings, c.num_reqs)
                 for c in chunks
             ]
-            loop_hidden = list(hidden_carry_per_chunk)
-            loop_positions = list(positions_carry_per_chunk)
+            loop_hidden = [
+                _maybe_pad_dim0(h, p)
+                for h, p in zip(hidden_carry_per_chunk, padded_nr_per_chunk)
+            ]
+            loop_positions = [
+                _maybe_pad_dim1(pos, p) if
+                (getattr(runner, "uses_mrope", False) and pos.ndim == 2) else
+                _maybe_pad_dim0(pos, p) for pos, p in zip(
+                    positions_carry_per_chunk, padded_nr_per_chunk)
+            ]
             # Per-chunk rejected count padded to kernel_num_reqs so the loop's
             # seq_lens subtraction is full-length (constant) — no per-num_reqs
             # recompile. Sync pads on the host (free, reused across the K-1 loop
@@ -584,8 +621,9 @@ class Eagle3Proposer:
                         loop_query_start_loc=loop_qsl_per_chunk[ci],
                         loop_request_distribution=loop_reqdist_per_chunk[ci],
                     )
-                    draft_tokens_per_chunk[ci].append(
-                        self._draft_propose_token(last_hidden))
+                    with set_model_tag("eagle_head"):
+                        draft_tokens_per_chunk[ci].append(
+                            self._draft_propose_token(last_hidden))
                     loop_hidden[ci] = hidden
 
         # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
@@ -898,6 +936,9 @@ class Eagle3Proposer:
         effective_num_tokens = (num_tokens_padded
                                 if num_tokens_padded else num_tokens)
 
+        mamba_state_indices = (runner._build_mamba_state_indices(
+            chunk.start_index, num_reqs, kernel_num_reqs) if getattr(
+                runner, "_has_mamba_state", False) else None)
         saved_ctx = runner._attn_metadata_builder_ctx
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
@@ -906,6 +947,7 @@ class Eagle3Proposer:
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            mamba_state_indices=mamba_state_indices,
         )
         try:
             slot_mappings = runner.empty_slot_mappings
@@ -974,16 +1016,23 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
-        with set_forward_context(
+
+        kwargs = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "hidden_states": target_hidden_states,
+        }
+        if self.speculative_config.method == "mtp":
+            kwargs["spec_step_idx"] = step_idx
+
+        draft_vllm_cfg = getattr(self.draft_model, "vllm_config",
+                                 self.vllm_config)
+        with set_model_tag("eagle_head"), set_forward_context(
                 attn_metadata,
-                self.vllm_config,
+                draft_vllm_cfg,
                 num_tokens=num_tokens,
         ), set_vllm_model_wrapper_context(mesh=self.runner.mesh):
-            out = self.draft_model(
-                input_ids=input_ids,
-                positions=positions,
-                hidden_states=target_hidden_states,
-            )
+            out = self.draft_model(**kwargs)
 
         return self._unwrap_model_out(out)
 
@@ -1011,6 +1060,8 @@ class Eagle3Proposer:
         """Whether this draft checkpoint feeds combine_hidden_states the
         concatenation of several target aux hidden-state layers.
         """
+        if self.speculative_config.method == "mtp":
+            return False
         return bool(
             getattr(self.draft_model.model, "use_aux_hidden_state", True))
 
@@ -1026,6 +1077,9 @@ class Eagle3Proposer:
         return self._draft_hidden_size()
 
     def _precompile_combine_hidden_states(self) -> None:
+        if self.speculative_config.method == "mtp":
+            return  # MTP does not use combine_hidden_states
+
         runner = self.runner
         if not self._draft_uses_aux_hidden_state():
             # combine_hidden_states is an identity for non-aux drafts.
@@ -1034,7 +1088,8 @@ class Eagle3Proposer:
         # aux dummies (not one pre-cat [N, 3*aux] dummy) so the compiled
         # cat+mm grouping's shape-key matches the real first-pass dispatch.
         aux_w = self._draft_combine_input_size() // 3
-        with runner._precompile_timed("drafter combine_hidden_states"):
+        with set_model_tag("eagle_head"), runner._precompile_timed(
+                "drafter combine_hidden_states"):
             for num_tokens in runner.num_tokens_paddings:
                 aux = [
                     torch.zeros((num_tokens, aux_w),
@@ -1093,7 +1148,8 @@ class Eagle3Proposer:
             t
             for t in runner.num_tokens_paddings if t <= max_loop_bucket
         }
-        with runner._precompile_timed("drafter compute_logits"):
+        with set_model_tag("eagle_head"), runner._precompile_timed(
+                "drafter compute_logits"):
             for n in all_sizes:
                 dummy_hidden = torch.zeros(
                     (n, hidden_size),
@@ -1103,3 +1159,91 @@ class Eagle3Proposer:
                 out = self._draft_propose_token(dummy_hidden)
                 sync.synchronize(out, wait=True)
                 logger.info("  -- drafter compute_logits n: %d", n)
+
+    def _dummy_draft_forward(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        use_max_model_len: bool,
+    ) -> None:
+        runner = self.runner
+
+        input_ids = torch.zeros((num_tokens),
+                                dtype=torch.int32).to(runner.device)
+        positions = (torch.zeros(
+            (3, num_tokens), dtype=torch.int32, device=runner.device)
+                     if getattr(runner, "uses_mrope", False) else torch.zeros(
+                         num_tokens, dtype=torch.int32, device=runner.device))
+        target_hidden_states = torch.zeros(
+            (num_tokens, self._draft_hidden_size()),
+            dtype=runner._hidden_states_dtype).to(runner.device)
+
+        actual_num_reqs = min(num_tokens, num_reqs)
+        query_lens = [1] * num_reqs
+        query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
+                                                    dtype=torch.int32),
+                                       dim=0,
+                                       dtype=torch.int32).to(runner.device)
+        seq_lens = torch.ones((num_reqs, ),
+                              dtype=torch.int32).to(runner.device)
+        request_distribution = torch.tensor(
+            [actual_num_reqs, actual_num_reqs, actual_num_reqs],
+            dtype=torch.int32).to(runner.device)
+
+        dummy_mamba_state_indices = (torch.zeros(
+            (num_reqs, ), dtype=torch.int32, device=runner.device) if getattr(
+                runner, "_has_mamba_state", False) else None)
+        saved_ctx = getattr(runner, "_attn_metadata_builder_ctx", None)
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=num_reqs,
+            start_index=0,
+            use_max_model_len=use_max_model_len,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            request_distribution=request_distribution,
+            position_ids_override=positions,
+            mamba_state_indices=dummy_mamba_state_indices,
+        )
+        try:
+            slot_mappings = runner.empty_slot_mappings
+            per_layer_attn_metadata, _ = runner._build_attention_metadata(
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                max_query_len=1,
+                num_tokens_padded=num_tokens,
+                num_reqs_padded=num_reqs,
+                slot_mappings=slot_mappings,
+            )
+            draft_per_layer_attn = {
+                name: md
+                for name, md in per_layer_attn_metadata.items()
+                if name in (self._draft_attn_layer_names or {})
+            }
+            draft_vllm_cfg = getattr(self.draft_model, "vllm_config",
+                                     self.vllm_config)
+            with (
+                    set_model_tag("eagle_head"),
+                    runner.maybe_select_dummy_loras(
+                        runner.lora_config,
+                        np.array([num_tokens], dtype=np.int32)),
+                    set_forward_context(draft_per_layer_attn,
+                                        draft_vllm_cfg,
+                                        num_tokens=num_tokens),
+                    set_vllm_model_wrapper_context(mesh=runner.mesh),
+            ):
+                steps = (range(self.speculative_config.num_speculative_tokens +
+                               1)
+                         if self.speculative_config.method == "mtp" else [0])
+                for step in steps:
+                    kwargs = {
+                        "input_ids": input_ids,
+                        "positions": positions,
+                        "hidden_states": target_hidden_states,
+                    }
+                    if self.speculative_config.method == "mtp":
+                        kwargs["spec_step_idx"] = step
+                    out = self.draft_model(**kwargs)
+                    last_hidden, _ = self._unwrap_model_out(out)
+                    sync.synchronize(last_hidden, wait=True)
+        finally:
+            runner._attn_metadata_builder_ctx = saved_ctx

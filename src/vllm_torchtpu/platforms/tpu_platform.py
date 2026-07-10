@@ -476,7 +476,7 @@ class TpuPlatform(Platform):
         if cls._speculative_enabled and \
                 vllm_config.scheduler_config.async_scheduling:
             method = vllm_config.speculative_config.method
-            if method != "eagle3":
+            if not vllm_config.speculative_config.use_eagle():
                 # Ngram needs the sampled tokens on the host, which async defers.
                 raise NotImplementedError(
                     f"Async scheduling with speculative method '{method}' is "

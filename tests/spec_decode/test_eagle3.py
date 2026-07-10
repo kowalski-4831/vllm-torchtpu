@@ -25,8 +25,10 @@ from vllm_torchtpu.spec_decode.eagle3 import (DraftChunkInputs, Eagle3Proposer,
 
 
 def _make_proposer(draft_tp: int | None = 1,
-                   target_tp: int = 1) -> Eagle3Proposer:
-    speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp)
+                   target_tp: int = 1,
+                   method: str = "eagle3") -> Eagle3Proposer:
+    speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp,
+                                         method=method)
     parallel_config = SimpleNamespace(tensor_parallel_size=target_tp)
     vllm_config = SimpleNamespace(speculative_config=speculative_config,
                                   parallel_config=parallel_config)
