@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
     USE_MOE_SPARSE_CORE: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    RAGGED_GATHER_VERSION: str = "v2"
+    RAGGED_GATHER_REDUCE_VERSION: str = "v2"
 
 
 def env_with_choices(
@@ -197,6 +199,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is effectively disabled.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD") or "0"),
+    # SparseCore MoE gather kernel version used by fused_moe_gmm.
+    # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
+    "RAGGED_GATHER_VERSION":
+    env_with_choices("RAGGED_GATHER_VERSION", "v2", ["v1", "v2"]),
+    # SparseCore MoE gather-reduce (combine) kernel version used by
+    # fused_moe_gmm. "v2" (default) = ragged_gather_reduce_v2; "v1" = legacy
+    # ragged_gather_reduce.
+    "RAGGED_GATHER_REDUCE_VERSION":
+    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
 }
 
 
