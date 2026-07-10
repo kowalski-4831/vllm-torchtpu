@@ -12,6 +12,7 @@ import torch
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
     PCP_AXIS_NAME, sharded_pcp_ragged_paged_attention)
@@ -112,20 +113,19 @@ def _named_shardings(mesh: jax.sharding.Mesh,
         jax.sharding.NamedSharding(mesh, spec) for spec in partition_specs)
 
 
-def pcp_streaming_jax_op(
+def build_pcp_streaming_callable(
     name: str,
     fn: Callable[..., object],
     *,
     donate_argnums: Sequence[int] | None,
     mesh: jax.sharding.Mesh,
     input_partition_specs: Sequence[PartitionSpec],
-):
-    """Register a PCP streaming custom op with explicit output sharding.
+) -> "_PcpStreamingJaxCallable":
+    """Build the eager JaxCallable for a PCP streaming kernel fn.
 
-    TorchTPU's stock pallas.jax_op derives output placeholder shapes from
-    lowered.out_avals, but jax.export records shard_map outputs there as
-    replicated. Explicit out_shardings are preserved in _out_named_shardings;
-    the PCP-specific JaxCallable uses that to allocate local torch outputs.
+    Split out of ``pcp_streaming_jax_op`` so kernel-iteration hot-reload can
+    rebuild the callable from freshly reloaded kernel modules and swap it in
+    behind the already-registered torch op.
     """
     signature = inspect.signature(fn, follow_wrapped=False)
     pallas_impl._verify_signature(signature)
@@ -149,7 +149,7 @@ def pcp_streaming_jax_op(
             tuple(map(str, PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)),
         },
     )
-    wrapped_fn = _PcpStreamingJaxCallable(
+    return _PcpStreamingJaxCallable(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
@@ -159,7 +159,40 @@ def pcp_streaming_jax_op(
         donate_argnums=donate_argnums_tuple,
     )
 
-    result = torch.library.custom_op(name, wrapped_fn, mutates_args=())
+
+def pcp_streaming_jax_op(
+    name: str,
+    fn: Callable[..., object],
+    *,
+    donate_argnums: Sequence[int] | None,
+    mesh: jax.sharding.Mesh,
+    input_partition_specs: Sequence[PartitionSpec],
+):
+    """Register a PCP streaming custom op with explicit output sharding.
+
+    TorchTPU's stock pallas.jax_op derives output placeholder shapes from
+    lowered.out_avals, but jax.export records shard_map outputs there as
+    replicated. Explicit out_shardings are preserved in _out_named_shardings;
+    the PCP-specific JaxCallable uses that to allocate local torch outputs.
+    """
+    wrapped_fn = build_pcp_streaming_callable(
+        name,
+        fn,
+        donate_argnums=donate_argnums,
+        mesh=mesh,
+        input_partition_specs=input_partition_specs,
+    )
+
+    # Kernel-iteration mode registers the op against a dispatcher indirection
+    # so hot-reload can swap the callable without re-registering the op.
+    if envs.TPU_KERNEL_ITER_MODE:
+        from vllm_torchtpu.compilation import kernel_reload
+        kernel_reload.set_live(name, wrapped_fn)
+        op_target = kernel_reload.make_dispatcher(name, wrapped_fn)
+    else:
+        op_target = wrapped_fn
+
+    result = torch.library.custom_op(name, op_target, mutates_args=())
 
     def fake_fn(*args, **kwargs):
         jax_args = pallas_impl.jax_placeholders(

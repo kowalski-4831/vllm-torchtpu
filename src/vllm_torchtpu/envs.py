@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     RAGGED_GATHER_VERSION: str = "v2"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
+    TPU_KERNEL_ITER_MODE: bool = False
+    TPU_KERNEL_RELOAD_MODULES: str = ""
 
 
 def env_with_choices(
@@ -212,6 +214,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ragged_gather_reduce.
     "RAGGED_GATHER_REDUCE_VERSION":
     env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
+    # Kernel-iteration mode: split the compiled graph at the Pallas custom
+    # ops, keep kernel sources out of the compile-cache key, and enable the
+    # /reload_kernel endpoint so kernel edits apply to a running server
+    # without restarting it. Development aid; off by default.
+    "TPU_KERNEL_ITER_MODE":
+    lambda: bool(int(os.getenv("TPU_KERNEL_ITER_MODE") or "0")),
+    # Comma-separated module names re-imported by /reload_kernel (and, in
+    # kernel-iteration mode, excluded from the compile-cache key). Defaults
+    # to the in-tree experimental RPA kernel modules; see
+    # compilation/kernel_reload.py.
+    "TPU_KERNEL_RELOAD_MODULES":
+    lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
 }
 
 
