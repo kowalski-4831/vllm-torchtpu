@@ -78,6 +78,7 @@ class RaggedGatedDeltaRuleImpl(enum.Enum):
         'n_v',
         'd_k',
         'd_v',
+        'state_ops',
     ),
 )
 @jax.named_scope('ragged_gated_delta_rule_wrapper')
@@ -101,6 +102,7 @@ def ragged_gated_delta_rule_wrapper(
     n_v: int,
     d_k: int,
     d_v: int,
+    state_ops: jax_impl.StateOps = jax_impl.DENSE_STATE_OPS,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies the gated delta rule over ragged seq lengths using various implementations.
 
@@ -146,6 +148,11 @@ def ragged_gated_delta_rule_wrapper(
     def decode_only_branch(_):
         impl = config.decode_impl
         if impl == 'fused':
+            if state_ops is not jax_impl.DENSE_STATE_OPS:
+                raise NotImplementedError(
+                    "the fused decode kernel reads recurrent state inside "
+                    "its Pallas kernel and cannot use pluggable state ops; "
+                    "use decode_impl='jax' with the unified block pool")
             new_state, output = ragged_gated_delta_rule_decode_only(
                 mixed_qkv=mixed_qkv,
                 b=b,
@@ -194,6 +201,7 @@ def ragged_gated_delta_rule_wrapper(
                 state_indices=state_indices,
                 distribution=distribution,
                 use_qk_norm_in_gdn=config.use_qk_norm_in_gdn,
+                state_ops=state_ops,
             )
             return new_state, output.astype(mixed_qkv.dtype)
         else:
@@ -233,8 +241,14 @@ def ragged_gated_delta_rule_wrapper(
                 use_qk_norm_in_gdn=config.use_qk_norm_in_gdn,
                 triangle_solver_impl=triangle_solver_impl,
                 has_initial_state=has_initial_state,
+                state_ops=state_ops,
             )
         elif impl == 'recurrent_scan_v2':
+            if state_ops is not jax_impl.DENSE_STATE_OPS:
+                raise NotImplementedError(
+                    "recurrent_scan_v2 reads recurrent state inside its "
+                    "kernel and cannot use pluggable state ops; use "
+                    "prefill_impl='jax' with the unified block pool")
             return recurrent_scan(
                 mixed_qkv=mixed_qkv,
                 b=b,
