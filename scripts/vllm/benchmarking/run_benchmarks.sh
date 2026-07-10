@@ -198,7 +198,12 @@ start_vllm_server() {
         echo "Profiler capture enabled. Traces will be written to: $VLLM_TORCH_PROFILER_DIR"
     fi
 
-    local server_cmd="vllm serve --model=${MODEL} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling --no-enable-prefix-caching --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=fp8 $extra_args"
+    local prefix_caching_flag="--no-enable-prefix-caching"
+    if [ "${ENABLE_PREFIX_CACHING:-false}" = "true" ]; then
+        prefix_caching_flag="--enable-prefix-caching"
+    fi
+    local kv_cache_dtype="${KV_CACHE_DTYPE:-fp8}"
+    local server_cmd="vllm serve --model=${MODEL} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling $prefix_caching_flag --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=$kv_cache_dtype $extra_args"
 
     echo ""
     echo "================================================"
