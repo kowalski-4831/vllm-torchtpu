@@ -77,7 +77,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_block_pool_enabled
-from vllm_torchtpu.runner.mamba_apc import MambaApcStateCopier
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from vllm_torchtpu.runner.tpu_runner_async_output import (
@@ -309,9 +308,6 @@ class TPUModelRunner(GPUModelRunner):
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
-        self._mamba_align_mode: bool = (
-            self.vllm_config.cache_config.mamba_cache_mode == "align")
-        self._mamba_apc_copier: MambaApcStateCopier | None = None
         # Use uniform Mamba layout for disagg until compact cache is supported
         # for disagg serving.
         self._uniform_mamba_layout: bool = (self.vllm_config.kv_transfer_config
@@ -2298,9 +2294,6 @@ class TPUModelRunner(GPUModelRunner):
                                           wait_for_completion=raiden_inline,
                                           report_completion=not raiden_inline)
 
-        if self._mamba_apc_copier is not None:
-            self._mamba_apc_copier.preprocess(scheduler_output)
-
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
                 assert self._dp_target_bucket is not None
@@ -4005,9 +3998,6 @@ class TPUModelRunner(GPUModelRunner):
                 kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self)
-
-        if self._mamba_align_mode and kv_cache_config.has_mamba_layers:
-            self._mamba_apc_copier = MambaApcStateCopier(self)
 
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()

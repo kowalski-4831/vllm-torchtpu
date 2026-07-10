@@ -128,12 +128,12 @@ class TestTpuPlatform:
         mock_pallas.get_page_size.assert_not_called()
 
     @pytest.mark.parametrize(
-        ("mamba_cache_mode", "speculative_config", "async_scheduling",
+        ("mamba_cache_mode", "speculative_config", "kv_transfer_config",
          "message"),
         [
-            ("all", None, False, "mamba_cache_mode='align'"),
-            ("align", MagicMock(), False, "Speculative decoding"),
-            ("align", None, True, "Async scheduling"),
+            ("all", None, None, "mamba_cache_mode='align'"),
+            ("align", MagicMock(), None, "Speculative decoding"),
+            ("align", None, MagicMock(), "unified block pool"),
         ],
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
@@ -147,14 +147,14 @@ class TestTpuPlatform:
     def test_check_and_update_config_rejects_incomplete_mamba_apc_modes(
             self, mock_vllm_envs, mock_prepare_env, mock_sharding,
             mock_apply_patches, vllm_config, mamba_cache_mode,
-            speculative_config, async_scheduling, message):
+            speculative_config, kv_transfer_config, message):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.enable_prefix_caching = True
         vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
         vllm_config.speculative_config = speculative_config
-        vllm_config.scheduler_config.async_scheduling = async_scheduling
+        vllm_config.kv_transfer_config = kv_transfer_config
 
         mock_pallas = MagicMock()
         mock_pallas.get_page_size.return_value = 256
