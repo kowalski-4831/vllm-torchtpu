@@ -122,7 +122,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
         # that gets updated every step.
-        source_block_tables = None
         if ctx.position_ids_override is not None:
             block_tables_dev = torch.zeros(
                 (target_num_reqs * target_num_blocks, ),
@@ -132,10 +131,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             block_tables = self.block_tables_cpu[:target_num_reqs, :
                                                  target_num_blocks]
             block_tables.zero_()
-            source_block_tables = block_table_obj.get_cpu_tensor()
             block_tables[:ctx.num_reqs, :target_num_blocks] = (
-                source_block_tables[ctx.start_index:ctx.start_index +
-                                    ctx.num_reqs, :target_num_blocks])
+                block_table_obj.get_cpu_tensor()[
+                    ctx.start_index:ctx.start_index +
+                    ctx.num_reqs, :target_num_blocks])
             # Flatten on CPU before H2D to avoid device-side as_strided/reshape
             # materialization on every decode step.
             block_tables_dev = block_tables.reshape(-1).to(runner.device,
@@ -150,28 +149,24 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_state_indices = ctx.mamba_state_indices
         elif runner._unified_block_pool:
             # Unified block pool: Mamba state is keyed by the same vLLM block
-            # ids as attention. Derive from the source block table because
-            # AttentionMetadata.block_tables intentionally zero-pads tail rows.
-            # ctx.seq_lens lives on runner.device, but source_block_tables is
-            # the CPU block table. Keep the gathered offsets on CPU for that
-            # indexing path; the dummy/device path converts them back below.
-            state_block_offsets_cpu = torch.clamp(
+            # ids as attention. Derive on device from the zero-padded
+            # `block_tables_dev` so padded tail rows resolve to the null
+            # block, never a stale id — the GDN op scans the full length
+            # every step — and no host-device sync lands on the hot path
+            # (`ctx.seq_lens` lives on the device).
+            block_tables_2d = block_tables_dev.reshape(target_num_reqs,
+                                                       target_num_blocks)
+            state_block_offsets = torch.clamp(
                 (ctx.seq_lens - 1) // self.target_block_size,
                 min=0,
                 max=target_num_blocks - 1,
-            ).to(device="cpu", dtype=torch.int64)
-            req_offsets_cpu = torch.arange(target_num_reqs, dtype=torch.int64)
-            if source_block_tables is None:
-                block_tables_2d = block_tables_dev.reshape(
-                    target_num_reqs, target_num_blocks)
-                mamba_state_indices = block_tables_2d[
-                    req_offsets_cpu.to(runner.device),
-                    state_block_offsets_cpu.to(runner.device)].to(torch.int32)
-            else:
-                mamba_state_indices = source_block_tables[
-                    ctx.start_index + req_offsets_cpu,
-                    state_block_offsets_cpu].to(runner.device,
-                                                non_blocking=True)
+            ).to(torch.int64)
+            req_offsets = torch.arange(target_num_reqs,
+                                       device=runner.device,
+                                       dtype=torch.int64)
+            mamba_state_indices = block_tables_2d[req_offsets,
+                                                  state_block_offsets].to(
+                                                      torch.int32)
         else:
             mamba_state_indices = None
 
