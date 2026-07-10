@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
     TPU_VLLM_KV_CACHE_ALIAS_FALLBACK: bool = True
-    RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
+    RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_kernel_v3_pd"
     USE_MOE_SPARSE_CORE: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     RAGGED_GATHER_VERSION: str = "v2"
@@ -180,10 +180,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reinterpret-cast + in-place update path needed for aliased TPU writes.
     "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK":
     env_bool("TPU_VLLM_KV_CACHE_ALIAS_FALLBACK", default=True),
-    # Gated Delta Rule implementation
+    # Gated Delta Rule implementation. Default is the fused Conv1D+GDN v3
+    # kernel; the older `chunked_kernel_pd` (v1) path is intentionally not a
+    # valid choice — v1's ConcatBitcast conv-state assembly corrupts persistent
+    # I/O-aliased state under libtpu 0.0.42.1 (mmlu_pro collapse on Qwen3.5),
+    # and v3 supersedes it in every config we run.
     "RAGGED_GATED_DELTA_RULE_IMPL":
-    env_with_choices("RAGGED_GATED_DELTA_RULE_IMPL", "chunked_jax_pd", [
-        "ref", "chunked_jax_pd", "chunked_kernel_pd", "chunked_kernel_p_jax_d",
+    env_with_choices("RAGGED_GATED_DELTA_RULE_IMPL", "chunked_kernel_v3_pd", [
+        "ref", "chunked_jax_pd", "chunked_kernel_p_jax_d",
         "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd",
         "chunked_kernel_v3_pd"
     ]),

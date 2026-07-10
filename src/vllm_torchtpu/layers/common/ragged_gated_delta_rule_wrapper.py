@@ -38,40 +38,27 @@ class RaggedGatedDeltaRuleImpl(enum.Enum):
     """Implementation options for the ragged gated delta rule."""
     REF = 'ref'
     CHUNKED_JAX_PD = 'chunked_jax_pd'
-    # Full kernel path: fused Pallas recurrent-scan prefill kernel + fused Pallas
-    # decode kernel.
-    CHUNKED_KERNEL_PD = 'chunked_kernel_pd'
     # V3 fuses Conv1D and GDN, so it is routed at the GDN attention layer rather
-    # than through this Conv1D-after wrapper.
+    # than through this Conv1D-after wrapper. Superseded the removed v1
+    # (`chunked_kernel_pd`) path — v1's ConcatBitcast conv-state assembly
+    # corrupts persistent I/O-aliased state under libtpu 0.0.42.1.
     CHUNKED_KERNEL_V3_PD = 'chunked_kernel_v3_pd'
 
     @property
     def prefill_impl(self) -> str:
-        if self in (
-                RaggedGatedDeltaRuleImpl.REF,
-                RaggedGatedDeltaRuleImpl.CHUNKED_JAX_PD,
-        ):
-            return 'jax'
-        elif self == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
+        if self == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
             raise ValueError(
                 'chunked_kernel_v3_pd is a fused Conv1D+GDN implementation '
                 'and must be routed by gdn_attention.')
-        else:
-            return 'recurrent_scan_v2'
+        return 'jax'
 
     @property
     def decode_impl(self) -> str:
-        if self in (
-                RaggedGatedDeltaRuleImpl.REF,
-                RaggedGatedDeltaRuleImpl.CHUNKED_JAX_PD,
-        ):
-            return 'jax'
-        elif self == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
+        if self == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
             raise ValueError(
                 'chunked_kernel_v3_pd is a fused Conv1D+GDN implementation '
                 'and must be routed by gdn_attention.')
-        else:
-            return 'fused'
+        return 'jax'
 
     def to_config(self) -> RaggedGatedDeltaRuleConfig:
         return RaggedGatedDeltaRuleConfig(

@@ -11,12 +11,16 @@ CONCURRENCY_OPTIONS="64"
 RANDOM_RANGE_RATIO="0.8"
 GPU_MEMORY_UTILIZATION=0.9
 
-# Route through the fused Conv1D+GDN v3 kernel: the non-fused
-# chunked_kernel_pd path hits a whole-graph libtpu scheduling regression on
-# this model that the single-custom_call fused kernel avoids. Scoped to this
-# config because the same override significantly regresses the 397B DP=8 EP
-# configuration.
-export RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd
+# Route MoE token movement through the SparseCore ragged_gather / gather_reduce
+# path. The plain-JAX (SC=0) path regressed ~1.7pp on mmlu_pro after PR #371
+# added the ragged_gather_v2 defaults (two consecutive CI runs at 0.7564 and
+# 0.7521 vs the pre-#371 8ed931c5 sample at 0.7771), despite the SC=0 fused_moe
+# HLO being byte-identical between v1 and v2 selection in local repro across
+# 33 shape buckets. Enabling SC=1 routes 35B through the same path already
+# quality-validated on Qwen3.5-397B DP=8 (local mmlu_pro 0.8264 near baseline
+# 0.8321). Also picks up the ~26-43% MoE-routing perf improvement from
+# ragged_gather_v2 (PR #371 kernel benchmarks).
+export USE_MOE_SPARSE_CORE=1
 
 # Extra arguments for vllm serve
 EXTRA_SERVE_ARGS="--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
