@@ -13,7 +13,11 @@
 # limitations under the License.
 """Donating slot-to-slot copy for Mamba recurrent state arrays."""
 
+import jax
 import torch
+from torch_tpu._internal import pallas
+
+from vllm_torchtpu.kernels import pool_adapters
 
 _mamba_state_copy_op = None
 
@@ -57,3 +61,41 @@ def mamba_state_copy(state: torch.Tensor, src: torch.Tensor,
     """In-place `state[dst] = state[src]` along dim 0 with buffer donation."""
     ensure_op_built()
     state.copy_(_mamba_state_copy_op(state, src, dst))
+
+
+# --- Unified-pool block seeding (block-table-derived state indexing) ---
+# The GDN state lives in the block containing the request's last computed
+# token; when that block advances between scheduler steps (chunked-prefill
+# boundary, decode crossing, prefix-cache resume) the new block must be
+# seeded from the previous state block before the forward runs — the
+# counterpart of upstream vLLM's ``preprocess_mamba`` block copies.
+
+
+def _copy_fn(pool: jax.Array, src: jax.Array,
+             dst: jax.Array) -> tuple[jax.Array, jax.Array]:
+    new_pool = pool_adapters.copy_blocks(pool, src, dst)
+    return new_pool, src[0]
+
+
+_copy_op = pallas.jax_op("pallas::mamba_state_block_copy",
+                         _copy_fn,
+                         donate_argnums=(0, ),
+                         inplace_donate=True)
+
+
+def _fake_copy(pool: torch.Tensor, src: torch.Tensor, dst: torch.Tensor):
+    return torch.empty_like(pool), torch.empty((),
+                                               dtype=src.dtype,
+                                               device=src.device)
+
+
+_copy_op.register_fake(_fake_copy)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def copy_mamba_state_blocks(pool: torch.Tensor, src: torch.Tensor,
+                            dst: torch.Tensor) -> torch.Tensor:
+    # The pool is donated and written in place; the scalar keeps the op live.
+    new_pool, marker = _copy_op(pool, src, dst)
+    del new_pool
+    return marker
