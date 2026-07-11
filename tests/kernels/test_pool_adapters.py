@@ -504,3 +504,56 @@ class TestGatherScatterBlocks:
                                         nblocks=2,
                                         out_dtype=jnp.bfloat16).view(
                                             jnp.uint16))
+
+
+class TestGatherScatterBlocksFp8:
+    """fp8 (1-byte) pool with f32 region access — the ratio-4 bitcast on a
+    multi-block window (the 397B fp8 serving shape)."""
+
+    def _pool(self):
+        # (nb, block, k2p, p, hd): fp8 packing p=4, 5-D like the real cache
+        shape = (12, 16, 2, 4, 128)
+        import math
+        n = math.prod(shape)
+        return (jnp.arange(n, dtype=jnp.float32) % 240).astype(
+            jnp.float8_e4m3fn).reshape(shape)
+
+    def test_gather_blocks_fp8_to_f32_matches_per_block(self):
+        pool = self._pool()
+        mgr = jnp.array([0, 2], dtype=jnp.int32)
+        multi = pool_adapters.gather_blocks(pool,
+                                            mgr,
+                                            split=3,
+                                            kb0=0,
+                                            nblocks=2,
+                                            out_dtype=jnp.float32,
+                                            out_lanes=128)
+        singles = jnp.concatenate([
+            pool_adapters.gather_region(pool,
+                                        mgr * 3 + j,
+                                        tok0=0,
+                                        ntok=16,
+                                        out_dtype=jnp.float32,
+                                        out_lanes=128) for j in range(2)
+        ],
+                                  axis=1)
+        assert jnp.array_equal(multi.view(jnp.uint32),
+                               singles.view(jnp.uint32))
+
+    def test_scatter_blocks_fp8_roundtrip_and_copy_through(self):
+        pool = self._pool()
+        mgr = jnp.array([1, 3], dtype=jnp.int32)
+        vals = pool_adapters.gather_blocks(pool,
+                                           mgr,
+                                           split=3,
+                                           kb0=0,
+                                           nblocks=2,
+                                           out_dtype=jnp.float32)
+        new_pool = pool_adapters.scatter_blocks(pool,
+                                                vals,
+                                                mgr,
+                                                split=3,
+                                                kb0=0,
+                                                nblocks=2)
+        # pure roundtrip: bytes unchanged everywhere
+        assert jnp.array_equal(new_pool.view(jnp.uint8), pool.view(jnp.uint8))
