@@ -745,6 +745,16 @@ def _pool_gather(pool,
     to a single-block gather; only the small gathered arrays are ever
     reshaped, never the pool."""
     kernel_bs = pool.shape[1]
+    if split > 1 and tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
+        # Whole kernel blocks (the ssm region): one grid step and one DMA
+        # window per request over the whole manager block.
+        return pool_adapters.gather_blocks(pool,
+                                           mgr_indices,
+                                           split=split,
+                                           kb0=tok0 // kernel_bs,
+                                           nblocks=ntok // kernel_bs,
+                                           out_dtype=out_dtype,
+                                           out_lanes=out_lanes)
     outs = []
     for kb, local0, n in _pool_region_pieces(tok0, ntok, kernel_bs):
         idx = mgr_indices * split + kb if split > 1 else mgr_indices
@@ -760,6 +770,13 @@ def _pool_gather(pool,
 
 def _pool_scatter(pool, vals, mgr_indices, *, tok0, ntok, split):
     kernel_bs = pool.shape[1]
+    if split > 1 and tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
+        return pool_adapters.scatter_blocks(pool,
+                                            vals,
+                                            mgr_indices,
+                                            split=split,
+                                            kb0=tok0 // kernel_bs,
+                                            nblocks=ntok // kernel_bs)
     pieces = _pool_region_pieces(tok0, ntok, kernel_bs)
     rows_per_tok = vals.shape[1] // ntok
     assert rows_per_tok * ntok == vals.shape[1], (vals.shape, ntok)

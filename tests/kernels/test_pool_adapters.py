@@ -441,3 +441,66 @@ class TestPartialSelfConsistency:
 
     def test_gs_id_w512_t512(self):
         self._gather_scatter_id(512, 512)
+
+
+def _arange_pool(shape, dtype):
+    import math
+    n = math.prod(shape)
+    return (jnp.arange(n, dtype=jnp.float32) %
+            251).astype(dtype).reshape(shape)
+
+
+class TestGatherScatterBlocks:
+    """Single-call consecutive-block access == per-block calls concatenated."""
+
+    def test_gather_blocks_matches_per_block_gathers(self):
+        pool = _arange_pool((12, 16, 2, 128), jnp.bfloat16)
+        base = jnp.array([0, 4, 8], dtype=jnp.int32)
+        multi = pool_adapters.gather_blocks(pool,
+                                            base,
+                                            nblocks=2,
+                                            out_dtype=jnp.float32,
+                                            out_lanes=128)
+        singles = jnp.concatenate([
+            pool_adapters.gather_region(pool,
+                                        base + j,
+                                        tok0=0,
+                                        ntok=16,
+                                        out_dtype=jnp.float32,
+                                        out_lanes=128) for j in range(2)
+        ],
+                                  axis=1)
+        assert multi.shape == singles.shape
+        assert jnp.array_equal(multi.view(jnp.uint32),
+                               singles.view(jnp.uint32))
+
+    def test_scatter_blocks_roundtrip_and_complement(self):
+        pool = _arange_pool((12, 16, 2, 128), jnp.bfloat16)
+        base = jnp.array([2, 6], dtype=jnp.int32)
+        vals = pool_adapters.gather_blocks(pool,
+                                           base,
+                                           nblocks=2,
+                                           out_dtype=jnp.float32)
+        new_pool = pool_adapters.scatter_blocks(pool,
+                                                vals * 0 + 1.5,
+                                                base,
+                                                nblocks=2)
+        back = pool_adapters.gather_blocks(new_pool,
+                                           base,
+                                           nblocks=2,
+                                           out_dtype=jnp.float32)
+        assert jnp.array_equal(back,
+                               jnp.full_like(back, 1.5).astype(back.dtype))
+        # untouched blocks preserved byte-exactly
+        others = jnp.array([0, 10], dtype=jnp.int32)
+        assert jnp.array_equal(
+            pool_adapters.gather_blocks(new_pool,
+                                        others,
+                                        nblocks=2,
+                                        out_dtype=jnp.bfloat16).view(
+                                            jnp.uint16),
+            pool_adapters.gather_blocks(pool,
+                                        others,
+                                        nblocks=2,
+                                        out_dtype=jnp.bfloat16).view(
+                                            jnp.uint16))

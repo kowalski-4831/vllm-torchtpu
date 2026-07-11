@@ -140,6 +140,139 @@ def gather_region(pool,
     )(state_indices, pool)
 
 
+def gather_blocks(pool,
+                  mgr_indices,
+                  *,
+                  split: int,
+                  kb0: int,
+                  nblocks: int,
+                  out_dtype,
+                  out_lanes: int | None = None):
+    """Typed read of `nblocks` whole kernel blocks inside each request's
+    manager block, one grid step and ONE DMA window per request.
+
+    The pool is born at kernel granularity; a manager block is `split`
+    consecutive kernel blocks (upstream map_to_kernel_blocks), so the
+    window (split, block_size, ...) indexed by the manager id is always
+    aligned (element offset = mgr * split). Reading the whole manager
+    window costs a little extra DMA but restores the single-window-per-
+    request shape whose per-window setup dominates the region cost.
+    """
+    assert 0 <= kb0 and kb0 + nblocks <= split, (kb0, nblocks, split)
+    na = mgr_indices.shape[0]
+    block_size, payload, lanes = _pool_geometry(pool)
+    same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(out_dtype)
+    out_payload = (payload if same_dtype else _bitcast_payload(
+        payload, pool.dtype, out_dtype))
+    rows_pb = _out_rows(out_payload, block_size)
+    if not payload and not same_dtype:
+        rows_pb = _rescale_rows(block_size, pool.dtype, out_dtype)
+    lane_split = 1
+    if out_lanes is not None and out_lanes != lanes:
+        assert lanes % out_lanes == 0, (lanes, out_lanes)
+        lane_split = lanes // out_lanes
+        rows_pb *= lane_split
+    o_lanes = lanes // lane_split
+    pad = (0, ) * (len(payload) + 1)
+
+    def _kernel(sidx_ref, pool_ref, o_ref):
+        for j in range(nblocks):
+            block = pool_ref.at[kb0 + j]
+            if not same_dtype:
+                block = block.bitcast(jnp.dtype(out_dtype))
+            arr = block[...].reshape(rows_pb // lane_split, lanes)
+            if lane_split > 1:
+                arr = jnp.stack([
+                    arr[:, k * o_lanes:(k + 1) * o_lanes]
+                    for k in range(lane_split)
+                ],
+                                axis=1).reshape(rows_pb, o_lanes)
+            o_ref[0, j * rows_pb:(j + 1) * rows_pb, :] = arr
+
+    return pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(na, ),
+            in_specs=[
+                pl.BlockSpec((split, block_size) + payload + (lanes, ),
+                             lambda i, s: (s[i], 0) + pad)
+            ],
+            out_specs=pl.BlockSpec((1, nblocks * rows_pb, o_lanes),
+                                   lambda i, s: (i, 0, 0)),
+        ),
+        out_shape=jax.ShapeDtypeStruct((na, nblocks * rows_pb, o_lanes),
+                                       out_dtype),
+    )(mgr_indices, pool)
+
+
+def scatter_blocks(pool, vals, mgr_indices, *, split: int, kb0: int,
+                   nblocks: int):
+    """Typed write of `nblocks` whole kernel blocks inside each request's
+    manager block (in place), one grid step per request; vals is the
+    gather_blocks shape. The aliased output window covers the whole
+    manager block, so the non-region kernel blocks are copied through
+    from the aliased input to satisfy the full-write rule.
+    """
+    assert 0 <= kb0 and kb0 + nblocks <= split, (kb0, nblocks, split)
+    na = mgr_indices.shape[0]
+    block_size, payload, lanes = _pool_geometry(pool)
+    same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(vals.dtype)
+    val_payload = (payload if same_dtype else _bitcast_payload(
+        payload, pool.dtype, vals.dtype))
+    rows_pb = _out_rows(val_payload, block_size)
+    if not payload and not same_dtype:
+        rows_pb = _rescale_rows(block_size, pool.dtype, vals.dtype)
+    v_lanes = vals.shape[-1]
+    lane_split = 1
+    if v_lanes != lanes:
+        assert lanes % v_lanes == 0, (lanes, v_lanes)
+        lane_split = lanes // v_lanes
+    v_rows_pb = rows_pb * lane_split
+    assert vals.shape == (na, nblocks * v_rows_pb,
+                          v_lanes), (vals.shape, nblocks, v_rows_pb, v_lanes)
+    pad = (0, ) * (len(payload) + 1)
+
+    def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
+        for j in range(split):
+            if kb0 <= j < kb0 + nblocks:
+                arr = val_ref[0, (j - kb0) * v_rows_pb:(j - kb0 + 1) *
+                              v_rows_pb, :]
+                if lane_split > 1:
+                    arr = arr.reshape(rows_pb, lane_split, v_lanes)
+                    arr = jnp.concatenate(
+                        [arr[:, k, :] for k in range(lane_split)], axis=-1)
+                block = pool_out_ref.at[j]
+                if not same_dtype:
+                    block = block.bitcast(jnp.dtype(vals.dtype))
+                if not payload and not same_dtype:
+                    block[...] = arr.reshape(rows_pb, lanes)
+                else:
+                    block[...] = arr.reshape((block_size, ) + val_payload +
+                                             (lanes, ))
+            else:
+                # full-write rule: pass the untouched kernel blocks through
+                pool_out_ref.at[j][...] = pool_in_ref.at[j][...]
+
+    return pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(na, ),
+            in_specs=[
+                pl.BlockSpec((1, nblocks * v_rows_pb, v_lanes), lambda i, s:
+                             (i, 0, 0)),
+                pl.BlockSpec((split, block_size) + payload + (lanes, ),
+                             lambda i, s: (s[i], 0) + pad),
+            ],
+            out_specs=pl.BlockSpec((split, block_size) + payload + (lanes, ),
+                                   lambda i, s: (s[i], 0) + pad),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={2: 0},
+    )(mgr_indices, vals, pool)
+
+
 def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int):
     """Per-request typed write of a pool token-range (in place).
 
