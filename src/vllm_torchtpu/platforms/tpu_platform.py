@@ -272,11 +272,29 @@ def apply_tpu_patches() -> None:
     _unwrap_dynamic_compile_fns()
     _patch_api_server_kernel_reload_endpoint()
 
-    # Model-specific patches (applied only if relevant modules are present)
-    _apply_model_specific_patches()
+
+def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
+    if model_config is None:
+        return False
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is not None:
+        model_type = getattr(hf_config, "model_type", "")
+        if model_type and "qwen3_vl" in str(model_type).lower():
+            return True
+        architectures = getattr(hf_config, "architectures", [])
+        if any("qwen3vl" in str(arch).lower() for arch in architectures):
+            return True
+    model_name = getattr(model_config, "model", "")
+    if "qwen3-vl" in str(model_name).lower() or "qwen3vl" in str(
+            model_name).lower():
+        return True
+    return False
 
 
-def _apply_model_specific_patches() -> None:
+def _apply_model_specific_patches(
+        model_config: Optional["ModelConfig"] = None) -> None:
+    if not _is_qwen3_vl_model(model_config):
+        return
     """Apply model-specific and PyTorch XLA op-level patches for Qwen3-VL on TPU.
 
     This function applies the following patches:
@@ -291,12 +309,15 @@ def _apply_model_specific_patches() -> None:
        - Moves `cu_seqlens` (cumulative visual patch sequence lengths) to CPU to avoid
          device mismatch in vision attention kernels.
     3. torch.masked_scatter / masked_scatter_:
-       - Replaces native TPU `masked_scatter` with a 1D `torch.where` and `index_put_`
-         decomposition, eliminating unlowered XLA `scan` HLO nodes that cause
-         NotImplementedError during Device-to-Host (DtoH) memory transfers.
+       - Replaces native TPU `masked_scatter` with a strict 1D sequential indexing
+         decomposition (`indices = torch.nonzero(flat_mask)[0]`; `res[indices] = flat_source`),
+         eliminating unlowered XLA `scan` HLO nodes while preserving exact PyTorch
+         sequential source consumption semantics.
     4. torch.repeat_interleave & torch.cumsum:
-       - Evaluates `repeat_interleave` and `cumsum` on CPU for TPU tensors to avoid
-         generating XLA `scan` HLO nodes on integer/boolean tensors.
+       - Evaluates `repeat_interleave` and `cumsum` on CPU strictly for integer and
+         boolean TPU tensors (`int64`, `int32`, `int16`, `bool`) and returns tensors
+         on the original TPU device (`res_cpu.to(input.device)`), preventing unlowered
+         XLA `scan` HLO nodes without affecting standard floating-point TPU ops.
     """
     try:
         import transformers.models.qwen3_vl.modeling_qwen3_vl as modeling
@@ -379,11 +400,6 @@ def _apply_model_specific_patches() -> None:
         def patched_masked_scatter_(self, mask, source):
             if self.device.type == "tpu":
                 mask_bool = mask.bool()
-                if isinstance(source,
-                              torch.Tensor) and source.shape == self.shape:
-                    res = torch.where(mask_bool, source, self)
-                    self.copy_(res)
-                    return self
                 flat_self = self.reshape(-1)
                 flat_mask = mask_bool.reshape(-1)
                 flat_source = source.reshape(-1)
@@ -402,9 +418,6 @@ def _apply_model_specific_patches() -> None:
         def patched_masked_scatter(input, mask, source):
             if isinstance(input, torch.Tensor) and input.device.type == "tpu":
                 mask_bool = mask.bool()
-                if isinstance(source,
-                              torch.Tensor) and source.shape == input.shape:
-                    return torch.where(mask_bool, source, input)
                 flat_input = input.reshape(-1)
                 flat_mask = mask_bool.reshape(-1)
                 flat_source = source.reshape(-1)
@@ -432,14 +445,17 @@ def _apply_model_specific_patches() -> None:
                                       repeats,
                                       dim=None,
                                       output_size=None):
-            if isinstance(input, torch.Tensor) and input.device.type == "tpu":
+            if (isinstance(input, torch.Tensor) and input.device.type == "tpu"
+                    and input.dtype
+                    in (torch.int64, torch.int32, torch.int16, torch.bool)):
                 input_cpu = input.cpu()
                 repeats_cpu = repeats.cpu() if isinstance(
                     repeats, torch.Tensor) else repeats
-                return orig_repeat_interleave(input_cpu,
-                                              repeats_cpu,
-                                              dim=dim,
-                                              output_size=output_size)
+                res_cpu = orig_repeat_interleave(input_cpu,
+                                                 repeats_cpu,
+                                                 dim=dim,
+                                                 output_size=output_size)
+                return res_cpu.to(input.device)
             return orig_repeat_interleave(input,
                                           repeats,
                                           dim=dim,
@@ -451,7 +467,9 @@ def _apply_model_specific_patches() -> None:
         orig_cumsum = torch.cumsum
 
         def patched_cumsum(input, *args, **kwargs):
-            if isinstance(input, torch.Tensor) and input.device.type == "tpu":
+            if (isinstance(input, torch.Tensor) and input.device.type == "tpu"
+                    and input.dtype
+                    in (torch.int64, torch.int32, torch.int16, torch.bool)):
                 return orig_cumsum(input.cpu(), *args,
                                    **kwargs).to(input.device)
             return orig_cumsum(input, *args, **kwargs)
@@ -461,7 +479,8 @@ def _apply_model_specific_patches() -> None:
         orig_tensor_cumsum = torch.Tensor.cumsum
 
         def patched_tensor_cumsum(self, *args, **kwargs):
-            if self.device.type == "tpu":
+            if (self.device.type == "tpu" and self.dtype
+                    in (torch.int64, torch.int32, torch.int16, torch.bool)):
                 return orig_tensor_cumsum(self.cpu(), *args,
                                           **kwargs).to(self.device)
             return orig_tensor_cumsum(self, *args, **kwargs)
@@ -657,6 +676,8 @@ class TpuPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         apply_tpu_patches()
+        _apply_model_specific_patches(
+            getattr(vllm_config, "model_config", None))
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(

@@ -449,6 +449,9 @@ class TPUWorker(WorkerBase):
                     "Profiler context is not set. Cannot stop profiler.")
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        from vllm_torchtpu.platforms.tpu_platform import \
+            _apply_model_specific_patches
+        _apply_model_specific_patches(self.model_config)
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:

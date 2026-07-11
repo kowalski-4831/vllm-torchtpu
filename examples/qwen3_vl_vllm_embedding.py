@@ -56,6 +56,14 @@ def parse_args():
         action="store_false",
         dest="verify_accuracy",
         help="Disable accuracy check against CPU reference model")
+    parser.add_argument("--enforce-eager",
+                        action="store_true",
+                        default=True,
+                        help="Enforce eager mode (default: True)")
+    parser.add_argument("--no-enforce-eager",
+                        action="store_false",
+                        dest="enforce_eager",
+                        help="Disable enforce eager mode (test failure path)")
     return parser.parse_args()
 
 
@@ -138,7 +146,7 @@ def main(args):
         trust_remote_code=True,
         max_model_len=4096,
         max_num_batched_tokens=16384,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         disable_log_stats=True,
         disable_chunked_mm_input=True,
     )
