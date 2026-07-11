@@ -79,8 +79,19 @@ def gather_region(pool,
                   tok0: int,
                   ntok: int,
                   out_dtype,
-                  out_lanes: int | None = None):
+                  out_lanes: int | None = None,
+                  split: int = 1):
     """Per-request typed read of a pool token-range.
+
+    ``split`` > 1 addresses a MANAGER-block token range on a pool born at
+    kernel granularity (a manager block is `split` consecutive kernel
+    blocks; ``state_indices`` are manager ids): whole-kernel-block ranges
+    go through one DMA window per request; a range inside a single kernel
+    block goes through the plain path at the kernel-block offset. Ranges
+    that straddle kernel blocks partially are unsupported (no current
+    region shape needs them).
+
+    Plain path (split == 1): per-request typed read of a pool token-range.
 
     pool: (num_blocks, block_size, heads2, lanes) KV dtype.
     state_indices: (num_reqs,) int32 block ids.
@@ -90,6 +101,28 @@ def gather_region(pool,
     pay no XLA lane-crossing relayout; the remaining outside reshape is
     lane-preserving (free).
     """
+    if split > 1:
+        kernel_bs = pool.shape[1]
+        if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
+            return _gather_window(pool,
+                                  state_indices,
+                                  split=split,
+                                  kb0=tok0 // kernel_bs,
+                                  nblocks=ntok // kernel_bs,
+                                  out_dtype=out_dtype,
+                                  out_lanes=out_lanes)
+        kb, local0 = divmod(tok0, kernel_bs)
+        if local0 + ntok > kernel_bs:
+            raise NotImplementedError(
+                "region partially straddles kernel blocks: "
+                f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}")
+        return gather_region(pool,
+                             state_indices * split + kb,
+                             tok0=local0,
+                             ntok=ntok,
+                             out_dtype=out_dtype,
+                             out_lanes=out_lanes)
+
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
     assert tok0 % ntok == 0 and tok0 + ntok <= block_size
@@ -140,14 +173,14 @@ def gather_region(pool,
     )(state_indices, pool)
 
 
-def gather_blocks(pool,
-                  mgr_indices,
-                  *,
-                  split: int,
-                  kb0: int,
-                  nblocks: int,
-                  out_dtype,
-                  out_lanes: int | None = None):
+def _gather_window(pool,
+                   mgr_indices,
+                   *,
+                   split: int,
+                   kb0: int,
+                   nblocks: int,
+                   out_dtype,
+                   out_lanes: int | None = None):
     """Typed read of `nblocks` whole kernel blocks inside each request's
     manager block, one grid step and ONE DMA window per request.
 
@@ -206,11 +239,11 @@ def gather_blocks(pool,
     )(mgr_indices, pool)
 
 
-def scatter_blocks(pool, vals, mgr_indices, *, split: int, kb0: int,
-                   nblocks: int):
+def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int,
+                    nblocks: int):
     """Typed write of `nblocks` whole kernel blocks inside each request's
     manager block (in place), one grid step per request; vals is the
-    gather_blocks shape. The aliased output window covers the whole
+    gather shape. The aliased output window covers the whole
     manager block, so the non-region kernel blocks are copied through
     from the aliased input to satisfy the full-write rule.
     """
@@ -273,14 +306,41 @@ def scatter_blocks(pool, vals, mgr_indices, *, split: int, kb0: int,
     )(mgr_indices, vals, pool)
 
 
-def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int):
-    """Per-request typed write of a pool token-range (in place).
+def scatter_region(pool,
+                   vals,
+                   state_indices,
+                   *,
+                   tok0: int,
+                   ntok: int,
+                   split: int = 1):
+    """Per-request typed write of a pool token-range (in place); mirrors
+    ``gather_region`` including the ``split`` manager-range routing.
 
     pool: (num_blocks, block_size, heads2, lanes) KV dtype (aliased;
     unwritten bytes preserved).
     vals: (num_reqs, rows, lanes) — the gather_region shape.
     returns: the updated pool.
     """
+    if split > 1:
+        kernel_bs = pool.shape[1]
+        if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
+            return _scatter_window(pool,
+                                   vals,
+                                   state_indices,
+                                   split=split,
+                                   kb0=tok0 // kernel_bs,
+                                   nblocks=ntok // kernel_bs)
+        kb, local0 = divmod(tok0, kernel_bs)
+        if local0 + ntok > kernel_bs:
+            raise NotImplementedError(
+                "region partially straddles kernel blocks: "
+                f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}")
+        return scatter_region(pool,
+                              vals,
+                              state_indices * split + kb,
+                              tok0=local0,
+                              ntok=ntok)
+
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
     assert tok0 % ntok == 0 and tok0 + ntok <= block_size
