@@ -28,6 +28,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     PcpStreamingSchedule, ScheduleField,
     build_pcp_streaming_active_page_groups,
     build_pcp_streaming_schedule_inputs_from_metadata_host,
+    build_pcp_streaming_schedule_inputs_from_metadata_jax,
     estimate_pcp_streaming_metadata_schedule_steps_ub,
     estimate_pcp_streaming_schedule_steps_ub, generate_pcp_streaming_schedule,
     generate_pcp_streaming_schedule_from_metadata_host,
@@ -902,8 +903,8 @@ def test_vectorized_schedule_supports_unaligned_multiple_active_requests():
     assert np.any(schedule.q_tile_size == 1)
 
 
-def test_generate_schedule_rejects_non_aligned_page_and_interleave_size():
-    with pytest.raises(NotImplementedError, match="page_size == interleave"):
+def test_generate_schedule_rejects_non_divisible_page_and_interleave_size():
+    with pytest.raises(NotImplementedError, match="divisible"):
         generate_pcp_streaming_schedule(
             kv_lens=[12],
             cu_q_lens=[0, 7],
@@ -911,7 +912,63 @@ def test_generate_schedule_rejects_non_aligned_page_and_interleave_size():
             block_tables=np.array([[100, 101]], dtype=np.int32),
             page_size=4,
             pcp_size=4,
-            interleave_size=2,
+            interleave_size=3,
             num_lanes=1,
-            bq_sz=2,
+            bq_sz=3,
         )
+
+
+@pytest.mark.parametrize("interleave_size", [0, -2])
+def test_metadata_jax_schedule_rejects_nonpositive_interleave_size(
+        interleave_size):
+    with pytest.raises(ValueError, match="interleave_size must be positive"):
+        build_pcp_streaming_schedule_inputs_from_metadata_jax(
+            kv_lens=np.array([4], dtype=np.int32),
+            page_indices=np.array([0], dtype=np.int32),
+            cu_q_lens=np.array([0, 4], dtype=np.int32),
+            distribution=np.array([0, 0, 1], dtype=np.int32),
+            global_bucket_tokens=4,
+            local_kv_cache_num_blocks=1,
+            page_size=4,
+            pcp_size=1,
+            interleave_size=interleave_size,
+            q_block_size=4,
+        )
+
+
+def test_metadata_schedule_supports_smaller_interleave_than_page_size():
+    actual = generate_pcp_streaming_schedule_from_metadata_host(
+        kv_lens=np.array([7], dtype=np.int32),
+        page_indices=np.array([10], dtype=np.int32),
+        cu_q_lens=np.array([0, 2], dtype=np.int32),
+        distribution=np.array([0, 0, 1], dtype=np.int32),
+        global_bucket_tokens=2,
+        local_kv_cache_num_blocks=16,
+        page_size=4,
+        pcp_size=2,
+        interleave_size=2,
+        q_block_size=2,
+    )
+    schedule = actual
+    active_page_groups = build_pcp_streaming_active_page_groups(schedule)
+    fields = {
+        name: unpack_pcp_streaming_schedule_field(schedule.packed_schedule,
+                                                  field)
+        for name, field in (
+            ("req_id", ScheduleField.REQ_ID),
+            ("kv_page_rank", ScheduleField.KV_PAGE_RANK),
+            ("kv_global_start", ScheduleField.KV_GLOBAL_START),
+            ("kv_valid_len", ScheduleField.KV_VALID_LEN),
+        )
+    }
+
+    np.testing.assert_array_equal(active_page_groups,
+                                  np.array([1], dtype=np.int32))
+    np.testing.assert_array_equal(fields["req_id"][:, :2, 0],
+                                  np.zeros((2, 2), dtype=np.int32))
+    np.testing.assert_array_equal(fields["kv_page_rank"][:, :2, 0],
+                                  np.array([[0, 1], [0, 1]], dtype=np.int32))
+    np.testing.assert_array_equal(fields["kv_global_start"][:, :2, 0],
+                                  np.array([[0, 2], [0, 2]], dtype=np.int32))
+    np.testing.assert_array_equal(fields["kv_valid_len"][:, :2, 0],
+                                  np.array([[4, 3], [4, 3]], dtype=np.int32))
