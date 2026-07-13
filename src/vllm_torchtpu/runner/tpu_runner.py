@@ -70,6 +70,7 @@ from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend)
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.vllm.sample.rejection_sampler import RejectionSampler
+from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
@@ -437,6 +438,10 @@ class TPUModelRunner(GPUModelRunner):
         self.speculative_config = self.vllm_config.speculative_config
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
+
+        # Dedicated RNG for non-greedy sampling, to keep the draws consistent
+        # across a replica's TP ranks (else they diverge -> collective hang).
+        self._sampling_generator: torch.Generator | None = None
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
@@ -2210,6 +2215,24 @@ class TPUModelRunner(GPUModelRunner):
             return None
         return self.spec_decode_manager.take_draft_token_ids()
 
+    def _get_sampling_generator(self) -> torch.Generator:
+        """Return the dedicated non-greedy sampling generator, seeded once.
+
+        Seeded lazily on first use from ``model_config.seed`` -- the same value
+        on every worker -- then advanced naturally by the draws (never reseeded
+        per step). A replica's TP ranks run in lockstep (same ``SchedulerOutput``
+        -> same bucketed draw shapes each step), so with the same seed they stay
+        at the same offset in the stream and sample identical tokens -- the
+        property spec decode needs to keep the TP ranks from diverging. (DP
+        replicas share the same base sequence but draw at their own pace on
+        independent request streams, so they decorrelate, which is fine.)
+        """
+        if self._sampling_generator is None:
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(self.model_config.seed or 0))
+            self._sampling_generator = gen
+        return self._sampling_generator
+
     @torch.no_grad()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -2221,6 +2244,9 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
+
+        # Used to keep rand draws consistent across TP ranks.
+        sampling_generator = self._get_sampling_generator()
 
         # Hand the per-chunk draft inputs to the proposer.
         if self.speculative_config and self.speculative_config.use_eagle():
@@ -2256,27 +2282,77 @@ class TPUModelRunner(GPUModelRunner):
             # Per-chunk device rejection outputs, kept for the async-spec
             # producer below.
             next_tokens_per_chunk: list[torch.Tensor] = []
+            cur_start_idx = 0
+            all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, md in zip(state.logits_list,
                                             state.num_reqs_list,
                                             state.spec_decode_metadata_list):
+                cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
-                    # Extract bonus tokens + gather target_logits from the target
-                    # model logits in one compiled region (bonus argmax + the two
-                    # gathers) so they don't eager-fuse per context.
-                    bonus_token_ids, target_logits = (
-                        self.spec_bonus_and_target_logits(
-                            logits, md.bonus_logits_indices,
-                            md.target_logits_indices))
-                    next_tokens = self.rejection_sampler(
-                        draft_token_ids=md.draft_token_ids,
-                        num_draft_tokens=md.draft_lengths,
-                        target_logits=target_logits,
-                        bonus_token_ids=bonus_token_ids,
-                        segment_ids=md.segment_ids,
-                        group_indices=md.group_indices,
-                        max_draft_tokens=self.speculative_config.
-                        num_speculative_tokens,
-                    )
+                    if all_greedy:
+                        # Extract bonus tokens + gather target_logits from the
+                        # target model logits in one compiled region (bonus argmax
+                        # + the two gathers) so they don't eager-fuse per context.
+                        bonus_token_ids, target_logits = (
+                            self.spec_bonus_and_target_logits(
+                                logits, md.bonus_logits_indices,
+                                md.target_logits_indices))
+                        next_tokens = self.rejection_sampler(
+                            draft_token_ids=md.draft_token_ids,
+                            num_draft_tokens=md.draft_lengths,
+                            target_logits=target_logits,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=md.segment_ids,
+                            group_indices=md.group_indices,
+                            max_draft_tokens=self.speculative_config.
+                            num_speculative_tokens,
+                        )
+                    else:
+                        # Gather bonus + target logits in one compiled region
+                        # (mirrors the greedy spec_bonus_and_target_logits) so
+                        # the raw logits[...] gathers don't eager-fuse into
+                        # per-context programs.
+                        bonus_logits, target_logits = (
+                            self.spec_gather_bonus_and_target_logits(
+                                logits, md.bonus_logits_indices,
+                                md.target_logits_indices))
+                        req_temperatures, req_top_k, req_top_p = (
+                            self._build_padded_sampling_params(
+                                cur_start_idx, cur_end_idx, bonus_logits))
+                        bonus_u = torch.rand_like(bonus_logits,
+                                                  generator=sampling_generator)
+                        bonus_token_ids = self.sample_from_logits_func(
+                            bonus_logits,
+                            req_temperatures,
+                            bonus_u,
+                            req_top_k,
+                            req_top_p,
+                            all_greedy=False,
+                        ).view(-1)
+                        accept_u = torch.rand(md.draft_token_ids.shape,
+                                              dtype=torch.float32,
+                                              device=target_logits.device,
+                                              generator=sampling_generator)
+                        recover_u = torch.rand_like(
+                            target_logits,
+                            dtype=torch.float32,
+                            generator=sampling_generator)
+                        next_tokens = self.rejection_sampler(
+                            draft_token_ids=md.draft_token_ids,
+                            num_draft_tokens=md.draft_lengths,
+                            target_logits=target_logits,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=md.segment_ids,
+                            group_indices=md.group_indices,
+                            max_draft_tokens=self.speculative_config.
+                            num_speculative_tokens,
+                            temperatures=req_temperatures[md.segment_ids],
+                            top_k=req_top_k[md.segment_ids],
+                            top_p=req_top_p[md.segment_ids],
+                            accept_u=accept_u,
+                            recover_u=recover_u,
+                            do_sampling=True,
+                        )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
@@ -2284,10 +2360,33 @@ class TPUModelRunner(GPUModelRunner):
                     dummy = torch.empty((1, 1),
                                         dtype=logits.dtype,
                                         device=logits.device)
-                    selected = self.sample_from_logits_func(logits,
-                                                            dummy,
-                                                            dummy,
-                                                            all_greedy=True)
+                    dummy_int = torch.empty((1, 1),
+                                            dtype=torch.int32,
+                                            device=logits.device)
+                    dummy_float = torch.empty((1, 1),
+                                              dtype=torch.float32,
+                                              device=logits.device)
+                    if all_greedy:
+                        selected = self.sample_from_logits_func(
+                            logits,
+                            dummy,
+                            dummy,
+                            dummy_int,
+                            dummy_float,
+                            all_greedy=True)
+                    else:
+                        temperatures_tpu, top_k_tpu, top_p_tpu = (
+                            self._build_padded_sampling_params(
+                                cur_start_idx, cur_end_idx, logits))
+                        u = torch.rand_like(logits,
+                                            generator=sampling_generator)
+                        selected = self.sample_from_logits_func(
+                            logits,
+                            temperatures_tpu,
+                            u,
+                            top_k_tpu,
+                            top_p_tpu,
+                            all_greedy=False)
                     padded = torch.full(
                         (selected.shape[0],
                          self.speculative_config.num_speculative_tokens + 1),
@@ -2299,6 +2398,7 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(padded)
                 self._update_num_xla_graphs("spec_step")
+                cur_start_idx = cur_end_idx
         else:
             cur_start_idx = 0
             req_ids = cast(
@@ -2323,13 +2423,25 @@ class TPUModelRunner(GPUModelRunner):
                         logits,
                         dummy_placeholder,
                         dummy_placeholder,
+                        torch.empty((1, 1),
+                                    dtype=torch.int32,
+                                    device=logits.device),
+                        torch.empty((1, 1),
+                                    dtype=torch.float32,
+                                    device=logits.device),
                         all_greedy=True)
                 else:
-                    temperatures_tpu = self._build_padded_temperatures(
-                        cur_start_idx, cur_end_idx, logits)
-                    u = torch.rand_like(logits)
+                    temperatures_tpu, top_k_tpu, top_p_tpu = (
+                        self._build_padded_sampling_params(
+                            cur_start_idx, cur_end_idx, logits))
+                    u = torch.rand_like(logits, generator=sampling_generator)
                     selected_token_ids = self.sample_from_logits_func(
-                        logits, temperatures_tpu, u, all_greedy=all_greedy)
+                        logits,
+                        temperatures_tpu,
+                        u,
+                        top_k_tpu,
+                        top_p_tpu,
+                        all_greedy=all_greedy)
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
@@ -2841,10 +2953,18 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=self._hidden_states_dtype,
                     device=self.device)
                 dummy_u = torch.rand_like(dummy_logits)
+                dummy_top_k = torch.zeros((num_reqs, 1),
+                                          dtype=torch.int32,
+                                          device=self.device)
+                dummy_top_p = torch.ones((num_reqs, 1),
+                                         dtype=torch.float32,
+                                         device=self.device)
                 for all_greedy in [False, True]:
                     out = self.sample_from_logits_func(dummy_logits,
                                                        dummy_temperatures,
                                                        dummy_u,
+                                                       dummy_top_k,
+                                                       dummy_top_p,
                                                        all_greedy=all_greedy)
                     sync.synchronize(out, wait=True)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -2901,17 +3021,25 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
 
-        The rejection sampler (``_greedy_rejection_sample_with_segment``) is
-        ``@torch.compile(backend="tpu", dynamic=False)`` -> a fresh graph per
-        input shape, and the ``logits[...]`` gathers + bonus ``argmax`` around
-        it are eager. None are covered by ``_precompile_sampling_subgraphs``
-        (non-spec sampling only) or ``drafter.precompile()`` (draft forward
-        only), so they recompile every time the verify length
-        (``padded_logits_length``) lands in a new num-tokens bucket as requests
-        finish and the batch shrinks. Replay the verify inner body (the
-        ``use_spec`` branch in ``sample_tokens``) at every
-        ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
+        The rejection sampler is ``@torch.compile(backend="tpu",
+        dynamic=False)`` -> a fresh graph per input shape, and the
+        ``logits[...]`` gathers around it are eager. None are covered by
+        ``_precompile_sampling_subgraphs`` (non-spec sampling only) or
+        ``drafter.precompile()`` (draft forward only), so they recompile every
+        time the verify length (``padded_logits_length``) lands in a new
+        num-tokens bucket as requests finish and the batch shrinks. Replay the
+        verify inner body (the ``use_spec`` branch in ``sample_tokens``) at
+        every ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
         produce so the real call is a cache hit. Shared sync + async.
+
+        Both verify sub-branches are distinct ``dynamic=False`` graphs, so warm
+        each: greedy (``do_sampling=False`` ->
+        ``_greedy_rejection_sample_with_segment``, prelude
+        ``spec_bonus_and_target_logits``) and non-greedy (``do_sampling=True``
+        -> ``_random_rejection_sample_with_segment``, prelude
+        ``spec_gather_bonus_and_target_logits``). Which one runs is decided per
+        step by ``input_batch.all_greedy``, so both are reachable and must be
+        pre-compiled here.
         """
         if not (self.speculative_config is not None
                 and self.speculative_config.use_eagle()):
@@ -2950,6 +3078,7 @@ class TPUModelRunner(GPUModelRunner):
                     bonus_logits_indices = torch.zeros(num_reqs,
                                                        dtype=torch.int32,
                                                        device=self.device)
+                    # --- greedy verify path (do_sampling=False) ---
                     bonus_token_ids, target_logits_warm = (
                         self.spec_bonus_and_target_logits(
                             dummy_logits, bonus_logits_indices,
@@ -2962,6 +3091,42 @@ class TPUModelRunner(GPUModelRunner):
                         segment_ids=segment_ids,
                         group_indices=group_indices,
                         max_draft_tokens=k,
+                    )
+                    sync.synchronize(out, wait=True)
+                    # --- non-greedy verify path (do_sampling=True) ---
+                    _, target_logits_ng = (
+                        self.spec_gather_bonus_and_target_logits(
+                            dummy_logits, bonus_logits_indices,
+                            target_logits_indices))
+                    warm_temps = torch.zeros((num_tokens, 1),
+                                             dtype=self._hidden_states_dtype,
+                                             device=self.device)
+                    warm_top_k = torch.zeros((num_tokens, 1),
+                                             dtype=torch.int32,
+                                             device=self.device)
+                    warm_top_p = torch.ones((num_tokens, 1),
+                                            dtype=torch.float32,
+                                            device=self.device)
+                    warm_accept_u = torch.zeros(num_tokens,
+                                                dtype=torch.float32,
+                                                device=self.device)
+                    warm_recover_u = torch.zeros((num_tokens, self.vocab_size),
+                                                 dtype=torch.float32,
+                                                 device=self.device)
+                    out = self.rejection_sampler(
+                        draft_token_ids=draft_token_ids,
+                        num_draft_tokens=draft_lengths,
+                        target_logits=target_logits_ng,
+                        bonus_token_ids=bonus_token_ids,
+                        segment_ids=segment_ids,
+                        group_indices=group_indices,
+                        max_draft_tokens=k,
+                        temperatures=warm_temps,
+                        top_k=warm_top_k,
+                        top_p=warm_top_p,
+                        accept_u=warm_accept_u,
+                        recover_u=warm_recover_u,
+                        do_sampling=True,
                     )
                     sync.synchronize(out, wait=True)
                     logger.info("  -- padded_logits_length: %d, num_seqs: %d",
@@ -3019,8 +3184,10 @@ class TPUModelRunner(GPUModelRunner):
         ops into *combined* programs that depend on the live dispatch sequence —
         which an isolated precompile cannot reproduce. The only way to emit those
         exact fused programs is to run the real two-phase execute path once. We
-        do that here on a synthetic greedy request, then fully tear the request
-        down so serving starts from a clean batch. execute_model / sample_tokens
+        do that here on synthetic requests -- both greedy and non-greedy
+        (do_sampling=True), since the two verify+sample paths fuse into distinct
+        programs -- then fully tear each request down so serving starts from a
+        clean batch. execute_model / sample_tokens
         branch internally on async_scheduling, so this same body warms whichever
         mode the process is configured for: in async it auto-routes through the
         real async dispatch (the unified device-seeded propose,
@@ -3060,29 +3227,39 @@ class TPUModelRunner(GPUModelRunner):
                 # max_model_len, e.g. small max_model_len configs.
                 if int(P) > self.max_model_len:
                     continue
-                if not self._warmup_one_spec_request(int(P), idx=i,
-                                                     quiet=True):
-                    # First attempt cold-compiles the draft forward; a SymInt
-                    # from that cold compile can leak into the dynamic=False
-                    # gather wrapper on the first bucket. Retry once now that the
-                    # forward is compiled and returns concrete-shaped tensors
-                    # (this attempt logs loudly if it also fails).
-                    self._warmup_one_spec_request(int(P), idx=i)
+                # Greedy and non-greedy (do_sampling=True) verify+sample are
+                # DISTINCT fused programs, so sweep both at every prompt bucket.
+                for greedy in (True, False):
+                    if not self._warmup_one_spec_request(
+                            int(P), idx=i, quiet=True, greedy=greedy):
+                        # First attempt cold-compiles the draft forward; a
+                        # SymInt from that cold compile can leak into the
+                        # dynamic=False gather wrapper on the first bucket. Retry
+                        # once now that the forward is compiled and returns
+                        # concrete-shaped tensors (this attempt logs loudly if it
+                        # also fails).
+                        self._warmup_one_spec_request(int(P),
+                                                      idx=i,
+                                                      greedy=greedy)
             # (2) The propose+verify+sampling fusions are also keyed on the
             # decode batch size (num_reqs). Only relevant when serving actually
             # batches (>1 concurrent request); sweep real multi-request batches
-            # so nr>1 serving steps are cached too.
+            # so nr>1 serving steps are cached too -- both greedy and non-greedy.
             if self.scheduler_config.max_num_seqs > 1:
                 P_small = int(self.num_tokens_paddings[0])
                 for R in self.num_reqs_paddings:
                     if int(R) > 1:
-                        self._warmup_spec_batch(int(R), P_small)
+                        self._warmup_spec_batch(int(R), P_small, greedy=True)
+                        self._warmup_spec_batch(int(R), P_small, greedy=False)
         logger.info("spec-decode warmup compiled %d graphs",
                     self.num_xla_graphs - n0)
 
-    def _warmup_spec_batch(self, R: int, P: int) -> None:
+    def _warmup_spec_batch(self, R: int, P: int, greedy: bool = True) -> None:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode
-        them together so the multi-request fused programs are compiled."""
+        them together so the multi-request fused programs are compiled.
+
+        greedy=False routes the non-greedy (do_sampling=True) verify+sample
+        fusion, which is a distinct set of programs from the greedy path."""
         from vllm.sampling_params import SamplingParams
         from vllm.v1.core.sched.output import (CachedRequestData,
                                                NewRequestData, SchedulerOutput)
@@ -3100,7 +3277,7 @@ class TPUModelRunner(GPUModelRunner):
                 "skip spec-decode warmup R=%d: not enough kv blocks", R)
             return
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
-        sp = SamplingParams(temperature=0.0)
+        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         try:
             # ---- batched prefill of R requests (disjoint top-of-pool blocks) --
             new_reqs = []
@@ -3161,7 +3338,8 @@ class TPUModelRunner(GPUModelRunner):
     def _warmup_one_spec_request(self,
                                  P: int,
                                  idx: int,
-                                 quiet: bool = False) -> bool:
+                                 quiet: bool = False,
+                                 greedy: bool = True) -> bool:
         """Run one synthetic spec-decode request (prefill P + decodes).
 
         Returns True on success, False if the warmup raised (and was caught).
@@ -3196,7 +3374,7 @@ class TPUModelRunner(GPUModelRunner):
             return
         blk = list(range(top - nblk, top))
         block_ids = tuple(list(blk) for _ in range(ng))
-        sp = SamplingParams(temperature=0.0)  # greedy -> exercises reject path
+        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         try:
             # ---- prefill ----
             new_req = NewRequestData(req_id=rid,
@@ -3800,15 +3978,35 @@ class TPUModelRunner(GPUModelRunner):
             out, aux_hidden_states = out
         return out, aux_hidden_states
 
-    def _build_padded_temperatures(self, cur_start_idx: int, cur_end_idx: int,
-                                   logits: torch.Tensor) -> torch.Tensor:
-        # Stage [padded_num_reqs] on CPU (neutral 1.0 for padding slots),
-        # then one fixed-shape H2D copy to keep decode shape-stable.
+    def _build_padded_sampling_params(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Stage [padded_num_reqs] on CPU with neutral padding, then use one
+        # fixed-shape H2D copy per tensor to keep decode shape-stable.
         padded_num_reqs = logits.shape[0]
+        num_active_reqs = cur_end_idx - cur_start_idx
         temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
-        temps_cpu[:cur_end_idx - cur_start_idx].copy_(
+        top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
+        top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
+
+        temps_cpu[:num_active_reqs].copy_(
             self.input_batch.temperature_cpu_tensor[cur_start_idx:cur_end_idx])
-        return temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True)
+        active_top_k = self.input_batch.top_k_cpu_tensor[
+            cur_start_idx:cur_end_idx]
+        top_k_cpu[:num_active_reqs].copy_(
+            torch.where(active_top_k >= self.vocab_size,
+                        torch.zeros_like(active_top_k), active_top_k))
+        top_p_cpu[:num_active_reqs].copy_(
+            self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx])
+
+        return (
+            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+        )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
@@ -3835,6 +4033,23 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_token_ids, target_logits
 
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_gather_bonus_and_target_logits(
+        self, logits: torch.Tensor, bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Non-greedy verify prelude: gather the bonus-token logits and the
+        # target_logits rows in ONE compiled region keyed on [num_reqs,
+        # num_tokens] shapes. Unlike the greedy spec_bonus_and_target_logits,
+        # the bonus row is kept as FULL logits (not argmax'd) because the
+        # non-greedy path samples the bonus token from them. Run raw, the
+        # logits[indices] gathers are eager ops torch-tpu's DEFER_AND_FUSE fuses
+        # with the live per-step dispatch into per-context programs (cold
+        # recompiles).index_select is value-identical to logits[indices].
+        bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+        target_logits = torch.index_select(logits, 0, target_logits_indices)
+        return bonus_logits, target_logits
+
     def _apply_temperature(self, logits: torch.Tensor,
                            temperatures: torch.Tensor) -> torch.Tensor:
         safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
@@ -3847,6 +4062,8 @@ class TPUModelRunner(GPUModelRunner):
                            logits: torch.Tensor,
                            temperatures: torch.Tensor,
                            u: torch.Tensor,
+                           top_k: torch.Tensor,
+                           top_p: torch.Tensor,
                            all_greedy: bool = False) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
@@ -3856,11 +4073,12 @@ class TPUModelRunner(GPUModelRunner):
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
+        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
         u_clamped = torch.clamp(u,
                                 min=torch.finfo(u.dtype).tiny,
                                 max=1.0 - torch.finfo(u.dtype).eps)
         gumbel_noise = -torch.log(-torch.log(u_clamped))
-        noisy_logits = scaled_logits + gumbel_noise
+        noisy_logits = masked_logits + gumbel_noise
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
 

@@ -212,7 +212,10 @@ def probe_pcp_local_rank_remap(
                 "TORCH_TPU_XPROF_SESSION_ID": str(time.time_ns()),
             })
             log_path = os.path.join(tmpdir, f"rank-{rank}.log")
-            log_file = open(log_path, "w+", encoding="utf-8")
+            # errors="replace": verbose libtpu output (e.g. under TPU_VMODULE)
+            # can contain non-UTF8 bytes; a strict read kills the server
+            # inside VllmConfig validation.
+            log_file = open(log_path, "w+", encoding="utf-8", errors="replace")
             proc = subprocess.Popen(
                 [sys.executable, "-c", _PCP_REMAP_PROBE_SCRIPT],
                 stdout=log_file,

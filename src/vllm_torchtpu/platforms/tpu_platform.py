@@ -73,6 +73,14 @@ def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
 def _configure_torchtpu_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
     previous_mode = execution_mode.eager_mode
+    # Kernel-iteration mode keeps DEFER_NEVER: DEFER_AND_FUSE fuses the eager
+    # region around the split-out Pallas ops into per-context device programs,
+    # each of which recompiles after a kernel hot-swap. With DEFER_NEVER the
+    # kernel program is context-free, so a swap costs one kernel compile.
+    if envs.TPU_KERNEL_ITER_MODE:
+        logger.info("TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).",
+                    previous_mode.name)
+        return
     execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
     logger.info("TorchTPU eager mode configured: %s (previous=%s)",
                 execution_mode.eager_mode.name, previous_mode.name)
@@ -102,6 +110,57 @@ def _unwrap_dynamic_compile_fns() -> None:
             setattr(mod, fn_name, fn.__wrapped__)
             logger.debug("Unwrapped @torch.compile(dynamic=True) from %s.%s",
                          module_path, fn_name)
+
+
+def _patch_api_server_kernel_reload_endpoint() -> None:
+    """Add ``POST /reload_kernel`` to the OpenAI API server.
+
+    Kernel-iteration mode only. Wraps ``api_server.build_app`` so the route
+    is present on the served app; the request body may carry an optional
+    ``{"modules": [...]}`` override of the reloadable module list. Only takes
+    effect in the API-server process (the module is already imported there
+    when the platform activates); worker processes never import it.
+    """
+    if not envs.TPU_KERNEL_ITER_MODE:
+        return
+    import sys
+    api_server = sys.modules.get("vllm.entrypoints.openai.api_server")
+    if api_server is None or getattr(api_server, "_tpu_kernel_reload_patch",
+                                     False):
+        return
+
+    orig_build_app = api_server.build_app
+
+    def build_app_with_reload(*args, **kwargs):
+        app = orig_build_app(*args, **kwargs)
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+
+        @app.post("/reload_kernel")
+        async def reload_kernel(raw_request: Request):
+            modules = None
+            body = await raw_request.body()
+            if body:
+                import json
+                modules = json.loads(body).get("modules")
+            client = raw_request.app.state.engine_client
+            # The next request after the swap pays the kernel compile; make
+            # sure no batch is in flight while the workers swap.
+            if hasattr(client, "wait_for_requests_to_drain"):
+                await client.wait_for_requests_to_drain()
+            results = await client.collective_rpc(
+                "reload_kernels",
+                timeout=1800,
+                kwargs={"modules": modules},
+            )
+            return JSONResponse({"results": results})
+
+        return app
+
+    api_server.build_app = build_app_with_reload
+    api_server._tpu_kernel_reload_patch = True
+    logger.info("Applied TPU patch: /reload_kernel dev endpoint "
+                "(TPU_KERNEL_ITER_MODE).")
 
 
 def _patch_scheduler_mamba_external_kv() -> None:
@@ -205,6 +264,7 @@ def apply_tpu_patches() -> None:
     import vllm_torchtpu.layers.vllm.vision_attention  # noqa: F401
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
+    _patch_api_server_kernel_reload_endpoint()
 
 
 class TpuPlatform(Platform):
@@ -230,7 +290,8 @@ class TpuPlatform(Platform):
         "MOE_REQUANTIZE_BLOCK_SIZE", "MOE_REQUANTIZE_WEIGHT_DTYPE",
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
-        "TORCH_TPU_TOPOLOGY"
+        "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
+        "TPU_KERNEL_RELOAD_MODULES"
     ]
 
     @classmethod
@@ -418,6 +479,20 @@ class TpuPlatform(Platform):
 
         # No graph splitting — TPU handles the full graph including
         compilation_config.splitting_ops = []
+
+        # Kernel-iteration mode splits the compiled graph at the Pallas RPA
+        # custom ops so they execute eagerly outside the compiled pieces.
+        # Together with the cache-key scoping in tpu_compiler.py this lets a
+        # kernel-source edit reuse the cached backbone executables, and lets
+        # /reload_kernel swap the kernel in a running server. Op instance ids
+        # are allocated at model build, so list every id the registry could
+        # plausibly allocate (should_split does exact name matching).
+        if envs.TPU_KERNEL_ITER_MODE:
+            compilation_config.splitting_ops = [
+                f"pallas::{prefix}_{i}"
+                for prefix in ("rpa_kernel", "rpa_kernel_batched")
+                for i in range(64)
+            ]
 
         # Disable inductor-specific fusion passes (only available on CUDA).
         compilation_config.pass_config.fuse_norm_quant = False
@@ -668,15 +743,6 @@ class TpuPlatform(Platform):
                                             SamplingType.RANDOM):
                 raise ValueError(
                     f"Sampling type {params.sampling_type} is not supported on TPU."
-                )
-            if getattr(cls, "_speculative_enabled",
-                       False) and params.sampling_type != SamplingType.GREEDY:
-                raise NotImplementedError(
-                    "Speculative decoding currently only supports greedy "
-                    "sampling (temperature=0) on TPU.")
-            if params.top_k != 0 or params.top_p != 1.0:
-                logger.warning(
-                    "Top-K and Top-P are not yet supported on TPU and will be ignored."
                 )
 
     @classmethod

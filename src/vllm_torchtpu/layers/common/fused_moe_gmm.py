@@ -17,10 +17,29 @@ import functools
 import jax
 from jax import numpy as jnp
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.sparse_core.ragged_gather import ragged_gather
+from vllm_torchtpu.kernels.sparse_core.ragged_gather import \
+    ragged_gather as ragged_gather_v1
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
-    ragged_gather_reduce
+    ragged_gather_reduce as ragged_gather_reduce_v1
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
+    ragged_gather_reduce as ragged_gather_reduce_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+
+# Select the SparseCore MoE gather and gather-reduce kernels independently at
+# import time, driven by the RAGGED_GATHER_VERSION / RAGGED_GATHER_REDUCE_VERSION
+# env vars (set in the server process before boot, so they are fixed for the
+# server's lifetime). Both default to "v2" (the new kernels); set either to "v1"
+# to fall back to the legacy kernel. Call sites below use the bound names.
+if envs.RAGGED_GATHER_VERSION == "v1":
+    ragged_gather = ragged_gather_v1
+else:
+    ragged_gather = ragged_gather_v2
+if envs.RAGGED_GATHER_REDUCE_VERSION == "v1":
+    ragged_gather_reduce = ragged_gather_reduce_v1
+else:
+    ragged_gather_reduce = ragged_gather_reduce_v2
 
 
 def gmm_wrapper(lhs,

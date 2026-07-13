@@ -8,6 +8,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 
 import copy
 import hashlib
+import importlib.util
 import os
 import pickle
 from pathlib import Path
@@ -67,7 +68,40 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
         logger.warning(
             "[TpuCompilerAdaptor] Cache key source path missing: %s", path)
 
+    if envs.TPU_KERNEL_ITER_MODE:
+        for relpath in _reloadable_kernel_relpaths(repo_root):
+            files_by_relpath.pop(relpath, None)
+
     return [files_by_relpath[key] for key in sorted(files_by_relpath)]
+
+
+def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
+    """Repo-relative paths of the hot-reloadable kernel modules.
+
+    In kernel-iteration mode these execute eagerly outside the compiled
+    pieces (splitting_ops in tpu_platform.py) and are re-lowered from source
+    per process / per reload, so their bytes no longer affect the cached
+    executables and are dropped from the cache key. Everything else in
+    _RUNTIME_CACHE_KEY_PATHS stays hashed.
+    """
+    from vllm_torchtpu.compilation import kernel_reload
+
+    relpaths = []
+    for mod_name in kernel_reload.default_reload_modules():
+        spec = importlib.util.find_spec(mod_name)
+        origin = getattr(spec, "origin", None) if spec else None
+        if not origin:
+            logger.warning(
+                "[TpuCompilerAdaptor] Cannot resolve reload module %s; its "
+                "file stays in the cache key.", mod_name)
+            continue
+        try:
+            relpaths.append(
+                Path(origin).resolve().relative_to(repo_root).as_posix())
+        except ValueError:
+            # Outside the repo root: never part of the hashed set anyway.
+            continue
+    return relpaths
 
 
 # TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source

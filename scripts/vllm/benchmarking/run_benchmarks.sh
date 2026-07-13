@@ -105,6 +105,11 @@ ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
 RANDOM_RANGE_RATIO=""
 BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
+# Empty => do not pass --temperature, so the server default applies
+# (for Qwen3-Coder the model's generation_config enables sampling =>
+# non-greedy: temp 0.7 / top_p 0.8 / top_k 20).
+# Set to 0 for deterministic greedy decoding.
+BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
 EVAL_TOLERANCE=""
 
@@ -283,6 +288,14 @@ run_benchmark_once() {
         profile_arg="--profile"
     fi
 
+    # Force greedy (or any fixed temperature) when BENCHMARK_TEMPERATURE is set.
+    # Otherwise vllm bench serve sends no temperature and the server's
+    # generation_config decides sampling.
+    local temperature_arg=()
+    if [ -n "${BENCHMARK_TEMPERATURE:-}" ]; then
+        temperature_arg=(--temperature "$BENCHMARK_TEMPERATURE")
+    fi
+
     set +e
     vllm bench serve \
         --backend vllm \
@@ -300,6 +313,7 @@ run_benchmark_once() {
         --ignore-eos \
         --result-filename "$result_file" \
         $profile_arg \
+        "${temperature_arg[@]}" \
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
     set -e
@@ -323,6 +337,11 @@ if [ -n "$PROFILE_DIR" ]; then
 else
     profile_dir_json=null
 fi
+if [ -n "$BENCHMARK_TEMPERATURE" ]; then
+    benchmark_temperature_json=$BENCHMARK_TEMPERATURE
+else
+    benchmark_temperature_json=null
+fi
 
 # Save config metadata
 cat > "$RESULTS_DIR/config.json" << EOF
@@ -335,6 +354,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "isl_osl_configs": "$ISL_OSL_CONFIGS",
     "concurrency_options": "$CONCURRENCY_OPTIONS",
     "benchmark_warmup_runs": $BENCHMARK_WARMUP_RUNS,
+    "benchmark_temperature": $benchmark_temperature_json,
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,
@@ -358,6 +378,7 @@ echo "  TP=$TENSOR_PARALLELISM DP=$DATA_PARALLELISM EP=$ENABLE_EP"
 echo "  ISL/OSL: $ISL_OSL_CONFIGS"
 echo "  Concurrency: $CONCURRENCY_OPTIONS"
 echo "  Benchmark warmup runs: $BENCHMARK_WARMUP_RUNS"
+echo "  Benchmark temperature: ${BENCHMARK_TEMPERATURE:-<server default (non-greedy)>}"
 echo "  Results: $RESULTS_DIR"
 echo "================================================"
 

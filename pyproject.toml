@@ -39,13 +39,16 @@ dependencies = [
     # incompatible with torchvision's compiled `nms` op specifically (see
     # README troubleshooting tip) - plain import and non-nms ops are fine.
     "torchvision==0.26.0",
-    # jaxlib 0.10.0 is required by the fused GDN prefill scan kernel
-    # (recurrent_scan_v2 / chunked_kernel_pd): jaxlib 0.9.2's Mosaic rejects its
-    # tiled-squeeze. Verified compatible with the pinned torch-tpu wheel.
-    "jax==0.10.0",
-    "jaxlib==0.10.0",
-    # libtpu 0.0.41 regresses 30B decode TPOT ~2.9x in CI; keep 0.0.40 until fixed.
-    "libtpu==0.0.40",
+    # See the JAX fori-loop lowering monkey-patch in
+    # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
+    # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
+    "jax==0.10.2",
+    "jaxlib==0.10.2",
+    # This libtpu pin needs the workarounds in src/vllm_torchtpu/env_override.py
+    # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
+    # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
+    # bumping.
+    "libtpu==0.0.42.1",
     "ray[default]",
     "ray[data]",
 ]

@@ -12,6 +12,7 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType)
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
@@ -544,7 +545,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         op_name = f"{self._kernel_op_prefix}_{kernel_instance_id}"
 
         if use_pcp_streaming:
-            wrapped_fn = make_pcp_streaming_rpa_kernel(
+            pcp_make_kwargs = dict(
                 mesh=mesh,
                 sliding_window=self.sliding_window,
                 sm_scale=self.scale,
@@ -556,6 +557,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                 max_model_len=max_model_len,
             )
+            wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
             # Prepare wrapper function with static arguments.
             wrapped_fn = functools.partial(
@@ -572,18 +574,46 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
         # This prevents torch.compile from tracing into the Pallas kernel internals.
+        #
+        # Kernel-iteration mode runs the op eagerly between compiled pieces
+        # (splitting_ops); donating kv_cache there kills the buffer that
+        # rpa_kernel_impl's copy_ writes back into. Inside a compiled full
+        # graph XLA rewires the alias, so donation is only safe when the op
+        # is compiled.
+        rpa_donate_argnums = (None if envs.TPU_KERNEL_ITER_MODE else (0, ))
         if use_pcp_streaming:
             rpa_kernel_op = pcp_streaming_jax_op(
                 op_name,
                 wrapped_fn,
-                donate_argnums=(0, ),
+                donate_argnums=rpa_donate_argnums,
                 mesh=op_mesh,
                 input_partition_specs=input_partition_specs)
+            if envs.TPU_KERNEL_ITER_MODE:
+                from vllm_torchtpu.compilation import kernel_reload
+
+                def _rebuild_pcp_callable(name=op_name,
+                                          make_kwargs=pcp_make_kwargs,
+                                          op_mesh=op_mesh,
+                                          specs=input_partition_specs,
+                                          donate=rpa_donate_argnums):
+                    import importlib
+                    adapter = importlib.import_module(
+                        "vllm_torchtpu.kernels.experimental."
+                        "pcp_streaming_rpa.vllm_adapter")
+                    fn = adapter.make_pcp_streaming_rpa_kernel(**make_kwargs)
+                    return adapter.build_pcp_streaming_callable(
+                        name,
+                        fn,
+                        donate_argnums=donate,
+                        mesh=op_mesh,
+                        input_partition_specs=specs)
+
+                kernel_reload.register_builder(op_name, _rebuild_pcp_callable)
         else:
             rpa_kernel_op = pallas.jax_op(
                 op_name,
                 wrapped_fn,
-                donate_argnums=(0, ),
+                donate_argnums=rpa_donate_argnums,
                 mesh=op_mesh,
                 input_partition_specs=(input_partition_specs))
 

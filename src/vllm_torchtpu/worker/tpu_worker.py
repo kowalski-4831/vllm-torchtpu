@@ -458,6 +458,31 @@ class TPUWorker(WorkerBase):
         self.compilation_config.compilation_time = compilation_time
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
+    def reload_kernels(self, modules: list[str] | None = None) -> dict:
+        """Kernel-iteration hot-reload: re-import the reloadable kernel
+        sources and swap the live callables behind the registered custom ops.
+
+        Invoked on every worker via collective_rpc from the /reload_kernel
+        dev endpoint. Requires TPU_KERNEL_ITER_MODE=1: the ops execute
+        eagerly outside the cached compiled pieces, so swapping them cannot
+        leave stale compiled graphs. No eager rewarm is performed — the
+        serving path builds the device program around the swapped kernel
+        with its own identity, so a pre-warm compiles a program serving
+        would not reuse; the first request after the swap pays the single
+        kernel compile instead.
+        """
+        if not envs.TPU_KERNEL_ITER_MODE:
+            raise RuntimeError(
+                "reload_kernels requires TPU_KERNEL_ITER_MODE=1")
+        from vllm_torchtpu.compilation import kernel_reload
+
+        start = time.perf_counter()
+        stats = kernel_reload.reload_kernels(modules)
+        stats["rank"] = self.rank
+        stats["total_s"] = round(time.perf_counter() - start, 3)
+        logger.info("Kernel hot-reload done: %s", stats)
+        return stats
+
     def get_model(self):
         return self.model_runner.get_model()
 

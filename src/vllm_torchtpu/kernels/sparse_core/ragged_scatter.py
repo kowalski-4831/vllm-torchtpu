@@ -20,6 +20,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu.kernels.sparse_core import core_map_helper
+
 
 def main_kernel(
     # Inputs.
@@ -426,25 +428,25 @@ def ragged_scatter(x: jax.Array, indices: jax.Array, start: jax.Array,
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return pl.kernel(
+    return core_map_helper.kernel(
         functools.partial(
             main_kernel,
             core_axis_name=vector_mesh.core_axis_name,
             subcore_axis_name=vector_mesh.subcore_axis_name,
         ),
-        out_shape=jax.ShapeDtypeStruct(
+        out_type=jax.ShapeDtypeStruct(
             (out_size + out_pad_size, aligned_hidden_size), dtype),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             disable_bounds_checks=True,
         ),
-        scratch_shapes=[
-            pltpu.VMEM((num_simd_lanes, ), jnp.int32),  # total_num_rows
-            pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
-            pltpu.VMEM((num_simd_lanes, ), jnp.int32),  # src_indices
-            pltpu.VMEM((num_simd_lanes, ), jnp.int32),  # dst_indices
-            pltpu.SemaphoreType.DMA((2, )),
-        ],
+        scratch_types=dict(
+            total_num_rows_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
+            out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
+            src_indices_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
+            dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
+            sem_ref=pltpu.SemaphoreType.DMA((2, )),
+        ),
         mesh=vector_mesh,
         name="sc_ragged_scatter",
     )(total_num_rows, x, src_indices, dst_indices)[:out_size, :hidden_size]
