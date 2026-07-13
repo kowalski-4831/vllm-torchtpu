@@ -35,8 +35,7 @@ def _copy_fn(pool: jax.Array, src: jax.Array,
 
 _copy_op = pallas.jax_op("pallas::mamba_state_block_copy",
                          _copy_fn,
-                         donate_argnums=(0, ),
-                         inplace_donate=True)
+                         donate_argnums=(0, ))
 
 
 def _fake_copy(pool: torch.Tensor, src: torch.Tensor, dst: torch.Tensor):
@@ -51,7 +50,7 @@ _copy_op.register_fake(_fake_copy)
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def copy_mamba_state_blocks(pool: torch.Tensor, src: torch.Tensor,
                             dst: torch.Tensor) -> torch.Tensor:
-    # The pool is donated and written in place; the scalar keeps the op live.
+    # Plain donation + copy_ writeback (aliased in-place by XLA; no #2185).
     new_pool, marker = _copy_op(pool, src, dst)
-    del new_pool
+    pool.copy_(new_pool)
     return marker

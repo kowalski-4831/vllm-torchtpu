@@ -366,20 +366,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # adapters, so it is the only donated input. inplace-donation
         # aliases its program-level output to the input buffer so the
         # ~pool-sized update is not double-counted at compile.
-        gdn_jax_op = pallas.jax_op(op_name,
-                                   wrapped_fn,
-                                   donate_argnums=(3, ),
-                                   inplace_donate=True)
-        # The op returns (new_rec, outputs); the donated recurrent state
-        # (input 3) aliases new_rec (output 0), not output 3. The donation
-        # pass assumes output_idx == input_idx by default, so stamp the
-        # explicit input->output map it reads.
-        _donate_out_map = {3: 0}
-        _attr = "_pallas_inplace_donate_output_map"
-        setattr(gdn_jax_op, _attr, _donate_out_map)
-        _opoverload = getattr(gdn_jax_op, "_opoverload", None)
-        if _opoverload is not None:
-            setattr(_opoverload, _attr, _donate_out_map)
+        gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, ))
 
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
@@ -404,10 +391,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                           query_start_loc,
                                           request_distribution, seq_lens)
 
-            # recurrent_state is donated and written in place by the scatter
-            # kernels inside the op (ssm and conv regions), so new_rec
-            # aliases its buffer and no copy_ is needed.
-            del new_rec
+            # Plain donation + copy_ writeback (aliased in-place by XLA; no #2185).
+            recurrent_state.copy_(new_rec)
 
             return outputs
 
