@@ -63,9 +63,8 @@ def get_test_prompts(speculative_config: dict):
     raise NotImplementedError(f"{method} is not supported yet.")
 
 
-@pytest.fixture
-def sampling_config():
-    return SamplingParams(temperature=0,
+def _make_sampling_config(temperature: float = 0) -> SamplingParams:
+    return SamplingParams(temperature=temperature,
                           max_tokens=16,
                           ignore_eos=True,
                           repetition_penalty=1,
@@ -73,6 +72,11 @@ def sampling_config():
                           presence_penalty=0,
                           min_p=0,
                           logprobs=None)
+
+
+@pytest.fixture
+def sampling_config():
+    return _make_sampling_config()
 
 
 @pytest.fixture
@@ -255,35 +259,53 @@ def test_ngram_performance_greedy(
 @pytest.mark.parametrize(
     "max_num_seqs", [pytest.param(1, id="bs1"),
                      pytest.param(4, id="bs4")])
-def test_eagle3_performance_greedy(
+@pytest.mark.parametrize(
+    "temperature, min_acceptance_rate",
+    # Non-greedy accepts fewer drafts than greedy (the target samples instead
+    # of taking the argmax), so it gets a lower floor. The floor is a
+    # regression guard against a broken non-greedy/async pipeline (acceptance
+    # collapsing to ~0, hangs, or empty output), not a quality target. The run
+    # is deterministic: sampling draws come from the runner's seeded generator
+    # (model_config.seed, default 0), so the rate is reproducible run-to-run.
+    [
+        pytest.param(0.0, 0.75, id="greedy"),
+        pytest.param(0.7, 0.3, id="non_greedy")
+    ])
+def test_eagle3_performance(
     monkeypatch: pytest.MonkeyPatch,
-    sampling_config: SamplingParams,
     max_num_seqs: int,
     async_scheduling: bool,
+    temperature: float,
+    min_acceptance_rate: float,
 ):
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
 
     _test_performance_helper(
         monkeypatch,
-        sampling_config,
+        _make_sampling_config(temperature),
         {
             "method": "eagle3",
             "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
             "num_speculative_tokens": 2,
             "draft_tensor_parallel_size": 1,
         },
-        min_acceptance_rate=0.75,
+        min_acceptance_rate=min_acceptance_rate,
         max_num_seqs=max_num_seqs,
         model_name="NousResearch/Meta-Llama-3.1-8B-Instruct",
         async_scheduling=async_scheduling,
     )
 
 
-def test_sd_rejects_non_greedy(
+def test_sd_supports_non_greedy(
     monkeypatch: pytest.MonkeyPatch,
     model_name: str = "Qwen/Qwen3-0.6B",
 ):
-    # Currently only greedy is supported.
+    # Non-greedy (temperature > 0) sampling is now supported under
+    # speculative decoding on TPU; generation should succeed. Rejection
+    # sampling is stochastic, so we assert non-empty output (a smoke check)
+    # rather than exact-match against a reference. ngram is sync-only here
+    # (vLLM rejects ngram + async_scheduling at config time); the eagle3 +
+    # async + non-greedy path is covered by test_eagle3_performance.
     with monkeypatch.context():
         spec_llm = LLM(
             model=model_name,
@@ -299,9 +321,13 @@ def test_sd_rejects_non_greedy(
             async_scheduling=False,
         )
         try:
+            prompts = get_ngram_test_prompts()
             non_greedy = SamplingParams(temperature=0.7)
-            with pytest.raises(NotImplementedError, match="greedy"):
-                spec_llm.generate(get_ngram_test_prompts(), non_greedy)
+            outputs = spec_llm.generate(prompts, non_greedy)
+            assert len(outputs) == len(prompts)
+            for output in outputs:
+                assert output.outputs[0].text, \
+                    "non-greedy spec decode produced empty output"
         finally:
             spec_llm.llm_engine.engine_core.shutdown()
             del spec_llm

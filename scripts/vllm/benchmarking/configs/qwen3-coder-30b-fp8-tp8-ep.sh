@@ -10,6 +10,11 @@ ISL_OSL_CONFIGS="1024:1024"
 CONCURRENCY_OPTIONS="64"
 RANDOM_RANGE_RATIO="0.8"
 
+# Force greedy decoding for a deterministic perf measurement. Without this,
+# `vllm bench serve` sends no temperature, so the server applies Qwen3-Coder's
+# generation_config.json (temperature 0.7, top_p 0.8, top_k 20 -> non-greedy).
+BENCHMARK_TEMPERATURE=0
+
 # Switch attention from default RPA v3 to the experimental batched RPA kernel
 # under src/vllm_torchtpu/kernels/experimental/batched_rpa/, registered as the
 # CUSTOM AttentionBackend. Set per-config so the perf-gated nightly + PR-guard

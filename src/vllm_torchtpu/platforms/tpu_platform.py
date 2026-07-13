@@ -744,15 +744,6 @@ class TpuPlatform(Platform):
                 raise ValueError(
                     f"Sampling type {params.sampling_type} is not supported on TPU."
                 )
-            if getattr(cls, "_speculative_enabled",
-                       False) and params.sampling_type != SamplingType.GREEDY:
-                raise NotImplementedError(
-                    "Speculative decoding currently only supports greedy "
-                    "sampling (temperature=0) on TPU.")
-            if params.top_k != 0 or params.top_p != 1.0:
-                logger.warning(
-                    "Top-K and Top-P are not yet supported on TPU and will be ignored."
-                )
 
     @classmethod
     def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str,
