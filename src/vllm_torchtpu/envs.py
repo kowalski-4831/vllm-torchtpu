@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
     TPU_VLLM_KV_CACHE_ALIAS_FALLBACK: bool = True
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_kernel_v3_pd"
-    USE_MOE_SPARSE_CORE: bool = False
+    USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     RAGGED_GATHER_VERSION: str = "v2"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -199,7 +199,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # upstream vLLM's VLLM_USE_FLASHINFER_MOE_* style of env-gated MoE kernel
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
-    lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "0")),
+    lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
     # Use Onehot+Matmul for permute and unpermute before and after moe
     # when the batch size <= this threshold. When set to 0, this feature
     # is effectively disabled.
