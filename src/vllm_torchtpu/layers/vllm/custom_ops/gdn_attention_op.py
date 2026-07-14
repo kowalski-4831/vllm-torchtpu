@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 
 import jax
@@ -19,13 +20,19 @@ import torch
 from einops import rearrange
 from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
+from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.mamba_utils import \
+    is_conv_state_dim_first
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
+    pcp_streaming_jax_op
 from vllm_torchtpu.layers.common.gdn_attention import (
     GdnAttentionConfig, run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill, run_jax_gdn_attention_pooled)
@@ -189,6 +196,50 @@ def gdn_attention_core_tpu_pcp_prefill(
     return new_conv_state, new_recurrent_state, output
 
 
+def _get_pcp_size(vllm_config: VllmConfig) -> int:
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+    return pcp_size if isinstance(pcp_size, int) and pcp_size > 1 else 1
+
+
+def _localize_gdn_mamba_spec_for_pcp(
+    spec: MambaSpec,
+    pcp_size: int,
+) -> MambaSpec:
+    if pcp_size <= 1 or len(spec.shapes) != 2:
+        return spec
+    if is_conv_state_dim_first():
+        raise NotImplementedError("TPU GDN PCP state sharding requires "
+                                  "VLLM_SSM_CONV_STATE_LAYOUT=SD.")
+
+    conv_shape = tuple(spec.shapes[0])
+    recurrent_shape = tuple(spec.shapes[1])
+    if not conv_shape or not recurrent_shape:
+        return spec
+    if conv_shape[-1] % pcp_size != 0:
+        raise ValueError("GDN conv state width must be divisible by PCP size: "
+                         f"shape={conv_shape}, pcp_size={pcp_size}")
+    if recurrent_shape[0] % pcp_size != 0:
+        raise ValueError(
+            "GDN recurrent state head count must be divisible by PCP size: "
+            f"shape={recurrent_shape}, pcp_size={pcp_size}")
+
+    unpadded_page_size = dataclasses.replace(
+        spec, page_size_padded=None).page_size_bytes
+    page_size_padded = spec.page_size_padded
+    if page_size_padded == unpadded_page_size:
+        page_size_padded = None
+
+    return dataclasses.replace(
+        spec,
+        shapes=(
+            (*conv_shape[:-1], conv_shape[-1] // pcp_size),
+            (recurrent_shape[0] // pcp_size, *recurrent_shape[1:]),
+        ),
+        page_size_padded=page_size_padded,
+    )
+
+
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
@@ -198,6 +249,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_pooled_op = self._build_pooled_gdn_op()
         self.gdn_pcp_op = (self._build_gdn_op(
             pcp_streaming=True) if self._pcp_streaming_enabled() else None)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if spec is None:
+            return None
+        assert isinstance(spec, MambaSpec)
+        return _localize_gdn_mamba_spec_for_pcp(spec,
+                                                _get_pcp_size(vllm_config))
 
     @staticmethod
     def _pcp_streaming_enabled() -> bool:
@@ -258,8 +317,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 PartitionSpec("pcp"),  # mixed_qkv
                 PartitionSpec("pcp"),  # b
                 PartitionSpec("pcp"),  # a
-                PartitionSpec(),  # conv_state
-                PartitionSpec(),  # recurrent_state
+                PartitionSpec(None, None, "pcp"),  # conv_state
+                PartitionSpec(None, "pcp", None, None),  # recurrent_state
                 PartitionSpec(),  # conv_weight
                 PartitionSpec() if has_conv_bias else None,  # conv_bias
                 PartitionSpec(),  # A_log
@@ -269,12 +328,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 PartitionSpec(),  # request_distribution
                 PartitionSpec(),  # seq_lens
             )
-            gdn_jax_op = pallas.jax_op(
+            output_partition_specs = (
+                PartitionSpec(None, None, "pcp"),  # new_conv_state
+                PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
+                PartitionSpec(),  # output
+            )
+            gdn_jax_op = pcp_streaming_jax_op(
                 op_name,
                 wrapped_fn,
                 donate_argnums=(3, 4),
                 mesh=pcp_mesh,
                 input_partition_specs=input_partition_specs,
+                output_partition_specs=output_partition_specs,
             )
 
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,

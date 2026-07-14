@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
+from jax.sharding import PartitionSpec
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
@@ -29,11 +31,22 @@ def _mesh():
     return SimpleNamespace(shape={"attn_dp": 1, "expert": 1, "model": 1})
 
 
-def _vllm_config(*, pcp_size: int = 1, interleave_size: int = 16):
-    return SimpleNamespace(parallel_config=SimpleNamespace(
-        prefill_context_parallel_size=pcp_size,
-        cp_kv_cache_interleave_size=interleave_size,
-    ))
+def _vllm_config(*,
+                 pcp_size: int = 1,
+                 interleave_size: int = 16,
+                 mamba_page_size_padded: int | None = None):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp_size,
+            cp_kv_cache_interleave_size=interleave_size,
+        ),
+        cache_config=SimpleNamespace(
+            mamba_block_size=4096,
+            mamba_page_size_padded=mamba_page_size_padded,
+            mamba_cache_mode=None,
+        ),
+        speculative_config=None,
+    )
 
 
 def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
@@ -45,11 +58,57 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
     attn.head_k_dim = 128
     attn.head_v_dim = 128
     attn.conv_kernel_size = 4
+    attn.num_spec = 0
     attn.conv1d = SimpleNamespace(bias=torch.randn(64) if bias else None, )
     return attn
 
 
 class TestVllmGatedDeltaNetAttention:
+
+    def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
+
+        full_spec = attn.get_kv_cache_spec(_vllm_config(pcp_size=1))
+        local_spec = attn.get_kv_cache_spec(_vllm_config(pcp_size=8))
+
+        assert isinstance(full_spec, MambaSpec)
+        assert isinstance(local_spec, MambaSpec)
+        assert local_spec.shapes[0][:-1] == full_spec.shapes[0][:-1]
+        assert local_spec.shapes[0][-1] == full_spec.shapes[0][-1] // 8
+        assert local_spec.shapes[1][0] == full_spec.shapes[1][0] // 8
+        assert local_spec.shapes[1][1:] == full_spec.shapes[1][1:]
+        assert local_spec.page_size_bytes == full_spec.page_size_bytes // 8
+
+    def test_get_kv_cache_spec_drops_full_unpadded_padding_after_localizing(
+            self):
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
+        full_spec = attn.get_kv_cache_spec(_vllm_config(pcp_size=1))
+        assert isinstance(full_spec, MambaSpec)
+
+        local_spec = attn.get_kv_cache_spec(
+            _vllm_config(pcp_size=8,
+                         mamba_page_size_padded=full_spec.page_size_bytes))
+
+        assert isinstance(local_spec, MambaSpec)
+        assert local_spec.page_size_padded is None
+        assert local_spec.page_size_bytes == full_spec.page_size_bytes // 8
+
+    def test_get_kv_cache_spec_rejects_dim_first_state_for_pcp(self):
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
+
+        with patch(
+                "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                "is_conv_state_dim_first",
+                return_value=True,
+        ), pytest.raises(NotImplementedError,
+                         match="VLLM_SSM_CONV_STATE_LAYOUT=SD"):
+            attn.get_kv_cache_spec(_vllm_config(pcp_size=8))
 
     def test_init_builds_only_regular_gdn_op_without_pcp(self):
         regular_op = MagicMock()
@@ -150,21 +209,31 @@ class TestVllmGatedDeltaNetAttention:
                                                 pcp_size=8)), \
              patch(
                  "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
-                 "pallas.jax_op",
+                 "pcp_streaming_jax_op",
                  return_value=fake_jax_op,
-             ) as mock_jax_op:
+             ) as mock_pcp_jax_op:
             attn0._build_gdn_op(pcp_streaming=True)
             attn1._build_gdn_op(pcp_streaming=True)
 
-        assert mock_jax_op.call_count == 2
-        assert mock_jax_op.call_args_list[0].args[0] == (
+        assert mock_pcp_jax_op.call_count == 2
+        assert mock_pcp_jax_op.call_args_list[0].args[0] == (
             "pallas::gdn_attention_pcp_"
             "language_model_model_layers_0_linear_attn")
-        assert mock_jax_op.call_args_list[1].args[0] == (
+        assert mock_pcp_jax_op.call_args_list[1].args[0] == (
             "pallas::gdn_attention_pcp_"
             "language_model_model_layers_30_linear_attn")
-        assert mock_jax_op.call_args_list[0].kwargs["mesh"] is pcp_mesh
-        assert mock_jax_op.call_args_list[1].kwargs["mesh"] is pcp_mesh
+        assert mock_pcp_jax_op.call_args_list[0].kwargs["mesh"] is pcp_mesh
+        assert mock_pcp_jax_op.call_args_list[1].kwargs["mesh"] is pcp_mesh
+        assert mock_pcp_jax_op.call_args_list[0].kwargs[
+            "input_partition_specs"][3] == PartitionSpec(None, None, "pcp")
+        assert mock_pcp_jax_op.call_args_list[0].kwargs[
+            "input_partition_specs"][4] == PartitionSpec(
+                None, "pcp", None, None)
+        assert mock_pcp_jax_op.call_args_list[0].kwargs[
+            "output_partition_specs"][:2] == (
+                PartitionSpec(None, None, "pcp"),
+                PartitionSpec(None, "pcp", None, None),
+            )
         assert fake_jax_op.register_fake.call_count == 2
 
     @patch(
