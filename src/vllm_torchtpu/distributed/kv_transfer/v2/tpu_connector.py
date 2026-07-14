@@ -271,6 +271,10 @@ class TPUConnectorV2HandshakeMetadata:
     fa_group_indices: tuple[int, ...]
     mamba_group_indices: tuple[int, ...]
 
+    @property
+    def transfer_rank(self) -> int:
+        return int(self.remote_metadata.tp_rank)
+
     def __post_init__(self) -> None:
         if not isinstance(self.remote_metadata, RemoteWorkerMetadata):
             raise TypeError("remote_metadata must be RemoteWorkerMetadata")
@@ -913,6 +917,9 @@ class TPUConnectorV2Scheduler:
                                "attention blocks are present")
         source_capacity_tokens = (len(source_metadata.fa_block_ids) *
                                   source_metadata.block_size)
+        if PcpReshardingPolicy.is_enabled(source_metadata.kv_source_layout):
+            source_capacity_tokens *= (
+                source_metadata.kv_source_layout.full_attn_pcp_size)
         if source_metadata.fa_num_tokens is not None:
             source_capacity_tokens = min(source_capacity_tokens,
                                          source_metadata.fa_num_tokens)
@@ -959,6 +966,11 @@ class TPUConnectorV2Scheduler:
         mamba_block_ids = self._block_ids_for_mamba_groups(
             grouped_block_ids, first.mamba_group_indices)
         source_block_size = self._source_block_size_from_handshake()
+        fa_num_tokens = None
+        if fa_block_ids:
+            fa_num_tokens = len(fa_block_ids) * source_block_size
+            if PcpReshardingPolicy.is_enabled(first.kv_source_layout):
+                fa_num_tokens *= first.kv_source_layout.full_attn_pcp_size
         req_id = int(kv_transfer_params["uuid"])
         return ConnectorMetadataV2(
             req_id=req_id,
@@ -971,8 +983,7 @@ class TPUConnectorV2Scheduler:
             fa_block_ids=fa_block_ids,
             mamba_block_ids=mamba_block_ids,
             block_ids_by_group=grouped_block_ids,
-            fa_num_tokens=(len(fa_block_ids) *
-                           source_block_size if fa_block_ids else None),
+            fa_num_tokens=fa_num_tokens,
             mamba_num_tokens=None,
         )
 
@@ -1747,12 +1758,15 @@ class TPUConnectorV2Worker:
         parallel_config = getattr(self.vllm_config, "parallel_config", None)
         full_attn_pcp_size = int(
             getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        cp_kv_cache_interleave_size = int(
+            getattr(parallel_config, "cp_kv_cache_interleave_size", 1) or 1)
         tp_size = self._local_tp_size()
         return KVParallelLayout(
             full_attn_pcp_size=full_attn_pcp_size,
             full_attn_tp_size=tp_size,
             linear_attn_pcp_size=1,
             linear_attn_tp_size=tp_size,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 
     def _local_topology(self, layout: KVParallelLayout) -> TpKVTopology:
