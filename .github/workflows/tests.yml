@@ -112,6 +112,7 @@ jobs:
         run: |
           mkdir -p /local_hf_cache/hub
           gsutil -m cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-0.6B/ /local_hf_cache/hub/
+          gsutil -m cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/ /local_hf_cache/hub/
 
       - name: Run tests
         run: bash ./scripts/vllm/benchmarking/run_unit_test.sh ${{ inputs.nightly }}
