@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -21,7 +20,9 @@ from vllm_torchtpu.layers.common.attention_metadata import \
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
-from vllm_torchtpu.spec_decode.utils import maybe_share_embeddings
+from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
+                                             _force_draft_tp1,
+                                             maybe_share_embeddings)
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
@@ -54,64 +55,6 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
     if target_len <= n:
         return t
     return torch.nn.functional.pad(t, (0, target_len - n))
-
-
-@dataclass
-class DraftChunkInputs:
-    # Token ids the target consumed (post async-token-substitution).
-    # Device tensor, [padded_chunk_tokens].
-    input_ids: torch.Tensor
-    # Device tensor, [padded_chunk_tokens].
-    position_ids: torch.Tensor
-    # Host copy of the chunk-local cumsum of scheduled tokens. [num_reqs + 1]
-    query_start_loc_np: np.ndarray
-    # The chunk's attention-metadata builder context (chunk-local seq_lens /
-    # query_start_loc / request_distribution device tensors, plus the
-    # chunk's start_index for block-table slicing).
-    attn_ctx: "AttentionMetadataBuilderContext"
-    # First request of the chunk in batch order.
-    start_index: int
-    # Real (unpadded) request count in the chunk.
-    num_reqs: int
-    # Per-layer aux hidden states from the target forward; each is
-    # [padded_chunk_tokens, aux_hidden]. Only consumed when the draft
-    # checkpoint wants them.
-    aux_hidden_states: list[torch.Tensor]
-    # Chunk-local per-request draft count (device tensor, padded), a snapshot
-    # of the chunk's spec_decode_metadata.draft_lengths. Lets the async draft
-    # path read num_draft on-device instead of re-scanning the scheduler dict
-    # + H2D every step. None when the chunk has no spec metadata.
-    draft_lengths: torch.Tensor | None = None
-    # Plain target hidden state for the chunk,[padded_chunk_tokens, hidden_size].
-    # Used directly -- bypassing the aux-hidden-state concatenation.
-    hidden_states: torch.Tensor | None = None
-
-
-@contextlib.contextmanager
-def _force_draft_tp1():
-    """Collapse the TP group to world_size=1 / rank=0 for the duration of draft
-    construction + weight load, so the eagle3/mtp draft loads fully replicated
-    (tp=1) on every worker instead of TP-sharded.
-
-    NOTE: mutates the singleton GroupCoordinator returned by get_tp_group() in
-    place. This is safe only because model loading is single-threaded — no
-    other code reads tp.world_size or tp.rank_in_group concurrently. Do not
-    widen this context manager to cover parallel operations.
-
-    Currently acceptable given the single-threaded load. The cleaner long-term
-    fix is to construct/pass a dedicated tp=1 GroupCoordinator to the draft
-    load path instead of mutating the shared singleton; deferred to future work.
-    """
-    from vllm.distributed.parallel_state import get_tp_group
-    tp = get_tp_group()
-    saved_ws, saved_rank = tp.world_size, tp.rank_in_group
-    tp.world_size = 1
-    tp.rank_in_group = 0
-    try:
-        yield
-    finally:
-        tp.world_size = saved_ws
-        tp.rank_in_group = saved_rank
 
 
 if TYPE_CHECKING:
