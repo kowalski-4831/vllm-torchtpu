@@ -21,6 +21,7 @@ from vllm_torchtpu.layers.common.attention_metadata import \
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from vllm_torchtpu.spec_decode.utils import maybe_share_embeddings
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
@@ -192,7 +193,8 @@ class Eagle3Proposer:
         self._draft_attn_layer_names = (set(all_attn_layers.keys()) -
                                         target_attn_layer_names)
 
-        self._maybe_share_embeddings(target_model)
+        maybe_share_embeddings(self.draft_model, target_model,
+                               self._draft_replicated)
         self._maybe_share_lm_head(target_model)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
@@ -234,109 +236,6 @@ class Eagle3Proposer:
                 vllm_config=draft_vllm_config,
                 model_config=draft_model_config,
             )
-
-    def _maybe_share_embeddings(self, target_model) -> None:
-        """Give the draft the target's input embedding (eagle3/mtp checkpoints
-        typically ship no embed_tokens of their own). The form depends on the
-        draft's parallelism:
-
-        - REPLICATED (tp=1) draft: needs the FULL vocab on every worker, so
-          host-gather the target's sharded embed shards into a replicated
-          nn.Embedding (_populate_draft_embed_from_target).
-        - SHARDED (draft_tp == target tp) draft: its embed is sharded over the
-          vocab like the target, so share the target's VocabParallelEmbedding
-          module directly — same layout, no gather / no replicated copy.
-
-        Only fires when the draft opts to share (has_own_embed_tokens False or
-        absent); a draft with its own embed keeps it.
-        """
-        target_lm = target_model.get_language_model() if hasattr(
-            target_model, "get_language_model") else target_model
-        target_lm_model = getattr(target_lm, "model", None)
-        target_embed = getattr(target_lm_model, "embed_tokens",
-                               None) if target_lm_model is not None else None
-
-        if hasattr(self.draft_model, "has_own_embed_tokens"):
-            share_embed = not self.draft_model.has_own_embed_tokens
-        else:
-            logger.info(
-                "EAGLE/MTP draft model does not declare "
-                "`has_own_embed_tokens`; defaulting to share embed_tokens "
-                "with the target.")
-            share_embed = True
-
-        if share_embed:
-            if target_embed is None:
-                raise RuntimeError(
-                    "Eagle3 embedding sharing requires target_lm.model."
-                    "embed_tokens, but the target model does not expose that "
-                    "attribute. Set has_own_embed_tokens=True on the draft "
-                    "model to skip sharing.")
-            if self._draft_replicated:
-                logger.info(
-                    "Populating draft's own embed_tokens with a host-gathered, "
-                    "per-worker replicated copy of the target embedding.")
-                self._populate_draft_embed_from_target(target_embed)
-            else:
-                logger.info(
-                    "Sharing the target's sharded embed_tokens with the "
-                    "sharded draft.")
-                self.draft_model.model.embed_tokens = target_embed
-
-    def _populate_draft_embed_from_target(self, target_embed) -> None:
-        """Replicated (tp=1) draft only: fill the draft's own full-vocab
-        embed_tokens with the target's embedding, assembled on the host.
-
-        Memory note: allocates a full [org_vocab, dim] fp32 tensor on every
-        worker's CPU for the all_reduce (e.g. ~2 GB for Llama-3.1-8B:
-        128256 x 4096 x 4B), plus the down-cast device copy. One-time load-time
-        cost, freed once embed_tokens is replaced, but can spike host RAM on
-        memory-constrained hosts.
-        """
-        import torch.distributed as dist
-        from vllm.distributed.parallel_state import get_tp_group
-
-        draft_embed = self.draft_model.model.embed_tokens
-        org_vocab = target_embed.org_vocab_size
-        dim = target_embed.embedding_dim
-        assert draft_embed.org_vocab_size == org_vocab, (
-            f"draft embed org_vocab {draft_embed.org_vocab_size} != target "
-            f"{org_vocab}; cannot populate")
-
-        si = target_embed.shard_indices
-        num_added = si.added_vocab_end_index - si.added_vocab_start_index
-        if num_added > 0:
-            raise NotImplementedError(
-                "Eagle3 on TPU does not support LoRA with vocabulary "
-                "expansion (num_added_vocab_tokens > 0).")
-
-        num_org = si.org_vocab_end_index - si.org_vocab_start_index
-        org_vocab = target_embed.org_vocab_size
-        full = torch.zeros(org_vocab, dim, dtype=torch.float32)
-        my_rows = target_embed.weight.data[:num_org].to(torch.float32).cpu()
-        full[si.org_vocab_start_index:si.org_vocab_end_index] = my_rows
-        # Reconstruct the full vocab by summing the disjoint TP shards. Use the
-        # TP group (the axis the embedding is sharded over), NOT the world group:
-        # world would re-add each shard once per DP replica, scaling the draft
-        # embedding by the DP factor (silent acceptance collapse, not a crash).
-        # Runs outside _force_draft_tp1, so get_tp_group() is the real TP group.
-        # NOTE: only DP=1 is supported/validated for eagle3 today; DP>1 is
-        # deferred to future work — reducing over the TP group keeps this
-        # reconstruction correct for when DP>1 support lands.
-        dist.all_reduce(full, group=get_tp_group().cpu_group)
-
-        draft_dtype = draft_embed.weight.dtype
-        draft_device = draft_embed.weight.device
-        full_dev = full.to(draft_dtype).to(draft_device)
-        new_embed = torch.nn.Embedding(org_vocab, dim, _weight=full_dev)
-        new_embed.weight.requires_grad_(False)
-        del self.draft_model.model.embed_tokens
-        self.draft_model.model.embed_tokens = new_embed
-        if draft_device.type == "tpu":
-            sync.synchronize(new_embed.weight, wait=True)
-        logger.info(
-            "Draft embed_tokens replaced with full replicated nn.Embedding: "
-            "%d x %d per worker.", org_vocab, dim)
 
     def _maybe_share_lm_head(self, target_model) -> None:
         """Override of LLMBaseProposer._maybe_share_lm_head.
