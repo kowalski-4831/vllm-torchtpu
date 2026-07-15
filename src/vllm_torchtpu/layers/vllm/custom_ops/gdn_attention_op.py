@@ -391,7 +391,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                           query_start_loc,
                                           request_distribution, seq_lens)
 
-            # Plain donation + copy_ writeback (aliased in-place by XLA; no #2185).
+            # Plain donation + copy_ writeback (aliased in-place by XLA).
             recurrent_state.copy_(new_rec)
 
             return outputs

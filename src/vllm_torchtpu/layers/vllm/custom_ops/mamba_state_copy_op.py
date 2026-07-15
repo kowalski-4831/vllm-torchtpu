@@ -50,7 +50,7 @@ _copy_op.register_fake(_fake_copy)
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def copy_mamba_state_blocks(pool: torch.Tensor, src: torch.Tensor,
                             dst: torch.Tensor) -> torch.Tensor:
-    # Plain donation + copy_ writeback (aliased in-place by XLA; no #2185).
+    # Plain donation + copy_ writeback (aliased in-place by XLA).
     new_pool, marker = _copy_op(pool, src, dst)
     pool.copy_(new_pool)
     return marker
