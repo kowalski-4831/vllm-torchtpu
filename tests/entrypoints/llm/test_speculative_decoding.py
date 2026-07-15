@@ -163,9 +163,13 @@ def test_ngram_correctness_greedy(
     "async_scheduling",
     [pytest.param(False, id="sync"),
      pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(10, id="bs10")])
 def test_eagle3_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
+    max_num_seqs: int,
     async_scheduling: bool,
 ):
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
@@ -181,7 +185,7 @@ def test_eagle3_correctness_greedy(
             "num_speculative_tokens": 3,
             "draft_tensor_parallel_size": 1,
         },
-        max_num_seqs=10,
+        max_num_seqs=max_num_seqs,
         async_scheduling=async_scheduling,
     )
 
@@ -262,7 +266,7 @@ def test_ngram_performance_greedy(
      pytest.param(True, id="async")])
 @pytest.mark.parametrize(
     "max_num_seqs", [pytest.param(1, id="bs1"),
-                     pytest.param(4, id="bs4")])
+                     pytest.param(10, id="bs10")])
 @pytest.mark.parametrize(
     "temperature, min_acceptance_rate",
     # Non-greedy accepts fewer drafts than greedy (the target samples instead

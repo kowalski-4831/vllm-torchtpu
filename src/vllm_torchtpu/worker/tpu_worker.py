@@ -414,8 +414,9 @@ class TPUWorker(WorkerBase):
                               runner.max_num_blocks_per_req,
                               use_max_model_len=True)
             return
-        for _ in range(target_num_chunks):
-            runner._run_dp_dummy_chunk(bucket)
+        # Single DP-EP pairing entry: all target dummy forwards, then all draft
+        # dummy forwards, in the runner that owns the state.
+        runner._run_dp_idle_pairing(bucket, target_num_chunks)
 
     def profile(self,
                 is_start: bool = True,

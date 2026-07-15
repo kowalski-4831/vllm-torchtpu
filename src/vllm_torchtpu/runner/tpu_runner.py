@@ -212,7 +212,7 @@ def _torch_tpu_wrapper():
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
 #      (backbone, compute_selected_logits, sample_from_logits/structured_decode,
-#      gather_logprobs) so dummy_run and execute_model trace identically.
+#      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
@@ -316,6 +316,12 @@ class TPUModelRunner(GPUModelRunner):
         self._unified_block_pool: bool = (
             tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
+
+        # EP-DP lockstep state, refreshed each step by execute_model /
+        # execute_dummy_batch: the coordinated (max-across-ranks) token
+        # bucket and chunk count.
+        self._dp_target_bucket: int | None = None
+        self._dp_step_num_chunks: int = 0
 
         # TPU env-var flags.
         self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
@@ -1492,16 +1498,15 @@ class TPUModelRunner(GPUModelRunner):
         return placeholder_req_id_to_index
 
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk,
-                                          state, next_tokens_tpu_chunks,
-                                          next_token_indices):
+                                          state):
         """Async-spec substitution assembler.
 
         From the already-proposed on-device ``drafts`` (the unified eagle3
         propose call in ``sample_tokens``), builds the per-request
-        ``[bonus, draft_1..K]`` substitution source (appended to
-        ``next_tokens_tpu_chunks``) and the stride-``1+K``
+        ``[bonus, draft_1..K]`` substitution source and the stride-``1+K``
         ``next_token_indices``, and computes the per-request rejected count.
-        Returns ``(spec_decode_num_rejected_tokens, num_draft_per_req)``.
+        Returns ``(next_tokens_tpu_chunks, next_token_indices,
+        spec_decode_num_rejected_tokens, num_draft_per_req)``.
         """
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             assemble_spec_next_tokens, compute_num_rejected)
@@ -1509,6 +1514,8 @@ class TPUModelRunner(GPUModelRunner):
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens")
         K = self.speculative_config.num_speculative_tokens
+        next_tokens_tpu_chunks: list[torch.Tensor] = []
+        next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
@@ -1549,25 +1556,26 @@ class TPUModelRunner(GPUModelRunner):
             req_offset += num_reqs
         spec_num_rejected = (torch.cat(num_rejected_chunks)
                              if num_rejected_chunks else None)
-        return spec_num_rejected, num_draft_per_req
+        return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                num_draft_per_req)
 
     def _assemble_async_prefill_bootstrap(self, drafts,
                                           combined_selected_tokens,
-                                          combined_real_lens,
-                                          next_tokens_tpu_chunks,
-                                          next_token_indices):
+                                          combined_real_lens):
         """Async eagle3 bootstrap assembler for the prefill / pure-non-spec step.
 
         From the already-proposed prompt-context ``drafts`` (the unified eagle3
         propose call in ``sample_tokens``, device_seed path), parks a
         stride-(1+K) `[bonus, draft_1..K]` source so the NEXT step substitutes
-        REAL prompt-context drafts. Returns (spec_num_rejected=zeros,
-        num_draft_per_req).
+        REAL prompt-context drafts. Returns ``(next_tokens_tpu_chunks,
+        next_token_indices, spec_num_rejected=zeros, num_draft_per_req)``.
         """
         assert drafts is not None, (
             "async prefill bootstrap requires the eagle3 drafts proposed "
             "earlier in sample_tokens")
         K = self.speculative_config.num_speculative_tokens
+        next_tokens_tpu_chunks: list[torch.Tensor] = []
+        next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
@@ -1585,7 +1593,8 @@ class TPUModelRunner(GPUModelRunner):
             req_offset += n
         spec_num_rejected = (torch.cat(num_rejected_chunks)
                              if num_rejected_chunks else None)
-        return spec_num_rejected, num_draft_per_req
+        return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                num_draft_per_req)
 
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput",
                         start_index: int, num_decode_reqs: int):
@@ -2040,6 +2049,22 @@ class TPUModelRunner(GPUModelRunner):
                         use_max_model_len=True,
                         dp_lockstep=True)
 
+    def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
+        """Idle-rank EP-DP pairing: emit the same cross-DP collective stream a
+        busy rank does — ALL target dummy forwards, then ALL draft dummy
+        forwards.
+        """
+        # Set before any dummy fires: both _run_dp_dummy_chunk and the draft
+        # run_dp_dummy_draft read _dp_target_bucket for the coordinated, equal-token shape.
+        self._dp_target_bucket = bucket
+        # Phase 1: all TARGET dummy forwards.
+        for _ in range(num_chunks):
+            self._run_dp_dummy_chunk(bucket)
+        # Phase 2: all DRAFT dummy forwards (num_chunks * K).
+        spec = self.speculative_config
+        if num_chunks > 0 and spec is not None and spec.use_eagle():
+            self.drafter.run_dp_dummy_draft(num_chunks)
+
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
             return None
@@ -2110,6 +2135,11 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks = self._count_input_chunks(scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens, local_num_chunks)
+        # Retained for the spec-decode propose phase (sample_tokens): under
+        # EP-DP locksteps every rank must run the same number of draft forwards per step,
+        # and the coordinated chunk count from this one all-reduce is the shared
+        # bound — no additional draft-side collective is needed.
+        self._dp_step_num_chunks = target_num_chunks
 
         start_index = 0
         chunk_index = 0
@@ -2346,13 +2376,17 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_offset = 0
         combined_logprobs: list[Any] = []
 
-        use_spec = any(md is not None
-                       for md in state.spec_decode_metadata_list)
+        # True if the step has drafts to verify (a request carried drafts in
+        # from the previous step). Not the same as self.speculative_config, the
+        # static "spec configured" flag: on prefill/first-decode steps spec is
+        # configured but no drafts exist yet, so is_spec_step is False there.
+        is_spec_step = any(md is not None
+                           for md in state.spec_decode_metadata_list)
         if self.is_pooling_model:
             req_ids = cast(
                 list[str],
                 self.input_batch.req_ids[:self.input_batch.num_reqs])
-        elif use_spec:
+        elif is_spec_step:
             if needs_logprobs:
                 raise NotImplementedError(
                     "Logprobs are not supported with speculative decoding on "
@@ -2632,7 +2666,7 @@ class TPUModelRunner(GPUModelRunner):
         eagle3_drafts = None
         if (self.speculative_config and self.speculative_config.use_eagle()
                 and combined_selected_tokens):
-            if use_spec:
+            if is_spec_step:
                 eagle3_drafts = (
                     self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,
@@ -2667,11 +2701,10 @@ class TPUModelRunner(GPUModelRunner):
             # and the per-request rejected count to park.
             spec_num_rejected = None
             num_draft_per_req = None
-            if use_spec:
-                spec_num_rejected, num_draft_per_req = (
-                    self._assemble_async_spec_substitution(
-                        eagle3_drafts, next_tokens_per_chunk, state,
-                        next_tokens_tpu_chunks, next_token_indices))
+            if is_spec_step:
+                (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                 num_draft_per_req) = (self._assemble_async_spec_substitution(
+                     eagle3_drafts, next_tokens_per_chunk, state))
             elif (self.speculative_config
                   and self.speculative_config.use_eagle()
                   and next_tokens_tpu_chunks):
@@ -2680,13 +2713,10 @@ class TPUModelRunner(GPUModelRunner):
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
                 # prompt-context drafts so the NEXT step's verify gets real
                 # drafts instead of placeholders.
-                next_tokens_tpu_chunks.clear()
-                next_token_indices.clear()
-                spec_num_rejected, num_draft_per_req = (
-                    self._assemble_async_prefill_bootstrap(
-                        eagle3_drafts, combined_selected_tokens,
-                        combined_selected_tokens_real_lens,
-                        next_tokens_tpu_chunks, next_token_indices))
+                (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
+                 num_draft_per_req) = (self._assemble_async_prefill_bootstrap(
+                     eagle3_drafts, combined_selected_tokens,
+                     combined_selected_tokens_real_lens))
             req_id_to_index_copy = {}
             if not self.is_pooling_model:
                 req_id_to_index_copy = self._update_placeholder(
