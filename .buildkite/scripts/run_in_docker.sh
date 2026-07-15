@@ -46,8 +46,8 @@ docker pull "${IMAGE_TAG}"
 
 # Ensure cache directory exists on the host
 mkdir -p /mnt/disks/persist/models/hub
-
-
+mkdir -p /mnt/disks/persist/torchtpu_cache
+chmod 777 /mnt/disks/persist/torchtpu_cache 2>/dev/null || true
 
 # Ensure results directory exists on the persistent disk (always mountable)
 rm -rf /mnt/disks/persist/perf_eval_results
@@ -71,8 +71,11 @@ echo "--- Running command in Docker container"
 docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16g --device /dev/fuse \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
+  -v /mnt/disks/persist/torchtpu_cache:/torchtpu_cache \
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
+  -e VLLM_CACHE_ROOT=/torchtpu_cache \
+  -e VLLM_XLA_CACHE_PATH=/torchtpu_cache \
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e FORCE_COLOR="1" \
