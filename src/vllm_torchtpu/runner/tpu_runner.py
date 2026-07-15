@@ -1267,6 +1267,7 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_cur_input_indices_list = []
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
+        layout_plan = getattr(self, "_last_sequence_layout_plan", None)
 
         # 1+K for spec — `[bonus, draft_1..K]`), so a request's source span
         # starts at `position * stride`.
@@ -1290,8 +1291,16 @@ class TPUModelRunner(GPUModelRunner):
             src_start = (self._pre_async_results.req_id_to_index_copy[req_id] *
                          stride)
             for j in range(n_sched):
-                token_in_tpu_cur_input_indices_list.append(acc_cur_len -
-                                                           n_sched + j)
+                request_major_index = acc_cur_len - n_sched + j
+                if layout_plan is None:
+                    cur_input_index = request_major_index
+                else:
+                    cur_input_index = (
+                        layout_plan.local_index_for_request_major_token(
+                            request_major_index))
+                    if cur_input_index is None:
+                        continue
+                token_in_tpu_cur_input_indices_list.append(cur_input_index)
                 token_in_tpu_pre_next_tokens_indices_list.append(src_start + j)
 
         if len(token_in_tpu_cur_input_indices_list) > 0:
@@ -2169,13 +2178,22 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                 )
 
-            hidden_states = _get_sequence_layout_planner_for_runner(
-                self).finalize_hidden_states(
+            sequence_layout_planner = _get_sequence_layout_planner_for_runner(
+                self)
+            layout_plan = getattr(self, "_last_sequence_layout_plan", None)
+            sample_hidden_states = (
+                sequence_layout_planner.maybe_select_logits_hidden_states(
+                    hidden_states, layout_plan, logits_indices))
+            if sample_hidden_states is None:
+                hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
-                    getattr(self, "_last_sequence_layout_plan", None),
+                    layout_plan,
                 )
-            logits = self.compute_selected_logits(hidden_states,
-                                                  logits_indices)
+                logits = self.compute_selected_logits(hidden_states,
+                                                      logits_indices)
+            else:
+                logits = self.compute_logits_from_hidden_states(
+                    sample_hidden_states)
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -2932,6 +2950,17 @@ class TPUModelRunner(GPUModelRunner):
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
 
+    def _precompile_compute_logits_from_hidden_states(self) -> None:
+        hsize = self.model_config.get_hidden_size()
+        with self._precompile_timed("compute_logits_from_hidden_states"):
+            for num_reqs in self.num_reqs_paddings:
+                dummy_hidden = torch.zeros((num_reqs, hsize),
+                                           device=self.device,
+                                           dtype=self._hidden_states_dtype)
+                out = self.compute_logits_from_hidden_states(dummy_hidden)
+                sync.synchronize(out, wait=True)
+                logger.info("  -- num_seqs: %d", num_reqs)
+
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
             arange = self.structured_decode_arange.to(self.device)
@@ -3139,6 +3168,9 @@ class TPUModelRunner(GPUModelRunner):
         """Compile sampling-path subgraphs so their bottom-HBM reservations
         are visible to vLLM's available-memory probe in profile_run."""
         self._precompile_compute_selected_logits()
+        if (_get_sequence_layout_planner_for_runner(
+                self).uses_selected_logits_hidden_states):
+            self._precompile_compute_logits_from_hidden_states()
         self._precompile_structured_decoding()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
@@ -4015,6 +4047,11 @@ class TPUModelRunner(GPUModelRunner):
             indices_do_sample: torch.Tensor) -> torch.Tensor:
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_logits_from_hidden_states(
+            self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.compute_logits(hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(
