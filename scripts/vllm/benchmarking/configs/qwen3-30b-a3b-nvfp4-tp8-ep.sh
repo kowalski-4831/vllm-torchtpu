@@ -12,6 +12,7 @@ QUANTIZATION="modelopt_fp4"
 ISL_OSL_CONFIGS="1024:1024"
 CONCURRENCY_OPTIONS="64"
 RANDOM_RANGE_RATIO="0.8"
+EVAL_TOLERANCE="0.02"
 
 # Match the FP8 30B baseline's attention backend (experimental batched RPA,
 # registered as the CUSTOM AttentionBackend) so perf is comparable.
