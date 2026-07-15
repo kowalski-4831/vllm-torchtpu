@@ -102,11 +102,11 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16
   ${PROXY_PORT:+-e PROXY_PORT="${PROXY_PORT}"} \
   ${RAGGED_GATED_DELTA_RULE_IMPL:+-e RAGGED_GATED_DELTA_RULE_IMPL="${RAGGED_GATED_DELTA_RULE_IMPL}"} \
   "${IMAGE_TAG}" \
-  bash -c "
+  bash -c '
     umask 000
     rm -rf /perf_eval_results/*
-    $*
-  "
+    "$@"
+  ' _ "$@"
 DOCKER_EXIT_CODE=$?
 set -e
 

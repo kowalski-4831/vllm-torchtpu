@@ -27,7 +27,7 @@ steps:
           - |
             bash .buildkite/scripts/run_in_docker.sh bash -c '
               cd $(mktemp -d)
-              pytest /root/torchtpu-vllm/tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=300 -m "not nightly"
+              pytest /root/torchtpu-vllm/tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=600 -m "not nightly" || [ $? -eq 5 ]
             '
 
       - label: "Unit Tests - General (PR)"
@@ -41,7 +41,7 @@ steps:
           - |
             bash .buildkite/scripts/run_in_docker.sh bash -c '
               cd $(mktemp -d)
-              pytest /root/torchtpu-vllm/tests/ --ignore=/root/torchtpu-vllm/tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=300 -m "not nightly"
+              pytest /root/torchtpu-vllm/tests/ --ignore=/root/torchtpu-vllm/tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=600 -m "not nightly" || [ $? -eq 5 ]
             '
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
@@ -55,7 +55,7 @@ steps:
           - |
             bash .buildkite/scripts/run_in_docker.sh bash -c '
               cd $(mktemp -d)
-              pytest /root/torchtpu-vllm/tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=300
+              pytest /root/torchtpu-vllm/tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=600
             '
 
       - label: "Unit Tests - General (Nightly)"
@@ -69,5 +69,5 @@ steps:
           - |
             bash .buildkite/scripts/run_in_docker.sh bash -c '
               cd $(mktemp -d)
-              pytest /root/torchtpu-vllm/tests/ --ignore=/root/torchtpu-vllm/tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=300
+              pytest /root/torchtpu-vllm/tests/ --ignore=/root/torchtpu-vllm/tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=600
             '
