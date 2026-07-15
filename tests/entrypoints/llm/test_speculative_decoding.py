@@ -25,6 +25,10 @@ from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
 
+# Heavy Llama-3.1-8B spec-decode integration suite; presubmit deselects it via
+# `-m "not nightly"`, full coverage runs in the nightly workflow.
+pytestmark = pytest.mark.nightly
+
 
 def _is_v7x():
     return (tpu_info.get_tpu_type() or "").startswith("tpu7x")
