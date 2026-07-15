@@ -1253,6 +1253,8 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         buffer, so the worker must NOT shrink their budgets. Living on the
         spec class makes the gating explicit at the call site.
         """
+        if _USE_RAIDEN_OFFLOAD:
+            return 0
         max_pool_blocks = int(os.environ.get("KV_H2D_POOL_MAX_BLOCKS", "2048"))
         max_padded = 1
         while max_padded < max_pool_blocks:
