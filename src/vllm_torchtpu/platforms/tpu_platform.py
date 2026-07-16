@@ -784,8 +784,8 @@ class TpuPlatform(Platform):
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
         # the align-mode Mamba APC path (MambaApcStateCopier); other cache
-        # modes and the two combinations we haven't wired up yet must be
-        # rejected up front instead of failing partway through warmup.
+        # modes and speculative decoding must be rejected up front instead of
+        # failing partway through warmup.
         if is_hybrid and getattr(cache_config, "enable_prefix_caching", False):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
@@ -795,10 +795,6 @@ class TpuPlatform(Platform):
             if vllm_config.speculative_config is not None:
                 raise NotImplementedError(
                     "Speculative decoding is not yet supported with hybrid "
-                    "Mamba prefix caching (mamba_cache_mode='align').")
-            if vllm_config.scheduler_config.async_scheduling:
-                raise NotImplementedError(
-                    "Async scheduling is not yet supported with hybrid "
                     "Mamba prefix caching (mamba_cache_mode='align').")
         if not is_hybrid and block_size_was_unspecified:
             default = backend_cls.get_page_size(vllm_config)
