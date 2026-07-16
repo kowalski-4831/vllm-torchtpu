@@ -44,8 +44,9 @@ from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
                                                         FusedMoEMethodBase)
-from vllm.model_executor.layers.linear import (LinearBase,
-                                               UnquantizedLinearMethod)
+from vllm.model_executor.layers.linear import (
+    LinearBase, UnquantizedLinearMethod,
+    register_weight_loader_v2_supported_method)
 from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
@@ -56,6 +57,7 @@ from vllm.model_executor.layers.quantization.fp8 import (Fp8Config,
                                                          Fp8MoEMethod)
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
+from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
@@ -120,7 +122,8 @@ def _dequantize_fp8_linear(
     else:
         assert weight_scale is not None
         scales = weight_scale.to(out_dtype)
-        if scales.numel() > 1 and logical_widths is not None and scales.numel() == len(logical_widths):
+        if scales.numel() > 1 and logical_widths is not None and scales.numel(
+        ) == len(logical_widths):
             scales = scales.cpu().repeat_interleave(
                 torch.tensor(logical_widths)).unsqueeze(1).to(scales.device)
         weight_f = weight_f * scales
@@ -294,7 +297,8 @@ def _quantize_and_format_moe_weights(
     half = w13.shape[1] // 2
     aligned_half = (half + 127) // 128 * 128
     if aligned_half != half:
-        pad_w13 = w13.new_zeros(w13.shape[0], aligned_half - half, w13.shape[2])
+        pad_w13 = w13.new_zeros(w13.shape[0], aligned_half - half,
+                                w13.shape[2])
         w13 = torch.cat([w13[:, :half, :], pad_w13, w13[:, half:, :], pad_w13],
                         dim=1).contiguous()
         pad_w2 = w2.new_zeros(w2.shape[0], w2.shape[1], aligned_half - half)
@@ -357,10 +361,14 @@ def _process_fp8_moe_weights(
             "[MoE requantization]: re-quantizing MoE weights"))
 
     # Dequantize from checkpoint FP8 to float32
-    w13_scale_param = getattr(layer, "w13_weight_scale_inv", getattr(layer, "w13_weight_scale", None))
-    w2_scale_param = getattr(layer, "w2_weight_scale_inv", getattr(layer, "w2_weight_scale", None))
+    w13_scale_param = getattr(layer, "w13_weight_scale_inv",
+                              getattr(layer, "w13_weight_scale", None))
+    w2_scale_param = getattr(layer, "w2_weight_scale_inv",
+                             getattr(layer, "w2_weight_scale", None))
     if w13_scale_param is None or w2_scale_param is None:
-        raise ValueError("Missing MoE weight scale parameters (expected w13_weight_scale_inv or w13_weight_scale)")
+        raise ValueError(
+            "Missing MoE weight scale parameters (expected w13_weight_scale_inv or w13_weight_scale)"
+        )
 
     if weight_block_size is not None:
         # Validate block alignment
@@ -460,6 +468,13 @@ def _quantize_bf16_moe_weights(
 
 @register_quantization_config(get_tpu_quant_method(FP8))
 class VllmFp8Config(Fp8Config, VllmQuantConfig):
+    """Native "fp8" quant_method config.
+
+    Also constructed directly (bypassing from_config) by
+    VllmCompressedTensorsConfig in compressed_tensors.py, which adapts a
+    matched compressed-tensors FP8 scheme into an instance of this class to
+    reuse its dequant/requant runtime path.
+    """
 
     @classmethod
     def get_name(cls) -> str:
@@ -468,24 +483,12 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
     @classmethod
     def from_config(cls, config: dict) -> "VllmFp8Config":
         weight_block_size = config.get("weight_block_size")
-        is_channel_quant = False
-        if weight_block_size is None and "config_groups" in config:
-            for group in config["config_groups"].values():
-                weights_config = group.get("weights", {})
-                if weights_config and weights_config.get("block_structure") is not None:
-                    weight_block_size = weights_config["block_structure"]
-                    break
-                if weights_config and weights_config.get("strategy") == "channel":
-                    is_channel_quant = True
-                    break
         activation_scheme = config.get("activation_scheme", "dynamic")
-        instance = cls(
+        return cls(
             is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,
             weight_block_size=weight_block_size,
         )
-        instance.is_channel_quant = is_channel_quant
-        return instance
 
     def get_quant_method(
         self,
@@ -572,11 +575,11 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             Fp8MoEMethod.create_weights(self, layer, num_experts, hidden_size,
                                         intermediate_size_per_partition,
                                         params_dtype, **extra_weight_attrs)
-            if getattr(self.quant_config, "is_channel_quant", False) and not self.block_quant:
-                if hasattr(layer, "w13_weight_scale"):
-                    del layer.w13_weight_scale
-                if hasattr(layer, "w2_weight_scale"):
-                    del layer.w2_weight_scale
+            if getattr(self.quant_config, "is_channel_quant",
+                       False) and not self.block_quant:
+                # register_parameter() safely replaces the base class's
+                # differently-shaped w13_weight_scale/w2_weight_scale below;
+                # no need to delete them first.
                 w13_scale_data = torch.ones(
                     num_experts,
                     2 * intermediate_size_per_partition,
@@ -589,20 +592,31 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                     1,
                     dtype=torch.float32,
                 )
-                w13_weight_scale = torch.nn.Parameter(w13_scale_data, requires_grad=False)
-                w2_weight_scale = torch.nn.Parameter(w2_scale_data, requires_grad=False)
+                w13_weight_scale = torch.nn.Parameter(w13_scale_data,
+                                                      requires_grad=False)
+                w2_weight_scale = torch.nn.Parameter(w2_scale_data,
+                                                     requires_grad=False)
                 layer.register_parameter("w13_weight_scale", w13_weight_scale)
                 layer.register_parameter("w2_weight_scale", w2_weight_scale)
-                from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
+                from vllm.model_executor.layers.fused_moe import \
+                    FusedMoeWeightScaleSupported
                 attrs = dict(extra_weight_attrs)
-                attrs["quant_method"] = FusedMoeWeightScaleSupported.CHANNEL.value
+                attrs[
+                    "quant_method"] = FusedMoeWeightScaleSupported.CHANNEL.value
                 set_weight_attrs(w13_weight_scale, attrs)
                 set_weight_attrs(w2_weight_scale, attrs)
 
-            for param in [getattr(layer, "w13_weight", None), getattr(layer, "w2_weight", None),
-                          getattr(layer, "w13_weight_scale", None), getattr(layer, "w2_weight_scale", None),
-                          getattr(layer, "w13_weight_scale_inv", None), getattr(layer, "w2_weight_scale_inv", None)]:
-                if param is not None and getattr(param, "weight_loader", None) is None and hasattr(layer, "weight_loader"):
+            for param in [
+                    getattr(layer, "w13_weight", None),
+                    getattr(layer, "w2_weight", None),
+                    getattr(layer, "w13_weight_scale", None),
+                    getattr(layer, "w2_weight_scale", None),
+                    getattr(layer, "w13_weight_scale_inv", None),
+                    getattr(layer, "w2_weight_scale_inv", None)
+            ]:
+                if param is not None and getattr(param, "weight_loader",
+                                                 None) is None and hasattr(
+                                                     layer, "weight_loader"):
                     param.weight_loader = layer.weight_loader
         else:
             from vllm_torchtpu.layers.vllm.quantization.unquantized import \
@@ -637,9 +651,8 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
         if is_fp8_serialized:
-            weight_block_size = (
-                tuple(self.weight_block_size)
-                if self.weight_block_size is not None else None)
+            weight_block_size = (tuple(self.weight_block_size) if
+                                 self.weight_block_size is not None else None)
             (w13, w13_scale, w2, w2_scale, requant_dtype_name,
              requant_block_size) = _process_fp8_moe_weights(
                  layer,
@@ -735,10 +748,8 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         )
 
 
-from vllm.model_executor.layers.linear import register_weight_loader_v2_supported_method
-from vllm.model_executor.parameter import ChannelQuantScaleParameter
-
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
+
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         if loaded_weight.ndim == 1:
             loaded_weight = loaded_weight.view(-1, 1)
@@ -804,33 +815,48 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                        output_partition_sizes, input_size, output_size,
                        params_dtype, **extra_weight_attrs):
         if self.quant_config.is_checkpoint_fp8_serialized:
-            Fp8LinearMethod.create_weights(
-                self, layer, input_size_per_partition, output_partition_sizes,
-                input_size, output_size, params_dtype, **extra_weight_attrs)
+            Fp8LinearMethod.create_weights(self, layer,
+                                           input_size_per_partition,
+                                           output_partition_sizes, input_size,
+                                           output_size, params_dtype,
+                                           **extra_weight_attrs)
             if getattr(self.quant_config, "is_channel_quant", False):
-                weight_loader = extra_weight_attrs.get("weight_loader", getattr(layer, "weight_loader", None))
+                weight_loader = extra_weight_attrs.get(
+                    "weight_loader", getattr(layer, "weight_loader", None))
                 scale = ChannelQuantScaleParameterTPU(
-                    data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
+                    data=torch.empty((sum(output_partition_sizes), 1),
+                                     dtype=torch.float32),
                     output_dim=0,
                     weight_loader=weight_loader,
                 )
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale", scale)
-            if hasattr(layer, "weight_scale_inv") and not hasattr(layer, "weight_scale"):
-                from vllm.model_executor.parameter import BlockQuantScaleParameter
+            if hasattr(layer, "weight_scale_inv") and not hasattr(
+                    layer, "weight_scale"):
+                from vllm.model_executor.parameter import \
+                    BlockQuantScaleParameter
                 scale_inv = layer.weight_scale_inv
                 weight_scale = BlockQuantScaleParameter(
                     data=scale_inv.data,
                     input_dim=getattr(scale_inv, "input_dim", 1),
                     output_dim=getattr(scale_inv, "output_dim", 0),
-                    weight_loader=getattr(scale_inv, "weight_loader", getattr(layer, "weight_loader", None)),
+                    weight_loader=getattr(
+                        scale_inv, "weight_loader",
+                        getattr(layer, "weight_loader", None)),
                 )
                 layer.register_parameter("weight_scale", weight_scale)
-            for param in [getattr(layer, "weight", None), getattr(layer, "weight_scale_inv", None), getattr(layer, "weight_scale", None)]:
-                if param is not None and getattr(param, "weight_loader", None) is None and hasattr(layer, "weight_loader"):
+            for param in [
+                    getattr(layer, "weight", None),
+                    getattr(layer, "weight_scale_inv", None),
+                    getattr(layer, "weight_scale", None)
+            ]:
+                if param is not None and getattr(param, "weight_loader",
+                                                 None) is None and hasattr(
+                                                     layer, "weight_loader"):
                     param.weight_loader = layer.weight_loader
         else:
-            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+            from vllm.model_executor.layers.linear import \
+                UnquantizedLinearMethod
             UnquantizedLinearMethod().create_weights(
                 layer, input_size_per_partition, output_partition_sizes,
                 input_size, output_size, params_dtype, **extra_weight_attrs)
