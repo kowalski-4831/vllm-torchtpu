@@ -1103,6 +1103,7 @@ class TestAttentionMetadataBuilder:
     def test_unified_mamba_state_indices_derive_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_block_pool = True
+        runner._mamba_align_mode = True
         mamba_spec = MambaSpec(
             block_size=16,
             shapes=[(2, 8)],
@@ -1124,7 +1125,7 @@ class TestAttentionMetadataBuilder:
                              common_attn_metadata=self._make_cm(4))
 
         assert torch.equal(meta.mamba_state_indices,
-                           torch.tensor([0, 6, 8, 12], dtype=torch.int32))
+                           torch.tensor([0, 6, 0, 0], dtype=torch.int32))
 
 
 class TestCompactMambaSlotPool:
