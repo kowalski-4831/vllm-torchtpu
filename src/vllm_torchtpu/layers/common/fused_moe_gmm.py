@@ -42,6 +42,46 @@ else:
     ragged_gather_reduce = ragged_gather_reduce_v2
 
 
+def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
+    """Unpack a uint8-packed E2M1 weight (2 fp4 per byte along the last axis)
+    into ``float4_e2m1fn`` and move the contracting axis into GMM layout. Input
+    is the checkpoint layout ``[..., N, K/2]`` (output-major, packed contracting
+    dim last); output is ``[..., K, N]`` to match the ``[size_group, size_k,
+    size_n]`` rhs gmm_v2 expects. Run this once at weight load so the forward
+    pass hands native fp4 straight to the kernel with no per-forward unpack."""
+    fp4 = jax.lax.bitcast_convert_type(w_packed, jnp.float4_e2m1fn)
+    fp4 = fp4.reshape(*w_packed.shape[:-1], -1)  # [..., N, K]
+    return jnp.swapaxes(fp4, -1, -2)  # [..., K, N]
+
+
+def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
+                          block: int) -> tuple[jax.Array, jax.Array]:
+    """W4A8 requantization in JAX: unpack the checkpoint block-16 fp4 weight,
+    dequantize with its fused scale, requantize to ``block`` fp4, and lay out
+    K-major for gmm_v2. Input is checkpoint layout ``[..., N, K/2]`` packed
+    uint8 with fused fp32 block-16 ``scale_f`` ``[..., N, K/16]``; output is
+    native fp4 ``[..., K, N]`` plus the fp32 kernel scale ``[..., K/block, 1,
+    N]``. Requantizing in JAX (not torch) keeps the dequantized weight off the
+    host and rounds to fp4 with the cast the kernel expects."""
+    fp4 = jax.lax.bitcast_convert_type(w_packed, jnp.float4_e2m1fn)
+    fp4 = fp4.reshape(*w_packed.shape[:-1], -1)  # [..., N, K]
+    size_k = fp4.shape[-1]
+    num_in_blocks = scale_f.shape[-1]
+    dequant = (fp4.astype(jnp.float32).reshape(*fp4.shape[:-1], num_in_blocks,
+                                               size_k // num_in_blocks) *
+               scale_f[..., None]).reshape(*fp4.shape[:-1], size_k)
+    fp4_max = float(jnp.finfo(jnp.float4_e2m1fn).max)
+    blocked = dequant.reshape(*dequant.shape[:-1], size_k // block, block)
+    scale = jnp.max(jnp.abs(blocked), axis=-1, keepdims=True) * (1.0 / fp4_max)
+    scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
+    requant = jnp.clip(blocked * scale_inv, -fp4_max,
+                       fp4_max).astype(jnp.float4_e2m1fn)
+    requant = requant.reshape(*dequant.shape[:-1], size_k)  # [..., N, K]
+    scale = scale.squeeze(-1).astype(jnp.float32)  # [..., N, K/block]
+    return (jnp.swapaxes(requant, -1,
+                         -2), jnp.expand_dims(jnp.swapaxes(scale, -1, -2), -2))
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -51,6 +91,11 @@ def gmm_wrapper(lhs,
                 zero_initialize=False,
                 fuse_act=None,
                 preferred_element_type=None):
+    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
+    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
+    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
+    is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
+                     and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -61,6 +106,7 @@ def gmm_wrapper(lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
+        maybe_quantize_lhs=not is_fp4_weight,
     )
 
 
@@ -245,6 +291,10 @@ def fused_moe_func(
     SparseCore ragged gather/gather-reduce (vs the pre-#193 plain-JAX path).
     """
     num_tokens, hidden_size = hidden_states.shape
+
+    # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
+    # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
+    # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
     _, padded_hidden_size, _ = w1.shape
 
     assert topk_weights.shape == (num_tokens, topk)

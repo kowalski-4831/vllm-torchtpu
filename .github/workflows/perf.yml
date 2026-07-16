@@ -120,6 +120,13 @@ jobs:
             run_on: ["pr"]
             type: guard
             retention: 14
+          # NVFP4 (W4A16) guard. Fails until torch_tpu #1560 (fp4 pallas dtype)
+          # is in the CI wheel and the checkpoint is mirrored to the bucket.
+          - name: qwen3-30b-a3b-nvfp4-tp8-ep
+            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--nvidia--Qwen3-30B-A3B-NVFP4/
+            run_on: ["pr"]
+            type: guard
+            retention: 14
           - name: qwen3.5-35b-fp8-tp4-ep
             gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/
             run_on: ["pr"]

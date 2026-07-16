@@ -9,6 +9,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.blockwise_kernel import \
     quantized_matmul_kernel as blockwise_quantized_matmul_kernel
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
@@ -106,6 +107,73 @@ def quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
     orig_out_shape = (*x.shape[:-1], w_q.shape[0])
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
+    return out_2d.reshape(orig_out_shape)
+
+
+def _quantized_matmul_fp4_jax(x: jax.Array, w_q: jax.Array,
+                              w_s: jax.Array) -> jax.Array:
+    """W4A16 dense matmul for NVFP4 weights via gmm_v2 (single group).
+
+    `w_q` is the native fp4 weight in K-major layout [n_in, n_out] (unpacked at
+    load); it only needs a leading group axis for the gmm_v2 rhs layout
+    [1, n_in, n_out]. `w_s` is the fused fp32 block scale [1, num_blocks, 1,
+    n_out]. gmm_v2 selects the regime from the block size: block-16 dequantizes
+    the fp4 weight per block and keeps bf16 activations (W4A16).
+    """
+    rhs = w_q[None]  # [n_in, n_out] fp4 -> [1, n_in, n_out]
+    return gmm_v2(
+        lhs=x,
+        rhs=rhs,
+        group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
+        rhs_scale=w_s,
+        group_offset=jnp.array([0], dtype=jnp.int32),
+        preferred_element_type=x.dtype,
+        maybe_quantize_lhs=True,
+        zero_initialize=True,
+    )
+
+
+_quantized_matmul_fp4_op: Callable | None = None
+_quantized_matmul_fp4_op_lock = Lock()
+
+
+def _get_quantized_matmul_fp4_op() -> Callable:
+    global _quantized_matmul_fp4_op
+    if _quantized_matmul_fp4_op is not None:
+        return _quantized_matmul_fp4_op
+
+    with _quantized_matmul_fp4_op_lock:
+        if _quantized_matmul_fp4_op is not None:
+            return _quantized_matmul_fp4_op
+
+        op = pallas.jax_op("pallas::quantized_matmul_fp4_kernel",
+                           _quantized_matmul_fp4_jax)
+
+        def _fake_quantized_matmul_fp4(x: torch.Tensor, w_q: torch.Tensor,
+                                       w_s: torch.Tensor):
+            del w_q  # output width is the logical n_out carried by the scale
+            return torch.empty(x.shape[0],
+                               w_s.shape[-1],
+                               dtype=x.dtype,
+                               device=x.device)
+
+        op.register_fake(_fake_quantized_matmul_fp4)
+        _quantized_matmul_fp4_op = op
+        return op
+
+
+def quantized_matmul_fp4(x: torch.Tensor, w_q: torch.Tensor,
+                         w_s: torch.Tensor) -> torch.Tensor:
+    """Torch entry for the NVFP4 W4A16 dense-linear matmul.
+
+    `w_q` is the native fp4 weight in K-major layout [n_in, n_out] (unpacked at
+    load), stored as ``torch.float4_e2m1fn_x2`` (2 fp4 per byte, so its torch
+    last dim is packed). The fused fp32 block scale `w_s` [1, num_blocks, 1,
+    n_out] carries the logical output width.
+    """
+    orig_out_shape = (*x.shape[:-1], w_s.shape[-1])
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_2d = _get_quantized_matmul_fp4_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
 
 
