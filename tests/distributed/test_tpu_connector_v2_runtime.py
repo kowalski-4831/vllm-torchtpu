@@ -1539,12 +1539,72 @@ def test_v2_pcp_source_layout_includes_interleave_size(monkeypatch):
                                         kv_transfer_port=9100,
                                         host_ip=_local_test_host())
     worker.vllm_config.parallel_config.cp_kv_cache_interleave_size = 256
+    worker.vllm_config.model_config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(text_config=types.SimpleNamespace(
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+        )))
 
     layout = worker._local_kv_source_layout()
 
     assert layout.full_attn_pcp_size == 4
     assert layout.full_attn_tp_size == 1
+    assert layout.linear_attn_pcp_size == 1
+    assert layout.linear_attn_tp_size == 4
     assert layout.cp_kv_cache_interleave_size == 256
+
+
+def test_v2_pcp_source_layout_rejects_mixed_tp(monkeypatch):
+    mod = _load_v2_module(monkeypatch)
+    worker = _strided_port_probe_worker(mod,
+                                        dp_rank=0,
+                                        tp_rank=0,
+                                        tp_size=2,
+                                        pcp_rank=0,
+                                        pcp_size=2,
+                                        kv_transfer_port=9100,
+                                        host_ip=_local_test_host())
+
+    with pytest.raises(
+            ValueError,
+            match="source full attention PCP requires full_attn_tp_size == 1"):
+        worker._local_kv_source_layout()
+
+
+@pytest.mark.parametrize(
+    ("pcp_rank", "expected_key_heads", "expected_value_heads"),
+    (
+        (0, (0, 1, 2, 3), tuple(range(0, 8))),
+        (1, (4, 5, 6, 7), tuple(range(8, 16))),
+        (2, (8, 9, 10, 11), tuple(range(16, 24))),
+        (3, (12, 13, 14, 15), tuple(range(24, 32))),
+    ),
+)
+def test_v2_pcp_source_uses_effective_linear_head_ranges(
+        monkeypatch, pcp_rank, expected_key_heads, expected_value_heads):
+    mod = _load_v2_module(monkeypatch)
+    worker = _strided_port_probe_worker(mod,
+                                        dp_rank=0,
+                                        tp_rank=0,
+                                        tp_size=1,
+                                        pcp_rank=pcp_rank,
+                                        pcp_size=4,
+                                        kv_transfer_port=9100,
+                                        host_ip=_local_test_host())
+    worker.vllm_config.model_config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(text_config=types.SimpleNamespace(
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+        )))
+
+    assert worker._local_mamba_keyhead_range() == expected_key_heads
+    assert worker._local_mamba_valuehead_range() == expected_value_heads
 
 
 def test_v2_strided_listen_ports_are_unique_for_tp4_without_pcp(monkeypatch):

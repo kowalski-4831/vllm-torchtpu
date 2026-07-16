@@ -22,7 +22,7 @@ from vllm_torchtpu.distributed.kv_transfer.v2.strided_transfer import (
 from vllm_torchtpu.logger import init_logger
 
 from . import zmq_side_channel
-from .common import LayerType, TensorLayout, linear_rank
+from .common import LayerType, TensorLayout, head_range, linear_rank
 from .layout import HeadSegment, KVCacheRegion, TokenFirstLayoutSpec
 from .metadata import (ConnectorMetadataV2, HeadMapping, KVParallelLayout,
                        LocalDecodeAllocation, PullMeta, RankTransferPlan,
@@ -1761,11 +1761,17 @@ class TPUConnectorV2Worker:
         cp_kv_cache_interleave_size = int(
             getattr(parallel_config, "cp_kv_cache_interleave_size", 1) or 1)
         tp_size = self._local_tp_size()
+        if full_attn_pcp_size > 1 and tp_size != 1:
+            raise ValueError(
+                "source full attention PCP requires full_attn_tp_size == 1")
+        linear_attn_tp_size = tp_size
+        if self._gdn_state_is_pcp_sharded():
+            linear_attn_tp_size *= full_attn_pcp_size
         return KVParallelLayout(
             full_attn_pcp_size=full_attn_pcp_size,
             full_attn_tp_size=tp_size,
             linear_attn_pcp_size=1,
-            linear_attn_tp_size=tp_size,
+            linear_attn_tp_size=linear_attn_tp_size,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 
@@ -2128,10 +2134,32 @@ class TPUConnectorV2Worker:
         return len(self._local_mamba_valuehead_range())
 
     def _local_mamba_keyhead_range(self) -> tuple[int, ...]:
-        return self._localhead_range(self._linear_num_key_heads())
+        return self._local_linear_head_range(self._linear_num_key_heads())
 
     def _local_mamba_valuehead_range(self) -> tuple[int, ...]:
-        return self._localhead_range(self._linear_num_value_heads())
+        return self._local_linear_head_range(self._linear_num_value_heads())
+
+    def _gdn_state_is_pcp_sharded(self) -> bool:
+        if self._local_pcp_size() <= 1:
+            return False
+        return all(
+            self._config_int(field, 0) > 0 for field in (
+                "linear_num_key_heads",
+                "linear_num_value_heads",
+                "linear_key_head_dim",
+                "linear_value_head_dim",
+                "linear_conv_kernel_dim",
+            ))
+
+    def _local_linear_head_range(self, total_heads: int) -> tuple[int, ...]:
+        total = int(total_heads)
+        if total <= 0:
+            return ()
+        if not self._gdn_state_is_pcp_sharded():
+            return self._localhead_range(total)
+        effective_tp_size = self._local_tp_size() * self._local_pcp_size()
+        effective_tp_rank = self._local_transfer_rank()
+        return tuple(head_range(total, effective_tp_size, effective_tp_rank))
 
     def _localhead_range(self, total_heads: int) -> tuple[int, ...]:
         total = int(total_heads)
