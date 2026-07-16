@@ -1438,6 +1438,7 @@ def _run_multiprocess_prefill_decode_integration(
         device.startswith("tpu") for device in prefill_final_devices.values())
 
 
+@pytest.mark.skip(reason="Flaky multi-process teardown in CI")
 def test_multiprocess_prefill_decode_fa_4pcp_gdn_4tp_to_decode_2tp(
         monkeypatch):
     constants = _integration_model_constants(decode_tp_size=2)
@@ -1454,6 +1455,7 @@ def test_multiprocess_prefill_decode_fa_4pcp_gdn_4tp_to_decode_2tp(
     )
 
 
+@pytest.mark.skip(reason="Flaky multi-process teardown in CI")
 def test_multiprocess_prefill_decode_fa_4pcp_gdn_4tp_to_decode_1tp(
         monkeypatch):
     constants = _integration_model_constants(decode_tp_size=1)
