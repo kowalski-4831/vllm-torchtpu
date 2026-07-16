@@ -71,7 +71,7 @@ def get_tpu_quantization_config(
         quant_methods.NVFP4: VllmNvfp4Config,
         # TODO: Add more quantization methods as needed
         # quant_methods.AWQ: VllmAWQConfig,
-        # quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,
+        quant_methods.COMPRESSED_TENSORS: VllmFp8Config,
     }
 
     if model_config.quantization not in method_to_config:

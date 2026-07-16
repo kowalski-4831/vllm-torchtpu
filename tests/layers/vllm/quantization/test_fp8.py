@@ -252,6 +252,43 @@ class TestFp8LinearRuntimeQuant:
                               torch.tensor(2.5, device=device),
                               atol=0.1)
 
+    def test_per_tensor_dequant_with_logical_widths(self, device):
+        """Per-tensor dequant with multiple scales should use logical_widths repeat_interleave."""
+        # Simulate QKVParallelLinear with logical_widths [64, 32, 32] (total out_dim = 128)
+        logical_widths = [64, 32, 32]
+        out_dim = sum(logical_widths)
+        in_dim = 128
+
+        weight_fp8 = torch.ones(out_dim,
+                                in_dim,
+                                device=device,
+                                dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        scale = torch.tensor([1.0, 2.0, 3.0],
+                             device=device,
+                             dtype=torch.float32)
+
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+        layer.logical_widths = logical_widths
+
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=None))
+        method.process_weights_after_loading(layer)
+
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert layer.weight_scale.shape == (out_dim, )
+
+        w = layer.weight.float() * layer.weight_scale[:, None]
+        assert torch.allclose(w[:64].mean(),
+                              torch.tensor(1.0, device=device),
+                              atol=0.1)
+        assert torch.allclose(w[64:96].mean(),
+                              torch.tensor(2.0, device=device),
+                              atol=0.1)
+        assert torch.allclose(w[96:].mean(),
+                              torch.tensor(3.0, device=device),
+                              atol=0.1)
+
     def test_apply_is_linear(self, device):
         """apply() should use the runtime FP8 quantized matmul."""
         if device.type != "tpu":
