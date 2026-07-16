@@ -67,46 +67,63 @@ docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 trap 'docker kill "${CONTAINER_NAME}" 2>/dev/null || true' EXIT INT TERM
 
+# Buildkite and test suite related environment variables and volume mounts
+export BUILDKITE_PARALLEL_JOB="${BUILDKITE_PARALLEL_JOB:-0}"
+export BUILDKITE_PARALLEL_JOB_COUNT="${BUILDKITE_PARALLEL_JOB_COUNT:-1}"
+
+TEST_SUITE_VARS=()
+while IFS='=' read -r key _; do
+  if [[ "$key" == BUILDKITE_* ]]; then
+    TEST_SUITE_VARS+=(-e "$key")
+  fi
+done < <(env)
+if [ -n "${BUILDKITE_OIDC_TOKEN_PATH:-}" ]; then
+  TEST_SUITE_VARS+=(-v "$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}"):$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}")")
+fi
+
+# Spanner eval upload tracking & metadata variables (from PR #14)
+SPANNER_EVAL_VARS=(
+  -e CREATED_BY="${CREATED_BY:-}"
+  -e GCP_INSTANCE_NAME="${GCP_INSTANCE_NAME:-}"
+  -e NIGHTLY="${NIGHTLY:-}"
+  -e RUN_TYPE="${RUN_TYPE:-}"
+  -e TPU_NAME="${TPU_NAME:-}"
+)
+
 echo "--- Running command in Docker container"
 docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16g --device /dev/fuse \
+  -w /root/torchtpu-vllm \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
   -v /mnt/disks/persist/torchtpu_cache:/torchtpu_cache \
+  -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
+  -e EVALPLUS_DATASETS="${EVALPLUS_DATASETS:-}" \
+  -e EVALPLUS_PARALLEL="${EVALPLUS_PARALLEL:-}" \
+  -e FORCE_COLOR="1" \
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e VLLM_CACHE_ROOT=/torchtpu_cache \
   -e VLLM_XLA_CACHE_PATH=/torchtpu_cache \
-  -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
-  -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
-  -e FORCE_COLOR="1" \
-  -e UV_NO_CACHE="1" \
-  -e TQDM_MININTERVAL="30" \
   -e MODEL_IMPL_TYPE="${MODEL_IMPL_TYPE:-}" \
-  -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
-  -e EVALPLUS_DATASETS="${EVALPLUS_DATASETS:-}" \
-  -e EVALPLUS_PARALLEL="${EVALPLUS_PARALLEL:-}" \
-  -e TPU_NAME="${TPU_NAME:-}" \
-  -e BUILDKITE_COMMIT="${BUILDKITE_COMMIT:-}" \
-  -e BUILDKITE_AGENT_META_DATA_QUEUE="${BUILDKITE_AGENT_META_DATA_QUEUE:-}" \
-  -e BUILDKITE_AGENT_NAME="${BUILDKITE_AGENT_NAME:-}" \
-  -e BUILDKITE_BUILD_NUMBER="${BUILDKITE_BUILD_NUMBER:-}" \
-  -e GCP_INSTANCE_NAME="${GCP_INSTANCE_NAME:-}" \
-  -e RUN_TYPE="${RUN_TYPE:-}" \
-  -e CREATED_BY="${CREATED_BY:-}" \
-  -e NIGHTLY="${NIGHTLY:-}" \
-  ${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:+-e TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}"} \
-  ${RUN_ROOT:+-e RUN_ROOT="${RUN_ROOT}"} \
+  -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
+  -e TQDM_MININTERVAL="30" \
+  -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
+  -e UV_NO_CACHE="1" \
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"} \
-  ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"} \
   ${P4D2_BIND_HOST:+-e P4D2_BIND_HOST="${P4D2_BIND_HOST}"} \
   ${PROXY_PORT:+-e PROXY_PORT="${PROXY_PORT}"} \
   ${RAGGED_GATED_DELTA_RULE_IMPL:+-e RAGGED_GATED_DELTA_RULE_IMPL="${RAGGED_GATED_DELTA_RULE_IMPL}"} \
+  ${RUN_ROOT:+-e RUN_ROOT="${RUN_ROOT}"} \
+  ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"} \
+  ${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:+-e TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}"} \
+  "${TEST_SUITE_VARS[@]}" \
+  "${SPANNER_EVAL_VARS[@]}" \
   "${IMAGE_TAG}" \
   bash -c '
     umask 000
     rm -rf /perf_eval_results/*
     "$@"
-  ' _ "$@"
+  ' -- "$@"
 DOCKER_EXIT_CODE=$?
 set -e
 

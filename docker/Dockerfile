@@ -39,6 +39,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # and testing tools needed for CI/CD pipelines.
 FROM base AS ci
 
+# Copy bktec binary from Buildkite Test Engine client image
+COPY --from=buildkite/test-engine-client /usr/local/bin/bktec /usr/local/bin/bktec
+
 # Install tools needed for CI (git, gcloud, lsof, fuser)
 RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg git lsof psmisc lsb-release && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
