@@ -29,10 +29,15 @@ grid step moves only the region's bytes. Scatters alias the pool in place
 (`input_output_aliases`); the unwritten complement is preserved via the
 HBM alias, with no read-modify-write.
 """
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels import typed_ldst
+from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
 
 
 def _pool_geometry(pool):
@@ -143,19 +148,9 @@ def gather_region(pool,
     pad = (0, ) * (len(payload) + 1)
 
     def _kernel(sidx_ref, pool_ref, o_ref):
-        block = pool_ref.at[0]
-        if not same_dtype:
-            block = block.bitcast(jnp.dtype(out_dtype))
-        arr = block[...].reshape(out_rows // lane_split, lanes)
-        if lane_split > 1:
-            # In-kernel lane split: 128-aligned lane slices stacked on a
-            # new sublane axis preserve the row-major element order.
-            arr = jnp.stack([
-                arr[:, i * o_lanes:(i + 1) * o_lanes]
-                for i in range(lane_split)
-            ],
-                            axis=1).reshape(out_rows, o_lanes)
-        o_ref[...] = arr[None]
+        o_ref[...] = typed_ldst.load_typed(pool_ref.at[0],
+                                           view_dtype=out_dtype,
+                                           lane_split=lane_split)[None]
 
     return pl.pallas_call(
         _kernel,
@@ -210,17 +205,10 @@ def _gather_window(pool,
 
     def _kernel(sidx_ref, pool_ref, o_ref):
         for j in range(nblocks):
-            block = pool_ref.at[kb0 + j]
-            if not same_dtype:
-                block = block.bitcast(jnp.dtype(out_dtype))
-            arr = block[...].reshape(rows_pb // lane_split, lanes)
-            if lane_split > 1:
-                arr = jnp.stack([
-                    arr[:, k * o_lanes:(k + 1) * o_lanes]
-                    for k in range(lane_split)
-                ],
-                                axis=1).reshape(rows_pb, o_lanes)
-            o_ref[0, j * rows_pb:(j + 1) * rows_pb, :] = arr
+            o_ref[0, j * rows_pb:(j + 1) *
+                  rows_pb, :] = (typed_ldst.load_typed(pool_ref.at[kb0 + j],
+                                                       view_dtype=out_dtype,
+                                                       lane_split=lane_split))
 
     return pl.pallas_call(
         _kernel,
@@ -269,20 +257,11 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int,
     def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
         for j in range(split):
             if kb0 <= j < kb0 + nblocks:
-                arr = val_ref[0, (j - kb0) * v_rows_pb:(j - kb0 + 1) *
-                              v_rows_pb, :]
-                if lane_split > 1:
-                    arr = arr.reshape(rows_pb, lane_split, v_lanes)
-                    arr = jnp.concatenate(
-                        [arr[:, k, :] for k in range(lane_split)], axis=-1)
-                block = pool_out_ref.at[j]
-                if not same_dtype:
-                    block = block.bitcast(jnp.dtype(vals.dtype))
-                if not payload and not same_dtype:
-                    block[...] = arr.reshape(rows_pb, lanes)
-                else:
-                    block[...] = arr.reshape((block_size, ) + val_payload +
-                                             (lanes, ))
+                typed_ldst.store_typed(
+                    pool_out_ref.at[j],
+                    val_ref[0, (j - kb0) * v_rows_pb:(j - kb0 + 1) *
+                            v_rows_pb, :],
+                    lane_split=lane_split)
             else:
                 # full-write rule: pass the untouched kernel blocks through
                 pool_out_ref.at[j][...] = pool_in_ref.at[j][...]
@@ -364,18 +343,9 @@ def scatter_region(pool,
     def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
         # The output block covers exactly the region and is fully written;
         # the complement is preserved via the HBM alias.
-        block = pool_out_ref.at[0]
-        if not same_dtype:
-            block = block.bitcast(jnp.dtype(vals.dtype))
-        arr = val_ref[0]
-        if lane_split > 1:
-            arr = arr.reshape(out_rows, lane_split, v_lanes)
-            arr = jnp.concatenate([arr[:, i, :] for i in range(lane_split)],
-                                  axis=-1)
-        if not payload and not same_dtype:
-            block[...] = arr.reshape(out_rows, lanes)
-        else:
-            block[...] = arr.reshape((ntok, ) + val_payload + (lanes, ))
+        typed_ldst.store_typed(pool_out_ref.at[0],
+                               val_ref[0],
+                               lane_split=lane_split)
 
     return pl.pallas_call(
         _kernel,
@@ -424,3 +394,74 @@ def copy_blocks(pool, src_indices, dst_indices):
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
     )(src_indices, dst_indices, pool)
+
+
+def v3_state_source(pool, *, split: int, ssm_ntok: int, conv_tok0: int,
+                    conv_ntok: int, conv_dim: int, n_v: int, d_k: int,
+                    d_v: int,
+                    kernel_size: int) -> gdn_v3_config.StateSourcePlan:
+    """Static copy-plan letting the fused GDN V3 kernel stream the mamba
+    state regions directly between this pool and its double-buffered
+    pipeline — the exact bytes ``gather_region``/``scatter_region`` move
+    for these regions, without the external round trip.
+
+    The ssm region is the whole kernel blocks at the start of the manager
+    window (one contiguous DMA per slot), viewed f32 with the ``d_v``
+    lane split; the conv region is ``conv_ntok`` token rows inside a
+    single kernel block, viewed bf16 with the tail rows zero-padded.
+    Arguments mirror the region geometry computed by the pooled GDN
+    caller; ``pool`` contributes only its shape and dtype.
+    """
+    block_size, payload, lanes = _pool_geometry(pool)
+    tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
+
+    assert lanes % d_v == 0, (lanes, d_v)
+    ssm_rows = n_v * d_k
+    # The caller sizes the ssm region to exactly the f32 state bytes, so
+    # the kernel's write covers the whole region (no padding rows).
+    assert ssm_ntok * tok_bytes == ssm_rows * d_v * 4, (ssm_ntok, tok_bytes,
+                                                        n_v, d_k, d_v)
+    if ssm_ntok % block_size == 0:
+        ssm_nblocks, ssm_nrows = ssm_ntok // block_size, block_size
+    else:
+        assert ssm_ntok < block_size, (ssm_ntok, block_size)
+        ssm_nblocks, ssm_nrows = 1, ssm_ntok
+    ssm = gdn_v3_config.StateRegion(
+        kb0=0,
+        nblocks=ssm_nblocks,
+        row0=0,
+        nrows=ssm_nrows,
+        view_dtype=jnp.dtype(jnp.float32),
+        lane_split=lanes // d_v,
+        rows_used=ssm_rows,
+    )
+
+    kb0, row0 = divmod(conv_tok0, block_size)
+    if row0 + conv_ntok > block_size:
+        raise NotImplementedError(
+            "conv region partially straddles kernel blocks: "
+            f"tok0={conv_tok0} ntok={conv_ntok} kernel_block={block_size}")
+    assert conv_tok0 + conv_ntok <= split * block_size, (conv_tok0, conv_ntok,
+                                                         split, block_size)
+    assert (kernel_size - 1) * conv_dim % lanes == 0, (kernel_size, conv_dim,
+                                                       lanes)
+    # The kernel regroups conv rows into (kernel_size - 1, conv_dim) via
+    # 128-aligned lane concat, which needs whole rows per conv row.
+    assert conv_dim % lanes == 0, (conv_dim, lanes)
+    conv_rows = (kernel_size - 1) * conv_dim // lanes
+    assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (conv_rows,
+                                                            conv_ntok,
+                                                            tok_bytes)
+    conv = gdn_v3_config.StateRegion(
+        kb0=kb0,
+        nblocks=1,
+        row0=row0,
+        nrows=conv_ntok,
+        view_dtype=jnp.dtype(jnp.bfloat16),
+        lane_split=1,
+        rows_used=conv_rows,
+    )
+
+    return gdn_v3_config.StateSourcePlan(stride=split,
+                                         conv=conv,
+                                         recurrent=ssm)

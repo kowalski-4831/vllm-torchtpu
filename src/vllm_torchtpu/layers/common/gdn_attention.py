@@ -772,10 +772,12 @@ def run_jax_gdn_attention_pooled_local(
 
     ``recurrent_state`` is the attention-shaped pool holding the f32 ssm
     region at token offset 0 and the conv region in the tokens right after
-    it. All pool knowledge lives here: conv state is gathered/scattered
-    through `pool_adapters` around the stock conv kernel, and the ssm
-    region is threaded into the stock delta-rule via pluggable `StateOps`
-    — the model kernels are unmodified.
+    it. All pool knowledge lives here: for the chunked impls, conv state
+    is gathered/scattered through `pool_adapters` around the stock conv
+    kernel and the ssm region is threaded into the stock delta-rule via
+    pluggable `StateOps`; the fused V3 kernel instead streams both regions
+    in place through a `v3_state_source` copy-plan — the model kernels'
+    math is unmodified either way.
     """
     max_reqs = seq_lens.shape[0]
     query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
@@ -816,6 +818,50 @@ def run_jax_gdn_attention_pooled_local(
     conv_pool, conv_tok0 = recurrent_state, ssm_ntok
     conv_slot_rows = (conv_ntok * tok_bytes) // (2 * lanes)
 
+    if (config.ragged_gated_delta_rule_impl ==
+            RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD):
+        # Fused conv+GDN kernel: both state regions stream directly
+        # between the pool and the kernel's double-buffered pipeline (one
+        # contiguous DMA per slot per region) — no external gather/scatter
+        # round trip. The kernel masks fresh slots via has_initial_state,
+        # so a newly-allocated block's bytes are never read, and padded
+        # slots move no bytes in either direction.
+        plan = pool_adapters.v3_state_source(
+            recurrent_state,
+            split=split,
+            ssm_ntok=ssm_ntok,
+            conv_tok0=conv_tok0,
+            conv_ntok=conv_ntok,
+            conv_dim=conv_dim,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
+            mixed_qkv,
+            b,
+            a,
+            None,
+            None,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            state_source=recurrent_state,
+            state_plan=plan,
+        )
+        return recurrent_state, output
+
     def _write_conv(pool, new_conv):
         rows = new_conv.reshape(-1, conv_data_rows, lanes)
         pad = conv_slot_rows - conv_data_rows
@@ -837,53 +883,6 @@ def run_jax_gdn_attention_pooled_local(
     conv_state = conv_gathered[:, :conv_data_rows, :].reshape(
         -1, kernel_size - 1, conv_dim)
     identity_indices = jnp.arange(state_indices.shape[0], dtype=jnp.int32)
-
-    if (config.ragged_gated_delta_rule_impl ==
-            RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD):
-        # Fused conv+GDN kernel: gather BOTH state regions around the stock
-        # kernel — the same identity-indexed pattern the conv kernel uses
-        # below, with the ssm region joining the conv region in the round
-        # trip. The kernel self-handles fresh slots via seq_lens, so gathered
-        # garbage from a newly-allocated block is never read.
-        ssm_gathered = pool_adapters.gather_region(recurrent_state,
-                                                   state_indices,
-                                                   tok0=0,
-                                                   ntok=ssm_ntok,
-                                                   split=split,
-                                                   out_dtype=jnp.float32,
-                                                   out_lanes=d_v).reshape(
-                                                       max_reqs, n_v, d_k, d_v)
-        (new_conv_state, new_ssm), output = gdn_v3_wrapper.fused_conv1d_gdn(
-            mixed_qkv,
-            b,
-            a,
-            conv_state,
-            ssm_gathered,
-            conv_weight,
-            conv_bias,
-            A_log,
-            dt_bias,
-            query_start_loc,
-            identity_indices,
-            distribution,
-            seq_lens,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-        )
-        recurrent_state = _write_conv(conv_pool, new_conv_state)
-        ssm_rows = (n_v * d_k * d_v) // d_v
-        recurrent_state = pool_adapters.scatter_region(
-            recurrent_state,
-            new_ssm.astype(jnp.float32).reshape(max_reqs, ssm_rows, d_v),
-            state_indices,
-            tok0=0,
-            ntok=ssm_ntok,
-            split=split,
-        )
-        return recurrent_state, output
 
     out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
         mixed_qkv,
