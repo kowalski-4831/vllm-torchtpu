@@ -902,6 +902,17 @@ class TpuPlatform(Platform):
             "Forcing --disable_chunked_mm_input.")
             scheduler_config.disable_chunked_mm_input = True
 
+        if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
+            dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+            if scheduler_config.scheduler_cls != dp_sched_cls:
+                assert scheduler_config.scheduler_cls is None, (
+                    "Cannot have DP_SCHED_ENABLED enabled and also a custom "
+                    "scheduler being provided.")
+                scheduler_config.scheduler_cls = dp_sched_cls
+                logger.info(
+                    "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
+                    parallel_config.data_parallel_size)
+
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
