@@ -784,8 +784,8 @@ class TpuPlatform(Platform):
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
         # the align-mode Mamba APC path (MambaApcStateCopier); other cache
-        # modes and the two combinations we haven't wired up yet must be
-        # rejected up front instead of failing partway through warmup.
+        # modes and speculative decoding must be rejected up front instead of
+        # failing partway through warmup.
         if is_hybrid and getattr(cache_config, "enable_prefix_caching", False):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
@@ -795,10 +795,6 @@ class TpuPlatform(Platform):
             if vllm_config.speculative_config is not None:
                 raise NotImplementedError(
                     "Speculative decoding is not yet supported with hybrid "
-                    "Mamba prefix caching (mamba_cache_mode='align').")
-            if vllm_config.scheduler_config.async_scheduling:
-                raise NotImplementedError(
-                    "Async scheduling is not yet supported with hybrid "
                     "Mamba prefix caching (mamba_cache_mode='align').")
         if not is_hybrid and block_size_was_unspecified:
             default = backend_cls.get_page_size(vllm_config)
@@ -905,6 +901,17 @@ class TpuPlatform(Platform):
             " without setting `--disable_chunked_mm_input`. " \
             "Forcing --disable_chunked_mm_input.")
             scheduler_config.disable_chunked_mm_input = True
+
+        if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
+            dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+            if scheduler_config.scheduler_cls != dp_sched_cls:
+                assert scheduler_config.scheduler_cls is None, (
+                    "Cannot have DP_SCHED_ENABLED enabled and also a custom "
+                    "scheduler being provided.")
+                scheduler_config.scheduler_cls = dp_sched_cls
+                logger.info(
+                    "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
+                    parallel_config.data_parallel_size)
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:

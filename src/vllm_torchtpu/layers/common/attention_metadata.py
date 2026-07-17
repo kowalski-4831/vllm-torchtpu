@@ -44,11 +44,11 @@ class AttentionMetadata(object):
     # (3,)
     request_distribution: jax.Array = None
     # (max_num_seqs,) int32 - physical slot id in the mamba kv-cache for the
-    # request currently in each persistent-batch position. Mamba/GDN ops
-    # read/write recurrent state through this instead of `block_tables[:, 0]`,
-    # since under compact-mamba sizing the mamba pool is smaller than the
-    # attention pool and vLLM's attention block IDs no longer index it.
-    # None for the attention group / for non-mamba models.
+    # request currently in each persistent-batch position. Compact-mamba uses
+    # an explicit slot from its independent pool; unified align mode derives
+    # the slot from the current entry in the device block table. None for
+    # attention groups, non-mamba models, and Mamba modes whose native fallback
+    # addresses block_tables[:, 0].
     mamba_state_indices: jax.Array | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
@@ -95,7 +95,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.kv_cache_group_id = kv_cache_group_id
         self.target_block_size = getattr(self.kv_cache_spec, "block_size",
                                          runner.block_size)
-        # Only mamba/GDN layers consume the compact-mamba slot ids; attention
+        # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
         self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
 
@@ -122,7 +122,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
         # that gets updated every step.
-        source_block_tables = None
         if ctx.position_ids_override is not None:
             block_tables_dev = torch.zeros(
                 (target_num_reqs * target_num_blocks, ),
@@ -148,30 +147,24 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # Default compact-mamba path: the runner provides a per-request
             # physical slot id from the compact slot pool.
             mamba_state_indices = ctx.mamba_state_indices
-        elif runner._unified_block_pool:
-            # Unified block pool: Mamba state is keyed by the same vLLM block
-            # ids as attention. Derive from the source block table because
-            # AttentionMetadata.block_tables intentionally zero-pads tail rows.
-            # ctx.seq_lens lives on runner.device, but source_block_tables is
-            # the CPU block table. Keep the gathered offsets on CPU for that
-            # indexing path; the dummy/device path converts them back below.
-            state_block_offsets_cpu = torch.clamp(
+        elif runner._unified_block_pool and runner._mamba_align_mode:
+            # Unified align mode shares vLLM block ids with attention. Derive
+            # the current physical state slot using the same addressing as
+            # vLLM's mamba_get_block_table_tensor(), but from metadata already
+            # submitted to the device. This avoids a D2H -> CPU gather -> H2D
+            # dependency.
+            block_tables_2d = block_tables_dev.reshape(target_num_reqs,
+                                                       target_num_blocks)
+            state_block_offsets = torch.clamp(
                 (ctx.seq_lens - 1) // self.target_block_size,
                 min=0,
                 max=target_num_blocks - 1,
-            ).to(device="cpu", dtype=torch.int64)
-            req_offsets_cpu = torch.arange(target_num_reqs, dtype=torch.int64)
-            if source_block_tables is None:
-                block_tables_2d = block_tables_dev.reshape(
-                    target_num_reqs, target_num_blocks)
-                mamba_state_indices = block_tables_2d[
-                    req_offsets_cpu.to(runner.device),
-                    state_block_offsets_cpu.to(runner.device)].to(torch.int32)
-            else:
-                mamba_state_indices = source_block_tables[
-                    ctx.start_index + req_offsets_cpu,
-                    state_block_offsets_cpu].to(runner.device,
-                                                non_blocking=True)
+            ).to(torch.int64)
+            mamba_state_indices = torch.gather(
+                block_tables_2d,
+                dim=1,
+                index=state_block_offsets.unsqueeze(1),
+            ).squeeze(1)
         else:
             mamba_state_indices = None
 
