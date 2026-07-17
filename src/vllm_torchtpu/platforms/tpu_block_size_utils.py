@@ -28,6 +28,21 @@ def unified_block_pool_enabled(vllm_config: "VllmConfig") -> bool:
                 and vllm_config.kv_transfer_config is None))
 
 
+def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
+    """Whether hybrid KV materialization uses the unified layout family:
+    one shared buffer per kv_cache_tensor whose blocks are fungible between
+    attention KV and mamba state.
+
+    The env alone selects the family so kv-transfer deployments (where the
+    pool never engages) still run the typed-view layout whose byte offsets
+    the KV connector addresses; pool-enabled deployments run the pooled
+    layout on top of the same family.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+            or unified_block_pool_enabled(vllm_config))
+
+
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,
