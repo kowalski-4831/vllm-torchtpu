@@ -147,13 +147,15 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # Default compact-mamba path: the runner provides a per-request
             # physical slot id from the compact slot pool.
             mamba_state_indices = ctx.mamba_state_indices
-        elif runner._unified_block_pool or (runner._unified_kv_layout
-                                            and runner._mamba_align_mode):
-            # Unified layouts share vLLM block ids with attention. Derive
-            # the current physical state slot on device from the zero-padded
-            # `block_tables_dev` (padded tail rows resolve to the null block,
-            # never a stale id — the GDN op scans the full length every
-            # step), avoiding a D2H -> CPU gather -> H2D dependency.
+        elif ((runner._unified_block_pool or runner._unified_kv_layout)
+              and runner._mamba_align_mode):
+            # Unified layouts in align mode share vLLM block ids with
+            # attention (none mode carries compact slot ids in the ctx branch
+            # above). Derive the current physical state slot on device from
+            # the zero-padded `block_tables_dev` (padded tail rows resolve to
+            # the null block, never a stale id — the GDN op scans the full
+            # length every step), avoiding a D2H -> CPU gather -> H2D
+            # dependency.
             block_tables_2d = block_tables_dev.reshape(target_num_reqs,
                                                        target_num_blocks)
             state_block_offsets = torch.clamp(
