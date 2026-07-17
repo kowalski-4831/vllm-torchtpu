@@ -199,7 +199,7 @@ class TestTpuPlatform:
         [
             ("all", None, False, "mamba_cache_mode='align'"),
             ("align", MagicMock(), False, "Speculative decoding"),
-            ("align", None, True, "Async scheduling"),
+            ("align", None, True, None),
         ],
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
@@ -210,7 +210,7 @@ class TestTpuPlatform:
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
-    def test_check_and_update_config_rejects_incomplete_mamba_apc_modes(
+    def test_check_and_update_config_validates_mamba_apc_modes(
             self, mock_vllm_envs, mock_prepare_env, mock_sharding,
             mock_apply_patches, vllm_config, mamba_cache_mode,
             speculative_config, async_scheduling, message):
@@ -231,8 +231,11 @@ class TestTpuPlatform:
                     'vllm_torchtpu.layers.vllm.attention':
                     MagicMock(PallasAttentionBackend=mock_pallas)
                 }):
-            with pytest.raises(NotImplementedError, match=message):
+            if message is None:
                 TpuPlatform.check_and_update_config(vllm_config)
+            else:
+                with pytest.raises(NotImplementedError, match=message):
+                    TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize("connector_name",
                              ["TPUConnector", "TPURaidenConnector"])

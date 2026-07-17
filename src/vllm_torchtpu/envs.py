@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
+    DP_SCHED_ENABLED: bool = False
+    DP_SCHED_BUFFER_PREFILL: bool = False
+    DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS: int = 10000
 
 
 def env_with_choices(
@@ -226,6 +229,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES":
     lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
+    # Enable TpuDpScheduler.
+    "DP_SCHED_ENABLED":
+    lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # TpuDpScheduler: buffer new prefills and flush them in batches.
+    "DP_SCHED_BUFFER_PREFILL":
+    lambda: bool(int(os.getenv("DP_SCHED_BUFFER_PREFILL") or "0")),
+    # TpuDpScheduler: flush buffered prefills once the oldest pending request
+    # has waited this long (bounds TTFT).
+    "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS":
+    lambda: int(os.getenv("DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS") or "10000"),
 }
 
 

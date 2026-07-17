@@ -11,7 +11,7 @@ Pre-built Docker images are automatically built nightly and hosted on Google Art
 To access the images, you must first configure Docker to authenticate with Google Artifact Registry:
 
 ```bash
-gcloud auth configure-docker us-docker.pkg.dev
+gcloud auth configure-docker us-central1-docker.pkg.dev
 ```
 
 ### Pulling Images
@@ -21,19 +21,19 @@ You can pull the following pre-built nightly image targets using the `:latest` t
 * **CI Image** (`ci:latest` equivalent):
 
   ```bash
-  docker pull us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
+  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-ci:latest
   ```
 
 * **Developer Image** (`dev:latest` equivalent):
 
   ```bash
-  docker pull us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-dev:latest
+  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:latest
   ```
 
 * **Production Image** (`prod:latest` equivalent):
 
   ```bash
-  docker pull us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-prod:latest
+  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
   ```
 
 #### Date-Specific Tags
@@ -41,13 +41,13 @@ You can pull the following pre-built nightly image targets using the `:latest` t
 To pull an image for a specific build date, use the `nightly-YYYYMMDD` tag format:
 
 ```bash
-docker pull us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-<target>:nightly-YYYYMMDD
+docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-<target>:nightly-YYYYMMDD
 ```
 
 For example, to pull the Developer Image from May 23, 2026:
 
 ```bash
-docker pull us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-dev:nightly-20260523
+docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20260523
 ```
 
 ## Image targets

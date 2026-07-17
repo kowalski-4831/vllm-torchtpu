@@ -31,9 +31,11 @@ def main(args: argparse.Namespace):
     # Profile
     profile_dir = args.profile_result_dir
     print(f"Profiling (results will be saved to '{profile_dir}')...")
-    os.environ["VLLM_TORCH_PROFILER_DIR"] = profile_dir
-
     engine_kwargs = dataclasses.asdict(EngineArgs.from_cli_args(args))
+    if engine_kwargs.get("profiler_config") is None:
+        engine_kwargs["profiler_config"] = {}
+    engine_kwargs["profiler_config"]["torch_profiler_dir"] = profile_dir
+
     if engine_kwargs.get("compilation_config") is None:
         engine_kwargs["compilation_config"] = {}
     engine_kwargs["compilation_config"]["cudagraph_capture_sizes"] = []

@@ -375,6 +375,8 @@ def test_ci_wrapper_uses_hugging_face_model_and_existing_p4d2_launcher():
     assert "smoke_qwen35_p4d2_prefix_cache_e2e_divergence.py" in text
     assert "prefix_cache_e2e_divergence.log" in text
     assert "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL" in text
+    assert 'ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"' in text
+    assert "export ASYNC_SCHEDULING" in text
     assert "gsutil" not in text
     assert "gcloud storage cp" not in text
 

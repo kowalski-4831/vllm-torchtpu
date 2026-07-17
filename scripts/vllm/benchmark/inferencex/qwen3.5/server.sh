@@ -42,7 +42,11 @@ case "$SHARDING" in
       --tensor-parallel-size=1
       --data-parallel-size=8
       --enable-expert-parallel
-    ) ;;
+    )
+    export DP_SCHED_ENABLED=1
+    export DP_SCHED_BUFFER_PREFILL=1
+    export DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS=10000
+    ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
     DP_SIZE=1
@@ -65,9 +69,7 @@ esac
 MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 # Scale batched tokens based on input sequence length, but not too small.
 MAX_NUM_BATCHED_TOKENS=$(( ISL / DP_SIZE > 1024 ? ISL / DP_SIZE : 1024 ))
-# Cap at 2048 since larger prefill may run into XLA unimplemented
-# async-all-reduce-start error.
-[ "$MAX_NUM_BATCHED_TOKENS" -gt 2048 ] && MAX_NUM_BATCHED_TOKENS=2048
+
 MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
 
@@ -79,8 +81,10 @@ export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$_DEFAULT_CACHE_ROOT/$_CACHE_KEY}"
 mkdir -p "$VLLM_CACHE_ROOT"
 
 # Increase API-server frontend wait time since cold init may take long.
-export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
+export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
+export MODEL_IMPL_TYPE=vllm
+export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
 export RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd
@@ -92,7 +96,7 @@ args=(
   --max-num-batched-tokens="$MAX_NUM_BATCHED_TOKENS"
   --max-num-seqs="$MAX_NUM_SEQS"
   --no-enable-prefix-caching
-  --gpu-memory-utilization=0.8
+  --gpu-memory-utilization=0.92
   --block-size=256
   --async-scheduling
   --port="$PORT"

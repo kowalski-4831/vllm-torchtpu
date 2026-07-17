@@ -6,7 +6,7 @@ This repository contains the integration of **TorchTPU** and **vLLM**. It is a v
 
 ## 🛠️ Installation
 
-To run the **Qwen3** model on a single device, follow these installation steps:
+To run the **Qwen3** model, follow these installation steps:
 
 ### 1. Google Cloud Authentication
 
@@ -99,7 +99,7 @@ pip install --pre -e .
 > password <your_expired_token>
 > ```
 
-> **Note:** Prioritize compile mode for better performance. Add `--enforce-eager` if you want eager mode.
+> **Note:** Prioritize compile mode for better performance. The first startup may take several minutes while TPU graphs compile. Add `--enforce-eager` if you want eager mode.
 > On TPUv7, Qwen3-Coder-30B can fit on a single device. On v6, use a smaller model like Qwen3-4B or test with TP/EP.
 
 ---
@@ -110,14 +110,11 @@ Start the server with the following command:
 
 ```bash
 vllm serve "Qwen/Qwen3-Coder-30B-A3B-Instruct" \
-  --tensor_parallel_size=1 \
+  --tensor_parallel_size=2 \
   --max-model-len=256 \
   --max-num-batched-tokens=256 \
   --attention-backend CUSTOM
 ```
-
-> [!TIP]
-> If you see `RuntimeError: operator torchvision::nms does not exist`, run either `uv pip uninstall torchvision` or `pip uninstall torchvision`.
 
 ### Send a Request
 
@@ -138,14 +135,13 @@ curl http://localhost:8000/v1/completions \
 
 You can also run a simple offline inference script to verify the setup without starting a full server.
 
-#### Single Device
-
-```bash
-python3 examples/offline_inference.py \
-  --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
-  --max-model-len 256 \
-  --max-num-batched-tokens 256
-```
+> [!NOTE]
+> For current TorchTPU builds, set these temporary workarounds:
+>
+> ```bash
+> export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
+> export TORCHINDUCTOR_AUTOGRAD_CACHE=0
+> ```
 
 #### Tensor Parallelism (TP)
 
