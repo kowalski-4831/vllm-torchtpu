@@ -166,8 +166,12 @@ class TestAttentionMetadataBuilderPlumbing:
         assert torch.equal(meta.mamba_state_indices, expected)
 
     def test_unified_none_mode_uses_first_block_fallback(self):
+        # Typed-view layout in none mode: compact slot ids arrive via the
+        # builder ctx, so the builder itself yields no indices. (The pool
+        # has no compact slot pool and derives indices in every mode.)
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
-        runner._unified_block_pool = True
+        runner._unified_block_pool = False
+        runner._unified_kv_layout = True
         runner._mamba_align_mode = False
         builder = self._make_mamba_builder(runner)
 
