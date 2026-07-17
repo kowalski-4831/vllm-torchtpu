@@ -20,14 +20,18 @@ def unified_block_pool_enabled(vllm_config: "VllmConfig") -> bool:
     and mamba state served from one attention-shaped pool of fungible
     blocks).
 
-    Opt-in only, via TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL. Never engages for
-    kv-transfer deployments: the KV connector addresses the typed-view
-    layout by byte offsets and does not understand the pool, so the same
-    env keeps those deployments on the typed-view layout (see
+    On by default for single-server hybrid models at DP=1; attention-DP
+    deployments stay on the split layout, and
+    TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL forces the pool at any DP. Never
+    engages for kv-transfer deployments: the KV connector addresses the
+    typed-view layout by byte offsets and does not understand the pool, so
+    the same env keeps those deployments on the typed-view layout (see
     unified_kv_layout_enabled).
     """
     from vllm_torchtpu import envs as tpu_envs
-    return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+    return ((tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL or
+             (getattr(vllm_config.model_config, "is_hybrid", False)
+              and vllm_config.parallel_config.data_parallel_size == 1))
             and vllm_config.kv_transfer_config is None)
 
 

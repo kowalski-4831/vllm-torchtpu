@@ -106,6 +106,10 @@ class TestTpuPlatform:
                                                        vllm_config):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
+        # kv-transfer deployments run the split layout (the pool is
+        # default-on only for single-server hybrid at DP=1).
+        vllm_config.kv_transfer_config = MagicMock()
+        vllm_config.kv_transfer_config.kv_connector = "TPUConnector"
         vllm_config.cache_config.block_size = 123  # already set
 
         mock_pallas = MagicMock()
@@ -125,8 +129,8 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
         mock_mamba_patch.assert_not_called()
 
-        # Without the unified-layout env the hybrid path keeps the split
-        # layout: the block-size derivation helper must not run.
+        # Without the unified-layout env the split-layout path must not run
+        # the block-size derivation helper.
         mock_update.assert_not_called()
         # Verify block_size wasn't overridden by get_page_size
         assert vllm_config.cache_config.block_size == 123
@@ -174,16 +178,21 @@ class TestTpuPlatform:
         from vllm_torchtpu.platforms.tpu_block_size_utils import (
             unified_block_pool_enabled, unified_kv_layout_enabled)
         vllm_config.model_config.is_hybrid = True
-
-        # No env: neither the pool nor the unified layout engages, even for
-        # single-server hybrid models.
         vllm_config.kv_transfer_config = None
+
+        # Default-on for single-server hybrid at DP=1.
+        vllm_config.parallel_config.data_parallel_size = 1
+        assert unified_block_pool_enabled(vllm_config)
+        assert unified_kv_layout_enabled(vllm_config)
+
+        # Attention-DP is fenced to the split layout by default...
+        vllm_config.parallel_config.data_parallel_size = 8
         assert not unified_block_pool_enabled(vllm_config)
         assert not unified_kv_layout_enabled(vllm_config)
 
         with patch.dict("os.environ",
                         {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"}):
-            # Env opt-in: pool + unified layout.
+            # ... and the env forces the pool even at DP>1 (single-server).
             assert unified_block_pool_enabled(vllm_config)
             assert unified_kv_layout_enabled(vllm_config)
 
@@ -192,6 +201,10 @@ class TestTpuPlatform:
             vllm_config.kv_transfer_config = MagicMock()
             assert not unified_block_pool_enabled(vllm_config)
             assert unified_kv_layout_enabled(vllm_config)
+
+        # Without the env, kv-transfer stays fully on the split layout.
+        assert not unified_block_pool_enabled(vllm_config)
+        assert not unified_kv_layout_enabled(vllm_config)
 
     @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling",
@@ -221,6 +234,9 @@ class TestTpuPlatform:
         vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
         vllm_config.speculative_config = speculative_config
         vllm_config.scheduler_config.async_scheduling = async_scheduling
+        # Attention-DP runs the split layout; async+APC is only rejected
+        # there (the pool's seed copies support async scheduling).
+        vllm_config.parallel_config.data_parallel_size = 8
 
         mock_pallas = MagicMock()
         mock_pallas.get_page_size.return_value = 256
