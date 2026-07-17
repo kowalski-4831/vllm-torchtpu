@@ -22,7 +22,8 @@ from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_block_pool_enabled, update_tpu_block_size_and_slot_config)
+    unified_block_pool_enabled, unified_kv_layout_enabled,
+    update_tpu_block_size_and_slot_config)
 from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
@@ -695,17 +696,19 @@ class TpuPlatform(Platform):
             logger.info("Using vLLM native multiprocess PCP world; PCP is not "
                         "represented as a JAX mesh axis.")
 
-        # libtpu never completes an execution whose TP all-reduce was
-        # offloaded to the SparseCore (the `auto` payload threshold selects
-        # the offload from ~1024-token buckets upward); keep the all-reduce
-        # on the TensorCore. Set before workers spawn — torch_tpu reads this
-        # env once per process at first compile. Respect an explicit user
-        # setting of the same key.
-        sc_ar = "xla_tpu_enable_sparse_core_collective_offload_all_reduce"
-        xla_opts = os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", "")
-        if sc_ar not in xla_opts:
-            os.environ["TORCH_TPU_INTERNAL_XLA_OPTIONS"] = (
-                f"{xla_opts} {sc_ar}=false".strip())
+        # libtpu never completes a pool-program execution whose TP all-reduce
+        # was offloaded to the SparseCore (the `auto` payload threshold
+        # selects the offload from ~1024-token buckets upward); keep the
+        # all-reduce on the TensorCore when the unified block pool serves the
+        # KV cache. Set before workers spawn — torch_tpu reads this env once
+        # per process at first compile. Respect an explicit user setting of
+        # the same key.
+        if unified_block_pool_enabled(vllm_config):
+            sc_ar = "xla_tpu_enable_sparse_core_collective_offload_all_reduce"
+            xla_opts = os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", "")
+            if sc_ar not in xla_opts:
+                os.environ["TORCH_TPU_INTERNAL_XLA_OPTIONS"] = (
+                    f"{xla_opts} {sc_ar}=false".strip())
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
@@ -795,29 +798,30 @@ class TpuPlatform(Platform):
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # align-mode mamba state seeding, which only the unified block pool
-        # implements; unsupported combinations must be rejected up front
-        # instead of failing partway through warmup.
+        # align-mode mamba state seeding (the pool's seed copies, or
+        # MambaApcStateCopier on the typed-view layout); unsupported
+        # combinations must be rejected up front instead of failing partway
+        # through warmup.
         if is_hybrid and getattr(cache_config, "enable_prefix_caching", False):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
                     "mamba_cache_mode='align' (got "
                     f"{cache_config.mamba_cache_mode!r}).")
-            if not unified_block_pool_enabled(vllm_config):
-                raise NotImplementedError(
-                    "Prefix caching on hybrid Mamba models requires the "
-                    "unified block pool; the split kv-transfer layout has "
-                    "no mamba state seeding.")
             if vllm_config.speculative_config is not None:
                 raise NotImplementedError(
                     "Speculative decoding is not yet supported with hybrid "
+                    "Mamba prefix caching (mamba_cache_mode='align').")
+            if (vllm_config.scheduler_config.async_scheduling
+                    and not unified_block_pool_enabled(vllm_config)):
+                raise NotImplementedError(
+                    "Async scheduling is not yet supported with hybrid "
                     "Mamba prefix caching (mamba_cache_mode='align').")
         if not is_hybrid and block_size_was_unspecified:
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]
                 backend_cls.get_preferred_block_size(default))
-        if unified_block_pool_enabled(vllm_config):
+        if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
         min_page_size = backend_cls.get_min_page_size(vllm_config)

@@ -16,16 +16,19 @@ logger = init_logger(__name__)
 
 
 def unified_block_pool_enabled(vllm_config: "VllmConfig") -> bool:
-    """Whether this deployment runs on the unified block pool.
+    """Whether this deployment runs on the unified block pool (attention KV
+    and mamba state served from one attention-shaped pool of fungible
+    blocks).
 
-    On by default for single-server hybrid models (attention KV and mamba
-    state share one pool of fungible blocks); disagg/kv-transfer setups
-    require the explicit TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL opt-in.
+    Opt-in only, via TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL. Never engages for
+    kv-transfer deployments: the KV connector addresses the typed-view
+    layout by byte offsets and does not understand the pool, so the same
+    env keeps those deployments on the typed-view layout (see
+    unified_kv_layout_enabled).
     """
     from vllm_torchtpu import envs as tpu_envs
     return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-            or (getattr(vllm_config.model_config, "is_hybrid", False)
-                and vllm_config.kv_transfer_config is None))
+            and vllm_config.kv_transfer_config is None)
 
 
 def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
