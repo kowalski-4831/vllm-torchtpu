@@ -128,6 +128,23 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
         # 1500 rounds up to 2048
         self.assertEqual(reserve_1500, reserve_2048)
 
+    def test_raiden_defaults_to_zero_reserve(self):
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
+        cfg = self._make_vllm_config()
+        # Temporarily pop global env variable so we can test the fallback path
+        # when it is absent. We use try/finally to ensure it is restored even
+        # if the test assertions fail (avoiding environment leakage to other tests).
+        orig_max_blocks = os.environ.pop("KV_H2D_POOL_MAX_BLOCKS", None)
+        try:
+            with patch("vllm_torchtpu.offload.cpu_tpu._USE_RAIDEN_OFFLOAD",
+                       True):
+                raiden_reserve = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
+                    cfg)
+            self.assertEqual(raiden_reserve, 0)
+        finally:
+            if orig_max_blocks is not None:
+                os.environ["KV_H2D_POOL_MAX_BLOCKS"] = orig_max_blocks
+
 
 class TestPrewarmDelegation(unittest.TestCase):
     """TPUCPUOffloadingSpec.prewarm_shapes / prewarm_shape forward to the
