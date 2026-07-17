@@ -484,10 +484,16 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
     def from_config(cls, config: dict) -> "VllmFp8Config":
         weight_block_size = config.get("weight_block_size")
         activation_scheme = config.get("activation_scheme", "dynamic")
+        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        if not ignored_layers:
+            ignored_layers = cls.get_from_keys_or(config,
+                                                  ["modules_to_not_convert"],
+                                                  None)
         return cls(
             is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,
             weight_block_size=weight_block_size,
+            ignored_layers=ignored_layers,
         )
 
     def get_quant_method(
