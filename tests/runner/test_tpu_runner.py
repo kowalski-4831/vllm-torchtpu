@@ -1123,8 +1123,13 @@ class TestAttentionMetadataBuilder:
         meta = builder.build(common_prefix_len=0,
                              common_attn_metadata=self._make_cm(4))
 
+        # Derived from the zero-padded device block table: req0 (seq_len 1)
+        # -> block offset 0 -> bt[0, 0] = 0; req1 (seq_len 33) -> offset
+        # (33-1)//16 = 2 -> bt[1, 2] = 6. Padded tail rows (only 2 real
+        # reqs) resolve to the null block 0, never a stale block id — the
+        # GDN op scans the full target_num_reqs every step.
         assert torch.equal(meta.mamba_state_indices,
-                           torch.tensor([0, 6, 8, 12], dtype=torch.int32))
+                           torch.tensor([0, 6, 0, 0], dtype=torch.int32))
 
 
 class TestCompactMambaSlotPool:

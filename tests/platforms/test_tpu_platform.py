@@ -118,13 +118,19 @@ class TestTpuPlatform:
                     MagicMock(PallasAttentionBackend=mock_pallas)
                 }), patch(
                     "vllm_torchtpu.platforms.tpu_platform."
-                    "_patch_scheduler_mamba_external_kv") as mock_mamba_patch:
+                    "_patch_scheduler_mamba_external_kv") as mock_mamba_patch, \
+                patch(
+                    "vllm_torchtpu.platforms.tpu_platform."
+                    "update_tpu_block_size_and_slot_config") as mock_update:
             TpuPlatform.check_and_update_config(vllm_config)
         mock_mamba_patch.assert_not_called()
 
-        # Verify block_size wasn't overridden by get_page_size
+        # Hybrid (single-server) runs on the unified block pool: block size
+        # and slot sizing are owned by the derivation helper (its math is
+        # covered by test_tpu_block_size_utils.py) ...
+        mock_update.assert_called_once_with(vllm_config, mock_pallas)
         assert vllm_config.cache_config.block_size == 123
-        # And get_page_size shouldn't even be called because is_hybrid is True
+        # ... and the non-hybrid get_page_size default path must not run.
         mock_pallas.get_page_size.assert_not_called()
 
     @pytest.mark.parametrize(
