@@ -102,6 +102,7 @@ args=(
   --port="$PORT"
   --language-model-only
   --limit-mm-per-prompt='{"image": 0, "video": 0}'
+  --quantization=fp8
   --kv-cache-dtype=fp8
   --attention-backend CUSTOM
   "${SHARDING_ARGS[@]}"
