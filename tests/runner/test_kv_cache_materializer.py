@@ -53,7 +53,10 @@ def make_hybrid_config(
     num_blocks: int = 4,
     attn_dtype: torch.dtype = torch.bfloat16,
 ) -> KVCacheConfig:
-    page_size = 16 * 2 * 2 * 8 * torch.bfloat16.itemsize
+    # The attention page must be sized by the actual KV dtype: the unified
+    # pool is born attention-shaped, so the page bytes and the spec dtype
+    # have to agree (as the real block-size derivation guarantees).
+    page_size = 16 * 2 * 2 * 8 * attn_dtype.itemsize
     attn_spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=2,
@@ -272,10 +275,12 @@ def test_hybrid_shared_by_uses_one_raw_backing_tensor(monkeypatch):
     kv_caches = materialized.kv_caches
     raw_tensors = materialized.raw_tensors
 
+    # The unified pool is born attention-shaped in the KV dtype: size=4096 B
+    # over a 1024 B attention page -> 4 blocks of (16, 2, 2, 8) bf16.
     assert len(raw_tensors) == 1
-    assert raw_tensors[0].dtype == torch.int8
-    assert raw_tensors[0].numel() == cfg.kv_cache_tensors[0].size
-    assert raw_tensors[0].shape == (cfg.kv_cache_tensors[0].size, )
+    assert raw_tensors[0].dtype == torch.bfloat16
+    assert raw_tensors[0].shape == (cfg.num_blocks, 16, 2, 2, 8)
+    assert raw_tensors[0].nbytes == cfg.kv_cache_tensors[0].size
 
     attn_cache = kv_caches["model.layers.0.self_attn"]
     mamba_cache = kv_caches["model.layers.1.mamba"]
@@ -283,16 +288,24 @@ def test_hybrid_shared_by_uses_one_raw_backing_tensor(monkeypatch):
     assert isinstance(attn_cache, torch.Tensor)
     assert isinstance(mamba_cache, list)
     assert attn_cache.shape[0] == cfg.num_blocks
-    assert mamba_cache[0].shape[0] == cfg.num_blocks
-    assert mamba_cache[1].shape[0] == cfg.num_blocks
+
+    # Attention consumes the pool directly and the mamba "view" IS the pool
+    # tensor, so every layer sharing the buffer holds the same object and
+    # torch.compile dedupes them to a single graph input.
+    assert attn_cache is raw_tensors[0]
+    assert len(mamba_cache) == 1
+    assert mamba_cache[0] is raw_tensors[0]
 
     raw_storage = raw_tensors[0].untyped_storage().data_ptr()
     assert attn_cache.untyped_storage().data_ptr() == raw_storage
     assert mamba_cache[0].untyped_storage().data_ptr() == raw_storage
-    assert mamba_cache[1].untyped_storage().data_ptr() == raw_storage
 
 
-def test_hybrid_mamba_views_can_use_explicit_block_count(monkeypatch):
+def test_hybrid_mamba_views_ignore_explicit_block_count(monkeypatch):
+    # Unified pool: mamba state lives inside the attention-shaped pool
+    # blocks, so a compact `mamba_num_blocks` no longer truncates the mamba
+    # views -- the pool itself is the state store, sized by the shared
+    # buffer.
     monkeypatch.setenv("TPU_VLLM_KV_CACHE_ALIAS_FALLBACK", "0")
     cfg = make_hybrid_config(num_blocks=4)
     attn_group = AttentionGroup(
@@ -323,8 +336,9 @@ def test_hybrid_mamba_views_can_use_explicit_block_count(monkeypatch):
     assert isinstance(attn_cache, torch.Tensor)
     assert isinstance(mamba_cache, list)
     assert attn_cache.shape[0] == cfg.num_blocks
-    assert mamba_cache[0].shape[0] == 2
-    assert mamba_cache[1].shape[0] == 2
+    assert len(mamba_cache) == 1
+    assert mamba_cache[0] is materialized.raw_tensors[0]
+    assert mamba_cache[0].shape[0] == cfg.num_blocks
 
 
 def test_hybrid_materialization_maps_kernel_block_sizes_after_encoder_only_gap(
@@ -347,10 +361,15 @@ def test_hybrid_materialization_maps_kernel_block_sizes_after_encoder_only_gap(
     assert isinstance(first_attn_cache, torch.Tensor)
     assert isinstance(second_attn_cache, torch.Tensor)
     assert isinstance(mamba_cache, list)
-    assert first_attn_cache.shape == (4, 16, 2, 2, 8)
-    assert second_attn_cache.shape == (8, 8, 2, 2, 8)
-    assert mamba_cache[0].shape[0] == cfg.num_blocks
-    assert mamba_cache[1].shape[0] == cfg.num_blocks
+    # The encoder-only group consumes no kernel_block_sizes entry, and every
+    # layer sharing the hybrid buffer resolves to the one attention-shaped
+    # pool tensor (the pool fixes one kernel block per vLLM block).
+    pool = materialized.raw_tensors[0]
+    assert pool.shape == (4, 16, 2, 2, 8)
+    assert first_attn_cache is pool
+    assert second_attn_cache is pool
+    assert len(mamba_cache) == 1
+    assert mamba_cache[0] is pool
 
 
 @pytest.mark.parametrize("kernel_block_sizes", ([16], [16, 8, 16]))
@@ -368,8 +387,12 @@ def test_materialization_rejects_mismatched_kernel_block_size_count(
         )
 
 
-def test_cache_clone_fallback_detaches_attention_and_mamba_from_raw(
-        monkeypatch):
+def test_hybrid_pool_shares_storage_regardless_of_alias_fallback(monkeypatch):
+    # The alias fallback exists for typed views aliasing an int8 raw buffer;
+    # the unified pool creates no such views (attention consumes the pool
+    # directly, the mamba "view" IS the pool), so even with the fallback
+    # enabled (the default) the hybrid caches share one zero-initialized
+    # storage.
     monkeypatch.delenv("TPU_VLLM_KV_CACHE_ALIAS_FALLBACK", raising=False)
     cfg = make_hybrid_config(num_blocks=4)
     attn_group = AttentionGroup(
@@ -400,17 +423,17 @@ def test_cache_clone_fallback_detaches_attention_and_mamba_from_raw(
     assert isinstance(attn_cache, torch.Tensor)
     assert isinstance(mamba_cache, list)
     assert attn_cache.is_contiguous()
-    assert attn_cache.untyped_storage().data_ptr() != raw_storage
+    assert attn_cache.untyped_storage().data_ptr() == raw_storage
     assert torch.count_nonzero(attn_cache).item() == 0
-    assert mamba_cache[0].is_contiguous()
-    assert mamba_cache[1].is_contiguous()
-    assert mamba_cache[0].untyped_storage().data_ptr() != raw_storage
-    assert mamba_cache[1].untyped_storage().data_ptr() != raw_storage
-    assert torch.count_nonzero(mamba_cache[0]).item() == 0
-    assert torch.count_nonzero(mamba_cache[1]).item() == 0
+    assert len(mamba_cache) == 1
+    assert mamba_cache[0] is attn_cache
+    assert mamba_cache[0].untyped_storage().data_ptr() == raw_storage
 
 
-def test_cache_clone_fallback_uses_empty_for_fp8_attention(monkeypatch):
+def test_fp8_pool_is_born_uninitialized_without_zero_fill(monkeypatch):
+    # fp8 pools cannot zero-fill on TPU (and slots are overwritten before
+    # use), so the pool must be allocated via torch.empty; the monkeypatch
+    # makes any fp8 torch.zeros call fail loudly.
     monkeypatch.delenv("TPU_VLLM_KV_CACHE_ALIAS_FALLBACK", raising=False)
     torch_zeros = torch.zeros
 
@@ -449,8 +472,9 @@ def test_cache_clone_fallback_uses_empty_for_fp8_attention(monkeypatch):
     assert isinstance(mamba_cache, list)
     assert attn_cache.dtype == torch.float8_e4m3fn
     assert attn_cache.shape == (4, 16, 2, 2, 8)
-    assert torch.count_nonzero(mamba_cache[0]).item() == 0
-    assert torch.count_nonzero(mamba_cache[1]).item() == 0
+    assert attn_cache is materialized.raw_tensors[0]
+    assert len(mamba_cache) == 1
+    assert mamba_cache[0] is attn_cache
 
 
 def test_layout_summary_includes_attention_and_mamba_shapes(monkeypatch):
@@ -484,7 +508,9 @@ def test_layout_summary_includes_attention_and_mamba_shapes(monkeypatch):
     )
 
     assert "TPU KV cache layout summary:" in summary
-    assert "raw[0]: shape=(4096,)" in summary
+    # The raw backing tensor IS the attention-shaped pool (bf16, contiguous,
+    # offset 0), and the mamba entry is the single pool view.
+    assert "raw[0]: shape=(4, 16, 2, 2, 8) dtype=torch.bfloat16" in summary
     assert ("group[0]: spec=FullAttentionSpec backend=FakeAttentionBackend "
             "block_size=16" in summary)
     assert "model.layers.0.self_attn: attention shape=(4, 16, 2, 2, 8)" in summary
@@ -492,8 +518,7 @@ def test_layout_summary_includes_attention_and_mamba_shapes(monkeypatch):
     assert (
         "group[1]: spec=MambaSpec backend=FakeAttentionBackend block_size=16"
         in summary)
-    assert "model.layers.1.mamba: mamba states=2" in summary
-    assert "state[0]: shape=(4, 2, 8)" in summary
-    assert "state[1]: shape=(4, 2, 4, 8)" in summary
-    assert "contiguous=False" in summary
-    assert "storage_offset_bytes=32" in summary
+    assert "model.layers.1.mamba: mamba states=1" in summary
+    assert "state[0]: shape=(4, 16, 2, 2, 8)" in summary
+    assert "contiguous=True" in summary
+    assert "storage_offset_bytes=0" in summary
