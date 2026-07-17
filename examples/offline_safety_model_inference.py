@@ -20,7 +20,6 @@ python examples/offline_safety_model_inference.py \
 
 import os
 
-import vllm.envs as vllm_envs
 from vllm import LLM, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -168,7 +167,7 @@ def main(args: dict):
 
         prompts.append(TokensPrompt(prompt_token_ids=tokenized_prompt))
 
-    if vllm_envs.VLLM_TORCH_PROFILER_DIR is not None:
+    if llm.llm_engine.vllm_config.profiler_config.torch_profiler_dir is not None:
         llm.start_profile()
 
     outputs = llm.generate(
@@ -177,7 +176,7 @@ def main(args: dict):
         use_tqdm=True,
     )
 
-    if vllm_envs.VLLM_TORCH_PROFILER_DIR is not None:
+    if llm.llm_engine.vllm_config.profiler_config.torch_profiler_dir is not None:
         llm.stop_profile()
 
     passed_tests = 0

@@ -1,0 +1,78 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for TPUWorker"""
+
+from unittest.mock import MagicMock, patch
+
+import torch
+
+from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+
+def _make_vllm_config(profiler_torch_dir=None):
+    """Build a minimal mock VllmConfig for TPUWorker.__init__."""
+    cfg = MagicMock()
+    cfg.model_config.dtype = torch.bfloat16
+    cfg.cache_config.cache_dtype = "auto"
+    cfg.parallel_config.pipeline_parallel_size = 1
+    cfg.compilation_config.compile_ranges_endpoints = []
+    cfg.profiler_config.torch_profiler_dir = profiler_torch_dir
+    return cfg
+
+
+def _build_worker(vllm_config, rank=0):
+    """Construct a TPUWorker with heavy side-effects mocked out."""
+    with patch(
+            "vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches"), patch(
+                "vllm_torchtpu.worker.tpu_worker.envs") as mock_envs, patch(
+                    "vllm_torchtpu.worker.tpu_worker.WorkerBase.__init__",
+                    return_value=None,
+                ):
+        mock_envs.MODEL_IMPL_TYPE = "vllm"
+
+        worker = TPUWorker.__new__(TPUWorker)
+        # Set attributes that WorkerBase.__init__ would normally set.
+        worker.vllm_config = vllm_config
+        worker.model_config = vllm_config.model_config
+        worker.cache_config = vllm_config.cache_config
+        worker.parallel_config = vllm_config.parallel_config
+        worker.compilation_config = vllm_config.compilation_config
+        worker.rank = rank
+        worker.local_rank = 0
+
+        # Now call __init__ (WorkerBase.__init__ is a no-op mock).
+        worker.__init__(
+            vllm_config=vllm_config,
+            local_rank=0,
+            rank=rank,
+            distributed_init_method="tcp://127.0.0.1:29500",
+            is_driver_worker=True,
+        )
+        return worker
+
+
+class TestProfilerDir:
+    """Verify profiler_config.torch_profiler_dir logic."""
+
+    def test_uses_profiler_config_when_set(self):
+        """profiler_config.torch_profiler_dir is used when set."""
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
+        worker = _build_worker(cfg)
+        assert worker.profile_dir == "/config/profiler/dir"
+
+    def test_no_profiler_when_not_set(self):
+        """profile_dir is None when config is not set."""
+        cfg = _make_vllm_config(profiler_torch_dir=None)
+        worker = _build_worker(cfg)
+        assert worker.profile_dir is None

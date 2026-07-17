@@ -189,13 +189,11 @@ start_vllm_server() {
     export MODEL_IMPL_TYPE=vllm
 
     if [ -n "$PROFILE_DIR" ]; then
-        # tllm's worker reads VLLM_TORCH_PROFILER_DIR; the --profiler-config
-        # flags are what gate vllm's /start_profile endpoint and satisfy its
-        # ProfilerConfig validator. ignore_frontend skips the AsyncLLM CPU
-        # profiler (we only read the TPU xplane).
-        export VLLM_TORCH_PROFILER_DIR="$PROFILE_DIR"
-        extra_args="$extra_args --profiler-config.profiler torch --profiler-config.torch_profiler_dir $VLLM_TORCH_PROFILER_DIR --profiler-config.ignore_frontend true"
-        echo "Profiler capture enabled. Traces will be written to: $VLLM_TORCH_PROFILER_DIR"
+        # The --profiler-config flags gate vllm's /start_profile endpoint
+        # and satisfy its ProfilerConfig validator. ignore_frontend skips
+        # the AsyncLLM CPU profiler (we only read the TPU xplane).
+        extra_args="$extra_args --profiler-config.profiler torch --profiler-config.torch_profiler_dir $PROFILE_DIR --profiler-config.ignore_frontend true"
+        echo "Profiler capture enabled. Traces will be written to: $PROFILE_DIR"
     fi
 
     local prefix_caching_flag="--no-enable-prefix-caching"
