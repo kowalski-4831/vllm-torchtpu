@@ -178,7 +178,6 @@ def apply_tpu_patches() -> None:
     import vllm_torchtpu as tpu_plugin
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
-                               _patch_mla_prefill_backend,
                                _patch_moe_no_ep_tp_scope,
                                _patch_rowparallel_defer_bias,
                                _patch_vllm_disable_compile_ranges,
@@ -198,7 +197,6 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
-    _patch_mla_prefill_backend()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()
@@ -512,11 +510,11 @@ class TpuPlatform(Platform):
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         if getattr(attn_selector_config, "use_mla", False):
-            logger.info("Using TPU Pallas MLA attention backend.")
-            return "vllm_torchtpu.layers.vllm.attention.PallasMLAttentionBackend"
+            selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
         supported_backends = [
-            AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM
+            AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM,
+            AttentionBackendEnum.FLASH_ATTN_MLA
         ]
         if selected_backend not in supported_backends:
             logger.info("Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
