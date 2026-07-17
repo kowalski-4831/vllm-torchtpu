@@ -654,13 +654,29 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 remote_port=params["remote_port"],
             )
         else:
+            # If num_external_tokens is 0, we don't need to pull any data through
+            # this connector (either due to a full local cache hit, or because
+            # another MultiConnector child owns the load). But the producer
+            # (prefill node) doesn't know that: it has the prefill KV blocks
+            # registered under this uuid and keeps them pinned until they are
+            # pulled or p2p_wait_pull_timeout expires. So we still enqueue an
+            # empty read (LoadMeta with no block ids), which the worker turns
+            # into a "release now" signal to the producer instead of a pull.
+            # TODO: Remove this branch once the producer releases
+            # unpulled sends by another path (e.g. a direct scheduler-side
+            # release, or the unified Raiden connector); otherwise its blocks
+            # stay pinned until p2p_wait_pull_timeout.
             self.reqs_to_load[request.request_id] = LoadMeta(
                 uuid=params["uuid"],
                 local_block_ids=None,
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                report_completion=False,
             )
+            logger.info(
+                "TPURaidenConnectorScheduler no-load release req_id=%s "
+                "uuid=%s", request.request_id, params["uuid"])
         logger.info(
             "TPURaidenConnectorScheduler update_state_after_alloc --> "
             "reqs_to_load=%s", self.reqs_to_load)
@@ -740,10 +756,18 @@ class TPURaidenConnectorWorker:
             if (req_meta.remote_block_ids is None
                     and req_meta.local_block_ids is None):
                 engine.start_read(req_id, req_meta.uuid, endpoint, [], [])
+                if not req_meta.report_completion:
+                    # The request is not WAITING_FOR_REMOTE_KVS on this
+                    # connector (another MultiConnector child may own its
+                    # load); reporting this empty read as finished_recving
+                    # trips the scheduler's is_finished assert or prematurely
+                    # resumes a request whose offload load is still in flight.
+                    self._suppress_done_recving.add(req_id)
                 logger.debug(
                     "TPURaidenConnectorWorker rank%d --> released remote "
-                    "send req_id=%s uuid=%s endpoint=%s", self.tp_rank, req_id,
-                    req_meta.uuid, endpoint)
+                    "send req_id=%s uuid=%s endpoint=%s report_completion=%s",
+                    self.tp_rank, req_id, req_meta.uuid, endpoint,
+                    req_meta.report_completion)
                 continue
             if (req_meta.remote_block_ids is None
                     or req_meta.local_block_ids is None):
@@ -793,6 +817,7 @@ class TPURaidenConnectorWorker:
         if finished_req_ids:
             self._reported_recving -= finished_req_ids
             self._failed_recving -= finished_req_ids
+            self._suppress_done_recving -= finished_req_ids
             for req_id in finished_req_ids:
                 self._load_block_ids.pop(req_id, None)
         self._done_sending = set()

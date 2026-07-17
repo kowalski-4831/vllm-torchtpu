@@ -237,8 +237,9 @@ class TestTpuPlatform:
                 with pytest.raises(NotImplementedError, match=message):
                     TpuPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("connector_name",
-                             ["TPUConnector", "TPURaidenConnector"])
+    @pytest.mark.parametrize(
+        "connector_name",
+        ["TPUConnector", "TPURaidenConnector", "TPUMultiConnector"])
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"

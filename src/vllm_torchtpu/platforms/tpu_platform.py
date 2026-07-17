@@ -935,6 +935,7 @@ class TpuPlatform(Platform):
                 "TPUConnector",
                 "TPUConnectorV2",
                 "TPURaidenConnector",
+                "TPUMultiConnector",
                 "TPUConnectorHMA",
                 "OffloadingConnector",
             }
