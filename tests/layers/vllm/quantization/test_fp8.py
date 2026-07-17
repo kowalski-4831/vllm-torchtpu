@@ -36,9 +36,13 @@ from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
 class FakeQuant:
     """Minimal quant config for testing."""
 
-    def __init__(self, weight_block_size=None, activation_scheme="dynamic"):
+    def __init__(self,
+                 weight_block_size=None,
+                 activation_scheme="dynamic",
+                 is_checkpoint_fp8_serialized=True):
         self.weight_block_size = weight_block_size
         self.activation_scheme = activation_scheme
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
 
 class FakeMoEConfig:
@@ -477,14 +481,18 @@ class TestOnlineFp8Quantization:
         w13, w13_s, w2, w2_s, dtype_name, block_size = (
             _quantize_bf16_moe_weights(layer, activation="silu"))
 
+        # _quantize_and_format_moe_weights rounds the intermediate size up to
+        # a multiple of 128 before quantizing, padding w13/w2 accordingly.
+        aligned_inter = (inter + 127) // 128 * 128
+
         # Weights should be transposed: [E, in, out]
-        assert w13.shape == (E, H, 2 * inter)
-        assert w2.shape == (E, inter, H)
+        assert w13.shape == (E, H, 2 * aligned_inter)
+        assert w2.shape == (E, aligned_inter, H)
         assert w13.dtype == torch.float8_e4m3fn
         assert w2.dtype == torch.float8_e4m3fn
 
         # Scales should be 4D: [E, num_blocks, 1, N]
-        assert w13_s.shape == (E, 1, 1, 2 * inter)
+        assert w13_s.shape == (E, 1, 1, 2 * aligned_inter)
         assert w2_s.shape == (E, 1, 1, H)
         assert w13_s.dtype == torch.float32
 
