@@ -105,7 +105,7 @@ class TPUWorker(WorkerBase):
         # TPU profiler: only on rank 0 single-host, or every PP worker.
         self.profile_dir: str | None = None
         self.profile_context = None
-        torch_profiler_dir = os.getenv("VLLM_TORCH_PROFILER_DIR")
+        torch_profiler_dir = self.vllm_config.profiler_config.torch_profiler_dir
         pp_size = self.parallel_config.pipeline_parallel_size
         if torch_profiler_dir and pp_size == 1 and self.rank < 1 and (
                 not self.devices or 0 in self.device_ranks):
