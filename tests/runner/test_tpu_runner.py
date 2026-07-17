@@ -1132,6 +1132,7 @@ class TestAttentionMetadataBuilder:
     def test_pool_mamba_state_indices_derive_from_padded_device_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_block_pool = True
+        runner._mamba_align_mode = True
         mamba_spec = MambaSpec(
             block_size=16,
             shapes=[(2, 8)],
