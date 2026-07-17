@@ -170,6 +170,7 @@ class TestTPURunner:
         self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
                                              is not None)
         self.runner._unified_block_pool = False
+        self.runner._unified_kv_layout = False
         self.runner.kv_cache_raw_tensors = []
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
             self.runner)
