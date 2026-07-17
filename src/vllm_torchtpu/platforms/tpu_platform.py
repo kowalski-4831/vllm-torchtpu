@@ -876,10 +876,7 @@ class TpuPlatform(Platform):
                     TpuMultiprocExecutor
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            # TODO(ranlihao): Use the vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND to determine which executor to use.
-            # use_ray_v2 = vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-            use_ray_v2 = False
-            if use_ray_v2:
+            if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                 from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
                     RayDistributedExecutorV2
                 parallel_config.distributed_executor_backend = RayDistributedExecutorV2
