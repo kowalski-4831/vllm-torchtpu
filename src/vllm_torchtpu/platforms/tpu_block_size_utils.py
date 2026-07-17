@@ -170,13 +170,21 @@ def _derive_tpu_block_slot_config(
         )
         user_specified = getattr(vllm_config.cache_config,
                                  "user_specified_block_size", False)
-        if user_specified and input_block_size >= mamba_fit_block_size:
+        if user_specified and (input_block_size >= mamba_fit_block_size
+                               or vllm_config.kv_transfer_config is not None):
             # An explicit block size that already contains the mamba slot
             # is honored: the fit size is a floor, not a mandate.
             # Disaggregated deployments rely on this to run one shared,
             # TP-independent block size on both roles (the KV connector
             # requires prefill/decode block sizes to nest, which the
             # per-role fit sizes do not guarantee).
+            # The fit floor only binds when the unified block pool serves
+            # mamba state from attention-shaped slots; the pool never
+            # engages for kv-transfer deployments (see
+            # unified_block_pool_enabled), where state is materialized per
+            # mamba group with its own padded page. A below-fit user block
+            # is therefore legal there — reshard geometries such as the
+            # Stage-3 1024-token decode page depend on this.
             final_block_size = _align_block_to_backend(input_block_size,
                                                        supported)
             block_size_source = "user_block_size"
