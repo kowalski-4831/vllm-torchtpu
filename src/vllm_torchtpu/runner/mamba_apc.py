@@ -51,7 +51,7 @@ class MambaApcStateCopier:
 
     def preprocess(self, scheduler_output) -> None:
         runner = self.runner
-        if not runner._unified_block_pool:
+        if not runner._unified_kv_layout:
             return
 
         input_batch = runner.input_batch

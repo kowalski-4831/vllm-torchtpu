@@ -53,7 +53,6 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
@@ -68,12 +67,16 @@ from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend)
+from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
+    copy_mamba_state_blocks
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    unified_block_pool_enabled, unified_kv_layout_enabled)
 from vllm_torchtpu.runner.mamba_apc import MambaApcStateCopier
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
@@ -313,8 +316,16 @@ class TPUModelRunner(GPUModelRunner):
         # for disagg serving.
         self._uniform_mamba_layout: bool = (self.vllm_config.kv_transfer_config
                                             is not None)
-        self._unified_block_pool: bool = (
-            tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL)
+        # Unified layout family: attention KV and mamba state are fungible
+        # block-table blocks in one shared buffer per kv_cache_tensor. On
+        # top of it, the unified block pool serves that buffer as one
+        # attention-shaped pool (mamba state addressed through the pool
+        # adapters); without the pool the buffer is flat int8 with typed
+        # per-state views (the layout kv-transfer connectors address).
+        self._unified_kv_layout: bool = unified_kv_layout_enabled(
+            self.vllm_config)
+        self._unified_block_pool: bool = unified_block_pool_enabled(
+            self.vllm_config)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
 
         # EP-DP lockstep state, refreshed each step by execute_model /
@@ -400,6 +411,15 @@ class TPUModelRunner(GPUModelRunner):
         self.mamba_state_indices_cpu = torch.zeros(self.max_num_reqs,
                                                    dtype=torch.int32,
                                                    device="cpu")
+        # Block-table-derived mamba state: the state-block position each
+        # request's state currently lives at, the mamba-group -> raw-pool
+        # mapping (built in initialize_kv_cache), and the block-seed copies
+        # staged by _prepare_inputs and flushed before the forward.
+        self._mamba_state_pos: dict[str, int] = {}
+        self._mamba_copy_plan: list[tuple[int, list[torch.Tensor]]] = []
+        self._pending_mamba_state_copies: list[tuple[torch.Tensor,
+                                                     torch.Tensor,
+                                                     torch.Tensor]] = []
         if self.uses_mrope:
             # Override parent's int64 mrope buffer with int32 so the H2D copy is
             # dtype-identical to what the TPU model expects. Parent's
@@ -656,7 +676,7 @@ class TPUModelRunner(GPUModelRunner):
 
         has_attention = any(isinstance(m, Attention) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
-        if has_attention and has_mamba and not self._unified_block_pool:
+        if has_attention and has_mamba and not self._unified_kv_layout:
             self._update_mamba_page_size_padded(layers)
 
         hma_enabled = (
@@ -774,7 +794,7 @@ class TPUModelRunner(GPUModelRunner):
         return normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
-            enable_unified_block_pool=self._unified_block_pool,
+            enable_unified_block_pool=self._unified_kv_layout,
         )
 
     @staticmethod
@@ -1219,6 +1239,121 @@ class TPUModelRunner(GPUModelRunner):
                 self._mamba_slot_by_req_id[req_id] = slot
             indices[i] = slot
         return indices.to(self.device, non_blocking=True)
+
+    def _build_mamba_copy_plan(
+        self,
+        kv_cache_config: KVCacheConfig,
+        raw_tensors: list[torch.Tensor],
+    ) -> None:
+        """Map each mamba kv-cache group to the raw pool buffers hosting its
+        layers, for the per-step state-block seed copies.
+
+        Seed copies only exist in mamba align mode, where the state block
+        follows the request's last token through the block table. In any
+        other mode each request keeps one fixed state block for its whole
+        lifetime, so the plan stays empty and the per-step collector is a
+        no-op.
+        """
+        if self.cache_config.mamba_cache_mode != "align":
+            self._mamba_copy_plan = []
+            return
+        layer_to_raw: dict[str, torch.Tensor] = {}
+        for raw, kv_cache_tensor in zip(raw_tensors,
+                                        kv_cache_config.kv_cache_tensors):
+            for layer_name in kv_cache_tensor.shared_by:
+                layer_to_raw[layer_name] = raw
+        plan: list[tuple[int, list[torch.Tensor]]] = []
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            if not isinstance(group.kv_cache_spec, MambaSpec):
+                continue
+            raws: list[torch.Tensor] = []
+            seen: set[int] = set()
+            for layer_name in group.layer_names:
+                raw = layer_to_raw.get(layer_name)
+                if raw is not None and id(raw) not in seen:
+                    seen.add(id(raw))
+                    raws.append(raw)
+            if raws:
+                plan.append((gid, raws))
+        self._mamba_copy_plan = plan
+
+    def _collect_mamba_state_seed_copies(self, scheduler_output,
+                                         start_index: int,
+                                         num_reqs: int) -> None:
+        """Stage this chunk's mamba state-block seed copies (the counterpart
+        of upstream vLLM's ``preprocess_mamba``).
+
+        The GDN op reads and writes state at the block holding the request's
+        last token of the step (see AttentionMetadataBuilder). When that
+        block advances — chunked-prefill boundary, decode crossing, or a
+        prefix-cache resume, where the previous position is the cached
+        boundary-state block — the new block must be seeded from the
+        previous one, for every mamba group, on every pool buffer hosting
+        that group's layers.
+        """
+        if not self._mamba_copy_plan:
+            return
+        live_req_ids = set(self.input_batch.req_id_to_index.keys())
+        for req_id in list(self._mamba_state_pos.keys()):
+            if req_id not in live_req_ids:
+                del self._mamba_state_pos[req_id]
+
+        block_size = self.block_size
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        req_ids = self.input_batch.req_ids
+        crossings: list[tuple[int, int, int]] = []
+        for i in range(num_reqs):
+            row = start_index + i
+            req_id = req_ids[row]
+            assert req_id is not None
+            computed = int(num_computed[row])
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            curr = (computed + scheduled - 1) // block_size
+            prev = self._mamba_state_pos.get(req_id,
+                                             (computed - 1) // block_size)
+            self._mamba_state_pos[req_id] = curr
+            if 0 <= prev != curr:
+                crossings.append((row, prev, curr))
+        if not crossings:
+            return
+
+        per_raw: dict[int, tuple[torch.Tensor, list[int], list[int]]] = {}
+        for gid, raws in self._mamba_copy_plan:
+            bt = self.input_batch.block_table[gid].get_cpu_tensor()
+            pairs: list[tuple[int, int]] = []
+            for row, prev, curr in crossings:
+                src = int(bt[row, prev])
+                dst = int(bt[row, curr])
+                if src != dst and src != 0 and dst != 0:
+                    pairs.append((src, dst))
+            if not pairs:
+                continue
+            for raw in raws:
+                entry = per_raw.setdefault(id(raw), (raw, [], []))
+                entry[1].extend(p[0] for p in pairs)
+                entry[2].extend(p[1] for p in pairs)
+
+        for raw, srcs, dsts in per_raw.values():
+            # Pad the pair count to a small bucket ladder so the copy op
+            # compiles for a handful of shapes; (0, 0) pads are null-block
+            # self-copies.
+            padded = 8
+            while padded < len(srcs):
+                padded *= 4
+            srcs = srcs + [0] * (padded - len(srcs))
+            dsts = dsts + [0] * (padded - len(dsts))
+            src_t = torch.tensor(srcs, dtype=torch.int32).to(self.device,
+                                                             non_blocking=True)
+            dst_t = torch.tensor(dsts, dtype=torch.int32).to(self.device,
+                                                             non_blocking=True)
+            self._pending_mamba_state_copies.append((raw, src_t, dst_t))
+
+    def _flush_mamba_state_seed_copies(self) -> None:
+        if not self._pending_mamba_state_copies:
+            return
+        for raw, src_t, dst_t in self._pending_mamba_state_copies:
+            copy_mamba_state_blocks(raw, src_t, dst_t)
+        self._pending_mamba_state_copies.clear()
 
     def _maybe_set_num_blocks_override(self, attn_page_size_bytes: int,
                                        uniform_page_size_bytes: int,
@@ -1933,6 +2068,9 @@ class TPUModelRunner(GPUModelRunner):
         cur_input_indices, pre_next_tokens_indices = self._prepare_async_token_substitution_indices(
             start_index, num_reqs, num_scheduled_tokens_per_req)
 
+        self._collect_mamba_state_seed_copies(scheduler_output, start_index,
+                                              num_reqs)
+
         return (
             per_layer_attn_metadata,
             logits_indices,
@@ -2178,6 +2316,10 @@ class TPUModelRunner(GPUModelRunner):
              end_index, cur_input_indices, pre_next_tokens_indices,
              spec_decode_metadata) = (self._prepare_inputs(
                  scheduler_output, start_index, num_decode_reqs))
+
+            # Seed newly-advanced mamba state blocks before the forward reads
+            # them (chunk boundaries, decode crossings, prefix-cache resumes).
+            self._flush_mamba_state_seed_copies()
 
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices)
@@ -3658,6 +3800,7 @@ class TPUModelRunner(GPUModelRunner):
         # call get_current_vllm_config().
         cc = self.vllm_config.compilation_config
         saved_cache = (cc.cache_dir, cc.local_cache_dir)
+        saved_sizes = cc.compile_sizes
         with set_current_vllm_config(self.vllm_config):
             self._initialize_attention_kernels()
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
@@ -3668,8 +3811,13 @@ class TPUModelRunner(GPUModelRunner):
             # Compile backbone here so XLA materializes the FP8 activation
             # slab; vLLM's post-probe sees the real HBM. Cache writes are
             # disabled so the kv=0-specialized graph never lands in the
-            # persistent serving cache.
+            # persistent serving cache. Compile only the max token bucket:
+            # every program loaded on the TPU holds a permanent bottom-of-HBM
+            # program-region reservation, and the kv=0-specialized graphs are
+            # dead after the dynamo reset below — one throwaway program keeps
+            # the region within budget for capture_model's full bucket ladder.
             with self._profile_no_cache_writes():
+                cc.compile_sizes = [num_tokens]
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req)
             compiled = (self.model.get_language_model().model if hasattr(
@@ -3678,6 +3826,7 @@ class TPUModelRunner(GPUModelRunner):
             # reset_compile_wrapper wipes cache_dir; restore so
             # capture_model can read/write the persistent cache.
             cc.cache_dir, cc.local_cache_dir = saved_cache
+            cc.compile_sizes = saved_sizes
             torch._dynamo.reset()
             sync.synchronize()
 
@@ -3815,9 +3964,13 @@ class TPUModelRunner(GPUModelRunner):
             kernel_block_sizes=kernel_block_sizes,
             device=self.device,
             cache_dtype=self.kv_cache_dtype,
+            unified_block_pool=self._unified_block_pool,
         )
         kv_caches = materialized.kv_caches
         self.kv_cache_raw_tensors = materialized.raw_tensors
+        if self._unified_block_pool:
+            self._build_mamba_copy_plan(kv_cache_config,
+                                        materialized.raw_tensors)
         if kv_cache_config.has_mamba_layers:
             self._update_hybrid_attention_mamba_layout(kv_caches,
                                                        kernel_block_sizes)
@@ -3827,6 +3980,15 @@ class TPUModelRunner(GPUModelRunner):
             logger.debug("%s reuses KV cache of %s", layer_name,
                          target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+        if self._unified_block_pool:
+            # Flush the pool zero-fill before any compiled execution. PJRT
+            # only donates quiescent buffers: a pending write at enqueue time
+            # makes every donated pool parameter fall back to a fresh
+            # pool-sized output copy (a 2x-pool transient that OOMs at high
+            # gpu_memory_utilization).
+            for raw in self.kv_cache_raw_tensors:
+                sync.synchronize(raw, wait=True)
 
         logger.info(
             "%s",
@@ -3853,7 +4015,8 @@ class TPUModelRunner(GPUModelRunner):
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self)
 
-        if self._mamba_align_mode and kv_cache_config.has_mamba_layers:
+        if (not self._unified_block_pool and self._mamba_align_mode
+                and kv_cache_config.has_mamba_layers):
             self._mamba_apc_copier = MambaApcStateCopier(self)
 
         if not self.enforce_eager:
@@ -3878,7 +4041,7 @@ class TPUModelRunner(GPUModelRunner):
             gid: torch.empty(0, device=self.device)
             for gid in range(len(self.kv_cache_config.kv_cache_groups))
         }
-        if self._unified_block_pool:
+        if self._unified_kv_layout:
             self._initialize_unified_kv_cache(kv_cache_config)
             return
 

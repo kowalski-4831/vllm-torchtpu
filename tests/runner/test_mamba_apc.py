@@ -82,7 +82,7 @@ def _make_runner(num_reqs,
             static_forward_context=static_ctx)),
         input_batch=input_batch,
         device="cpu",
-        _unified_block_pool=True,
+        _unified_kv_layout=True,
     )
     if extras:
         return runner, conv, ssm, block_table_cpu, extras

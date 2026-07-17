@@ -14,6 +14,38 @@ else:
 
 logger = init_logger(__name__)
 
+
+def unified_block_pool_enabled(vllm_config: "VllmConfig") -> bool:
+    """Whether this deployment runs on the unified block pool (attention KV
+    and mamba state served from one attention-shaped pool of fungible
+    blocks).
+
+    Opt-in only, via TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL. Never engages for
+    kv-transfer deployments: the KV connector addresses the typed-view
+    layout by byte offsets and does not understand the pool, so the same
+    env keeps those deployments on the typed-view layout (see
+    unified_kv_layout_enabled).
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+            and vllm_config.kv_transfer_config is None)
+
+
+def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
+    """Whether hybrid KV materialization uses the unified layout family:
+    one shared buffer per kv_cache_tensor whose blocks are fungible between
+    attention KV and mamba state.
+
+    The env alone selects the family so kv-transfer deployments (where the
+    pool never engages) still run the typed-view layout whose byte offsets
+    the KV connector addresses; pool-enabled deployments run the pooled
+    layout on top of the same family.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+            or unified_block_pool_enabled(vllm_config))
+
+
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,
@@ -36,11 +68,19 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
-def _floor_power_of_two(value: int) -> int:
-    if value <= 0:
-        raise ValueError(
-            f"power-of-two lowering needs positive value: {value}")
-    return 1 << (value.bit_length() - 1)
+def _align_block_to_backend(block_size: int, supported) -> int:
+    """Smallest manager block >= block_size the backend can serve.
+
+    A fixed int entry means the kernel runs that exact block size, so the
+    manager block must be a multiple of it (vLLM's kernel-block machinery
+    splits manager blocks into kernel blocks); a MultipleOf(b) entry accepts
+    any multiple of b directly."""
+    from vllm.v1.attention.backend import MultipleOf
+    candidates = []
+    for entry in supported:
+        base = entry.base if isinstance(entry, MultipleOf) else int(entry)
+        candidates.append(_round_up_to_multiple(block_size, base))
+    return min(candidates) if candidates else block_size
 
 
 def _resolve_tpu_cache_dtype(vllm_config: VllmConfig) -> torch.dtype:
@@ -79,11 +119,8 @@ def _tpu_attention_page_size_bytes(vllm_config: VllmConfig,
 
 
 def _hybrid_mamba_page_size_bytes(vllm_config: VllmConfig) -> int | None:
-    cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
     if not model_config.is_hybrid:
-        return None
-    if cache_config.mamba_cache_mode != "align":
         return None
 
     from vllm.model_executor.models import ModelRegistry
@@ -124,7 +161,6 @@ def _derive_tpu_block_slot_config(
 
     mamba_raw_state_bytes = _hybrid_mamba_page_size_bytes(vllm_config)
     mamba_fit_block_size: int | None = None
-    power2_lowered_block_size: int | None = None
     final_block_size = input_block_size
     block_size_source = "input_block_size"
     if mamba_raw_state_bytes is not None:
@@ -132,9 +168,25 @@ def _derive_tpu_block_slot_config(
             _ceil_div(mamba_raw_state_bytes, fa_physical_bytes_per_token),
             16,
         )
-        power2_lowered_block_size = _floor_power_of_two(mamba_fit_block_size)
-        final_block_size = power2_lowered_block_size
-        block_size_source = "mamba_state_power2_lowering"
+        user_specified = getattr(vllm_config.cache_config,
+                                 "user_specified_block_size", False)
+        if user_specified and input_block_size >= mamba_fit_block_size:
+            # An explicit block size that already contains the mamba slot
+            # is honored: the fit size is a floor, not a mandate.
+            # Disaggregated deployments rely on this to run one shared,
+            # TP-independent block size on both roles (the KV connector
+            # requires prefill/decode block sizes to nest, which the
+            # per-role fit sizes do not guarantee).
+            final_block_size = _align_block_to_backend(input_block_size,
+                                                       supported)
+            block_size_source = "user_block_size"
+        else:
+            # Fit-size block (non-pow2 pages are RPA-supported): the
+            # attention page contains the whole mamba slot with <1%
+            # padding, so mamba state addresses whole token rows of an
+            # ordinary attention page.
+            final_block_size = mamba_fit_block_size
+            block_size_source = "mamba_state_fit"
 
     fa_physical_slot_bytes = _tpu_attention_slot_size_bytes(
         vllm_config, backend_cls, final_block_size)
@@ -165,7 +217,6 @@ def _derive_tpu_block_slot_config(
         "fa_physical_bytes_per_token": fa_physical_bytes_per_token,
         "fa_layout_padding_bytes_per_token": fa_layout_padding_bytes_per_token,
         "mamba_fit_block_size": mamba_fit_block_size,
-        "power2_lowered_block_size": power2_lowered_block_size,
         "final_block_size": final_block_size,
         "fa_raw_payload_slot_bytes": fa_raw_payload_slot_bytes,
         "fa_layout_padding_slot_bytes": fa_layout_padding_slot_bytes,
@@ -187,15 +238,11 @@ def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
     mamba_raw_state_bytes = derivation["mamba_raw_state_bytes"]
     if mamba_raw_state_bytes is None:
         mamba_fit_formula = "n/a"
-        power2_lowering_formula = "n/a"
     else:
         mamba_fit_formula = (
             "ceil(%s / %s) rounded_to_16 = %s" %
             (mamba_raw_state_bytes, derivation["fa_physical_bytes_per_token"],
              mamba_fit_block_size))
-        power2_lowering_formula = (
-            "floor_power2(%s) = %s" %
-            (mamba_fit_block_size, derivation["power2_lowered_block_size"]))
 
     logger.info(
         "TPU block_size derivation path: backend=%s -> "
@@ -203,7 +250,7 @@ def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
         "mamba_raw_state_bytes=%s -> "
         "fa_bytes_per_token(raw_payload=%s + layout_padding=%s -> "
         "physical=%s) -> mamba_fit_block_size=%s -> "
-        "power2_lowering=%s -> final_block_size=%s "
+        "final_block_size=%s "
         "(source=%s).",
         derivation["backend"],
         derivation["backend_supported_kernel_block_sizes"],
@@ -213,7 +260,6 @@ def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
         derivation["fa_layout_padding_bytes_per_token"],
         derivation["fa_physical_bytes_per_token"],
         mamba_fit_formula,
-        power2_lowering_formula,
         derivation["final_block_size"],
         derivation["block_size_source"],
     )
@@ -280,16 +326,18 @@ def update_tpu_block_size_and_slot_config(vllm_config: VllmConfig,
         cache_config.block_size = final_block_size
 
     if (vllm_config.model_config.is_hybrid
-            and cache_config.mamba_cache_mode == "align"
             and derivation["mamba_raw_state_bytes"] is not None):
         logger.info(
             "Aligning hybrid Mamba KV cache to TPU block slot: "
             "mamba_block_size %s -> %s, mamba_page_size_padded %s -> %s.",
             cache_config.mamba_block_size,
-            final_block_size,
+            final_block_size if cache_config.mamba_cache_mode == "align" else
+            cache_config.mamba_block_size,
             cache_config.mamba_page_size_padded,
             derivation["final_block_slot_bytes"],
         )
-        cache_config.mamba_block_size = final_block_size
+        if cache_config.mamba_cache_mode == "align":
+            # State follows the block table; mamba blocks are pool blocks.
+            cache_config.mamba_block_size = final_block_size
         cache_config.mamba_page_size_padded = int(
             derivation["final_block_slot_bytes"])
