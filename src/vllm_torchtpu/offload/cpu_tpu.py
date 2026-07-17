@@ -982,9 +982,9 @@ class _RaidenOffloadingHandler(OffloadingHandler):
             # Barrier so the D2h store reads these blocks only after the
             # forward step's in-place KV write to them has completed.
             _tpu_sync(wait=True)
-            fut = self._mgr.D2h(src_ids.tolist(), dst_ids.tolist(), sizes)
+            fut = self._mgr.d2h(src_ids.tolist(), dst_ids.tolist(), sizes)
         else:
-            fut = self._mgr.H2d(src_ids.tolist(), dst_ids.tolist(), sizes)
+            fut = self._mgr.h2d(src_ids.tolist(), dst_ids.tolist(), sizes)
         self._pending[job_id] = (fut, n * self._bytes_per_kernel_block)
         return True
 
@@ -1154,10 +1154,10 @@ class CpuTpuOffloadingHandlers:
             # buffers) alive on the factory, or they get GC'd after __init__
             # and raiden's D2h/H2d dereferences freed buffers (segfault).
             self._raiden_device_tensors = device_tensors
-            self._raiden_mgr = _kcm._impl.KVCacheManager(
-                device_tensors,
+            self._raiden_mgr = _kcm.KVCacheManager(
+                kv_caches=device_tensors,
+                local_control_port=0,
                 host_blocks_to_allocate=num_cpu_kernel_blocks,
-                unsafe_skip_buffer_lock=True,
             )
             bytes_per_kernel_block = (
                 int(np.prod(per_block_shape)) *

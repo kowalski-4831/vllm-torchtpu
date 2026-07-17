@@ -374,5 +374,67 @@ class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
         self.assertEqual(worker._estimate_kv_connector_hbm_reserve(), 0)
 
 
+class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
+    """`_RaidenOffloadingHandler.transfer_async` must call the raiden
+    wheel's public KVCacheManager wrapper methods, which are lowercase
+    `d2h`/`h2d` — the capitalized `D2h`/`H2d` spellings only exist on the
+    private `_impl` object and die with AttributeError on the wrapper."""
+
+    def _make_handler(self, tpu_to_cpu: bool):
+        from vllm_torchtpu.offload.cpu_tpu import _RaidenOffloadingHandler
+
+        # spec-limited: any call other than d2h/h2d (e.g. the legacy D2h)
+        # raises AttributeError, pinning the public wrapper API.
+        mgr = MagicMock(spec=["d2h", "h2d"])
+        handler = _RaidenOffloadingHandler(mgr,
+                                           tpu_to_cpu=tpu_to_cpu,
+                                           src_block_size_factor=1,
+                                           dst_block_size_factor=1,
+                                           bytes_per_kernel_block=64)
+        return handler, mgr
+
+    @staticmethod
+    def _spec(block_ids):
+        from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec
+
+        class _TestSpec(BlockIDsLoadStoreSpec):
+
+            @staticmethod
+            def medium() -> str:
+                return "TEST"
+
+        return _TestSpec(block_ids)
+
+    def test_d2h_store_uses_lowercase_wrapper_method(self):
+        handler, mgr = self._make_handler(tpu_to_cpu=True)
+        fut = MagicMock()
+        mgr.d2h.return_value = fut
+
+        with patch("vllm_torchtpu.offload.cpu_tpu._tpu_sync") as sync:
+            self.assertTrue(
+                handler.transfer_async(
+                    7, (self._spec([3, 5]), self._spec([1, 2]))))
+
+        # The store must barrier on the forward step's in-place KV write
+        # before raiden reads the device blocks.
+        sync.assert_called_once_with(wait=True)
+        mgr.d2h.assert_called_once_with([3, 5], [1, 2], [1, 1])
+        mgr.h2d.assert_not_called()
+        self.assertEqual(handler._pending[7], (fut, 2 * 64))
+
+    def test_h2d_load_uses_lowercase_wrapper_method(self):
+        handler, mgr = self._make_handler(tpu_to_cpu=False)
+        fut = MagicMock()
+        mgr.h2d.return_value = fut
+
+        self.assertTrue(
+            handler.transfer_async(8,
+                                   (self._spec([1, 2]), self._spec([3, 5]))))
+
+        mgr.h2d.assert_called_once_with([1, 2], [3, 5], [1, 1])
+        mgr.d2h.assert_not_called()
+        self.assertEqual(handler._pending[8], (fut, 2 * 64))
+
+
 if __name__ == "__main__":
     unittest.main()
