@@ -237,6 +237,9 @@ class TestTpuPlatform:
         # Attention-DP runs the split layout; async+APC is only rejected
         # there (the pool's seed copies support async scheduling).
         vllm_config.parallel_config.data_parallel_size = 8
+        # The non-raising row reaches the single-host DP env setup; a falsy
+        # master ip takes the code's "localhost" fallback.
+        vllm_config.parallel_config.data_parallel_master_ip = ""
 
         mock_pallas = MagicMock()
         mock_pallas.get_page_size.return_value = 256
