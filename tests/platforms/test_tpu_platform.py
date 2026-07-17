@@ -125,21 +125,81 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
         mock_mamba_patch.assert_not_called()
 
-        # Hybrid (single-server) runs on the unified block pool: block size
-        # and slot sizing are owned by the derivation helper (its math is
-        # covered by test_tpu_block_size_utils.py) ...
-        mock_update.assert_called_once_with(vllm_config, mock_pallas)
+        # Without the unified-layout env the hybrid path keeps the split
+        # layout: the block-size derivation helper must not run.
+        mock_update.assert_not_called()
+        # Verify block_size wasn't overridden by get_page_size
         assert vllm_config.cache_config.block_size == 123
-        # ... and the non-hybrid get_page_size default path must not run.
+        # And get_page_size shouldn't even be called because is_hybrid is True
         mock_pallas.get_page_size.assert_not_called()
 
+    @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"})
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
+    )
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
+    def test_check_and_update_config_hybrid_derives_block_size_with_env(
+            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
+            mock_apply_patches, vllm_config):
+        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.cache_config.block_size = 123  # already set
+
+        mock_pallas = MagicMock()
+        mock_pallas.get_page_size.return_value = 999
+        mock_pallas.get_min_page_size.return_value = 16
+
+        with patch.dict(
+                'sys.modules', {
+                    'vllm_torchtpu.layers.vllm.attention':
+                    MagicMock(PallasAttentionBackend=mock_pallas)
+                }), patch(
+                    "vllm_torchtpu.platforms.tpu_platform."
+                    "_patch_scheduler_mamba_external_kv"), \
+                patch(
+                    "vllm_torchtpu.platforms.tpu_platform."
+                    "update_tpu_block_size_and_slot_config") as mock_update:
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        # The env opts into the unified layout family: block size and slot
+        # sizing are owned by the derivation helper (its math is covered by
+        # test_tpu_block_size_utils.py).
+        mock_update.assert_called_once_with(vllm_config, mock_pallas)
+
+    def test_unified_block_pool_enablement_contract(self, vllm_config):
+        from vllm_torchtpu.platforms.tpu_block_size_utils import (
+            unified_block_pool_enabled, unified_kv_layout_enabled)
+        vllm_config.model_config.is_hybrid = True
+
+        # No env: neither the pool nor the unified layout engages, even for
+        # single-server hybrid models.
+        vllm_config.kv_transfer_config = None
+        assert not unified_block_pool_enabled(vllm_config)
+        assert not unified_kv_layout_enabled(vllm_config)
+
+        with patch.dict("os.environ",
+                        {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"}):
+            # Env opt-in: pool + unified layout.
+            assert unified_block_pool_enabled(vllm_config)
+            assert unified_kv_layout_enabled(vllm_config)
+
+            # kv-transfer never runs the pool (the connector addresses the
+            # typed views), but keeps the unified layout family.
+            vllm_config.kv_transfer_config = MagicMock()
+            assert not unified_block_pool_enabled(vllm_config)
+            assert unified_kv_layout_enabled(vllm_config)
+
     @pytest.mark.parametrize(
-        ("mamba_cache_mode", "speculative_config", "kv_transfer_config",
+        ("mamba_cache_mode", "speculative_config", "async_scheduling",
          "message"),
         [
-            ("all", None, None, "mamba_cache_mode='align'"),
-            ("align", MagicMock(), None, "Speculative decoding"),
-            ("align", None, MagicMock(), "unified block pool"),
+            ("all", None, False, "mamba_cache_mode='align'"),
+            ("align", MagicMock(), False, "Speculative decoding"),
+            ("align", None, True, "Async scheduling"),
         ],
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
@@ -153,14 +213,14 @@ class TestTpuPlatform:
     def test_check_and_update_config_rejects_incomplete_mamba_apc_modes(
             self, mock_vllm_envs, mock_prepare_env, mock_sharding,
             mock_apply_patches, vllm_config, mamba_cache_mode,
-            speculative_config, kv_transfer_config, message):
+            speculative_config, async_scheduling, message):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.enable_prefix_caching = True
         vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
         vllm_config.speculative_config = speculative_config
-        vllm_config.kv_transfer_config = kv_transfer_config
+        vllm_config.scheduler_config.async_scheduling = async_scheduling
 
         mock_pallas = MagicMock()
         mock_pallas.get_page_size.return_value = 256

@@ -963,6 +963,7 @@ class TestAttentionMetadataBuilder:
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner._unified_block_pool = False
+        runner._unified_kv_layout = False
         runner.position_ids = torch.full((8, ), 42, dtype=torch.int32)
 
         block_tables = []
@@ -1101,6 +1102,32 @@ class TestAttentionMetadataBuilder:
         assert meta.block_tables.shape == (4 * 2, )
 
     def test_unified_mamba_state_indices_derive_from_block_table(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(2, 8)],
+            dtypes=[torch.bfloat16],
+            page_size_padded=256,
+        )
+        builder = self._make_builder(runner, spec=mamba_spec)
+
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 33, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert torch.equal(meta.mamba_state_indices,
+                           torch.tensor([0, 6, 8, 12], dtype=torch.int32))
+
+    def test_pool_mamba_state_indices_derive_from_padded_device_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_block_pool = True
         mamba_spec = MambaSpec(
