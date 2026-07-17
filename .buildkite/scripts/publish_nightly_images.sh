@@ -25,9 +25,6 @@ REGISTRY="${NIGHTLY_REGISTRY:-us-central1-docker.pkg.dev/cloud-ullm-inference-ci
 DATE_TAG="nightly-$(date +%Y%m%d)"
 LATEST_TAG="latest"
 
-echo "--- Configuring Docker authentication for Google Artifact Registry"
-gcloud auth configure-docker us-central1-docker.pkg.dev us-docker.pkg.dev --quiet
-
 cd "${REPO_ROOT}"
 
 # Build and push variants in order of dependency (ci -> dev, prod) so BuildKit layer cache is reused

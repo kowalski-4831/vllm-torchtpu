@@ -28,7 +28,6 @@ echo "--- Building Docker Image: ${IMAGE_TAG}"
 ./docker/build_image.sh --target dev -t "${IMAGE_TAG}"
 
 echo "--- Pushing Docker Image to Registry"
-gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 docker push "${IMAGE_TAG}"
 
 echo "--- Cleaning up local built image"

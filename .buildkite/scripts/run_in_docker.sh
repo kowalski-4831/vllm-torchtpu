@@ -41,7 +41,6 @@ echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
 echo "--- Pulling Docker Image: ${IMAGE_TAG}"
-gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 docker pull "${IMAGE_TAG}"
 
 # Ensure cache directory exists on the host
