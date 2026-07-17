@@ -150,15 +150,29 @@ def _derive_tpu_block_slot_config(
             _ceil_div(mamba_raw_state_bytes, fa_physical_bytes_per_token),
             16,
         )
-        # Fit-size block (non-pow2 pages are RPA-supported): the attention
-        # page contains the whole mamba slot with <1% padding, so mamba
-        # state addresses whole token rows of an ordinary attention page.
-        # Backends with a fixed kernel block (batched RPA: 256) get the fit
-        # size rounded up to a splittable multiple; the extra padding only
-        # exists inside state blocks, a small fraction of the pool.
-        final_block_size = _align_block_to_backend(mamba_fit_block_size,
-                                                   supported)
-        block_size_source = "mamba_state_fit"
+        user_specified = getattr(vllm_config.cache_config,
+                                 "user_specified_block_size", False)
+        if user_specified and input_block_size >= mamba_fit_block_size:
+            # An explicit block size that already contains the mamba slot
+            # is honored: the fit size is a floor, not a mandate.
+            # Disaggregated deployments rely on this to run one shared,
+            # TP-independent block size on both roles (the KV connector
+            # requires prefill/decode block sizes to nest, which the
+            # per-role fit sizes do not guarantee).
+            final_block_size = _align_block_to_backend(input_block_size,
+                                                       supported)
+            block_size_source = "user_block_size"
+        else:
+            # Fit-size block (non-pow2 pages are RPA-supported): the
+            # attention page contains the whole mamba slot with <1%
+            # padding, so mamba state addresses whole token rows of an
+            # ordinary attention page. Backends with a fixed kernel block
+            # (batched RPA: 256) get the fit size rounded up to a
+            # splittable multiple; the extra padding only exists inside
+            # state blocks, a small fraction of the pool.
+            final_block_size = _align_block_to_backend(mamba_fit_block_size,
+                                                       supported)
+            block_size_source = "mamba_state_fit"
 
     fa_physical_slot_bytes = _tpu_attention_slot_size_bytes(
         vllm_config, backend_cls, final_block_size)
