@@ -9,6 +9,27 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _patch_vllm_aot_compile_cache_key() -> None:
+    """Include the TPU compiler hash in vLLM's outer AOT cache key."""
+    from vllm.compilation import caching
+
+    original = caching.aot_compile_hash_factors
+    if getattr(original, "_tpu_compiler_hash_patch", False):
+        return
+
+    def tpu_aot_compile_hash_factors(vllm_config):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+        return [
+            *original(vllm_config),
+            compute_tpu_compilation_hash(vllm_config),
+        ]
+
+    tpu_aot_compile_hash_factors._tpu_compiler_hash_patch = True
+    caching.aot_compile_hash_factors = tpu_aot_compile_hash_factors
+    logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
+
+
 def _patch_vllm_tpu_group_custom_ops() -> None:
     """Disable vLLM custom collective ops for TPU in this TorchTPU integration.
 

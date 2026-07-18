@@ -247,6 +247,7 @@ def apply_tpu_patches() -> None:
         return
     _tpu_patches_applied = True
 
+    import vllm_torchtpu as tpu_plugin
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_no_ep_tp_scope,
@@ -255,6 +256,7 @@ def apply_tpu_patches() -> None:
                                _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
     _register_custom_ops()
+    tpu_plugin._patch_vllm_aot_compile_cache_key()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_vllm_disable_compile_ranges()

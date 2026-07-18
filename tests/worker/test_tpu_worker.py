@@ -76,3 +76,19 @@ class TestProfilerDir:
         cfg = _make_vllm_config(profiler_torch_dir=None)
         worker = _build_worker(cfg)
         assert worker.profile_dir is None
+
+
+def test_initialize_from_config_updates_num_gpu_blocks():
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = MagicMock(num_gpu_blocks=None)
+    worker.vllm_config = MagicMock()
+    worker.model_runner = MagicMock()
+    kv_cache_config = MagicMock(num_blocks=2048)
+
+    with patch("vllm_torchtpu.worker.tpu_worker."
+               "ensure_kv_transfer_initialized"):
+        worker.initialize_from_config(kv_cache_config)
+
+    assert worker.cache_config.num_gpu_blocks == 2048
+    worker.model_runner.initialize_kv_cache.assert_called_once_with(
+        kv_cache_config)
