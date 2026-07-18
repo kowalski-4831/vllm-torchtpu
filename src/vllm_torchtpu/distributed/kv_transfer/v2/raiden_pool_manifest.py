@@ -26,9 +26,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Mapping, Sequence
 
-TAG_FA = "fa"
-TAG_GDN_CONV = "gdn.conv"
-TAG_GDN_SSM = "gdn.ssm"
+from .common import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"

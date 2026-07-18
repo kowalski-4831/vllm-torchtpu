@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from enum import Enum
 
+TAG_FA = "fa"
+TAG_GDN_CONV = "gdn.conv"
+TAG_GDN_SSM = "gdn.ssm"
+
 
 class LayerType(str, Enum):
     FULL_ATTN = "full_attn"
