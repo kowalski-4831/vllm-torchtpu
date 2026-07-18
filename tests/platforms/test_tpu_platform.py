@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -58,6 +59,19 @@ def test_debug_tpu_local_rank_offset_env(monkeypatch):
     monkeypatch.setenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "not-an-int")
     with pytest.raises(ValueError, match=DEBUG_TPU_LOCAL_RANK_OFFSET_ENV):
         _debug_tpu_local_rank_offset()
+
+
+def test_prepare_singlehost_tpu_env_skips_distributed_bootstrap_for_tp1(
+        monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1234")
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "1,1,1")
+
+    TpuPlatform._prepare_singlehost_tpu_env(1)
+
+    assert "WORLD_SIZE" not in os.environ
+    assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ
+    assert "TORCH_TPU_TOPOLOGY" not in os.environ
 
 
 class TestTpuPlatform:

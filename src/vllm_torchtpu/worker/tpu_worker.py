@@ -49,6 +49,17 @@ def _debug_tpu_local_rank_offset() -> int:
                          f"got {value!r}") from exc
 
 
+def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
+                               local_world_size: int) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
+    if world_size > 1:
+        os.environ["WORLD_SIZE"] = str(world_size)
+    else:
+        os.environ.pop("WORLD_SIZE", None)
+
+
 class TPUWorker(WorkerBase):
 
     def __init__(
@@ -253,10 +264,8 @@ class TPUWorker(WorkerBase):
                 init_rank = self.rank
                 init_world = pc.world_size
                 dist_world_size = pc.world_size
-                os.environ["RANK"] = str(self.rank)
-                os.environ["LOCAL_RANK"] = str(tpu_local_rank_env)
-                os.environ["WORLD_SIZE"] = str(pc.world_size)
-                os.environ["LOCAL_WORLD_SIZE"] = str(tpu_local_world)
+                _configure_tpu_process_env(self.rank, tpu_local_rank_env,
+                                           pc.world_size, tpu_local_world)
             if int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"):
                 logger.info(
                     "TPU local-rank offset binding | rank=%d local_rank=%d "

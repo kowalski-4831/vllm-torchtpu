@@ -552,14 +552,19 @@ class TpuPlatform(Platform):
     def _prepare_singlehost_tpu_env(cls, world_size: int) -> None:
         """Set TORCH_TPU_* env vars needed by PjRt initialization.
 
-        TPUWorker.init_device() always sets WORLD_SIZE in the env, which
-        causes PjRt to require TORCH_TPU_SLICEBUILDER_ADDRESSES and
-        TORCH_TPU_TOPOLOGY. For world_size > 1, topology is looked up
-        via PCI scan using world_size (not auto-detected chip count) so
-        slicebuilder and topology match the actual number of workers.
+        For world_size > 1, topology is looked up via PCI scan using
+        world_size (not auto-detected chip count) so slicebuilder and topology
+        match the actual number of workers. A single TPU does not need the
+        distributed PjRt bootstrap.
         """
         os.environ.setdefault("TORCH_TPU_XPROF_SESSION_ID",
                               str(time.time_ns()))
+
+        if world_size == 1:
+            os.environ.pop("WORLD_SIZE", None)
+            os.environ.pop("TORCH_TPU_SLICEBUILDER_ADDRESSES", None)
+            os.environ.pop("TORCH_TPU_TOPOLOGY", None)
+            return
 
         sb_addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
         sb_count = len(sb_addresses.split(",")) if sb_addresses else 0
@@ -570,11 +575,7 @@ class TpuPlatform(Platform):
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
                 f"localhost:{p}" for p in sb_ports)
 
-        if world_size == 1:
-            os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1"
-        else:
-            os.environ["TORCH_TPU_TOPOLOGY"] = \
-                cls._get_tpu_topology(world_size)
+        os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(world_size)
 
     @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
