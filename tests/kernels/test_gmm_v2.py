@@ -292,7 +292,10 @@ def test_gmm_weight_quantized_block_larger_than_tile_k():
     out_size = 512
     num_groups = 16
     block_size = 1024
-    tile_info = TileSizes(tile_m=128, tile_k=256, tile_n=out_size)
+    tile_info = TileSizes(tile_m=128,
+                          bucket_base=128,
+                          tile_k=256,
+                          tile_n=out_size)
     key = jax.random.key(0)
 
     lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
