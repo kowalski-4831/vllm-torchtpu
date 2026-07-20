@@ -106,6 +106,10 @@ class TestTpuPlatform:
                                                        vllm_config):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
+        # kv-transfer deployments run the split layout (the pool is opt-in
+        # via the env and never engages for kv-transfer).
+        vllm_config.kv_transfer_config = MagicMock()
+        vllm_config.kv_transfer_config.kv_connector = "TPUConnector"
         vllm_config.cache_config.block_size = 123  # already set
 
         mock_pallas = MagicMock()
@@ -125,8 +129,8 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
         mock_mamba_patch.assert_not_called()
 
-        # Without the unified-layout env the hybrid path keeps the split
-        # layout: the block-size derivation helper must not run.
+        # Without the unified-layout env the split-layout path must not run
+        # the block-size derivation helper.
         mock_update.assert_not_called()
         # Verify block_size wasn't overridden by get_page_size
         assert vllm_config.cache_config.block_size == 123
@@ -221,6 +225,12 @@ class TestTpuPlatform:
         vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
         vllm_config.speculative_config = speculative_config
         vllm_config.scheduler_config.async_scheduling = async_scheduling
+        # Attention-DP runs the split layout; async+APC is only rejected
+        # there (the pool's seed copies support async scheduling).
+        vllm_config.parallel_config.data_parallel_size = 8
+        # The non-raising row reaches the single-host DP env setup; a falsy
+        # master ip takes the code's "localhost" fallback.
+        vllm_config.parallel_config.data_parallel_master_ip = ""
 
         mock_pallas = MagicMock()
         mock_pallas.get_page_size.return_value = 256

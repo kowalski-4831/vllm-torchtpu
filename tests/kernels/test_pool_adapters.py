@@ -441,3 +441,110 @@ class TestPartialSelfConsistency:
 
     def test_gs_id_w512_t512(self):
         self._gather_scatter_id(512, 512)
+
+
+def _arange_pool(shape, dtype):
+    import math
+    n = math.prod(shape)
+    return (jnp.arange(n, dtype=jnp.float32) %
+            251).astype(dtype).reshape(shape)
+
+
+class TestGatherScatterBlocks:
+    """split>1: a manager-block token range routes through one DMA window
+    per request and equals the per-kernel-block gathers concatenated."""
+
+    def test_split_gather_matches_per_block_gathers(self):
+        pool = _arange_pool((12, 16, 2, 128), jnp.bfloat16)
+        mgr = jnp.array([0, 1, 2], dtype=jnp.int32)
+        multi = pool_adapters.gather_region(pool,
+                                            mgr,
+                                            tok0=0,
+                                            ntok=32,
+                                            out_dtype=jnp.float32,
+                                            out_lanes=128,
+                                            split=3)
+        singles = jnp.concatenate([
+            pool_adapters.gather_region(pool,
+                                        mgr * 3 + j,
+                                        tok0=0,
+                                        ntok=16,
+                                        out_dtype=jnp.float32,
+                                        out_lanes=128) for j in range(2)
+        ],
+                                  axis=1)
+        assert multi.shape == singles.shape
+        assert jnp.array_equal(multi.view(jnp.uint32),
+                               singles.view(jnp.uint32))
+
+    def test_split_subblock_region_matches_offset_call(self):
+        # a range inside ONE kernel block (the conv shape) routes to the
+        # plain path at the kernel-block offset
+        pool = _arange_pool((12, 16, 2, 128), jnp.bfloat16)
+        mgr = jnp.array([0, 3], dtype=jnp.int32)
+        got = pool_adapters.gather_region(pool,
+                                          mgr,
+                                          tok0=32,
+                                          ntok=8,
+                                          out_dtype=jnp.bfloat16,
+                                          split=3)
+        want = pool_adapters.gather_region(pool,
+                                           mgr * 3 + 2,
+                                           tok0=0,
+                                           ntok=8,
+                                           out_dtype=jnp.bfloat16)
+        assert jnp.array_equal(got.view(jnp.uint16), want.view(jnp.uint16))
+
+
+class TestGatherScatterBlocksFp8:
+    """fp8 (1-byte) pool with f32 region access — the ratio-4 bitcast on a
+    manager-block window (the 397B fp8 serving shape)."""
+
+    def _pool(self):
+        # (nb, block, k2p, p, hd): fp8 packing p=4, 5-D like the real cache
+        shape = (12, 16, 2, 4, 128)
+        import math
+        n = math.prod(shape)
+        return (jnp.arange(n, dtype=jnp.float32) % 240).astype(
+            jnp.float8_e4m3fn).reshape(shape)
+
+    def test_split_gather_fp8_to_f32_matches_per_block(self):
+        pool = self._pool()
+        mgr = jnp.array([0, 2], dtype=jnp.int32)
+        multi = pool_adapters.gather_region(pool,
+                                            mgr,
+                                            tok0=0,
+                                            ntok=32,
+                                            out_dtype=jnp.float32,
+                                            out_lanes=128,
+                                            split=3)
+        singles = jnp.concatenate([
+            pool_adapters.gather_region(pool,
+                                        mgr * 3 + j,
+                                        tok0=0,
+                                        ntok=16,
+                                        out_dtype=jnp.float32,
+                                        out_lanes=128) for j in range(2)
+        ],
+                                  axis=1)
+        assert jnp.array_equal(multi.view(jnp.uint32),
+                               singles.view(jnp.uint32))
+
+    def test_split_scatter_fp8_roundtrip(self):
+        pool = self._pool()
+        mgr = jnp.array([1, 3], dtype=jnp.int32)
+        vals = pool_adapters.gather_region(pool,
+                                           mgr,
+                                           tok0=0,
+                                           ntok=32,
+                                           out_dtype=jnp.float32,
+                                           split=3)
+        new_pool = pool_adapters.scatter_region(pool,
+                                                vals,
+                                                mgr,
+                                                tok0=0,
+                                                ntok=32,
+                                                split=3)
+        # pure roundtrip: bytes unchanged everywhere (incl. the
+        # copied-through third kernel block of each manager block)
+        assert jnp.array_equal(new_pool.view(jnp.uint8), pool.view(jnp.uint8))

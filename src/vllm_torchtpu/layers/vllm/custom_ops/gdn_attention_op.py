@@ -109,6 +109,7 @@ def gdn_attention_pooled_core_tpu(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    pool_block_tokens: int,
     config: GdnAttentionConfig,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
@@ -129,6 +130,7 @@ def gdn_attention_pooled_core_tpu(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
         mesh=mesh,
         config=config,
     )
@@ -358,6 +360,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             d_k=self.head_k_dim,
             d_v=self.head_v_dim,
             kernel_size=self.conv_kernel_size,
+            # Manager block size: the pool may be born at a smaller kernel
+            # granularity for backends with a fixed kernel block.
+            pool_block_tokens=(
+                vllm_context.vllm_config.cache_config.block_size),
             config=config,
         )
         op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"

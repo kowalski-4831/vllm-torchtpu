@@ -127,6 +127,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
         use_lookahead: bool,
         cfg: config.GDNConfig,
         metadata_ref: MetadataRef,
+        **fields,
     ):
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
@@ -139,6 +140,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
         return cls(
             cfg=cfg,
             metadata_ref=metadata_ref,
+            **fields,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -317,6 +319,77 @@ class StateBufferedRef(BaseBufferedRef):
         ).wait()
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ExternalStateBufferedRef(StateBufferedRef):
+    """State tiles streamed from/to an indexed external state source.
+
+    Unlike ``StateBufferedRef``'s dense per-slot state tensor, the source
+    stores each slot's state as raw bytes inside a window of ``stride``
+    consecutive source blocks addressed by the slot's state index;
+    ``region`` selects the block/row range of this state within that
+    window. copy_in/copy_out move the whole region with one contiguous
+    async copy per slot, gated by the same first/last-tile and
+    has_initial_state metadata as the dense path, so padded or invalid
+    slots move no bytes in either direction. The waits count slots like
+    the dense path (each slot's copy covers its full tile). vmem_ldst
+    applies the region's typed view when the tile is loaded or stored.
+    """
+
+    region: config.StateRegion = dataclasses.field(metadata=dict(static=True))
+    stride: int = dataclasses.field(metadata=dict(static=True))
+
+    def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
+        base = state_idx * self.stride + self.region.kb0
+        if self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]:
+            return src_ref.at[pl.ds(base, nblocks)]
+        return src_ref.at[pl.ds(base, nblocks),
+                          pl.ds(self.region.row0, self.region.nrows)]
+
+    def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_copy_in_slot
+        sem = self.sem_recvs.at[slot]
+        vmem_ref = self.window_ref.at[slot]
+        p_id = grid_indices[0]
+
+        for idx in range(self.cfg.seq_tile_size):
+            is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
+            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
+                s_idx]
+            should_read = jnp.logical_and(is_first_tile, has_initial_state)
+            nblocks = jnp.where(should_read, self.region.nblocks, 0)
+
+            pltpu.make_async_copy(
+                self._region_slice(src_ref, state_idx, nblocks),
+                vmem_ref.at[idx, pl.ds(0, nblocks)],
+                sem,
+            ).start()
+
+    def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
+        slot = self.current_copy_out_slot
+        sem = self.sem_sends.at[slot]
+        vmem_ref = self.window_ref.at[slot]
+        p_id = grid_indices[0]
+
+        for idx in range(self.cfg.seq_tile_size):
+            is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
+            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
+            nblocks = jnp.where(is_last_tile, self.region.nblocks, 0)
+
+            pltpu.make_async_copy(
+                vmem_ref.at[idx, pl.ds(0, nblocks)],
+                self._region_slice(dst_ref, state_idx, nblocks),
+                sem,
+            ).start()
+
+
 def create_allocs(
     metadata_ref: MetadataRef,
     qkv_ref: jax.Array,
@@ -341,13 +414,6 @@ def create_allocs(
         cfg.seq_tile_size,
         cfg.chunk_size,
         cfg.num_v_heads,
-        cfg.v_head_dim,
-    )
-    conv_shape = (cfg.seq_tile_size, cfg.prev_kernel_size, 1, cfg.dim_size)
-    recurrent_shape = (
-        cfg.seq_tile_size,
-        cfg.num_v_heads,
-        cfg.kq_head_dim,
         cfg.v_head_dim,
     )
 
@@ -383,18 +449,52 @@ def create_allocs(
         metadata_ref=metadata_ref,
     )
 
-    conv_spec = block_spec_partial(block_shape=conv_shape)
-    recurrent_spec = block_spec_partial(block_shape=recurrent_shape)
-    state_buffered_partial = functools.partial(
-        StateBufferedRef.input_output,
-        buffer_count=pipeline_mode.buffer_count,
-        use_lookahead=pipeline_mode.use_lookahead,
-        cfg=cfg,
-        metadata_ref=metadata_ref,
-    )
-    conv_alloc = state_buffered_partial(spec=conv_spec,
-                                        dtype_or_type=conv_state_ref)
-    recurrent_alloc = state_buffered_partial(spec=recurrent_spec,
-                                             dtype_or_type=recurrent_state_ref)
+    if cfg.state_plan is None:
+        conv_shape = (cfg.seq_tile_size, cfg.prev_kernel_size, 1, cfg.dim_size)
+        recurrent_shape = (
+            cfg.seq_tile_size,
+            cfg.num_v_heads,
+            cfg.kq_head_dim,
+            cfg.v_head_dim,
+        )
+        state_buffered_partial = functools.partial(
+            StateBufferedRef.input_output,
+            buffer_count=pipeline_mode.buffer_count,
+            use_lookahead=pipeline_mode.use_lookahead,
+            cfg=cfg,
+            metadata_ref=metadata_ref,
+        )
+        conv_alloc = state_buffered_partial(
+            spec=block_spec_partial(block_shape=conv_shape),
+            dtype_or_type=conv_state_ref)
+        recurrent_alloc = state_buffered_partial(
+            spec=block_spec_partial(block_shape=recurrent_shape),
+            dtype_or_type=recurrent_state_ref)
+    else:
+        # Both state regions stream from the one external source ref
+        # (passed as both state refs); the tiles keep the source's raw
+        # block layout and vmem_ldst applies the typed region view.
+        plan = cfg.state_plan
+        window = conv_state_ref.shape[2:]
+        conv_shape = (cfg.seq_tile_size, plan.conv.nblocks, plan.conv.nrows,
+                      *window)
+        recurrent_shape = (cfg.seq_tile_size, plan.recurrent.nblocks,
+                           plan.recurrent.nrows, *window)
+        state_buffered_partial = functools.partial(
+            ExternalStateBufferedRef.input_output,
+            buffer_count=pipeline_mode.buffer_count,
+            use_lookahead=pipeline_mode.use_lookahead,
+            cfg=cfg,
+            metadata_ref=metadata_ref,
+            stride=plan.stride,
+        )
+        conv_alloc = state_buffered_partial(
+            spec=block_spec_partial(block_shape=conv_shape),
+            dtype_or_type=conv_state_ref,
+            region=plan.conv)
+        recurrent_alloc = state_buffered_partial(
+            spec=block_spec_partial(block_shape=recurrent_shape),
+            dtype_or_type=conv_state_ref,
+            region=plan.recurrent)
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc
