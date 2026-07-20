@@ -19,11 +19,34 @@ and ``vllm/model_executor/layers/mamba/gdn_linear_attn.py``). See PR
 #2408 for the ablation that ties this to Qwen3.5-397B GPQA-Diamond.
 """
 
+from typing import Callable, NamedTuple
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 import vllm_torchtpu.kernels.gdn.triangle_solver as triangle_solver
+
+
+class StateOps(NamedTuple):
+    """Pluggable recurrent-state access.
+
+    ``read(pool, indices)`` returns per-request states
+    ``(num_reqs, n_v, d_k, d_v)``; ``write(pool, states, indices)`` returns
+    the updated pool. The default indexes the dense
+    ``(num_blocks, n_v, d_k, d_v)`` state tensor; the unified block pool
+    substitutes adapter kernels that gather/scatter the state byte-region of
+    its canonical-dtype pool. Callers must reuse one instance across steps —
+    the ops are static jit arguments and a fresh instance would retrace.
+    """
+    read: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
+    write: Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], jnp.ndarray]
+
+
+DENSE_STATE_OPS = StateOps(
+    read=lambda pool, idx: pool[idx],
+    write=lambda pool, states, idx: pool.at[idx].set(states),
+)
 
 
 def l2norm(x: jnp.ndarray, dim: int = -1, eps: float = 1e-6) -> jnp.ndarray:
@@ -212,6 +235,7 @@ def ragged_gated_delta_rule_mixed_prefill(
     distribution: jnp.ndarray,
     has_initial_state: jnp.ndarray,
     chunk_size: int = 64,
+    state_ops: StateOps = DENSE_STATE_OPS,
     use_qk_norm_in_gdn: bool = False,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     precision: jax.lax.Precision = jax.lax.Precision.HIGHEST,
@@ -387,10 +411,10 @@ def ragged_gated_delta_rule_mixed_prefill(
     k_i_g_diff_scan = k_i_g_diff_chunks
 
     # Prepare init_h_per_chunk
+    init_states_for_seqs = state_ops.read(recurrent_state, state_indices)
     init_h_per_chunk = jnp.zeros((num_chunks, H, K_dim, V_dim),
-                                 dtype=recurrent_state.dtype)
+                                 dtype=init_states_for_seqs.dtype)
     start_chunk_indices = new_query_start_loc[:-1] // chunk_size
-    init_states_for_seqs = recurrent_state[state_indices]
     # For brand-new prefills (no prior context), use zero initial state
     # rather than whatever a reused mamba slot still held. Matches GPU's
     # `initial_state[~has_initial_state, ...] = 0`.
@@ -472,14 +496,14 @@ def ragged_gated_delta_rule_mixed_prefill(
 
     num_seqs = last_chunk_indices.shape[0]
     valid_seq_mask = jnp.arange(num_seqs) < distribution[2]
-    current_states = recurrent_state[state_indices]
+    current_states = state_ops.read(recurrent_state, state_indices)
     states_to_set = jnp.where(
         valid_seq_mask[:, None, None, None],
-        final_states.astype(recurrent_state.dtype),
+        final_states.astype(current_states.dtype),
         current_states,
     )
-    updated_recurrent_state = recurrent_state.at[state_indices].set(
-        states_to_set)
+    updated_recurrent_state = state_ops.write(recurrent_state, states_to_set,
+                                              state_indices)
 
     return updated_recurrent_state, output
 
@@ -554,6 +578,7 @@ def ragged_gated_delta_rule_decode_only(
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
     use_qk_norm_in_gdn: bool,
+    state_ops: StateOps = DENSE_STATE_OPS,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies gated delta rule for decode-only case (sequence lengths = 1).
 
@@ -600,7 +625,7 @@ def ragged_gated_delta_rule_decode_only(
 
     # Gather the current states for the requests in this batch
     req_state_indices = state_indices[req_indices]
-    current_states = recurrent_state[req_state_indices]
+    current_states = state_ops.read(recurrent_state, req_state_indices)
 
     # Call step function directly with the inputs (no scattering needed)
     outputs, new_states = recurrent_gated_delta_rule_step(
@@ -620,10 +645,10 @@ def ragged_gated_delta_rule_decode_only(
     states_to_set = jnp.where(valid_mask[:, None, None, None], new_states,
                               current_states)
 
-    updated_recurrent_state = recurrent_state.at[req_state_indices].set(
-        states_to_set)
+    updated_recurrent_state = state_ops.write(recurrent_state, states_to_set,
+                                              req_state_indices)
 
-    return updated_recurrent_state.astype(recurrent_state.dtype), outputs
+    return updated_recurrent_state, outputs
 
 
 # Donate conv_state to avoid "copy" op by XLA
@@ -637,6 +662,7 @@ def ragged_gated_delta_rule_decode_only(
         'chunk_size',
         'use_qk_norm_in_gdn',
         'triangle_solver_impl',
+        'state_ops',
     ),
 )
 @jax.named_scope('ragged_gated_delta_rule_chunked')
@@ -660,6 +686,7 @@ def ragged_gated_delta_rule(
     use_qk_norm_in_gdn: bool = True,
     triangle_solver_impl: triangle_solver.TriangleSolverImpl = triangle_solver.
     TriangleSolverImpl.GAUSSIAN,
+    state_ops: StateOps = DENSE_STATE_OPS,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies the gated delta rule over ragged seq lengths
 
@@ -732,6 +759,7 @@ def ragged_gated_delta_rule(
             state_indices=state_indices,
             distribution=distribution,
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+            state_ops=state_ops,
         )
         return new_state, output.astype(mixed_qkv.dtype)
 
@@ -753,6 +781,7 @@ def ragged_gated_delta_rule(
             chunk_size=chunk_size,
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
             triangle_solver_impl=triangle_solver_impl,
+            state_ops=state_ops,
         )
 
     # distribution[0] is decode_end, distribution[2] is mixed_end.

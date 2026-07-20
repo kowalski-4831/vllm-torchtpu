@@ -41,13 +41,10 @@ echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
 echo "--- Pulling Docker Image: ${IMAGE_TAG}"
-gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 docker pull "${IMAGE_TAG}"
 
 # Ensure cache directory exists on the host
-mkdir -p /mnt/disks/persist/models/hub
-mkdir -p /mnt/disks/persist/torchtpu_cache
-chmod 777 /mnt/disks/persist/torchtpu_cache 2>/dev/null || true
+mkdir -p /mnt/disks/persist/models
 
 # Ensure results directory exists on the persistent disk (always mountable)
 rm -rf /mnt/disks/persist/perf_eval_results
@@ -95,15 +92,12 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16
   -w /root/torchtpu-vllm \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
-  -v /mnt/disks/persist/torchtpu_cache:/torchtpu_cache \
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
   -e EVALPLUS_DATASETS="${EVALPLUS_DATASETS:-}" \
   -e EVALPLUS_PARALLEL="${EVALPLUS_PARALLEL:-}" \
   -e FORCE_COLOR="1" \
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
-  -e VLLM_CACHE_ROOT=/torchtpu_cache \
-  -e VLLM_XLA_CACHE_PATH=/torchtpu_cache \
   -e MODEL_IMPL_TYPE="${MODEL_IMPL_TYPE:-}" \
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
   -e TQDM_MININTERVAL="30" \

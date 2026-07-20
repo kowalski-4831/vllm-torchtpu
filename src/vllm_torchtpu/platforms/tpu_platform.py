@@ -21,8 +21,9 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    update_tpu_block_size_and_slot_config
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    unified_block_pool_enabled, unified_kv_layout_enabled,
+    update_tpu_block_size_and_slot_config)
 from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
@@ -695,6 +696,20 @@ class TpuPlatform(Platform):
             logger.info("Using vLLM native multiprocess PCP world; PCP is not "
                         "represented as a JAX mesh axis.")
 
+        # libtpu never completes a pool-program execution whose TP all-reduce
+        # was offloaded to the SparseCore (the `auto` payload threshold
+        # selects the offload from ~1024-token buckets upward); keep the
+        # all-reduce on the TensorCore when the unified block pool serves the
+        # KV cache. Set before workers spawn — torch_tpu reads this env once
+        # per process at first compile. Respect an explicit user setting of
+        # the same key.
+        if unified_block_pool_enabled(vllm_config):
+            sc_ar = "xla_tpu_enable_sparse_core_collective_offload_all_reduce"
+            xla_opts = os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", "")
+            if sc_ar not in xla_opts:
+                os.environ["TORCH_TPU_INTERNAL_XLA_OPTIONS"] = (
+                    f"{xla_opts} {sc_ar}=false".strip())
+
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
         if compilation_config.mode == CompilationMode.NONE:
@@ -783,9 +798,10 @@ class TpuPlatform(Platform):
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # the align-mode Mamba APC path (MambaApcStateCopier); other cache
-        # modes and the two combinations we haven't wired up yet must be
-        # rejected up front instead of failing partway through warmup.
+        # align-mode mamba state seeding (MambaApcStateCopier on the
+        # typed-view layout, or the pool's seed copies); other cache modes
+        # and speculative decoding must be rejected up front instead of
+        # failing partway through warmup.
         if is_hybrid and getattr(cache_config, "enable_prefix_caching", False):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
@@ -796,15 +812,11 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     "Speculative decoding is not yet supported with hybrid "
                     "Mamba prefix caching (mamba_cache_mode='align').")
-            if vllm_config.scheduler_config.async_scheduling:
-                raise NotImplementedError(
-                    "Async scheduling is not yet supported with hybrid "
-                    "Mamba prefix caching (mamba_cache_mode='align').")
         if not is_hybrid and block_size_was_unspecified:
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]
                 backend_cls.get_preferred_block_size(default))
-        if envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:
+        if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
         min_page_size = backend_cls.get_min_page_size(vllm_config)
@@ -903,12 +915,24 @@ class TpuPlatform(Platform):
             "Forcing --disable_chunked_mm_input.")
             scheduler_config.disable_chunked_mm_input = True
 
+        if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
+            dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+            if scheduler_config.scheduler_cls != dp_sched_cls:
+                assert scheduler_config.scheduler_cls is None, (
+                    "Cannot have DP_SCHED_ENABLED enabled and also a custom "
+                    "scheduler being provided.")
+                scheduler_config.scheduler_cls = dp_sched_cls
+                logger.info(
+                    "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
+                    parallel_config.data_parallel_size)
+
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
                 "TPUConnectorV2",
                 "TPURaidenConnector",
+                "TPUMultiConnector",
                 "TPUConnectorHMA",
                 "OffloadingConnector",
             }
@@ -922,7 +946,9 @@ class TpuPlatform(Platform):
                     and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
-            if kv_transfer_config.kv_connector == "TPUConnectorV2":
+            if kv_transfer_config.kv_connector in {
+                    "TPUConnectorV2", "TPURaidenConnector"
+            }:
                 _patch_scheduler_mamba_external_kv()
 
     @classmethod

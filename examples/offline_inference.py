@@ -106,7 +106,7 @@ def main(args: dict):
         'Who wrote the novel "Pride and Prejudice"?',
     ]
 
-    torch_profiler_dir = os.getenv("VLLM_TORCH_PROFILER_DIR")
+    torch_profiler_dir = llm.llm_engine.vllm_config.profiler_config.torch_profiler_dir
     if torch_profiler_dir is not None:
         llm.start_profile()
     if use_chat_template:

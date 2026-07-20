@@ -28,7 +28,7 @@ from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
 from vllm_torchtpu.layers.common.gdn_attention import (
     GdnAttentionConfig, run_jax_gdn_attention,
-    run_jax_gdn_attention_pcp_tp_prefill)
+    run_jax_gdn_attention_pcp_tp_prefill, run_jax_gdn_attention_pooled)
 from vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper import \
     RaggedGatedDeltaRuleImpl
 from vllm_torchtpu.layers.common.sequence_layout import \
@@ -87,6 +87,53 @@ def gdn_attention_core_tpu(
     )
 
     return new_conv_state, new_recurrent_state, output
+
+
+def gdn_attention_pooled_core_tpu(
+    mixed_qkv: jax.Array,
+    b: jax.Array,
+    a: jax.Array,
+    recurrent_state: jax.Array,
+    conv_weight: jax.Array,
+    conv_bias: jax.Array | None,
+    A_log: jax.Array,
+    dt_bias: jax.Array,
+    state_indices: jax.Array,
+    query_start_loc: jax.Array,
+    distribution: jax.Array,
+    seq_lens: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pool_block_tokens: int,
+    config: GdnAttentionConfig,
+) -> tuple[jax.Array, jax.Array]:
+    return run_jax_gdn_attention_pooled(
+        mixed_qkv,
+        b,
+        a,
+        recurrent_state,
+        conv_weight,
+        conv_bias,
+        A_log,
+        dt_bias,
+        state_indices,
+        query_start_loc,
+        distribution,
+        seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
+        mesh=mesh,
+        config=config,
+    )
 
 
 def gdn_attention_core_tpu_pcp_prefill(
@@ -148,6 +195,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gdn_op = self._build_gdn_op()
+        self.gdn_pooled_op = self._build_pooled_gdn_op()
         self.gdn_pcp_op = (self._build_gdn_op(
             pcp_streaming=True) if self._pcp_streaming_enabled() else None)
 
@@ -298,6 +346,64 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
+    def _build_pooled_gdn_op(self):
+        vllm_context = get_vllm_model_wrapper_context()
+        config = GdnAttentionConfig(
+            ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl(
+                envs.RAGGED_GATED_DELTA_RULE_IMPL))
+        local_num_v_heads = self.num_v_heads // self.tp_size
+        wrapped_fn = functools.partial(
+            gdn_attention_pooled_core_tpu,
+            mesh=vllm_context.mesh,
+            n_kq=self.num_k_heads // self.tp_size,
+            n_v=local_num_v_heads,
+            d_k=self.head_k_dim,
+            d_v=self.head_v_dim,
+            kernel_size=self.conv_kernel_size,
+            # Manager block size: the pool may be born at a smaller kernel
+            # granularity for backends with a fixed kernel block.
+            pool_block_tokens=(
+                vllm_context.vllm_config.cache_config.block_size),
+            config=config,
+        )
+        op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
+        # The recurrent state (arg 3) is the attention-shaped pool: the ssm
+        # and conv byte-regions are read/written through it by the pool
+        # adapters, so it is the only donated input. inplace-donation
+        # aliases its program-level output to the input buffer so the
+        # ~pool-sized update is not double-counted at compile.
+        gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, ))
+
+        def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
+            num_tokens = mixed_qkv.size(0)
+            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            out = torch.empty(out_shape,
+                              dtype=mixed_qkv.dtype,
+                              device=mixed_qkv.device)
+            return torch.empty_like(recurrent_state), out
+
+        gdn_jax_op.register_fake(_fake_gdn)
+
+        def gdn_impl(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
+                     recurrent_state: torch.Tensor, conv_weight: torch.Tensor,
+                     conv_bias: torch.Tensor | None, A_log: torch.Tensor,
+                     dt_bias: torch.Tensor, state_indices: torch.Tensor,
+                     query_start_loc: torch.Tensor,
+                     request_distribution: torch.Tensor,
+                     seq_lens: torch.Tensor) -> torch.Tensor:
+            new_rec, outputs = gdn_jax_op(mixed_qkv, b, a, recurrent_state,
+                                          conv_weight, conv_bias, A_log,
+                                          dt_bias, state_indices,
+                                          query_start_loc,
+                                          request_distribution, seq_lens)
+
+            # Plain donation + copy_ writeback (aliased in-place by XLA).
+            recurrent_state.copy_(new_rec)
+
+            return outputs
+
+        return gdn_impl
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -351,67 +457,87 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            conv_state, recurrent_state = None, None
+            recurrent_state = None
         else:
             fc = get_forward_context()
             attn_metadata = fc.attn_metadata[self.prefix]
 
-            conv_state, recurrent_state = kv_cache
-            # Recurrent-state slot id per persistent-batch position.
-            # Compact-mamba: the mamba pool has only `_mamba_num_blocks` slots
-            # (< attention `num_blocks`), so the slot id is carried explicitly
-            # in `mamba_state_indices` (in [0, _mamba_num_blocks)) rather than
-            # derived from the attention `block_tables[:, 0]`. Fall back to
-            # `block_tables[:, 0]` only when compact sizing was skipped and
-            # mamba shares the attention block pool (uniform layout).
-            if attn_metadata.mamba_state_indices is not None:
+            if len(kv_cache) == 1:
+                # Unified block pool: the attention-shaped pool carries the
+                # ssm and conv byte-regions; state ids come from the pool
+                # metadata builder.
+                (recurrent_state, ) = kv_cache
+                assert attn_metadata.mamba_state_indices is not None
                 state_indices = attn_metadata.mamba_state_indices.to(
                     torch.int32)
-            else:
-                max_reqs = attn_metadata.seq_lens.shape[0]
-                max_blocks_per_req = (attn_metadata.block_tables.shape[0] //
-                                      max_reqs)
-                block_tables_2d = torch.reshape(
-                    attn_metadata.block_tables,
-                    (max_reqs, max_blocks_per_req),
-                )
-                state_indices = block_tables_2d[:, 0].to(torch.int32)
-
-            # Execute the TorchTPU custom op
-            use_pcp_streaming = is_pcp_streaming_attention_metadata(
-                attn_metadata)
-            if not use_pcp_streaming:
-                core_attn_out = self.gdn_op(
-                    mixed_qkv, b, a, conv_state, recurrent_state,
-                    self.conv1d.weight, self.conv1d.bias, self.A_log,
-                    self.dt_bias, state_indices, attn_metadata.query_start_loc,
+                core_attn_out = self.gdn_pooled_op(
+                    mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
+                    self.conv1d.bias, self.A_log, self.dt_bias, state_indices,
+                    attn_metadata.query_start_loc,
                     attn_metadata.request_distribution, attn_metadata.seq_lens)
-            else:
-                gdn_pcp_op = getattr(self, "gdn_pcp_op", None)
-                if gdn_pcp_op is None:
-                    raise RuntimeError(
-                        "GDN PCP prefill op was not initialized during model "
-                        "loading.")
-                core_attn_out = gdn_pcp_op(
-                    mixed_qkv, b, a, conv_state, recurrent_state,
-                    self.conv1d.weight, self.conv1d.bias, self.A_log,
-                    self.dt_bias, state_indices, attn_metadata.query_start_loc,
-                    attn_metadata.request_distribution, attn_metadata.seq_lens)
-            if core_attn_out.shape[0] != num_tokens:
-                if not use_pcp_streaming:
+                if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError(
                         "GDN op returned an incompatible output shape.")
-                start = get_pcp_rank() * num_tokens
-                core_attn_out = core_attn_out[start:start + num_tokens]
-            if use_pcp_streaming:
-                local_core_attn_out = torch.empty(
-                    tuple(core_attn_out.shape),
-                    dtype=core_attn_out.dtype,
-                    device=core_attn_out.device,
-                )
-                local_core_attn_out.copy_(core_attn_out)
-                core_attn_out = local_core_attn_out
+            else:
+                conv_state, recurrent_state = kv_cache
+                # Recurrent-state slot id per persistent-batch position.
+                # Compact-mamba: the mamba pool has only `_mamba_num_blocks` slots
+                # (< attention `num_blocks`), so the slot id is carried explicitly
+                # in `mamba_state_indices` (in [0, _mamba_num_blocks)) rather than
+                # derived from the attention `block_tables[:, 0]`. Fall back to
+                # `block_tables[:, 0]` only when compact sizing was skipped and
+                # mamba shares the attention block pool (uniform layout).
+                if attn_metadata.mamba_state_indices is not None:
+                    state_indices = attn_metadata.mamba_state_indices.to(
+                        torch.int32)
+                else:
+                    max_reqs = attn_metadata.seq_lens.shape[0]
+                    max_blocks_per_req = (
+                        attn_metadata.block_tables.shape[0] // max_reqs)
+                    block_tables_2d = torch.reshape(
+                        attn_metadata.block_tables,
+                        (max_reqs, max_blocks_per_req),
+                    )
+                    state_indices = block_tables_2d[:, 0].to(torch.int32)
 
+                # Execute the TorchTPU custom op
+                use_pcp_streaming = is_pcp_streaming_attention_metadata(
+                    attn_metadata)
+                if not use_pcp_streaming:
+                    core_attn_out = self.gdn_op(
+                        mixed_qkv, b, a, conv_state, recurrent_state,
+                        self.conv1d.weight, self.conv1d.bias, self.A_log,
+                        self.dt_bias, state_indices,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                        attn_metadata.seq_lens)
+                else:
+                    gdn_pcp_op = getattr(self, "gdn_pcp_op", None)
+                    if gdn_pcp_op is None:
+                        raise RuntimeError(
+                            "GDN PCP prefill op was not initialized during model "
+                            "loading.")
+                    core_attn_out = gdn_pcp_op(
+                        mixed_qkv, b, a, conv_state, recurrent_state,
+                        self.conv1d.weight, self.conv1d.bias, self.A_log,
+                        self.dt_bias, state_indices,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                        attn_metadata.seq_lens)
+                if core_attn_out.shape[0] != num_tokens:
+                    if not use_pcp_streaming:
+                        raise RuntimeError(
+                            "GDN op returned an incompatible output shape.")
+                    start = get_pcp_rank() * num_tokens
+                    core_attn_out = core_attn_out[start:start + num_tokens]
+                if use_pcp_streaming:
+                    local_core_attn_out = torch.empty(
+                        tuple(core_attn_out.shape),
+                        dtype=core_attn_out.dtype,
+                        device=core_attn_out.device,
+                    )
+                    local_core_attn_out.copy_(core_attn_out)
+                    core_attn_out = local_core_attn_out
         # ============================================================
         # Part 3: Output Projection
         # ============================================================

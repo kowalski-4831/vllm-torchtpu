@@ -625,6 +625,32 @@ class TestTPURaidenConnectorScheduler:
         meta = self.consumer.reqs_to_load["req-hit"]
         assert meta.local_block_ids is None
         assert meta.remote_block_ids is None
+        # The request IS waiting on this connector (num_external_tokens > 0),
+        # so the empty release read must still report finished_recving.
+        assert meta.report_completion is True
+
+    def test_update_consumer_zero_external_tokens_suppresses_report(self):
+        # num_external_tokens == 0: nothing is pulled through this connector
+        # (full local cache hit, or another MultiConnector child owns the
+        # load). The release read must still be enrolled, but its completion
+        # must not surface as finished_recving.
+        req = MagicMock()
+        req.request_id = "req-release"
+        req.kv_transfer_params = {
+            "uuid": 45,
+            "remote_block_ids": [10, 11],
+            "remote_host": "2.2.2.2",
+            "remote_port": 9200,
+        }
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([4], )
+
+        self.consumer.update_state_after_alloc(req, blocks, 0)
+
+        meta = self.consumer.reqs_to_load["req-release"]
+        assert meta.local_block_ids is None
+        assert meta.remote_block_ids is None
+        assert meta.report_completion is False
 
     def test_get_finished_count_uses_vllm_world_size(self):
         assert self.consumer.get_finished_count() == 0
@@ -733,6 +759,63 @@ class TestTPURaidenConnectorWorker:
 
         assert self.engine.calls == [("start_read", "req", 5, "10.1.2.3:9202",
                                       [], [])]
+
+    def test_consumer_release_read_reports_completion_by_default(self):
+        # A release-only read whose request IS waiting on this connector
+        # (prefix hit with num_external_tokens > 0) keeps reporting.
+        worker = _make_raiden_worker(is_producer=False)
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], ["req"], [])]
+        worker._raiden_transfer_engine = engine
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["req"] = LoadMeta(uuid=5,
+                                            local_block_ids=None,
+                                            remote_block_ids=None,
+                                            remote_host="10.1.2.3",
+                                            remote_port=9200)
+
+        worker.process_send_load(meta)
+
+        assert worker.get_finished() == (set(), {"req"})
+
+    def test_consumer_suppressed_release_read_not_reported(self):
+        # report_completion=False (another MultiConnector child owns the
+        # load): the empty read is still issued to release P's payload, but
+        # its completion must never surface as finished_recving — vLLM's
+        # scheduler asserts on a finished_recving req that isn't
+        # WAITING_FOR_REMOTE_KVS.
+        worker = _make_raiden_worker(is_producer=False)
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], ["req"], [])]
+        worker._raiden_transfer_engine = engine
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["req"] = LoadMeta(uuid=5,
+                                            local_block_ids=None,
+                                            remote_block_ids=None,
+                                            remote_host="10.1.2.3",
+                                            remote_port=9200,
+                                            report_completion=False)
+
+        worker.process_send_load(meta)
+
+        assert engine.calls == [("start_read", "req", 5, "10.1.2.3:9202", [],
+                                 [])]
+        assert worker.get_finished() == (set(), set())
+        # The suppression entry is consumed once the recv completion lands.
+        assert worker._suppress_done_recving == set()
+
+    def test_finished_req_ids_prune_suppression_state(self):
+        # A suppressed request whose recv never surfaces (or that finished
+        # generating first) must not leak bookkeeping forever.
+        worker = _make_raiden_worker(is_producer=False)
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], [])]
+        worker._raiden_transfer_engine = engine
+        worker._suppress_done_recving.add("req")
+
+        worker.get_finished(finished_req_ids={"req"})
+
+        assert worker._suppress_done_recving == set()
 
     def test_get_finished_returns_engine_sets(self):
         assert self.worker.get_finished() == ({"sent"}, {"recv"})

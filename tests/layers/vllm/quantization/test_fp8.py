@@ -36,9 +36,13 @@ from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
 class FakeQuant:
     """Minimal quant config for testing."""
 
-    def __init__(self, weight_block_size=None, activation_scheme="dynamic"):
+    def __init__(self,
+                 weight_block_size=None,
+                 activation_scheme="dynamic",
+                 is_checkpoint_fp8_serialized=True):
         self.weight_block_size = weight_block_size
         self.activation_scheme = activation_scheme
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
 
 class FakeMoEConfig:
@@ -252,6 +256,43 @@ class TestFp8LinearRuntimeQuant:
                               torch.tensor(2.5, device=device),
                               atol=0.1)
 
+    def test_per_tensor_dequant_with_logical_widths(self, device):
+        """Per-tensor dequant with multiple scales should use logical_widths repeat_interleave."""
+        # Simulate QKVParallelLinear with logical_widths [64, 32, 32] (total out_dim = 128)
+        logical_widths = [64, 32, 32]
+        out_dim = sum(logical_widths)
+        in_dim = 128
+
+        weight_fp8 = torch.ones(out_dim,
+                                in_dim,
+                                device=device,
+                                dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        scale = torch.tensor([1.0, 2.0, 3.0],
+                             device=device,
+                             dtype=torch.float32)
+
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+        layer.logical_widths = logical_widths
+
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=None))
+        method.process_weights_after_loading(layer)
+
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert layer.weight_scale.shape == (out_dim, )
+
+        w = layer.weight.float() * layer.weight_scale[:, None]
+        assert torch.allclose(w[:64].mean(),
+                              torch.tensor(1.0, device=device),
+                              atol=0.1)
+        assert torch.allclose(w[64:96].mean(),
+                              torch.tensor(2.0, device=device),
+                              atol=0.1)
+        assert torch.allclose(w[96:].mean(),
+                              torch.tensor(3.0, device=device),
+                              atol=0.1)
+
     def test_apply_is_linear(self, device):
         """apply() should use the runtime FP8 quantized matmul."""
         if device.type != "tpu":
@@ -440,14 +481,18 @@ class TestOnlineFp8Quantization:
         w13, w13_s, w2, w2_s, dtype_name, block_size = (
             _quantize_bf16_moe_weights(layer, activation="silu"))
 
+        # _quantize_and_format_moe_weights rounds the intermediate size up to
+        # a multiple of 128 before quantizing, padding w13/w2 accordingly.
+        aligned_inter = (inter + 127) // 128 * 128
+
         # Weights should be transposed: [E, in, out]
-        assert w13.shape == (E, H, 2 * inter)
-        assert w2.shape == (E, inter, H)
+        assert w13.shape == (E, H, 2 * aligned_inter)
+        assert w2.shape == (E, aligned_inter, H)
         assert w13.dtype == torch.float8_e4m3fn
         assert w2.dtype == torch.float8_e4m3fn
 
         # Scales should be 4D: [E, num_blocks, 1, N]
-        assert w13_s.shape == (E, 1, 1, 2 * inter)
+        assert w13_s.shape == (E, 1, 1, 2 * aligned_inter)
         assert w2_s.shape == (E, 1, 1, H)
         assert w13_s.dtype == torch.float32
 

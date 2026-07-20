@@ -50,6 +50,40 @@ JOB_PRIORITY=$(determine_job_priority)
 export JOB_PRIORITY
 buildkite-agent meta-data set "JOB_PRIORITY" "$JOB_PRIORITY"
 
+# --- Check for explicit skip-ci or non-code/documentation-only changes ---
+echo "--- :git: Checking if CI build should be skipped"
+
+if [[ "${BUILDKITE_MESSAGE:-}" =~ \[skip[[:space:]]ci\] || "${BUILDKITE_MESSAGE:-}" =~ \[ci[[:space:]]skip\] ]]; then
+  echo "Commit message contains [skip ci]. Skipping build."
+  exit 0
+fi
+
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  BASE_BRANCH=${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-"main"}
+  echo "PR detected. Target branch: ${BASE_BRANCH}"
+
+  git fetch origin "${BASE_BRANCH}" --depth=20 --quiet || echo "Base fetch failed"
+  git fetch origin "${BUILDKITE_COMMIT:-HEAD}" --depth=20 --quiet || true
+
+  FILES_CHANGED=$(git diff --name-only origin/"${BASE_BRANCH}"..."${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true)
+  if [[ -z "${FILES_CHANGED}" ]]; then
+    FILES_CHANGED=$(git diff-tree --no-commit-id --name-only -r -m "${BUILDKITE_COMMIT:-HEAD}")
+  fi
+
+  echo "Files changed:"
+  echo "${FILES_CHANGED}"
+
+  # Filter out files we want to skip builds for (docs, md, icons, CODEOWNERS, LICENSE)
+  NON_SKIPPABLE_FILES=$(echo "${FILES_CHANGED}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$)" || true)
+
+  if [[ -z "${NON_SKIPPABLE_FILES}" && -n "${FILES_CHANGED}" ]]; then
+    echo "Only documentation/non-code files changed. Skipping CI build."
+    exit 0
+  else
+    echo "Code files changed. Proceeding with pipeline upload."
+  fi
+fi
+
 # Benchmark / Perf jobs should use PRIORITY_BENCHMARK (unless it is a nightly run).
 PERF_PRIORITY="$PRIORITY_BENCHMARK"
 if [[ "${NIGHTLY:-0}" == "1" ]]; then

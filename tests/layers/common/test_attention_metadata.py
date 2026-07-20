@@ -137,6 +137,8 @@ class TestAttentionMetadataBuilderPlumbing:
 
     def test_build_mamba_state_indices_from_current_block_table_entry(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_block_pool = True
+        runner._mamba_align_mode = True
         builder = self._make_mamba_builder(runner)
 
         seq_lens = torch.tensor([1, 16, 17, 64], dtype=torch.int32)
@@ -162,3 +164,27 @@ class TestAttentionMetadataBuilderPlumbing:
         ],
                                 dtype=torch.int32)
         assert torch.equal(meta.mamba_state_indices, expected)
+
+    def test_unified_none_mode_uses_first_block_fallback(self):
+        # Typed-view layout in none mode: compact slot ids arrive via the
+        # builder ctx, so the builder itself yields no indices. (The pool
+        # has no compact slot pool and derives indices in every mode.)
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_block_pool = False
+        runner._unified_kv_layout = True
+        runner._mamba_align_mode = False
+        builder = self._make_mamba_builder(runner)
+
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([1, 16, 17, 64], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert meta.mamba_state_indices is None

@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
 
@@ -134,6 +137,93 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     return jnp.concat(vreg_list, axis=-1).reshape(new_shape)
 
 
+def _regroup_rows(arr: jax.Array, width: int) -> jax.Array:
+    """(rows, lanes) -> (rows * lanes // width, width), row-major.
+
+    Rebuilds wider rows by lane-concatenating groups of consecutive rows;
+    all slices are 128-lane aligned, so no generic relayout is needed.
+    """
+    lanes = arr.shape[-1]
+    if width == lanes:
+        return arr
+    group = width // lanes
+    assert group * lanes == width, (width, lanes)
+    assert arr.shape[0] % group == 0, (arr.shape, group)
+    wide_rows = [
+        jnp.concat([arr[r * group + i][None] for i in range(group)], axis=-1)
+        for r in range(arr.shape[0] // group)
+    ]
+    return jnp.concat(wide_rows, axis=0)
+
+
+def _split_rows(arr: jax.Array, lanes: int) -> jax.Array:
+    """Inverse of ``_regroup_rows``: (rows, width) -> (rows', lanes)."""
+    width = arr.shape[-1]
+    if width == lanes:
+        return arr
+    group = width // lanes
+    narrow_rows = [
+        arr[r, i * lanes:(i + 1) * lanes][None] for r in range(arr.shape[0])
+        for i in range(group)
+    ]
+    return jnp.concat(narrow_rows, axis=0)
+
+
+def _region_rows_per_block(slot_ref: jax.Ref,
+                           region: config.StateRegion) -> tuple[int, int]:
+    """(typed rows per source block, typed lane count) of a slot tile."""
+    out_lanes = slot_ref.shape[-1] // region.lane_split
+    block_bytes = (math.prod(slot_ref.shape[1:]) *
+                   jnp.dtype(slot_ref.dtype).itemsize)
+    rows_pb = block_bytes // (jnp.dtype(region.view_dtype).itemsize *
+                              out_lanes)
+    return rows_pb, out_lanes
+
+
+def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
+                      shape: tuple[int, ...]) -> jax.Array:
+    """Loads one slot's state from its raw source-layout tile.
+
+    Args:
+        slot_ref: One slot's VMEM tile of shape [region.nblocks,
+            region.nrows, *source payload dims, source lanes] in the
+            source dtype.
+        region: The region's copy-plan (typed view parameters).
+        shape: Logical state shape; its last dim must be a multiple of
+            the typed view's lane count.
+
+    Returns:
+        The logical state of ``shape`` in ``region.view_dtype``.
+    """
+    parts = [
+        typed_ldst.load_typed(slot_ref.at[j],
+                              view_dtype=region.view_dtype,
+                              lane_split=region.lane_split)
+        for j in range(region.nblocks)
+    ]
+    arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
+    return _regroup_rows(arr[:region.rows_used], shape[-1]).reshape(shape)
+
+
+def store_state_region(slot_ref: jax.Ref, region: config.StateRegion,
+                       values: jax.Array) -> None:
+    """Stores one slot's logical state into its raw source-layout tile.
+
+    Typed rows past ``region.rows_used`` are zeroed so the tile's whole
+    region has deterministic bytes when copied out.
+    """
+    rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
+    arr = values.astype(region.view_dtype)
+    arr = _split_rows(arr.reshape(-1, arr.shape[-1]), out_lanes)
+    capacity = region.nblocks * rows_pb
+    if region.rows_used < capacity:
+        arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
+    for j in range(region.nblocks):
+        typed_ldst.store_typed(slot_ref.at[j],
+                               arr[j * rows_pb:(j + 1) * rows_pb],
+                               lane_split=region.lane_split)
+
+
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
@@ -149,6 +239,10 @@ def load_and_select_states(
     is True, it selects states read from HBM. If it is False, it selects
     carry states from previous tile. If `has_initial_state` is False, states are
     zero initialized.
+
+    When `cfg.state_plan` is set, the state refs hold raw source-layout
+    tiles (see `memory_ref.ExternalStateBufferedRef`) and are decoded
+    through the plan's typed region views instead of read directly.
 
     Args:
         metadata_ref: Metadata reference containing grid and sequence mappings.
@@ -182,7 +276,12 @@ def load_and_select_states(
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
         # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-        hbm_conv_state = conv_state_slot_ref[idx].astype(jnp.float32)
+        if cfg.state_plan is None:
+            hbm_conv_state = conv_state_slot_ref[idx].astype(jnp.float32)
+        else:
+            hbm_conv_state = load_state_region(
+                conv_state_slot_ref.at[idx], cfg.state_plan.conv,
+                (cfg.prev_kernel_size, 1, cfg.dim_size)).astype(jnp.float32)
         prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
 
         if carry_conv_scratch_ref is not None:
@@ -190,7 +289,12 @@ def load_and_select_states(
             prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
                                         prev_tile_conv)
 
-        hbm_recurrent_state = recurrent_slot_ref[idx]
+        if cfg.state_plan is None:
+            hbm_recurrent_state = recurrent_slot_ref[idx]
+        else:
+            hbm_recurrent_state = load_state_region(
+                recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
+                (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
         prev_recurrent_state = jnp.where(has_initial_state,
                                          hbm_recurrent_state, 0)
 
