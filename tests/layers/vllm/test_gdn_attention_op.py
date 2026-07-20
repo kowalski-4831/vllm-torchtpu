@@ -53,6 +53,7 @@ class TestVllmGatedDeltaNetAttention:
 
     def test_init_builds_only_regular_gdn_op_without_pcp(self):
         regular_op = MagicMock()
+        pooled_op = MagicMock()
 
         with set_vllm_model_wrapper_context(mesh=_mesh(),
                                             vllm_config=_vllm_config()), \
@@ -63,15 +64,21 @@ class TestVllmGatedDeltaNetAttention:
              ), \
              patch.object(VllmGatedDeltaNetAttention,
                           "_build_gdn_op",
-                          return_value=regular_op) as mock_build:
+                          return_value=regular_op) as mock_build, \
+             patch.object(VllmGatedDeltaNetAttention,
+                          "_build_pooled_gdn_op",
+                          return_value=pooled_op) as mock_build_pooled:
             attn = VllmGatedDeltaNetAttention()
 
         mock_build.assert_called_once_with()
+        mock_build_pooled.assert_called_once_with()
         assert attn.gdn_op is regular_op
+        assert attn.gdn_pooled_op is pooled_op
         assert attn.gdn_pcp_op is None
 
     def test_init_builds_pcp_gdn_op_when_pcp_enabled(self):
         regular_op = MagicMock()
+        pooled_op = MagicMock()
         pcp_op = MagicMock()
 
         with set_vllm_model_wrapper_context(mesh=_mesh(),
@@ -84,11 +91,16 @@ class TestVllmGatedDeltaNetAttention:
              ), \
              patch.object(VllmGatedDeltaNetAttention,
                           "_build_gdn_op",
-                          side_effect=[regular_op, pcp_op]) as mock_build:
+                          side_effect=[regular_op, pcp_op]) as mock_build, \
+             patch.object(VllmGatedDeltaNetAttention,
+                          "_build_pooled_gdn_op",
+                          return_value=pooled_op) as mock_build_pooled:
             attn = VllmGatedDeltaNetAttention()
 
         assert mock_build.call_args_list == [call(), call(pcp_streaming=True)]
+        mock_build_pooled.assert_called_once_with()
         assert attn.gdn_op is regular_op
+        assert attn.gdn_pooled_op is pooled_op
         assert attn.gdn_pcp_op is pcp_op
 
     def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):

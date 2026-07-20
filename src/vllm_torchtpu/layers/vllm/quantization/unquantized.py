@@ -182,6 +182,9 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w13_weight = torch.cat(
                 [w13_weight[..., :half], pad, w13_weight[..., half:], pad],
                 dim=-1).contiguous()
+            pad2 = w2_weight.new_zeros(
+                (w2_weight.shape[0], aligned_half - half, w2_weight.shape[2]))
+            w2_weight = torch.cat([w2_weight, pad2], dim=1).contiguous()
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)

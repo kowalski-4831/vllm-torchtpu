@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 import vllm_torchtpu.distributed.utils as dist_utils
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm_hma import (
     HostKVShmPoolHMA, PoolSpecHMA)
@@ -72,6 +73,7 @@ __all__ = [
     "LoadMeta",
     "_CoordSendEntry",
     "_CoordRecvEntry",
+    "stage3_fa_raiden_id_fields",
 ]
 
 
@@ -105,7 +107,51 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+def stage3_fa_raiden_id_fields(
+    *,
+    job_name: str,
+    engine_id: str,
+    dp_rank: int,
+    transfer_rank: int,
+    is_producer: bool,
+) -> dict[str, Any]:
+    """Build the canonical Stage-3 FA work-unit identity.
+
+    PCP ranks share a vLLM DP identity, so the transfer rank is part of the
+    producer's engine replica label.  Decode engines are already distinguished
+    by ``data_replica_idx``.  Keeping this in one helper lets the VB3 consumer
+    enumerate source units with exactly the same scheme.
+    """
+    job_name = str(job_name).strip()
+    engine_id = str(engine_id).strip()
+    dp_rank = int(dp_rank)
+    transfer_rank = int(transfer_rank)
+    if not job_name:
+        raise ValueError("Stage-3 Raiden job_name must not be empty")
+    if not engine_id:
+        raise ValueError("Stage-3 Raiden engine_id must not be empty")
+    if dp_rank < 0:
+        raise ValueError("Stage-3 Raiden dp_rank must be non-negative")
+    if transfer_rank < 0:
+        raise ValueError("Stage-3 Raiden transfer_rank must be non-negative")
+    replica_id = (f"{engine_id}-rank{transfer_rank}"
+                  if is_producer else engine_id)
+    return {
+        "job_name": job_name,
+        "job_replica_id": replica_id,
+        "data_name": "kv.fa",
+        "data_replica_idx": dp_rank,
+    }
+
+
+def _use_raiden_stage3_transport() -> bool:
+    return str(getattr(tpu_envs, "TPU_KV_RESHARD_TRANSPORT",
+                       "zmq")).strip().lower() == "raiden"
+
+
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
+    if _use_raiden_stage3_transport():
+        return True
     extra_config = _get_extra_config(vllm_config)
     if "use_raiden_connector" in extra_config:
         return _as_bool(extra_config["use_raiden_connector"])
@@ -132,6 +178,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         use_raiden = self.force_raiden_connector or _use_raiden_connector(
             vllm_config)
         self.use_hma = use_hma
+        self.use_raiden = use_raiden
         if use_hma:
             scheduler_cls = TPUConnectorHMAScheduler
             worker_cls = TPUConnectorHMAWorker
@@ -229,10 +276,14 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
 
     # ---- Worker-side methods --------------------------------------------
     def register_kv_caches(self, kv_caches: dict[str, Any]):
-        """For non-HMA connectors,this is a no-op: we call
-        register_runner() from the runner after bind_kv_cache and read
-        runner.kv_caches lazily in the worker."""
-        if self.use_hma and self.connector_worker is not None:
+        """Registers the named cache materialization when the backend needs it.
+
+        ZMQ reads ``runner.kv_caches`` positionally. HMA needs layer-to-group
+        identity and Raiden explicit-pool admission needs the layer names and
+        group specs to derive its canonical pool manifest.
+        """
+        if ((self.use_hma or self.use_raiden)
+                and self.connector_worker is not None):
             self.connector_worker.named_kv_caches = kv_caches
 
     def register_runner(self, runner: TPUModelRunner) -> None:
@@ -654,13 +705,29 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 remote_port=params["remote_port"],
             )
         else:
+            # If num_external_tokens is 0, we don't need to pull any data through
+            # this connector (either due to a full local cache hit, or because
+            # another MultiConnector child owns the load). But the producer
+            # (prefill node) doesn't know that: it has the prefill KV blocks
+            # registered under this uuid and keeps them pinned until they are
+            # pulled or p2p_wait_pull_timeout expires. So we still enqueue an
+            # empty read (LoadMeta with no block ids), which the worker turns
+            # into a "release now" signal to the producer instead of a pull.
+            # TODO: Remove this branch once the producer releases
+            # unpulled sends by another path (e.g. a direct scheduler-side
+            # release, or the unified Raiden connector); otherwise its blocks
+            # stay pinned until p2p_wait_pull_timeout.
             self.reqs_to_load[request.request_id] = LoadMeta(
                 uuid=params["uuid"],
                 local_block_ids=None,
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                report_completion=False,
             )
+            logger.info(
+                "TPURaidenConnectorScheduler no-load release req_id=%s "
+                "uuid=%s", request.request_id, params["uuid"])
         logger.info(
             "TPURaidenConnectorScheduler update_state_after_alloc --> "
             "reqs_to_load=%s", self.reqs_to_load)
@@ -691,6 +758,14 @@ class TPURaidenConnectorWorker:
         self.kv_transfer_port = int(dist_utils.get_kv_transfer_port()) + (
             2 * self.dp_rank * self.tp_size)
         self._raiden_transfer_engine: Optional["KVCacheManager"] = None
+        self.named_kv_caches: Optional[dict[str, Any]] = None
+        self._raiden_admission_summary: dict[str, Any] | None = None
+        self._raiden_manifest: Any | None = None
+        self._raiden_layout_fingerprint: str | None = None
+        self._raiden_layout_fingerprint_payload: dict[str, Any] | None = None
+        self._raiden_controller_facade: Any | None = None
+        self._raiden_controller_address: str | None = None
+        self._raiden_work_unit: Any | None = None
         self._done_sending: set[str] = set()
         self._done_recving: set[str] = set()
         self._failed_recving: set[str] = set()
@@ -717,7 +792,377 @@ class TPURaidenConnectorWorker:
 
     def register_runner(self, runner: TPUModelRunner) -> None:
         self.runner = runner
+        if (self._raiden_stage3_enabled()
+                and not self._raiden_qwen35_admission_enabled()):
+            raise RuntimeError(
+                "TPU_KV_RESHARD_TRANSPORT=raiden requires explicit Qwen3.5 "
+                "pool admission (TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and "
+                "TPU_RAIDEN_QWEN35_ADMISSION=1)")
+        if self._raiden_qwen35_admission_enabled():
+            self._admit_raiden_qwen35_kv_cache(runner)
+            return
         self._ensure_raiden_transfer_engine()
+
+    @staticmethod
+    def _raiden_stage3_enabled() -> bool:
+        return _use_raiden_stage3_transport()
+
+    @staticmethod
+    def _raiden_qwen35_admission_enabled() -> bool:
+        return bool(
+            getattr(tpu_envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+            and getattr(tpu_envs, "TPU_RAIDEN_QWEN35_ADMISSION", False))
+
+    def _admit_raiden_qwen35_kv_cache(self, runner: TPUModelRunner) -> None:
+        """Constructs the v1 Raiden engine over the explicit Qwen3.5 pools."""
+        if self._raiden_transfer_engine is not None:
+            return
+
+        stage3_enabled = self._raiden_stage3_enabled()
+        controller_address = ""
+        if stage3_enabled:
+            controller_address = str(
+                getattr(tpu_envs, "TPU_RAIDEN_CONTROLLER_ADDRESS",
+                        "")).strip()
+            if not controller_address:
+                raise ValueError(
+                    "TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
+                    "TPU_KV_RESHARD_TRANSPORT=raiden")
+
+        from vllm_torchtpu.distributed.kv_transfer.v2 import \
+            raiden_pool_manifest as rpm
+
+        topology = self._raiden_qwen35_admission_topology()
+        role = "kv_producer" if self.is_producer else "kv_consumer"
+        named_kv_caches = self.named_kv_caches
+        if not named_kv_caches:
+            raise ValueError("Raiden pool admission requires "
+                             "register_kv_caches() before register_runner()")
+        kv_cache_groups = tuple(
+            getattr(getattr(runner, "kv_cache_config", None),
+                    "kv_cache_groups", ()) or ())
+        raw_tensors = tuple(getattr(runner, "kv_cache_raw_tensors", ()) or ())
+
+        manifest = rpm.build_qwen35_pool_manifest(
+            named_kv_caches=named_kv_caches,
+            kv_cache_groups=kv_cache_groups,
+            raw_tensors=raw_tensors,
+            gdn_geometry=rpm.GdnHeadGeometry(
+                local_key_heads=self._local_head_count(
+                    self._model_config_int("linear_num_key_heads", 0)),
+                local_value_heads=self._local_head_count(
+                    self._model_config_int("linear_num_value_heads", 0)),
+                key_head_dim=self._model_config_int("linear_key_head_dim", 1),
+                value_head_dim=self._model_config_int(
+                    "linear_value_head_dim",
+                    self._model_config_int("linear_key_head_dim", 1)),
+            ),
+        )
+        alias_fallback = getattr(tpu_envs, "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK",
+                                 True)
+        expected_binding = (rpm.BINDING_PRIVATE_TYPED
+                            if alias_fallback else rpm.BINDING_ALIASED_RAW)
+        if manifest.binding != expected_binding:
+            raise ValueError(
+                "Raiden pool admission binding does not match the alias "
+                f"fallback setting: resolved={manifest.binding} "
+                f"expected={expected_binding}")
+
+        # Hard-fail before manager construction if the pools point at storage
+        # that the model kernels do not actually use.
+        verified_storages = rpm.verify_storage_binding(
+            manifest=manifest,
+            named_kv_caches=named_kv_caches,
+            raw_tensors=raw_tensors,
+        )
+        rpm.materialize_storages(manifest)
+
+        storages = list(manifest.storages)
+        engine = self._construct_raiden_transfer_engine(storages, num_slots=1)
+        summary = dict(engine.register_pools(manifest.pool_dicts()))
+
+        if stage3_enabled:
+            registration = self._register_raiden_stage3_work_unit(
+                engine=engine,
+                manifest=manifest,
+                controller_address=controller_address,
+            )
+            summary["stage3_registration"] = registration
+
+        self._raiden_transfer_engine = engine
+        self._raiden_manifest = manifest
+
+        counts = manifest.tag_counts()
+        geometry = manifest.geometry_by_tag()
+        summary_geometry = {tag: dict(geo) for tag, geo in geometry.items()}
+        summary.update({
+            "topology": topology,
+            "model_server_role": role,
+            "binding": manifest.binding,
+            "tag_counts": dict(counts),
+            "geometry": summary_geometry,
+        })
+        self._raiden_admission_summary = dict(summary)
+
+        logger.info(
+            "Raiden pool admission complete topology=%s role=%s binding=%s "
+            "pools=%d storages=%d fa=%d gdn.conv=%d gdn.ssm=%d",
+            topology,
+            role,
+            manifest.binding,
+            len(manifest.pools),
+            len(manifest.storages),
+            counts.get(rpm.TAG_FA, 0),
+            counts.get(rpm.TAG_GDN_CONV, 0),
+            counts.get(rpm.TAG_GDN_SSM, 0),
+        )
+        for tag in (rpm.TAG_FA, rpm.TAG_GDN_CONV, rpm.TAG_GDN_SSM):
+            geo = geometry.get(tag)
+            if geo is None:
+                continue
+            logger.info(
+                "Raiden pool geometry tag=%s num_blocks=%d "
+                "block_stride_bytes=%d live_bytes_per_block=%d",
+                tag,
+                int(geo["num_blocks"]),
+                int(geo["block_stride_bytes"]),
+                int(geo["live_bytes_per_block"]),
+            )
+        logger.info(
+            "Raiden pool binding verified: %d/%d pool storages matched "
+            "typed KV cache storages",
+            verified_storages,
+            len(manifest.storages),
+        )
+
+    @staticmethod
+    def _measure_raiden_fa_layout(
+        manifest: Any, ) -> tuple[str, dict[str, Any]]:
+        from vllm_torchtpu.distributed.kv_transfer.v2.raiden_layout_fingerprint import \
+            measured_fa_layout_fingerprint
+
+        return measured_fa_layout_fingerprint(manifest)
+
+    @staticmethod
+    def _new_raiden_controller_facade(controller_address: str) -> Any:
+        from tpu_raiden.rpc.raiden_controller import \
+            RaidenControllerClientFacade
+
+        return RaidenControllerClientFacade(controller_address)
+
+    @staticmethod
+    def _new_raiden_id(fields: dict[str, Any]) -> Any:
+        from tpu_raiden.rpc.raiden_controller import RaidenId
+
+        return RaidenId(**fields)
+
+    @staticmethod
+    def _new_raiden_manager(**kwargs: Any) -> "KVCacheManager":
+        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+
+        return KVCacheManager(**kwargs)
+
+    def _raiden_transfer_parallelism(self) -> int:
+        parallelism = int(
+            getattr(tpu_envs, "TPU_RAIDEN_TRANSFER_PARALLELISM", 8))
+        if parallelism <= 0:
+            raise ValueError(
+                "TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
+        return parallelism
+
+    def _local_raiden_transfer_rank(self) -> int:
+        if not self.is_producer:
+            return 0
+        from vllm_torchtpu.distributed.pcp import get_pcp_rank
+
+        return int(get_pcp_rank())
+
+    def _raiden_interleave_tokens(self, page_tokens: int,
+                                  transfer_parallelism: int) -> int:
+        """Returns the kernel interleave driving this rank's span generation.
+
+        The value never reaches raiden: it feeds compute_stage3_source_spans,
+        whose output rides the D5 registration as declared source spans.
+        """
+        page_tokens = int(page_tokens)
+        transfer_parallelism = int(transfer_parallelism)
+        if page_tokens <= 0:
+            raise ValueError("Raiden page_tokens must be positive")
+        if transfer_parallelism <= 0:
+            raise ValueError("Raiden transfer_parallelism must be positive")
+        # A TP1 destination is logically contiguous even if an unrelated PCP
+        # option remains present in its shared ParallelConfig.
+        if not self.is_producer or transfer_parallelism == 1:
+            return page_tokens
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        interleave_tokens = int(
+            getattr(parallel_config, "cp_kv_cache_interleave_size", 0) or 0)
+        if interleave_tokens <= 0:
+            raise ValueError("Stage-3 PCP source requires a positive "
+                             "cp_kv_cache_interleave_size")
+        if page_tokens % interleave_tokens:
+            raise ValueError(
+                "Stage-3 PCP page geometry requires page_tokens divisible by "
+                "cp_kv_cache_interleave_size: "
+                f"page_tokens={page_tokens}, "
+                f"cp_kv_cache_interleave_size={interleave_tokens}")
+        return interleave_tokens
+
+    def _raiden_work_unit_fields(self, transfer_rank: int) -> dict[str, Any]:
+        default_job = "prefill" if self.is_producer else "decode"
+        job_name = str(getattr(tpu_envs, "TPU_RAIDEN_JOB_NAME", "")).strip()
+        engine_id = str(getattr(tpu_envs, "TPU_RAIDEN_ENGINE_ID", "0")).strip()
+        return stage3_fa_raiden_id_fields(
+            job_name=job_name or default_job,
+            engine_id=engine_id,
+            dp_rank=self.dp_rank,
+            transfer_rank=transfer_rank,
+            is_producer=self.is_producer,
+        )
+
+    def _register_raiden_stage3_work_unit(
+        self,
+        *,
+        engine: Any,
+        manifest: Any,
+        controller_address: str,
+    ) -> dict[str, Any]:
+        """Measure and register this worker with its cluster controller."""
+        from vllm_torchtpu.distributed.kv_transfer.v2.raiden_layout_fingerprint import \
+            fa_page_tokens
+
+        data_address = str(getattr(engine, "transfer_address", "")).strip()
+        listener_address = str(getattr(engine, "listener_address", "")).strip()
+        if not data_address:
+            raise RuntimeError(
+                "Stage-3 Raiden manager did not advertise a data endpoint")
+        if not listener_address:
+            raise RuntimeError(
+                "Stage-3 Raiden manager did not advertise a listener endpoint")
+
+        fingerprint, fingerprint_payload = self._measure_raiden_fa_layout(
+            manifest)
+        page_tokens = fa_page_tokens(manifest)
+        transfer_parallelism = self._raiden_transfer_parallelism()
+        transfer_rank = self._local_raiden_transfer_rank()
+        interleave_tokens = self._raiden_interleave_tokens(
+            page_tokens, transfer_parallelism)
+        if self.is_producer:
+            pcp_size = int(
+                getattr(self.vllm_config.parallel_config,
+                        "prefill_context_parallel_size", 1) or 1)
+            if transfer_parallelism != pcp_size:
+                raise ValueError(
+                    "Producer transfer parallelism must equal the complete "
+                    "PCP rank count: "
+                    f"parallelism={transfer_parallelism}, pcp_size={pcp_size}")
+        if transfer_rank < 0 or transfer_rank >= transfer_parallelism:
+            raise ValueError(
+                "Raiden transfer rank is outside the admitted parallelism: "
+                f"rank={transfer_rank}, parallelism={transfer_parallelism}")
+
+        unit = self._new_raiden_id(
+            self._raiden_work_unit_fields(transfer_rank))
+        facade = self._new_raiden_controller_facade(controller_address)
+        facade.register_work_unit(
+            unit=unit,
+            shards=[data_address],
+            control_plane_rpc_address=listener_address,
+            pool_manifest=manifest.pool_dicts(),
+            layout_fingerprint=fingerprint,
+            page_tokens=page_tokens,
+            transfer_parallelism=transfer_parallelism,
+            transfer_rank=transfer_rank,
+        )
+
+        self._raiden_controller_facade = facade
+        self._raiden_controller_address = controller_address
+        self._raiden_work_unit = unit
+        self._raiden_layout_fingerprint = fingerprint
+        self._raiden_layout_fingerprint_payload = dict(fingerprint_payload)
+        logger.info(
+            "Raiden work unit registered controller=%s unit=%s "
+            "data=%s listener=%s page_tokens=%d transfer_rank=%d/%d "
+            "interleave_tokens=%d layout_fingerprint=%s",
+            controller_address,
+            unit,
+            data_address,
+            listener_address,
+            page_tokens,
+            transfer_rank,
+            transfer_parallelism,
+            interleave_tokens,
+            fingerprint,
+        )
+        return {
+            "controller_address": controller_address,
+            "unit": dict(self._raiden_work_unit_fields(transfer_rank)),
+            "shards": [data_address],
+            "control_plane_rpc_address": listener_address,
+            "layout_fingerprint": fingerprint,
+            "layout_fingerprint_payload": dict(fingerprint_payload),
+            "page_tokens": page_tokens,
+            "interleave_tokens": interleave_tokens,
+            "transfer_parallelism": transfer_parallelism,
+            "transfer_rank": transfer_rank,
+        }
+
+    def raiden_admission_summary(self) -> dict[str, Any]:
+        if self._raiden_admission_summary is None:
+            return {"admitted": False}
+        return dict(self._raiden_admission_summary)
+
+    def _raiden_qwen35_admission_topology(self) -> str:
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        pcp_size = int(
+            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        tp_size = int(
+            getattr(parallel_config, "tensor_parallel_size", self.tp_size)
+            or self.tp_size)
+        dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
+        if self.is_producer:
+            if pcp_size != 8 or tp_size != 1 or dp_size != 1:
+                raise ValueError(
+                    "Raiden Qwen3.5 admission topology pcp8_prefill requires "
+                    "kv_producer with prefill_context_parallel_size=8, "
+                    "tensor_parallel_size=1, data_parallel_size=1; got "
+                    f"prefill_context_parallel_size={pcp_size}, "
+                    f"tensor_parallel_size={tp_size}, "
+                    f"data_parallel_size={dp_size}")
+            return "pcp8_prefill"
+        if pcp_size != 1 or tp_size != 1 or dp_size != 8:
+            raise ValueError(
+                "Raiden Qwen3.5 admission topology dp8_decode requires "
+                "kv_consumer with prefill_context_parallel_size=1, "
+                "tensor_parallel_size=1, data_parallel_size=8; got "
+                f"prefill_context_parallel_size={pcp_size}, "
+                f"tensor_parallel_size={tp_size}, "
+                f"data_parallel_size={dp_size}")
+        return "dp8_decode"
+
+    def _model_config_int(self, name: str, default: int) -> int:
+        model_config = getattr(self.vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None:
+            hf_config = model_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        value = getattr(text_config, name, None)
+        return int(default if value is None else value)
+
+    def _local_head_count(self, total_heads: int) -> int:
+        total_heads = int(total_heads)
+        if total_heads <= 0:
+            return 0
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        tp_size = int(
+            getattr(parallel_config, "tensor_parallel_size", self.tp_size)
+            or self.tp_size)
+        if total_heads < tp_size:
+            return 1
+        if total_heads % tp_size:
+            raise ValueError(f"total_heads={total_heads} must be divisible by "
+                             f"tp_size={tp_size}")
+        return total_heads // tp_size
 
     def process_send_load(self,
                           metadata: TPUConnectorMetadata,
@@ -725,6 +1170,9 @@ class TPURaidenConnectorWorker:
                           report_completion: bool = True) -> None:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
+            if self._raiden_stage3_enabled():
+                self._register_stage3_request_blocks(metadata)
+                return
             for req_id, req_meta in metadata.reqs_to_send.items():
                 engine.register_read(req_id, req_meta.uuid,
                                      req_meta.local_block_ids)
@@ -740,10 +1188,18 @@ class TPURaidenConnectorWorker:
             if (req_meta.remote_block_ids is None
                     and req_meta.local_block_ids is None):
                 engine.start_read(req_id, req_meta.uuid, endpoint, [], [])
+                if not req_meta.report_completion:
+                    # The request is not WAITING_FOR_REMOTE_KVS on this
+                    # connector (another MultiConnector child may own its
+                    # load); reporting this empty read as finished_recving
+                    # trips the scheduler's is_finished assert or prematurely
+                    # resumes a request whose offload load is still in flight.
+                    self._suppress_done_recving.add(req_id)
                 logger.debug(
                     "TPURaidenConnectorWorker rank%d --> released remote "
-                    "send req_id=%s uuid=%s endpoint=%s", self.tp_rank, req_id,
-                    req_meta.uuid, endpoint)
+                    "send req_id=%s uuid=%s endpoint=%s report_completion=%s",
+                    self.tp_rank, req_id, req_meta.uuid, endpoint,
+                    req_meta.report_completion)
                 continue
             if (req_meta.remote_block_ids is None
                     or req_meta.local_block_ids is None):
@@ -793,6 +1249,7 @@ class TPURaidenConnectorWorker:
         if finished_req_ids:
             self._reported_recving -= finished_req_ids
             self._failed_recving -= finished_req_ids
+            self._suppress_done_recving -= finished_req_ids
             for req_id in finished_req_ids:
                 self._load_block_ids.pop(req_id, None)
         self._done_sending = set()
@@ -852,28 +1309,60 @@ class TPURaidenConnectorWorker:
         if self.runner is None:
             raise RuntimeError(
                 "register_runner must be called before transfer")
+        engine = self._construct_raiden_transfer_engine(
+            list(self.runner.kv_caches))
+        self._raiden_transfer_engine = engine
+        return engine
+
+    def _construct_raiden_transfer_engine(
+            self,
+            kv_caches: list[Any],
+            *,
+            num_slots: int | None = None) -> "KVCacheManager":
         max_blocks = self._max_request_blocks()
-        num_slots = self._num_raiden_slots(max_blocks)
-        local_control_port = self._rank_control_port(self.kv_transfer_port)
-        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
-        engine = KVCacheManager(
-            kv_caches=list(self.runner.kv_caches),
-            node_id=self.tp_rank,
+        if num_slots is None:
+            num_slots = self._num_raiden_slots(max_blocks)
+        stage3_enabled = self._raiden_stage3_enabled()
+        endpoint_rank = (self._local_raiden_transfer_rank() if stage3_enabled
+                         and self.is_producer else self.tp_rank)
+        node_id = (endpoint_rank if stage3_enabled and self.is_producer else
+                   self.dp_rank if stage3_enabled else self.tp_rank)
+        local_control_port = self._rank_control_port(self.kv_transfer_port,
+                                                     rank=endpoint_rank)
+        manager_kwargs: dict[str, Any] = dict(
+            kv_caches=kv_caches,
+            node_id=node_id,
             local_control_port=local_control_port,
             max_blocks=max_blocks,
             num_slots=num_slots,
             timeout_s=float(dist_utils.get_p2p_wait_pull_timeout()),
         )
-        self._raiden_transfer_engine = engine
+        if stage3_enabled:
+            manager_kwargs.update(
+                listener_port=0,
+                parallelism=self._raiden_transfer_parallelism(),
+            )
+        engine = self._new_raiden_manager(**manager_kwargs)
         logger.info(
             "TPURaidenConnectorWorker rank%d --> Raiden engine enabled | "
-            "control_port=%d data_port=%d max_blocks=%d num_slots=%d",
-            self.tp_rank, local_control_port, local_control_port + 1,
-            max_blocks, num_slots)
+            "legacy_control_port=%d data_endpoint=%s listener_endpoint=%s "
+            "max_blocks=%d num_slots=%d",
+            self.tp_rank,
+            local_control_port,
+            str(getattr(engine, "transfer_address", "")),
+            str(getattr(engine, "listener_address", "")),
+            max_blocks,
+            num_slots,
+        )
         return engine
 
-    def _rank_control_port(self, base_port: int) -> int:
-        return int(base_port) + 2 * self.tp_rank
+    def _rank_control_port(self,
+                           base_port: int,
+                           *,
+                           rank: int | None = None) -> int:
+        if rank is None:
+            rank = self.tp_rank
+        return int(base_port) + 2 * int(rank)
 
     def _resolve_remote_endpoint(self, req_meta: LoadMeta) -> str:
         if isinstance(req_meta.remote_host, list):

@@ -99,6 +99,11 @@ def _make_runner(*,
     runner._cached_request_distribution = None
     runner._dp_target_bucket = None
     runner._has_mamba_state = False
+    # Bind the real seed-copy collector; an empty copy plan makes it a no-op
+    # (no mamba align mode in these layout tests).
+    runner._mamba_copy_plan = []
+    runner._collect_mamba_state_seed_copies = (
+        TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner))
     runner._prepare_async_token_substitution_indices = (
         lambda *_args, **_kwargs:
         (np.array([], dtype=np.int32), np.array([], dtype=np.int32)))

@@ -96,6 +96,13 @@ class LoadMeta:
     remote_host: str | list[str]
     remote_port: int | list[int]
     remote_side_channel_port: Optional[int] = None
+    # Whether the worker reports this load's completion to the scheduler as
+    # finished_recving. False when this connector doesn't own the request's
+    # load state (the request is not WAITING_FOR_REMOTE_KVS here, e.g. a full
+    # local cache hit or delegation to another MultiConnector child), where a
+    # report would trip the scheduler's assert or prematurely resume the
+    # request.
+    report_completion: bool = True
 
 
 @dataclass

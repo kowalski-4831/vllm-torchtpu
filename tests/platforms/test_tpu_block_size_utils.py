@@ -50,6 +50,7 @@ def vllm_config():
     vllm_config.model_config.get_head_size.return_value = 256
     vllm_config.cache_config = MagicMock(spec=CacheConfig)
     vllm_config.cache_config.block_size = None
+    vllm_config.cache_config.user_specified_block_size = False
     vllm_config.cache_config.mamba_cache_mode = None
     vllm_config.cache_config.mamba_page_size_padded = None
     vllm_config.cache_config.mamba_block_size = None
@@ -74,8 +75,7 @@ def test_custom_backend_does_not_lower_non_hybrid_block_size(vllm_config):
     assert vllm_config.cache_config.block_size == 2112
 
 
-def test_hybrid_mamba_state_drives_power2_block_size_and_slot_logs(
-        vllm_config):
+def test_hybrid_mamba_state_drives_fit_block_size_and_slot_logs(vllm_config):
     vllm_config.model_config.is_hybrid = True
     vllm_config.model_config.architecture = (
         "Qwen3_5MoeForConditionalGeneration")
@@ -92,9 +92,9 @@ def test_hybrid_mamba_state_drives_power2_block_size_and_slot_logs(
         update_tpu_block_size_and_slot_config(vllm_config,
                                               FakeBatchedRPAAttentionBackend)
 
-    assert vllm_config.cache_config.block_size == 1024
-    assert vllm_config.cache_config.mamba_block_size == 1024
-    assert vllm_config.cache_config.mamba_page_size_padded == 1073152
+    assert vllm_config.cache_config.block_size == 1280
+    assert vllm_config.cache_config.mamba_block_size == 1280
+    assert vllm_config.cache_config.mamba_page_size_padded == 1310720
 
     logs = _format_logs(mock_logger_info)
     assert "TPU block_size derivation path" in logs
@@ -107,16 +107,99 @@ def test_hybrid_mamba_state_drives_power2_block_size_and_slot_logs(
             "-> physical=1024)" in logs)
     assert ("-> mamba_fit_block_size=ceil(1073152 / 1024) "
             "rounded_to_16 = 1056" in logs)
-    assert "-> power2_lowering=floor_power2(1056) = 1024" in logs
-    assert "-> final_block_size=1024" in logs
+    assert "-> final_block_size=1280" in logs
+    assert "(source=mamba_state_fit)" in logs
     assert "TPU block_slot derivation path" in logs
-    assert "final_block_size=1024 -> fa_raw_payload_slot_bytes=524288" in logs
-    assert "-> fa_layout_padding_slot_bytes=524288" in logs
-    assert "-> fa_physical_slot_bytes=1048576" in logs
+    assert "final_block_size=1280 -> fa_raw_payload_slot_bytes=655360" in logs
+    assert "-> fa_layout_padding_slot_bytes=655360" in logs
+    assert "-> fa_physical_slot_bytes=1310720" in logs
     assert ("-> slot_base_bytes=max(mamba_raw_state_bytes=1073152, "
-            "fa_physical_slot_bytes=1048576) = 1073152" in logs)
+            "fa_physical_slot_bytes=1310720) = 1310720" in logs)
     assert ("-> slot_alignment_bytes=16 -> "
-            "final_block_slot_bytes=round_up(1073152, 16) = 1073152" in logs)
-    assert "-> mamba_slot_padding_bytes=0" in logs
-    assert "-> fa_slot_tail_padding_bytes=24576" in logs
+            "final_block_slot_bytes=round_up(1310720, 16) = 1310720" in logs)
+    assert "-> mamba_slot_padding_bytes=237568" in logs
+    assert "-> fa_slot_tail_padding_bytes=0" in logs
     assert "kernel_blocks_per_logical_block" not in logs
+
+
+def test_hybrid_mode_none_still_sizes_the_envelope_slot(vllm_config):
+    # The unified pool holds mamba state in every cache mode; only the
+    # block-size retarget is align-specific.
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = (
+        "Qwen3_5MoeForConditionalGeneration")
+    vllm_config.model_config.get_head_size.return_value = 128
+    vllm_config.cache_config.block_size = 256
+    vllm_config.cache_config.mamba_block_size = 256
+    vllm_config.cache_config.mamba_cache_mode = "none"
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeQwenMambaModel, None)):
+        update_tpu_block_size_and_slot_config(vllm_config,
+                                              FakeBatchedRPAAttentionBackend)
+
+    assert vllm_config.cache_config.block_size == 1280
+    assert vllm_config.cache_config.mamba_block_size == 256
+    assert vllm_config.cache_config.mamba_page_size_padded == 1310720
+
+
+def test_user_block_size_at_or_above_fit_is_honored(vllm_config):
+    # The disaggregated launch passes one explicit block size to both
+    # roles; the fit size is a floor, not a mandate, so the user's choice
+    # wins (aligned up to the backend's kernel block when needed).
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = (
+        "Qwen3_5MoeForConditionalGeneration")
+    vllm_config.cache_config.block_size = 2112
+    vllm_config.cache_config.user_specified_block_size = True
+    vllm_config.cache_config.mamba_block_size = 2112
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.cache_config.cache_dtype = "fp8"
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeQwenMambaModel, None)), patch(
+                   "vllm_torchtpu.platforms.tpu_block_size_utils.logger.info"
+               ) as mock_logger_info:
+        update_tpu_block_size_and_slot_config(vllm_config,
+                                              FakeBatchedRPAAttentionBackend)
+
+    # 2112 contains the 1056-token slot; aligned up to the 256-token
+    # kernel block: 2304.
+    assert vllm_config.cache_config.block_size == 2304
+    assert vllm_config.cache_config.mamba_block_size == 2304
+    logs = _format_logs(mock_logger_info)
+    assert "(source=user_block_size)" in logs
+
+
+class FakePlainAttentionBackend(FakeBatchedRPAAttentionBackend):
+
+    @staticmethod
+    def get_name():
+        return "PALLAS"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return []
+
+
+def test_user_block_size_below_fit_still_gets_fit(vllm_config):
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = (
+        "Qwen3_5MoeForConditionalGeneration")
+    vllm_config.cache_config.block_size = 512
+    vllm_config.cache_config.user_specified_block_size = True
+    vllm_config.cache_config.mamba_block_size = 512
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.cache_config.cache_dtype = "fp8"
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeQwenMambaModel, None)), patch(
+                   "vllm_torchtpu.platforms.tpu_block_size_utils.logger.info"
+               ) as mock_logger_info:
+        update_tpu_block_size_and_slot_config(vllm_config,
+                                              FakePlainAttentionBackend)
+
+    # 512 cannot contain the 1056-token slot: the fit floor applies.
+    assert vllm_config.cache_config.block_size == 1056
+    logs = _format_logs(mock_logger_info)
+    assert "(source=mamba_state_fit)" in logs

@@ -2,6 +2,9 @@
 
 This repository contains the integration of **TorchTPU** and **vLLM**. It is a vLLM platform plugin packaged as `vllm_torchtpu`, with TPU kernels and runtime code for TorchTPU.
 
+> [!IMPORTANT] Pre-Public Development Governance
+> During the pre-public phase (July 2026 – Public Launch), we are operating with specialized repository rules due to missing automated GitHub branch protections. Please refer to [PRE_PUBLIC_DEV_GUIDE.md](file:///usr/local/google/home/johnqiangzhang/projects/vllm-torchtpu/PRE_PUBLIC_DEV_GUIDE.md) for standard submission flows, merge checklists, and mandatory guidelines.
+
 ---
 
 ## 🛠️ Installation
@@ -10,7 +13,7 @@ To run the **Qwen3** model, follow these installation steps:
 
 ### 1. Google Cloud Authentication
 
-We need to authenticate with Google Cloud to access the private Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`). This registry contains packages like `torch-tpu`, `torch`, and other dependencies required by `torchtpu-vllm`.
+We need to authenticate with Google Cloud to access the private Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`). This registry contains packages like `torch-tpu`, `torch`, and other dependencies required by `vllm-torchtpu`.
 
 Make sure you are logged into `gcloud` using your corporate account (i.e., one that has read permissions for the Torch TPU registry). If you need access to this registry, please reach out to the Torch TPU team.
 
@@ -29,7 +32,7 @@ gcloud auth login
 gcloud auth application-default login
 ```
 
-### 2. Install TorchTPU-vLLM and dependencies
+### 2. Install vLLM-TorchTPU and dependencies
 
 We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
 
@@ -45,23 +48,26 @@ export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
 # Install keyring and Google Artifact Registry plugin for persistent auth
 uv tool install keyring --with keyrings.google-artifactregistry-auth
 
+# Use CPU Torch when building vLLM's editable TPU package.
+export UV_TORCH_BACKEND=cpu
+
 # Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git ../vllm
+git clone --depth 1 --branch v0.23.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
-# plugin alongside torchtpu-vllm.
+# plugin alongside vllm-torchtpu.
 sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
 
-# Install vLLM in editable mode (forcing the 0.22.1 base version to prevent .dev prerelease mismatch during dependency resolution)
-SETUPTOOLS_SCM_PRETEND_VERSION=0.22.1 VLLM_TARGET_DEVICE="tpu" uv pip install -e ../vllm
+# Install vLLM in editable mode (forcing the 0.23.0 base version to prevent .dev prerelease mismatch during dependency resolution)
+SETUPTOOLS_SCM_PRETEND_VERSION=0.23.0 VLLM_TARGET_DEVICE="tpu" uv pip install -e ../vllm
 
-# Install TorchTPU-vLLM and dependencies
+# Install vLLM-TorchTPU and dependencies
 uv pip install --pre -e .
 ```
 
 #### Option B: Using `pip`
 
-> **Note:** Currently, `vllm==0.22.1` is supported.
+> **Note:** Currently, `vllm==0.23.0` is supported.
 
 ```bash
 python3.12 -m venv ~/pip_venv --symlinks
@@ -75,16 +81,16 @@ pip install keyring keyrings.google-artifactregistry-auth
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
 # Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git ../vllm
+git clone --depth 1 --branch v0.23.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Patch vLLM's TPU requirements to avoid installing the upstream tpu-inference
-# plugin alongside torchtpu-vllm.
+# plugin alongside vllm-torchtpu.
 sed -i '/tpu-inference/d' ../vllm/requirements/tpu.txt
 
-# Install vLLM in editable mode (forcing the 0.22.1 base version to prevent .dev prerelease mismatch during dependency resolution)
-SETUPTOOLS_SCM_PRETEND_VERSION=0.22.1 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
+# Install vLLM in editable mode (forcing the 0.23.0 base version to prevent .dev prerelease mismatch during dependency resolution)
+SETUPTOOLS_SCM_PRETEND_VERSION=0.23.0 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
 
-# Install TorchTPU-vLLM and dependencies
+# Install vLLM-TorchTPU and dependencies
 pip install --pre -e .
 ```
 
@@ -136,7 +142,7 @@ curl http://localhost:8000/v1/completions \
 You can also run a simple offline inference script to verify the setup without starting a full server.
 
 > [!NOTE]
-> For current TorchTPU builds, set these temporary workarounds:
+> For current TorchTPU builds, set the temporary workarounds below or append `PYTHONPATH=$(pwd)/src` to the `python3` command:
 >
 > ```bash
 > export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false

@@ -631,6 +631,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     rpa_kernel_op, kv_cache, args, kwargs)
             else:
                 new_kv_cache, output = rpa_kernel_op(kv_cache, *args, **kwargs)
+            if new_kv_cache.shape != kv_cache.shape:
+                raise RuntimeError(
+                    "RPA kernel returned an incompatible KV cache shape: "
+                    f"expected {tuple(kv_cache.shape)}, got "
+                    f"{tuple(new_kv_cache.shape)}.")
+            # Plain donation + copy_ writeback: XLA lifts the copy_ input
+            # mutation and aliases the op output onto the donated pool, so this
+            # compiles to an in-place pool update.
             kv_cache.copy_(new_kv_cache)
             return output
 
