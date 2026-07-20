@@ -78,12 +78,12 @@ def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(
                        ",".join(f"localhost:{p}" for p in range(1000, 1008)))
     monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2,2,1,2")
 
-    with patch.object(TpuPlatform, "_get_tpu_topology", return_value="2,2,1,2"):
+    with patch.object(TpuPlatform, "_get_tpu_topology",
+                      return_value="2,2,1,2"):
         TpuPlatform._prepare_singlehost_tpu_env(8)
 
     assert os.environ["WORLD_SIZE"] == "8"
-    assert len(
-        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
+    assert len(os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
     assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
 
 
