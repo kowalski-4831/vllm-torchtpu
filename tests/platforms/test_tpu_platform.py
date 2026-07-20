@@ -64,14 +64,27 @@ def test_debug_tpu_local_rank_offset_env(monkeypatch):
 def test_prepare_singlehost_tpu_env_skips_distributed_bootstrap_for_tp1(
         monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1234")
-    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "1,1,1")
 
     TpuPlatform._prepare_singlehost_tpu_env(1)
 
     assert "WORLD_SIZE" not in os.environ
-    assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ
-    assert "TORCH_TPU_TOPOLOGY" not in os.environ
+
+
+def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(
+        monkeypatch):
+    """A DP engine must not clear the slice env it inherited from the parent."""
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES",
+                       ",".join(f"localhost:{p}" for p in range(1000, 1008)))
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2,2,1,2")
+
+    with patch.object(TpuPlatform, "_get_tpu_topology", return_value="2,2,1,2"):
+        TpuPlatform._prepare_singlehost_tpu_env(8)
+
+    assert os.environ["WORLD_SIZE"] == "8"
+    assert len(
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
+    assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
 
 
 class TestTpuPlatform:

@@ -562,8 +562,6 @@ class TpuPlatform(Platform):
 
         if world_size == 1:
             os.environ.pop("WORLD_SIZE", None)
-            os.environ.pop("TORCH_TPU_SLICEBUILDER_ADDRESSES", None)
-            os.environ.pop("TORCH_TPU_TOPOLOGY", None)
             return
 
         sb_addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
@@ -865,8 +863,14 @@ class TpuPlatform(Platform):
                 cls._prepare_singlehost_tpu_env(
                     parallel_config.world_size_across_dp)
             else:
-                os.environ.pop("TORCH_TPU_DP_SIZE", None)
-                torch_tpu_world_size = parallel_config.world_size
+                # vLLM hands each DP engine a ParallelConfig with
+                # data_parallel_size collapsed to 1, so the inherited
+                # TORCH_TPU_DP_SIZE is the only record of how wide the slice
+                # really is. Keep sizing the bootstrap by the whole slice.
+                dp_slice_size = int(
+                    os.environ.pop("TORCH_TPU_DP_SIZE", "1") or 1)
+                torch_tpu_world_size = (parallel_config.world_size *
+                                        dp_slice_size)
                 if pcp_size > 1:
                     logger.info(
                         "Preparing TorchTPU bootstrap env for native PCP "
