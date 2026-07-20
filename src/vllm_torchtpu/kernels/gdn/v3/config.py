@@ -47,6 +47,36 @@ class Dtypes:
     conv_state: jnp.dtype
 
 
+@dataclasses.dataclass(frozen=True)
+class StateRegion:
+    """Copy-plan for one state region of an indexed external state source.
+
+    A slot's region spans ``nblocks`` consecutive source blocks starting
+    ``kb0`` blocks into the slot's window, rows ``[row0, row0 + nrows)``
+    of each — one contiguous DMA per slot. The raw bytes are accessed
+    through a typed view (``view_dtype`` elements, ``lane_split``-way
+    128-lane split); the leading ``rows_used`` typed rows carry the
+    state, the rest is zero padding.
+    """
+    kb0: int
+    nblocks: int
+    row0: int
+    nrows: int
+    view_dtype: jnp.dtype
+    lane_split: int
+    rows_used: int
+
+
+@dataclasses.dataclass(frozen=True)
+class StateSourcePlan:
+    """States live in an indexed external source instead of dense per-slot
+    tensors: each state index owns a window of ``stride`` consecutive
+    source blocks holding both state regions."""
+    stride: int
+    conv: StateRegion
+    recurrent: StateRegion
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GDNConfig:
@@ -61,6 +91,7 @@ class GDNConfig:
     kq_head_dim: int
     v_head_dim: int
     num_buffers: int = 2
+    state_plan: StateSourcePlan | None = None
 
     @property
     def chunk_size(self) -> int:

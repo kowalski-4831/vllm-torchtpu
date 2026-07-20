@@ -417,6 +417,9 @@ class TPUModelRunner(GPUModelRunner):
         # staged by _prepare_inputs and flushed before the forward.
         self._mamba_state_pos: dict[str, int] = {}
         self._mamba_copy_plan: list[tuple[int, list[torch.Tensor]]] = []
+        # Manager-block -> pool-block split: >1 when the pool is born at a
+        # smaller attention-kernel granularity (batched RPA).
+        self._pool_block_split: int = 1
         self._pending_mamba_state_copies: list[tuple[torch.Tensor,
                                                      torch.Tensor,
                                                      torch.Tensor]] = []
@@ -1276,6 +1279,11 @@ class TPUModelRunner(GPUModelRunner):
             if raws:
                 plan.append((gid, raws))
         self._mamba_copy_plan = plan
+        for raw in raw_tensors:
+            if raw.dim() > 1:
+                self._pool_block_split = (self.cache_config.block_size //
+                                          raw.shape[1])
+                break
 
     def _collect_mamba_state_seed_copies(self, scheduler_output,
                                          start_index: int,
@@ -1328,6 +1336,12 @@ class TPUModelRunner(GPUModelRunner):
                     pairs.append((src, dst))
             if not pairs:
                 continue
+            if self._pool_block_split > 1:
+                # The pool is born at kernel granularity: a manager state
+                # block is `split` consecutive pool blocks.
+                pairs = [(s * self._pool_block_split + j,
+                          d * self._pool_block_split + j) for s, d in pairs
+                         for j in range(self._pool_block_split)]
             for raw in raws:
                 entry = per_raw.setdefault(id(raw), (raw, [], []))
                 entry[1].extend(p[0] for p in pairs)
