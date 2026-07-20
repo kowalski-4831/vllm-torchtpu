@@ -238,8 +238,10 @@ class TestTpuPlatform:
                     TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
-        "connector_name",
-        ["TPUConnector", "TPURaidenConnector", "TPUMultiConnector"])
+        ("connector_name", "expects_mamba_patch"),
+        [("TPUConnector", False), ("TPURaidenConnector", True),
+         ("TPUMultiConnector", False)],
+    )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
@@ -250,7 +252,8 @@ class TestTpuPlatform:
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_accepts_tpu_disagg_connectors(
             self, mock_vllm_envs, mock_prepare_env, mock_sharding,
-            mock_apply_patches, vllm_config, connector_name):
+            mock_apply_patches, vllm_config, connector_name,
+            expects_mamba_patch):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = connector_name
@@ -268,7 +271,10 @@ class TestTpuPlatform:
                     "vllm_torchtpu.platforms.tpu_platform."
                     "_patch_scheduler_mamba_external_kv") as mock_mamba_patch:
             TpuPlatform.check_and_update_config(vllm_config)
-        mock_mamba_patch.assert_not_called()
+        if expects_mamba_patch:
+            mock_mamba_patch.assert_called_once_with()
+        else:
+            mock_mamba_patch.assert_not_called()
 
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"})
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")

@@ -30,6 +30,13 @@ if TYPE_CHECKING:
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
     TPU_VLLM_KV_CACHE_ALIAS_FALLBACK: bool = True
+    TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
+    TPU_RAIDEN_QWEN35_ADMISSION: bool = False
+    TPU_KV_RESHARD_TRANSPORT: str = "zmq"
+    TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
+    TPU_RAIDEN_JOB_NAME: str = ""
+    TPU_RAIDEN_ENGINE_ID: str = "0"
+    TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_kernel_v3_pd"
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
@@ -185,6 +192,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reinterpret-cast + in-place update path needed for aliased TPU writes.
     "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK":
     env_bool("TPU_VLLM_KV_CACHE_ALIAS_FALLBACK", default=True),
+    # Raiden admission gates: construct a Raiden KVCacheManager and
+    # register the pool manifest derived from the live typed KV caches.
+    # This does not switch the V2 strided transfer transport.
+    "TPU_USE_RAIDEN_KV_CACHE_MANAGER":
+    env_bool("TPU_USE_RAIDEN_KV_CACHE_MANAGER"),
+    "TPU_RAIDEN_QWEN35_ADMISSION":
+    env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
+    # Controller-driven PCP->DP pool resharding. The default preserves
+    # the existing v1 connector protocol; selecting ``raiden`` enables
+    # the fail-closed controller path.
+    "TPU_KV_RESHARD_TRANSPORT":
+    env_with_choices("TPU_KV_RESHARD_TRANSPORT",
+                     "zmq", ["zmq", "raiden"],
+                     case_sensitive=False),
+    "TPU_RAIDEN_CONTROLLER_ADDRESS":
+    lambda: os.getenv("TPU_RAIDEN_CONTROLLER_ADDRESS", "").strip(),
+    "TPU_RAIDEN_JOB_NAME":
+    lambda: os.getenv("TPU_RAIDEN_JOB_NAME", "").strip(),
+    "TPU_RAIDEN_ENGINE_ID":
+    lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
+    "TPU_RAIDEN_TRANSFER_PARALLELISM":
+    lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
     # Gated Delta Rule implementation. Default is the fused Conv1D+GDN v3
     # kernel; the older `chunked_kernel_pd` (v1) path is intentionally not a
     # valid choice — v1's ConcatBitcast conv-state assembly corrupts persistent

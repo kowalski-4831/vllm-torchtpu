@@ -949,7 +949,9 @@ class TpuPlatform(Platform):
                     and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
-            if kv_transfer_config.kv_connector == "TPUConnectorV2":
+            if kv_transfer_config.kv_connector in {
+                    "TPUConnectorV2", "TPURaidenConnector"
+            }:
                 _patch_scheduler_mamba_external_kv()
 
     @classmethod
