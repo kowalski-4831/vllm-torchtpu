@@ -73,6 +73,12 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
+def _ceil_power_of_two(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
 def _align_block_to_backend(block_size: int, supported) -> int:
     """Smallest manager block >= block_size the backend can serve.
 
@@ -204,6 +210,16 @@ def _derive_tpu_block_slot_config(
             final_block_size = _align_block_to_backend(mamba_fit_block_size,
                                                        supported)
             block_size_source = "mamba_state_fit"
+            if vllm_config.kv_transfer_config is not None:
+                # Disaggregated P/D: the KV connector requires the prefill
+                # and decode block sizes to nest (one a multiple of the
+                # other), which the per-TP fit sizes do not guarantee.
+                # Rounding up to a power of two restores that: power-of-two
+                # sizes always nest, and each role derives one independently
+                # (decode's lower TP yields the larger, block-containing
+                # size). The extra padding lives only in state blocks.
+                final_block_size = _ceil_power_of_two(final_block_size)
+                block_size_source = "mamba_state_fit_pow2"
 
     fa_physical_slot_bytes = _tpu_attention_slot_size_bytes(
         vllm_config, backend_cls, final_block_size)
