@@ -53,6 +53,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
@@ -77,6 +78,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
+from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mamba_apc import MambaApcStateCopier
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
@@ -531,6 +533,27 @@ class TPUModelRunner(GPUModelRunner):
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
+        self.batch_counter = 0
+        self._init_phased_profiling()
+
+    def _init_phased_profiling(self) -> None:
+        """Initializes the phase-based profiler if the environment variable is set."""
+        self.phased_profiling_dir = tpu_envs.PHASED_PROFILING_DIR
+        self.phase_based_profiler = None
+        if self.phased_profiling_dir:
+            global_rank = getattr(self.parallel_config, "rank", 0) or 0
+            world_size = getattr(self.parallel_config, "world_size", 1) or 1
+            self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
+                self.phased_profiling_dir,
+                worker_rank=global_rank,
+                world_size=world_size,
+                num_steps_to_profile_for=tpu_envs.
+                PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
+                num_decode_steps_to_skip=tpu_envs.
+                PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
+                decode_kv_len_threshold=tpu_envs.
+                PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+            )
 
     # ----- Backend hooks overridden from GPUModelRunner -----
 
@@ -2306,6 +2329,23 @@ class TPUModelRunner(GPUModelRunner):
             self._execute_mm_encoder(scheduler_output)
 
         num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
+
+        # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
+        if self.phase_based_profiler:
+            self.batch_counter += 1
+            padded_total_tokens = _get_padded_token_len(
+                self.num_tokens_paddings,
+                scheduler_output.total_num_scheduled_tokens)
+            batch_composition_stats = runner_utils.get_batch_composition_stats(
+                batch_id=self.batch_counter,
+                input_batch=self.input_batch,
+                total_num_scheduled_tokens=scheduler_output.
+                total_num_scheduled_tokens,
+                num_reqs=self.input_batch.num_reqs,
+                padded_total_num_scheduled_tokens=padded_total_tokens,
+                scheduler_output=scheduler_output,
+            )
+            self.phase_based_profiler.step(batch_composition_stats)
 
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
