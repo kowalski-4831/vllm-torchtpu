@@ -137,6 +137,7 @@ def _consume_scheduled_kv_page_multi_head(
     *,
     sm_scale,
     pcp_size,
+    interleave_size,
     q_compute_size,
     k_scale,
     v_scale,
@@ -175,6 +176,8 @@ def _consume_scheduled_kv_page_multi_head(
 
             def _q_compute_loop(q_compute_idx, carry):
                 del carry
+                k_compute = k
+                v_compute = v
                 q_start = pl.multiple_of(q_compute_idx * q_compute_size,
                                          q_compute_size)
                 q_slice = q_vmem_ref.at[
@@ -202,34 +205,40 @@ def _consume_scheduled_kv_page_multi_head(
                     :,
                 ][...]
 
+                if causal:
+                    q_row = (
+                        q_start +
+                        lax.broadcasted_iota(jnp.int32,
+                                             (q_compute_size, q_per_kv, 1), 0))
+                    kv_local_pos = lax.broadcasted_iota(
+                        jnp.int32, (1, 1, kv_block_tokens), 2)
+                    q_valid = q_row < q_tile_size
+                    kv_valid = kv_local_pos < kv_valid_len
+                    q_slice = jnp.where(q_valid, q_slice, 0.0)
+                    kv_input_row = lax.broadcasted_iota(jnp.int32, k.shape, 0)
+                    k_compute = jnp.where(kv_input_row < kv_valid_len, k, 0.0)
+                    v_compute = jnp.where(kv_input_row < kv_valid_len, v, 0.0)
+
                 scores = lax.dot_general(
                     q_slice,
-                    k,
+                    k_compute,
                     (((2, ), (1, )), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
 
                 if causal:
                     scores = scores * sm_scale
-                    q_row = (
-                        q_start +
-                        lax.broadcasted_iota(jnp.int32,
-                                             (q_compute_size, q_per_kv, 1), 0))
-                    q_interleave = page_size
+                    q_interleave = interleave_size
                     q_chunk_idx = lax.div(q_row, q_interleave)
                     q_chunk_offset = lax.rem(q_row, q_interleave)
                     q_pos = (q_global_start +
                              q_chunk_idx * pcp_size * q_interleave +
                              q_chunk_offset)
-                    kv_local_pos = lax.broadcasted_iota(
-                        jnp.int32, (1, 1, kv_block_tokens), 2)
-                    kv_page_offset = lax.div(kv_local_pos, page_size)
-                    kv_token_offset = lax.rem(kv_local_pos, page_size)
+                    kv_chunk_idx = lax.div(kv_local_pos, q_interleave)
+                    kv_chunk_offset = lax.rem(kv_local_pos, q_interleave)
                     kv_pos = (kv_global_start +
-                              kv_page_offset * pcp_size * page_size +
-                              kv_token_offset)
-                    kv_valid = kv_local_pos < kv_valid_len
-                    q_valid = q_row < q_tile_size
+                              kv_chunk_idx * pcp_size * q_interleave +
+                              kv_chunk_offset)
                     entry_valid = req_id != -1
                     row_active = jnp.logical_and(entry_valid, q_valid)
                     mask = jnp.logical_and(
@@ -252,7 +261,7 @@ def _consume_scheduled_kv_page_multi_head(
                 l_next = alpha * l_head + jnp.sum(p, axis=2, keepdims=True)
                 pv = lax.dot_general(
                     p.astype(compute_dtype),
-                    v,
+                    v_compute,
                     (((2, ), (0, )), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
@@ -586,6 +595,7 @@ def _run_pcp_page_groups_multi_head(
     o_ref,
     *,
     pcp_size,
+    interleave_size,
     lane,
     q_compute_size,
     sm_scale,
@@ -737,6 +747,7 @@ def _run_pcp_page_groups_multi_head(
                 acc_scratch_ref,
                 sm_scale=sm_scale,
                 pcp_size=pcp_size,
+                interleave_size=interleave_size,
                 q_compute_size=q_compute_size,
                 k_scale=k_scale,
                 v_scale=v_scale,
@@ -849,6 +860,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
     acc_scratch_ref,
     *,
     pcp_size,
+    interleave_size,
     num_lanes,
     q_compute_size,
     num_page_groups,
@@ -888,6 +900,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
             acc_out_ref,
             None,
             pcp_size=pcp_size,
+            interleave_size=interleave_size,
             lane=lane,
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
@@ -927,6 +940,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
     acc_scratch_ref,
     *,
     pcp_size,
+    interleave_size,
     num_lanes,
     q_compute_size,
     num_page_groups,
@@ -972,6 +986,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
             acc_in_ref,
             o_ref,
             pcp_size=pcp_size,
+            interleave_size=interleave_size,
             lane=lane,
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
@@ -1083,6 +1098,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         pcp_size: int,
         q_block_size: int,
         sm_scale: float,
+        interleave_size: int | None = None,
         q_compute_size: int | None = None,
         kv_pages_per_block: int = 1,
         k_scale: float | None = None,
@@ -1091,6 +1107,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         pcp_axis_name: str = AXIS,
 ):
     page_size = kv_cache_local.shape[2]
+    if interleave_size is None:
+        interleave_size = page_size
     local_tokens = q_multi_head.shape[0]
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
@@ -1122,6 +1140,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         functools.partial(
             _pcp_streaming_attention_current_state_page_groups_multi_head_kernel,
             pcp_size=pcp_size,
+            interleave_size=interleave_size,
             num_lanes=num_lanes,
             q_compute_size=q_compute_size,
             num_page_groups=num_page_groups,
@@ -1190,6 +1209,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         pcp_size: int,
         q_block_size: int,
         sm_scale: float,
+        interleave_size: int | None = None,
         q_compute_size: int | None = None,
         kv_pages_per_block: int = 1,
         k_scale: float | None = None,
@@ -1198,6 +1218,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         pcp_axis_name: str = AXIS,
 ):
     page_size = kv_cache_local.shape[2]
+    if interleave_size is None:
+        interleave_size = page_size
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
     head_dim = q_multi_head.shape[-1]
@@ -1221,6 +1243,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         functools.partial(
             _pcp_streaming_attention_history_output_page_groups_multi_head_kernel,
             pcp_size=pcp_size,
+            interleave_size=interleave_size,
             num_lanes=num_lanes,
             q_compute_size=q_compute_size,
             num_page_groups=num_page_groups,
@@ -1387,8 +1410,8 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             is the number of active requests considered by the schedule.
         pcp_size: Number of ranks in the PCP ring.
         interleave_size: Number of consecutive global tokens assigned to one
-            rank before rotating to the next PCP rank. The production path
-            requires this to match `page_size`.
+            rank before rotating to the next PCP rank. Must divide the KV page
+            size.
         q_block_size: Static local Q tile size used by the Pallas kernel.
         q_compute_size: Static Q rows consumed per multi-head softmax compute
             step. Defaults to `q_block_size`.
@@ -1438,6 +1461,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             current_schedule,
             current_active_page_groups,
             pcp_size=pcp_size,
+            interleave_size=interleave_size,
             q_block_size=q_block_size,
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
@@ -1457,6 +1481,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             acc_state,
             history_active_page_groups,
             pcp_size=pcp_size,
+            interleave_size=interleave_size,
             q_block_size=q_block_size,
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,

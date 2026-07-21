@@ -94,7 +94,8 @@ import numpy as np
 import torch
 from torch_tpu._internal.sync import synchronize as _tpu_sync
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (BlockIDsLoadStoreSpec, CanonicalKVCaches,
                                      GPULoadStoreSpec, LoadStoreSpec)
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
@@ -241,6 +242,17 @@ def _pad_to_power_of_2(ids: np.ndarray) -> tuple[np.ndarray, int]:
     return padded, n
 
 
+def _model_is_hybrid(vllm_config: VllmConfig) -> bool:
+    """Single source of truth for hybrid detection in this module.
+
+    Keyed on model_config.is_hybrid — the same signal tpu_platform gates
+    the unified block pool on — so the handler mapping and the HBM
+    reserve estimate can never disagree. getattr-with-default because
+    estimate_hbm_reserve_bytes runs against lightweight configs in tests.
+    """
+    return bool(getattr(vllm_config.model_config, "is_hybrid", False))
+
+
 def expand_block_ids(
     block_ids: np.ndarray,
     block_size_factor: int,
@@ -272,6 +284,119 @@ def expand_block_ids(
         output_end_idx = output_idx + len(indices)
         output[output_idx:output_end_idx] = base_block_id + indices
         output_idx = output_end_idx
+
+
+def expand_hybrid_pool_block_ids(
+    gpu_block_ids: np.ndarray,
+    group_sizes: "list[int] | tuple[int, ...]",
+    block_indices: "list[int] | tuple[int, ...]",
+    cpu_block_ids: np.ndarray,
+    cpu_block_size_factor: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map a grouped hybrid transfer spec to flat (gpu_row, cpu_row) pairs.
+
+    On the unified block pool every KV cache group's block IDs index rows
+    of the same pool tensors, so the device side needs no expansion: GPU
+    block IDs ARE pool row IDs. The CPU side is addressed per group: the
+    scheduler allocates offloaded (CPU) blocks per (group, offloaded-block)
+    key, concatenated in group order, and each CPU block spans
+    `cpu_block_size_factor` rows.
+
+    Per group, the GPU segment covers logically consecutive blocks starting
+    at position `block_indices[g]`; the leading `block_indices[g] % factor`
+    rows of the group's first CPU block belong to positions before the
+    segment and are skipped (upstream's GPULoadStoreSpec contract). Groups
+    whose leading GPU blocks are null placeholders (mamba) simply start at
+    a later position — the same skip arithmetic covers them.
+    """
+    factor = cpu_block_size_factor
+    num_rows = len(gpu_block_ids)
+    assert sum(group_sizes) == num_rows, (group_sizes, num_rows)
+    cpu_rows = np.empty(num_rows, dtype=np.int64)
+    gpu_off = 0
+    cpu_off = 0
+    for group_size, block_idx in zip(group_sizes, block_indices):
+        if group_size == 0:
+            continue
+        skip = block_idx % factor
+        num_group_cpu_blocks = cdiv(group_size + skip, factor)
+        group_cpu_blocks = cpu_block_ids[cpu_off:cpu_off +
+                                         num_group_cpu_blocks]
+        assert len(group_cpu_blocks) == num_group_cpu_blocks, (
+            "hybrid transfer spec has fewer CPU blocks than the GPU "
+            "group segments require", group_sizes, block_indices,
+            len(cpu_block_ids), factor)
+        positions = skip + np.arange(group_size)
+        cpu_rows[gpu_off:gpu_off + group_size] = (
+            group_cpu_blocks[positions // factor] * factor +
+            positions % factor)
+        gpu_off += group_size
+        cpu_off += num_group_cpu_blocks
+    assert cpu_off == len(cpu_block_ids), (
+        "hybrid transfer spec has unused CPU blocks", group_sizes,
+        block_indices, len(cpu_block_ids), factor)
+    return np.asarray(gpu_block_ids, dtype=np.int64), cpu_rows
+
+
+def _expand_transfer_ids(
+    transfer_spec: TransferSpec,
+    tpu_to_cpu: bool,
+    src_block_size_factor: int,
+    dst_block_size_factor: int,
+    hybrid_num_groups: "int | None",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expand (src, dst) scheduler-block specs to flat per-row ID arrays.
+
+    Shared by the torch and raiden handlers so their row mapping can never
+    drift apart. Non-hybrid: expand each side by its block-size factor,
+    skipping the partial leading rows of the first source block. Hybrid
+    unified block pool: the GPU-side spec carries per-KV-group segments
+    (GPULoadStoreSpec.group_sizes / block_indices); route them through
+    expand_hybrid_pool_block_ids.
+    """
+    src_spec, dst_spec = transfer_spec
+    assert isinstance(src_spec, BlockIDsLoadStoreSpec)
+    assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+    src_blocks = src_spec.block_ids
+    dst_blocks = dst_spec.block_ids
+    assert src_blocks.ndim == 1 and dst_blocks.ndim == 1
+
+    if hybrid_num_groups is not None:
+        gpu_spec, cpu_blocks, cpu_factor = ((src_spec, dst_blocks,
+                                             dst_block_size_factor)
+                                            if tpu_to_cpu else
+                                            (dst_spec, src_blocks,
+                                             src_block_size_factor))
+        assert isinstance(gpu_spec, GPULoadStoreSpec), (
+            "hybrid pool offloading requires grouped GPU load/store specs "
+            f"(group_sizes/block_indices), got {type(gpu_spec).__name__}")
+        assert len(
+            gpu_spec.group_sizes) == hybrid_num_groups, (gpu_spec.group_sizes,
+                                                         hybrid_num_groups)
+        gpu_rows, cpu_rows = expand_hybrid_pool_block_ids(
+            gpu_spec.block_ids,
+            gpu_spec.group_sizes,
+            gpu_spec.block_indices,
+            cpu_blocks,
+            cpu_factor,
+        )
+        return (gpu_rows, cpu_rows) if tpu_to_cpu else (cpu_rows, gpu_rows)
+
+    src_sub_count = src_blocks.size * src_block_size_factor
+    dst_sub_count = dst_blocks.size * dst_block_size_factor
+    src_skip = -dst_blocks.size % src_block_size_factor
+    assert dst_sub_count == src_sub_count - src_skip
+
+    # expand_block_ids writes compactly with the skip already applied, so
+    # both sides expand to exactly dst_sub_count entries.
+    src_expanded = np.empty(dst_sub_count, dtype=np.int64)
+    dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
+    expand_block_ids(src_blocks,
+                     src_block_size_factor,
+                     src_expanded,
+                     skip_count=src_skip)
+    expand_block_ids(dst_blocks, dst_block_size_factor, dst_expanded)
+    return src_expanded, dst_expanded
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +532,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         dst_tensors: list[torch.Tensor],
         src_block_size_factor: int,
         dst_block_size_factor: int,
+        hybrid_num_groups: "int | None" = None,
     ):
         assert len(src_tensors) == len(dst_tensors)
 
@@ -418,6 +544,13 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         assert dst_block_size_factor % min_factor == 0
         self.src_block_size_factor = src_block_size_factor // min_factor
         self.dst_block_size_factor = dst_block_size_factor // min_factor
+
+        # Hybrid unified-block-pool mode: every KV group's GPU block IDs
+        # address rows of the same pool tensors, and row mapping goes
+        # through the grouped path of _expand_transfer_ids. Requires device
+        # rows at scheduler-block granularity (device factor 1), asserted
+        # at the get_handlers choke point.
+        self._hybrid_num_groups = hybrid_num_groups
 
         self.block_size_in_bytes = [
             t.element_size() * t.stride(0) * min_factor for t in src_tensors
@@ -439,6 +572,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # initialized here so the unconditional `Transfer.req_id` lookup
         # in `transfer_async` works on both directions' instances.
         self._req_id_by_job_id: dict[int, str] = {}
+
+        # TransferResults collected early by a wait()-driven H2D flush
+        # drain; re-emitted by the next get_finished() call so the
+        # scheduler still sees every completion.
+        self._flushed_results: list[TransferResult] = []
 
         # Lightweight diagnostics — printed sparingly to spot stalls.
 
@@ -588,31 +726,10 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
     # -- OffloadingHandler interface -----------------------------------------
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        src_spec, dst_spec = transfer_spec
-        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
-
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1
-        assert dst_blocks.ndim == 1
-
-        src_sub_count = src_blocks.size * self.src_block_size_factor
-        dst_sub_count = dst_blocks.size * self.dst_block_size_factor
-        src_skip = -dst_blocks.size % self.src_block_size_factor
-        assert dst_sub_count == src_sub_count - src_skip
-
-        src_expanded = np.empty(src_sub_count, dtype=np.int64)
-        dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
-        expand_block_ids(
-            src_blocks,
-            self.src_block_size_factor,
-            src_expanded,
-            skip_count=src_skip,
-        )
-        expand_block_ids(dst_blocks, self.dst_block_size_factor, dst_expanded)
-        src_ids = src_expanded[src_skip:]
-        dst_ids = dst_expanded
+        src_ids, dst_ids = _expand_transfer_ids(transfer_spec, self.tpu_to_cpu,
+                                                self.src_block_size_factor,
+                                                self.dst_block_size_factor,
+                                                self._hybrid_num_groups)
         n = len(dst_ids)
 
         if self.tpu_to_cpu:
@@ -716,7 +833,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             self._start_h2d_dma(t)
         return True
 
-    def flush_pending_scatters(self, scatter_now_req_ids: set[str]) -> None:
+    def flush_pending_scatters(self,
+                               scatter_now_req_ids: set[str],
+                               force: bool = False) -> None:
         """Dispatch H2D scatter HLOs for deferred chunks whose owning
         request has been promoted to the active batch on ALL ranks.
 
@@ -728,6 +847,14 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         that lets each rank dispatch its scatter in lockstep with the
         others. Transfers whose req_id isn't in the set stay in
         `_pending_scatters` for a later step's flush.
+
+        `force=True` (used only by wait()'s flush drain) dispatches every
+        parked scatter, bypassing the scatter-now gate. An early dispatch
+        is safe (the data just lands sooner; the promotion step's flush
+        then finds nothing left), and it is the only way to unpark
+        last-chunk scatters of requests that will never be promoted
+        (finished/aborted), which would otherwise hold `_h2d_buffer_free`
+        cleared forever and wedge the H2D pipeline.
 
         For chunked transfers, re-submits the next chunk to the worker
         after this chunk's scatter is enqueued — preserving the libtpu
@@ -751,14 +878,15 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # `scatter_now_req_ids` until `finished_recving` is reported,
         # which only happens on the last chunk's `get_finished`.
         to_flush = [
-            ps for ps in self._pending_scatters if
-            (not ps.is_last_chunk or ps.transfer.req_id in scatter_now_req_ids)
+            ps for ps in self._pending_scatters
+            if (force or not ps.is_last_chunk
+                or ps.transfer.req_id in scatter_now_req_ids)
         ]
-        to_keep = [
+        to_keep = ([] if force else [
             ps for ps in self._pending_scatters
             if (ps.is_last_chunk
                 and ps.transfer.req_id not in scatter_now_req_ids)
-        ]
+        ])
 
         if not to_flush:
             # Nothing to dispatch on this rank this step. Return early
@@ -788,7 +916,10 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self._pending_scatters = to_keep
 
     def get_finished(self) -> list[TransferResult]:
-        results: list[TransferResult] = []
+        # Start from results collected early by a wait()-driven flush
+        # drain; the scheduler still needs them reported via this call.
+        results: list[TransferResult] = self._flushed_results
+        self._flushed_results = []
         while self._transfers:
             t = self._transfers[0]
 
@@ -871,26 +1002,62 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         Mirrors the CUDA reference impl in
         vllm/v1/kv_offload/cpu/gpu_worker.py:wait — purely a flush
-        primitive. Internal-state cleanup (popping from `_transfers`,
-        deleting from `_transfer_map`, building TransferResults) is left
-        to the next `get_finished()` call. Removing transfers here would
-        prevent `get_finished()` from emitting their TransferResults,
-        which the scheduler relies on to mark jobs complete.
+        primitive. TransferResults are still emitted by `get_finished()`
+        (directly, or via `_flushed_results` for transfers the H2D drain
+        below collects), which the scheduler relies on to mark jobs
+        complete.
+
+        D2H: block on each transfer's dma_done — the worker task ends
+        with the cpu_pool host scatter, so dma_done ⇒ fully landed.
+
+        H2D: the scheduler legitimately flushes load jobs too — it names
+        ALL pending jobs (stores AND loads) once every tracked request
+        has finished, and on reset_cache, because there may be no future
+        engine step to run get_finished / flush_pending_scatters (see
+        offloading/scheduler.py build_connector_meta). Drain the chunk
+        pipeline here: collect DMA-complete chunks via get_finished
+        (re-buffering their results) and force-dispatch parked scatters
+        past the scatter-now gate. The gate bypass is safe — every rank
+        completes this wait before its next forward, so scatter-before-
+        forward ordering still holds on all ranks; an early dispatch
+        just lands the data sooner. Bounded by the offload wait timeout
+        so a stalled DMA can't hang the engine (timed-out jobs stay in
+        `_transfer_map` and are reported by a later get_finished, as
+        before).
         """
-        for jid in job_ids:
-            t = self._transfer_map.get(jid)
-            if t is None:
-                continue
-            if self.tpu_to_cpu:
-                # Worker task ends with the cpu_pool host scatter, so
-                # dma_done.is_set() implies the D2H is fully landed.
+        if self.tpu_to_cpu:
+            for jid in job_ids:
+                t = self._transfer_map.get(jid)
+                if t is None:
+                    continue
                 t.dma_done.wait()
-            else:
-                # H2D skips non-ready transfers rather than waiting; the
-                # OffloadingConnector only ever calls wait() for D2H flush.
-                raise AssertionError(
-                    f"wait() called on H2D handler for job={jid}; "
-                    "OffloadingConnector should never invoke this path.")
+            return
+
+        remaining = {jid for jid in job_ids if jid in self._transfer_map}
+        deadline = time.perf_counter() + _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S
+        while True:
+            # Collect DMA-complete chunks (queues their pending scatters,
+            # pops finished transfers) and re-buffer the TransferResults
+            # for the next real get_finished() call.
+            self._flushed_results = self.get_finished()
+            # Dispatch every parked scatter: frees the device buffer so
+            # queued DMAs and next chunks can proceed, and unparks
+            # last-chunk scatters of never-promoted requests. Must run at
+            # least once even if `remaining` starts empty — a last-chunk
+            # scatter parks in the same get_finished() that pops its
+            # transfer, so an aborted request's scatter can be holding
+            # `_h2d_buffer_free` with no `_transfer_map` entry left.
+            self.flush_pending_scatters(set(), force=True)
+            remaining = {jid for jid in remaining if jid in self._transfer_map}
+            if not remaining:
+                return
+            if time.perf_counter() >= deadline:
+                logger.warning(
+                    "[kv-offload] H2D flush wait timed out after %.1fs "
+                    "for jobs=%s", _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S,
+                    sorted(remaining))
+                return
+            time.sleep(0.0005)
 
     def shutdown(self) -> None:
         """Tear down the worker thread cleanly.
@@ -932,8 +1099,13 @@ class _RaidenOffloadingHandler(OffloadingHandler):
     lives inside raiden (DmaMapped), so there is no `cpu_pool` tensor here.
     """
 
-    def __init__(self, mgr, tpu_to_cpu: bool, src_block_size_factor: int,
-                 dst_block_size_factor: int, bytes_per_kernel_block: int):
+    def __init__(self,
+                 mgr,
+                 tpu_to_cpu: bool,
+                 src_block_size_factor: int,
+                 dst_block_size_factor: int,
+                 bytes_per_kernel_block: int,
+                 hybrid_num_groups: "int | None" = None):
         self._mgr = mgr
         self.tpu_to_cpu = tpu_to_cpu
         self.src_block_size_factor = src_block_size_factor
@@ -941,41 +1113,20 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         self._bytes_per_kernel_block = bytes_per_kernel_block
         self.transfer_type = ("GPU", "CPU") if tpu_to_cpu else ("CPU", "GPU")
         self._pending: dict[int, tuple] = {}
-
-    def _expand_kernel_ids(
-            self,
-            transfer_spec: TransferSpec) -> tuple[np.ndarray, np.ndarray]:
-        """Expand (src, dst) scheduler block IDs to kernel-block IDs.
-
-        Mirrors SingleDirectionOffloadingHandler.transfer_async so D2H/H2D
-        granularity matches the torch path exactly.
-        """
-        src_spec, dst_spec = transfer_spec
-        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1 and dst_blocks.ndim == 1
-
-        src_sub_count = src_blocks.size * self.src_block_size_factor
-        dst_sub_count = dst_blocks.size * self.dst_block_size_factor
-        src_skip = -dst_blocks.size % self.src_block_size_factor
-        assert dst_sub_count == src_sub_count - src_skip
-
-        src_expanded = np.empty(src_sub_count, dtype=np.int64)
-        dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
-        expand_block_ids(src_blocks,
-                         self.src_block_size_factor,
-                         src_expanded,
-                         skip_count=src_skip)
-        expand_block_ids(dst_blocks, self.dst_block_size_factor, dst_expanded)
-        return src_expanded[src_skip:], dst_expanded
+        # Hybrid unified-block-pool mode: same grouped row mapping as the
+        # torch handler (see _expand_transfer_ids). Raiden host slots stay
+        # uniform because every pool row has identical bytes.
+        self._hybrid_num_groups = hybrid_num_groups
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        # src/dst are kernel-block IDs. D2H: src=device blocks, dst=host slots;
-        # H2D: src=host slots, dst=device blocks — matching D2h/H2d's
+        # src/dst are kernel-block IDs, expanded by the same mapping as the
+        # torch path. D2H: src=device blocks, dst=host slots; H2D: src=host
+        # slots, dst=device blocks — matching D2h/H2d's
         # (src_offsets_major_dim, dst_offsets_major_dim) contract.
-        src_ids, dst_ids = self._expand_kernel_ids(transfer_spec)
+        src_ids, dst_ids = _expand_transfer_ids(transfer_spec, self.tpu_to_cpu,
+                                                self.src_block_size_factor,
+                                                self.dst_block_size_factor,
+                                                self._hybrid_num_groups)
         n = len(dst_ids)
         sizes = [1] * n  # one major-dim slice (= one kernel block) per segment
         if self.tpu_to_cpu:
@@ -1075,6 +1226,7 @@ class CpuTpuOffloadingHandlers:
         kernel_block_size: int,
         kv_dtype: torch.dtype,
         per_block_shape: tuple[int, ...],
+        hybrid_num_groups: "int | None" = None,
     ):
         """
         Args:
@@ -1091,6 +1243,11 @@ class CpuTpuOffloadingHandlers:
               (e.g. (block_size, num_kv_heads_x2 // kv_packing, kv_packing,
               padded_head_size)) — everything after the leading num_blocks
               dim.
+          hybrid_num_groups: number of KV cache groups when the KV cache is
+              the hybrid unified block pool (attention + mamba sharing one
+              pool of fungible rows); None for non-hybrid models. In pool
+              mode each canonical tensor IS a pool buffer and transfer specs
+              are grouped — see expand_hybrid_pool_block_ids.
         """
         assert kv_caches.tensors
         assert cpu_block_size % gpu_block_size == 0
@@ -1146,7 +1303,8 @@ class CpuTpuOffloadingHandlers:
             # KVCacheManager over the device KV-cache views; two direct-DMA
             # handlers share it. host_blocks_to_allocate matches the scheduler's
             # CPU pool sized in kernel blocks, so CPU block IDs map 1:1 to
-            # raiden host slots after expand_block_ids.
+            # raiden host slots after _expand_transfer_ids (hybrid pool rows
+            # stay uniform, so raiden's per-slot byte accounting is unchanged).
             from tpu_raiden.api.torch import kv_cache_manager as _kcm
             device_tensors = [[t] for t in tpu_tensors]
             # raiden holds raw pointers / PJRT aliases to these device buffers
@@ -1168,6 +1326,7 @@ class CpuTpuOffloadingHandlers:
                 src_block_size_factor=gpu_block_size_factor,
                 dst_block_size_factor=cpu_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
+                hybrid_num_groups=hybrid_num_groups,
             )
             self.cpu_to_gpu_handler = _RaidenOffloadingHandler(
                 self._raiden_mgr,
@@ -1175,6 +1334,7 @@ class CpuTpuOffloadingHandlers:
                 src_block_size_factor=cpu_block_size_factor,
                 dst_block_size_factor=gpu_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
+                hybrid_num_groups=hybrid_num_groups,
             )
             logger.info(
                 "[kv-offload] RAIDEN direct-DMA offload: %d host kernel blocks",
@@ -1192,12 +1352,14 @@ class CpuTpuOffloadingHandlers:
             dst_tensors=cpu_tensors,
             src_block_size_factor=gpu_block_size_factor,
             dst_block_size_factor=cpu_block_size_factor,
+            hybrid_num_groups=hybrid_num_groups,
         )
         self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
             src_tensors=cpu_tensors,
             dst_tensors=tpu_tensors,
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
+            hybrid_num_groups=hybrid_num_groups,
         )
 
 
@@ -1212,12 +1374,29 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
     Reuses CPUOffloadingSpec.__init__ (block-size calculation, eviction-policy
     config) and get_manager() (LRU/ARC setup).  Only get_handlers() is
     overridden to create TPU-specific transfer handlers.
+
+    Hybrid attention+Mamba models (e.g. Qwen 3.5) run on the unified block
+    pool (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1, enforced by tpu_platform):
+    attention KV and mamba state live in the same attention-shaped pool
+    buffers, every group's block IDs address rows of those same buffers,
+    and a transferred block is one dtype-agnostic pool row. The same
+    canonical-tensor handlers serve both model families; hybrid only adds
+    the grouped row mapping (expand_hybrid_pool_block_ids).
     """
 
     def __init__(self, vllm_config: VllmConfig,
                  kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
         self._tpu_handlers: CpuTpuOffloadingHandlers | None = None
+        # Hybrid without the unified block pool is rejected at config time
+        # by TpuPlatform.check_and_update_config.
+        self.is_hybrid_model: bool = _model_is_hybrid(vllm_config)
+        assert self.is_hybrid_model == any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            for group in kv_cache_config.kv_cache_groups), (
+                "model_config.is_hybrid disagrees with MambaSpec presence "
+                "in kv_cache_groups; hybrid handler mapping would not match "
+                "the HBM reserve estimate")
 
     @property
     def prewarm_shapes(self) -> list[int]:
@@ -1255,6 +1434,8 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         """
         if _USE_RAIDEN_OFFLOAD:
             return 0
+        model_config = vllm_config.model_config
+        is_hybrid = _model_is_hybrid(vllm_config)
         max_pool_blocks = int(os.environ.get("KV_H2D_POOL_MAX_BLOCKS", "2048"))
         max_padded = 1
         while max_padded < max_pool_blocks:
@@ -1264,7 +1445,6 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
             TPU_STR_DTYPE_TO_TORCH_DTYPE, PallasAttentionBackend)
 
         cache_config = vllm_config.cache_config
-        model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
         # _resolve_kv_cache_dtype is strict on "auto", so resolve it here
@@ -1282,6 +1462,15 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
             model_config.get_head_size(),
             kv_dtype,
         )
+        if is_hybrid:
+            # Unified block pool: one pool buffer per attention layer
+            # position (each shared with its mamba layers), each staging
+            # max_padded pool rows of one attention page. block_size is
+            # already the fit size here (check_and_update_config ran), so
+            # per_block_bytes IS the pool page.
+            num_pool_buffers = model_config.get_num_layers_by_block_type(
+                parallel_config, "attention")
+            return num_pool_buffers * max_padded * per_block_bytes
         # Upper bound: vLLM may group multiple layers into one canonical
         # tensor, in which case the actual H2D buffer is smaller. Safe
         # direction (overestimate leaves a few GiB unused).
@@ -1299,8 +1488,13 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
             from vllm_torchtpu.layers.vllm.attention import \
                 PallasAttentionBackend
 
-            assert len(self.gpu_block_size) == 1
-            gpu_block_size = self.gpu_block_size[0]
+            gpu_block_sizes = set(self.gpu_block_size)
+            assert len(gpu_block_sizes) == 1, (
+                "TPU offloading requires a uniform block size across KV "
+                "cache groups (hybrid models: run with "
+                "--enable-prefix-caching and mamba_cache_mode='align'); "
+                f"got {self.gpu_block_size}")
+            gpu_block_size = gpu_block_sizes.pop()
             offloaded_block_size = gpu_block_size * self.block_size_factor
 
             # All kv_cache_groups must share the same attention spec so the
@@ -1320,6 +1514,25 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                 ), ("TPU offloading assumes a single attention spec across "
                     "all KV cache groups")
 
+            hybrid_num_groups = None
+            if self.is_hybrid_model:
+                # Unified block pool: pool buffers are born attention-shaped
+                # at the scheduler block size, and every group (attention
+                # and mamba alike) is a byte-region of the same pool pages,
+                # so each canonical tensor's rows must BE scheduler blocks.
+                assert spec0.block_size == gpu_block_size, (
+                    "hybrid pool offloading expects pool rows at scheduler-"
+                    f"block granularity; attention block_size="
+                    f"{spec0.block_size} vs gpu_block_size={gpu_block_size}")
+                for kv_cache_tensor in kv_caches.tensors:
+                    assert (kv_cache_tensor.page_size_bytes ==
+                            spec0.page_size_bytes), (
+                                "hybrid pool offloading expects every "
+                                "canonical tensor at the unified pool page "
+                                f"size {spec0.page_size_bytes}, got "
+                                f"{kv_cache_tensor.page_size_bytes}")
+                hybrid_num_groups = len(self.kv_cache_config.kv_cache_groups)
+
             full_5d_shape = PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks=1,
                 block_size=spec0.block_size,
@@ -1337,6 +1550,7 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                 kernel_block_size=spec0.block_size,
                 kv_dtype=spec0.dtype,
                 per_block_shape=per_block_shape,
+                hybrid_num_groups=hybrid_num_groups,
             )
 
         yield (

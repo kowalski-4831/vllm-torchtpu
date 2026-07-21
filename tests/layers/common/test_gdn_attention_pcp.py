@@ -197,6 +197,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
     num_tokens = sum(lengths)
     num_blocks = len(lengths) + 1
     dim = 2 * n_kq * d_k + n_v * d_v
+    qkv_split_sizes = [n_kq * d_k, n_kq * d_k, n_v * d_v]
 
     rng = jax.random.key(0)
     keys = jax.random.split(rng, 8)
@@ -281,6 +282,16 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
     def shard_tokens(x):
         return jax.device_put(x, NamedSharding(mesh, P('pcp', None)))
 
+    def shard_conv_state(x):
+        rank_major = reorder_concatenated_tensor_for_sharding(
+            x, qkv_split_sizes, pcp_size, -1)
+        return jax.device_put(rank_major,
+                              NamedSharding(mesh, P(None, None, 'pcp')))
+
+    def shard_rec_state(x):
+        return jax.device_put(x, NamedSharding(mesh, P(None, 'pcp', None,
+                                                       None)))
+
     def replicate(x):
         return jax.device_put(x, NamedSharding(mesh, P()))
 
@@ -288,8 +299,8 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
         shard_tokens(packed_qkv),
         shard_tokens(packed_b),
         shard_tokens(packed_a),
-        replicate(conv_state0),
-        replicate(rec_state0),
+        shard_conv_state(conv_state0),
+        shard_rec_state(rec_state0),
         replicate(conv_weight0),
         replicate(conv_bias0),
         replicate(A_log0),
@@ -317,7 +328,9 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
                                np.array(ref_output),
                                rtol=5e-2,
                                atol=5e-2)
-    np.testing.assert_allclose(np.array(pcp_conv),
+    pcp_conv_raw = inverse_reorder_for_sharding(pcp_conv, qkv_split_sizes,
+                                                pcp_size, -1)
+    np.testing.assert_allclose(np.array(pcp_conv_raw),
                                np.array(ref_conv),
                                rtol=5e-2,
                                atol=5e-2)

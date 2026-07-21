@@ -4,7 +4,6 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
-import importlib
 import os
 import time
 from typing import Dict, Tuple
@@ -37,9 +36,11 @@ logger = init_logger(__name__)
 DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
 
 
-def _get_kv_connector_handshake_metadata_key() -> tuple[int, int]:
-    return (get_pp_group().rank_in_group,
-            int(get_tensor_model_parallel_rank()))
+def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
+    transfer_rank = getattr(metadata, "transfer_rank", None)
+    rank = (int(transfer_rank) if transfer_rank is not None else int(
+        get_tensor_model_parallel_rank()))
+    return get_pp_group().rank_in_group, rank
 
 
 def _debug_tpu_local_rank_offset() -> int:
@@ -49,6 +50,17 @@ def _debug_tpu_local_rank_offset() -> int:
     except ValueError as exc:
         raise ValueError(f"{DEBUG_TPU_LOCAL_RANK_OFFSET_ENV} must be an int, "
                          f"got {value!r}") from exc
+
+
+def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
+                               local_world_size: int) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
+    if world_size > 1:
+        os.environ["WORLD_SIZE"] = str(world_size)
+    else:
+        os.environ.pop("WORLD_SIZE", None)
 
 
 class TPUWorker(WorkerBase):
@@ -255,10 +267,8 @@ class TPUWorker(WorkerBase):
                 init_rank = self.rank
                 init_world = pc.world_size
                 dist_world_size = pc.world_size
-                os.environ["RANK"] = str(self.rank)
-                os.environ["LOCAL_RANK"] = str(tpu_local_rank_env)
-                os.environ["WORLD_SIZE"] = str(pc.world_size)
-                os.environ["LOCAL_WORLD_SIZE"] = str(tpu_local_world)
+                _configure_tpu_process_env(self.rank, tpu_local_rank_env,
+                                           pc.world_size, tpu_local_world)
             if int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"):
                 logger.info(
                     "TPU local-rank offset binding | rank=%d local_rank=%d "
@@ -323,35 +333,6 @@ class TPUWorker(WorkerBase):
             return
         jax_parallel_state.connect(self.prev_worker_ip, self.rank - 1)
 
-    def _estimate_kv_connector_hbm_reserve(self) -> int:
-        """HBM bytes the active KV offload spec needs reserved upfront.
-
-        The configured spec is resolved dynamically from
-        kv_connector_extra_config (same lookup as vllm's OffloadingSpecFactory).
-        Any spec class implementing
-        `estimate_hbm_reserve_bytes(vllm_config) -> int` is asked for its
-        reserve; tpu_worker stays agnostic to connector type and spec class.
-        Returns 0 when no connector is configured, the spec can't be resolved,
-        or the spec doesn't advertise an HBM reserve.
-        """
-        kv_tc = self.vllm_config.kv_transfer_config
-        if kv_tc is None:
-            return 0
-        extra = kv_tc.kv_connector_extra_config or {}
-        spec_name = extra.get("spec_name")
-        spec_module_path = extra.get("spec_module_path")
-        if not spec_name or not spec_module_path:
-            return 0
-        try:
-            spec_module = importlib.import_module(spec_module_path)
-            spec_cls = getattr(spec_module, spec_name)
-        except (ImportError, AttributeError):
-            return 0
-        estimator = getattr(spec_cls, "estimate_hbm_reserve_bytes", None)
-        if estimator is None:
-            return 0
-        return estimator(self.vllm_config)
-
     def determine_available_memory(self) -> int:
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
@@ -365,7 +346,8 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes. Ask the active connector how much
         # to reserve and subtract from the KV-cache budget. Returns 0 if no
         # connector needs a reserve. The connector owns the size formula.
-        kv_connector_hbm_reserve = self._estimate_kv_connector_hbm_reserve()
+        kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
+            self.vllm_config)
         available = budget.available - kv_connector_hbm_reserve
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
@@ -508,6 +490,7 @@ class TPUWorker(WorkerBase):
         self.model_runner.prewarm_kv_offload_shape(p)
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
@@ -541,4 +524,4 @@ class TPUWorker(WorkerBase):
         metadata = connector.get_handshake_metadata()
         if metadata is None:
             return None
-        return {_get_kv_connector_handshake_metadata_key(): metadata}
+        return {_get_kv_connector_handshake_metadata_key(metadata): metadata}

@@ -8,6 +8,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import \
     AttentionMetadataBuilder as BaseAttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 from vllm_torchtpu.layers.common.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR, DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -93,11 +94,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.runner = runner
         self.kv_cache_group_id = kv_cache_group_id
+        self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
         self.target_block_size = getattr(self.kv_cache_spec, "block_size",
                                          runner.block_size)
+        if self.is_mamba_group:
+            self.target_block_size *= get_total_cp_world_size()
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
-        self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
 
         block_table_obj = runner.input_batch.block_table[
             self.kv_cache_group_id]

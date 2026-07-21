@@ -914,9 +914,11 @@ def _integration_layout(mod: Any, decode_tp_rank: int, constants: dict[str,
         block_size=c["source_block_size"],
         kv_source_layout=mod.KVParallelLayout(
             full_attn_pcp_size=c["prefill_workers"],
-            full_attn_tp_size=c["prefill_workers"],
+            full_attn_tp_size=1,
             linear_attn_pcp_size=1,
             linear_attn_tp_size=c["prefill_workers"],
+            cp_kv_cache_interleave_size=c.get("source_interleave_size",
+                                              c["source_block_size"]),
         ),
         kv_caches=source_regions_by_rank,
         fa_block_ids=c["fa_source_block_ids"],
@@ -1018,8 +1020,10 @@ def test_integration_layout_supports_fa_4pcp_gdn_4tp_to_decode_1tp(
         mod, decode_tp_rank=0, constants=constants)
 
     assert metadata.kv_source_layout.full_attn_pcp_size == 4
-    assert metadata.kv_source_layout.full_attn_tp_size == 4
+    assert metadata.kv_source_layout.full_attn_tp_size == 1
     assert metadata.kv_source_layout.linear_attn_tp_size == 4
+    assert (metadata.kv_source_layout.cp_kv_cache_interleave_size ==
+            constants["source_block_size"])
     assert topology.local_layout.full_attn_pcp_size == 1
     assert topology.local_layout.full_attn_tp_size == 1
     assert topology.local_layout.linear_attn_tp_size == 1
@@ -1067,6 +1071,153 @@ def test_integration_region_page_placement_is_contiguous(monkeypatch):
         offset %
         destination.kv_caches[region_id].physical_block_stride_bytes == 0
         for region_id, offset in dest_offsets.items())
+
+
+@pytest.mark.parametrize("decode_tp_size", (1, 2))
+def test_zmq_prefill_decode_fa_4pcp_gdn_4tp_to_decode_tp(
+        monkeypatch, decode_tp_size):
+    mod = _load_v2_module(monkeypatch, stub_zmq=False)
+    strided = sys.modules[
+        "vllm_torchtpu.distributed.kv_transfer.v2.strided_transfer"]
+    constants = _integration_model_constants(decode_tp_size=decode_tp_size)
+    constants["source_interleave_size"] = 16
+    source_metadata, _, _, _ = _integration_layout(mod,
+                                                   decode_tp_rank=0,
+                                                   constants=constants)
+    assert (source_metadata.kv_source_layout.cp_kv_cache_interleave_size == 16)
+    producers = []
+
+    try:
+        remote_metadata = []
+        for p_rank in range(constants["prefill_workers"]):
+            producer = strided.StridedKVTransferEngine(
+                local_dp_rank=0,
+                local_tp_rank=p_rank,
+                local_worker_id=f"prefill-rank{p_rank}",
+                listen_host="127.0.0.1",
+                listen_port=0,
+                transport="zmq",
+            )
+            source_buffers = _integration_region_source_buffers(
+                source_metadata, p_rank, constants)
+            _register_engine_regions(
+                producer,
+                {
+                    region_id: memoryview(buffer)
+                    for region_id, buffer in source_buffers.items()
+                },
+                _page_bytes_by_layer(source_metadata.kv_caches[p_rank]),
+            )
+            producer.start()
+            producers.append(producer)
+            remote_metadata.append(producer.local_metadata().to_dict())
+
+        for decode_tp_rank in range(decode_tp_size):
+            metadata, topology, destination, _ = _integration_layout(
+                mod,
+                decode_tp_rank=decode_tp_rank,
+                constants=constants,
+            )
+            destination_buffers = {
+                region_id: bytearray([0xA5]) * constants["dst_size"]
+                for region_id in destination.kv_caches
+            }
+            consumer = strided.StridedKVTransferEngine(
+                local_dp_rank=0,
+                local_tp_rank=decode_tp_rank,
+                local_worker_id=f"decode-rank{decode_tp_rank}",
+                listen_host="127.0.0.1",
+                listen_port=0,
+                transport="zmq",
+            )
+            try:
+                _register_engine_regions(
+                    consumer,
+                    {
+                        region_id: memoryview(buffer)
+                        for region_id, buffer in destination_buffers.items()
+                    },
+                    _page_bytes_by_layer(destination.kv_caches),
+                )
+                destination = mod.TPUConnectorV2Worker.apply_local_destination_region_metadata(
+                    destination, consumer.local_regions_metadata())
+                scheduler = mod.TPUConnectorV2Scheduler(
+                    types.SimpleNamespace(
+                        kv_transfer_config=types.SimpleNamespace(
+                            is_kv_producer=False),
+                        parallel_config=types.SimpleNamespace(
+                            data_parallel_rank=0),
+                    ))
+                scheduler.set_strided_decode_metadata(topology=topology,
+                                                      destination=destination)
+                request_id = f"req-{decode_tp_rank}"
+                request = types.SimpleNamespace(
+                    request_id=request_id,
+                    kv_transfer_params={
+                        "uuid": 123,
+                        "remote_block_ids": [1, 2],
+                        "remote_host": "unused-by-strided-bridge",
+                        "remote_port": 0,
+                        "remote_metadata": remote_metadata,
+                        "strided_source_metadata": metadata.to_dict(),
+                    },
+                    prompt_token_ids=list(range(constants["fa_num_tokens"] +
+                                                1)),
+                )
+                scheduler.update_state_after_alloc(
+                    request,
+                    object(),
+                    constants["fa_num_tokens"],
+                )
+                req_meta = scheduler.reqs_to_load[request_id]
+                rank_ops_by_decode_rank = (
+                    mod.TPUConnectorV2Worker.
+                    _remote_rank_ops_by_decode_rank_from_req_meta(req_meta))
+                plans = {
+                    p_rank: mod.RankTransferPlan(p_rank=p_rank, ops=tuple(ops))
+                    for p_rank, ops in
+                    rank_ops_by_decode_rank[decode_tp_rank].items()
+                }
+
+                consumer.start()
+                worker = mod.TPUConnectorV2Worker(object())
+                worker.tp_rank = decode_tp_rank
+                worker.set_strided_transfer_bridge(
+                    mod.TPUConnectorV2StridedBridge(consumer))
+                _disable_v2_pull_start(worker)
+                connector_metadata = types.SimpleNamespace(
+                    reqs_to_send={},
+                    reqs_to_load={
+                        request_id:
+                        types.SimpleNamespace(
+                            uuid=123,
+                            remote_block_ids=[1, 2],
+                            remote_metadata=req_meta.remote_metadata,
+                            remote_rank_ops_by_decode_rank=(
+                                rank_ops_by_decode_rank),
+                        )
+                    },
+                )
+
+                copied = worker.process_send_load(connector_metadata)
+                expected = _integration_expected_region_bytes(
+                    plans, metadata, destination, constants)
+
+                assert sorted(plans) == [0, 1, 2, 3]
+                assert copied == sum(plan.total_bytes
+                                     for plan in plans.values())
+                assert {
+                    region_id: bytes(buffer)
+                    for region_id, buffer in destination_buffers.items()
+                } == {
+                    region_id: bytes(buffer)
+                    for region_id, buffer in expected.items()
+                }
+            finally:
+                consumer.stop()
+    finally:
+        for producer in producers:
+            producer.stop()
 
 
 def _prefill_worker_process(p_rank: int, group_env: dict[str, str],

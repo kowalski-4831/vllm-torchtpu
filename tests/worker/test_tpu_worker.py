@@ -13,11 +13,38 @@
 # limitations under the License.
 """Tests for TPUWorker"""
 
+import os
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm_torchtpu.worker.tpu_worker import TPUWorker
+from vllm_torchtpu.worker.tpu_worker import (TPUWorker,
+                                             _configure_tpu_process_env)
+
+
+def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(
+        monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+
+    _configure_tpu_process_env(rank=0,
+                               local_rank=0,
+                               world_size=1,
+                               local_world_size=1)
+
+    assert os.environ["RANK"] == "0"
+    assert os.environ["LOCAL_RANK"] == "0"
+    assert os.environ["LOCAL_WORLD_SIZE"] == "1"
+    assert "WORLD_SIZE" not in os.environ
+
+    _configure_tpu_process_env(rank=1,
+                               local_rank=1,
+                               world_size=8,
+                               local_world_size=8)
+
+    assert os.environ["RANK"] == "1"
+    assert os.environ["LOCAL_RANK"] == "1"
+    assert os.environ["LOCAL_WORLD_SIZE"] == "8"
+    assert os.environ["WORLD_SIZE"] == "8"
 
 
 def _make_vllm_config(profiler_torch_dir=None):
@@ -76,3 +103,19 @@ class TestProfilerDir:
         cfg = _make_vllm_config(profiler_torch_dir=None)
         worker = _build_worker(cfg)
         assert worker.profile_dir is None
+
+
+def test_initialize_from_config_updates_num_gpu_blocks():
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = MagicMock(num_gpu_blocks=None)
+    worker.vllm_config = MagicMock()
+    worker.model_runner = MagicMock()
+    kv_cache_config = MagicMock(num_blocks=2048)
+
+    with patch("vllm_torchtpu.worker.tpu_worker."
+               "ensure_kv_transfer_initialized"):
+        worker.initialize_from_config(kv_cache_config)
+
+    assert worker.cache_config.num_gpu_blocks == 2048
+    worker.model_runner.initialize_kv_cache.assert_called_once_with(
+        kv_cache_config)
