@@ -30,7 +30,6 @@ from vllm_torchtpu.kernels.causal_conv1d import causal_conv1d
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.ragged_gated_delta_rule_ref import \
     ragged_gated_delta_rule as ragged_gated_delta_rule_ref
-from vllm_torchtpu.layers.common.sharding import ShardingAxisName
 from vllm_torchtpu.layers.common.utils import (
     inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
 from vllm_torchtpu.utils import get_mesh_shape_product
@@ -264,36 +263,30 @@ def run_jax_gdn_attention(
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
     in_specs = (
-        P(ShardingAxisName.ATTN_DATA,
-          ShardingAxisName.ATTN_HEAD),  # j_mixed_qkv
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_b
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_a
-        P(ShardingAxisName.ATTN_DATA, None,
-          ShardingAxisName.ATTN_HEAD),  # conv_state
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
-          None),  # recurrent_state
-        P(ShardingAxisName.ATTN_HEAD, None, None),  # j_conv_weight
-        P(ShardingAxisName.ATTN_HEAD)
-        if j_conv_bias is not None else None,  # j_conv_bias
-        P(ShardingAxisName.ATTN_HEAD),  # j_A_log
-        P(ShardingAxisName.ATTN_HEAD),  # j_dt_bias
-        P(ShardingAxisName.ATTN_DATA),  # query_start_loc
-        P(ShardingAxisName.ATTN_DATA),  # state_indices
-        P(ShardingAxisName.ATTN_DATA),  # distribution
-        P(ShardingAxisName.ATTN_DATA),  # seq_lens
+        P(None, "model"),  # j_mixed_qkv
+        P(None, "model"),  # j_b
+        P(None, "model"),  # j_a
+        P(None, None, "model"),  # conv_state
+        P(None, "model", None, None),  # recurrent_state
+        P("model", None, None),  # j_conv_weight
+        P("model") if j_conv_bias is not None else None,  # j_conv_bias
+        P("model"),  # j_A_log
+        P("model"),  # j_dt_bias
+        P(None),  # query_start_loc
+        P(None),  # state_indices
+        P(None),  # distribution
+        P(None),  # seq_lens
     )
 
     out_specs = (
         (
-            P(ShardingAxisName.ATTN_DATA, None,
-              ShardingAxisName.ATTN_HEAD),  # new_conv_state
-            P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
-              None),  # new_recurrent_state
+            P(None, None, "model"),  # new_conv_state
+            P(None, "model", None, None),  # new_recurrent_state
         ),
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # output
+        P(None, "model"),  # output
     )
 
-    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+    tp_size = get_mesh_shape_product(mesh, "model")
 
     p_run_jax_gdn_attention_local = functools.partial(
         run_jax_gdn_attention_local,
@@ -504,7 +497,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 
     The enclosing vLLM worker is already TP-local. This function only adds PCP
     as extra head parallelism inside the custom op, without reintroducing a
-    global JAX ``pcp`` axis in sharding.py.
+    global JAX ``pcp`` axis.
 
     The packed-rank-major token order is reconstructed from replicated metadata
     inside this op so callers do not need to pass a GDN-specific reorder tensor.
@@ -988,31 +981,28 @@ def run_jax_gdn_attention_pooled(
         - The updated pool (the in-place written state regions).
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
-    pool_spec = P(ShardingAxisName.ATTN_DATA, None, None,
-                  None)  # attention-shaped pool
+    pool_spec = P(None, None, None, None)  # attention-shaped pool
     in_specs = (
-        P(ShardingAxisName.ATTN_DATA,
-          ShardingAxisName.ATTN_HEAD),  # j_mixed_qkv
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_b
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_a
+        P(None, "model"),  # j_mixed_qkv
+        P(None, "model"),  # j_b
+        P(None, "model"),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
-        P(ShardingAxisName.ATTN_HEAD, None, None),  # j_conv_weight
-        P(ShardingAxisName.ATTN_HEAD)
-        if j_conv_bias is not None else None,  # j_conv_bias
-        P(ShardingAxisName.ATTN_HEAD),  # j_A_log
-        P(ShardingAxisName.ATTN_HEAD),  # j_dt_bias
-        P(ShardingAxisName.ATTN_DATA),  # query_start_loc
-        P(ShardingAxisName.ATTN_DATA),  # state_indices
-        P(ShardingAxisName.ATTN_DATA),  # distribution
-        P(ShardingAxisName.ATTN_DATA),  # seq_lens
+        P("model", None, None),  # j_conv_weight
+        P("model") if j_conv_bias is not None else None,  # j_conv_bias
+        P("model"),  # j_A_log
+        P("model"),  # j_dt_bias
+        P(None),  # query_start_loc
+        P(None),  # state_indices
+        P(None),  # distribution
+        P(None),  # seq_lens
     )
 
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # output
+        P(None, "model"),  # output
     )
 
-    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+    tp_size = get_mesh_shape_product(mesh, "model")
 
     p_run_jax_gdn_attention_pooled_local = functools.partial(
         run_jax_gdn_attention_pooled_local,
