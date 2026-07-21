@@ -36,9 +36,11 @@ logger = init_logger(__name__)
 DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
 
 
-def _get_kv_connector_handshake_metadata_key() -> tuple[int, int]:
-    return (get_pp_group().rank_in_group,
-            int(get_tensor_model_parallel_rank()))
+def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
+    transfer_rank = getattr(metadata, "transfer_rank", None)
+    rank = (int(transfer_rank) if transfer_rank is not None else int(
+        get_tensor_model_parallel_rank()))
+    return get_pp_group().rank_in_group, rank
 
 
 def _debug_tpu_local_rank_offset() -> int:
@@ -521,4 +523,4 @@ class TPUWorker(WorkerBase):
         metadata = connector.get_handshake_metadata()
         if metadata is None:
             return None
-        return {_get_kv_connector_handshake_metadata_key(): metadata}
+        return {_get_kv_connector_handshake_metadata_key(metadata): metadata}

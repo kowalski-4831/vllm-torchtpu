@@ -122,6 +122,7 @@ def build_pcp_streaming_callable(
     donate_argnums: Sequence[int] | None,
     mesh: jax.sharding.Mesh,
     input_partition_specs: Sequence[PartitionSpec],
+    output_partition_specs: Sequence[PartitionSpec] | None = None,
 ) -> "_PcpStreamingJaxCallable":
     """Build the eager JaxCallable for a PCP streaming kernel fn.
 
@@ -133,8 +134,9 @@ def build_pcp_streaming_callable(
     pallas_impl._verify_signature(signature)
     static_argnums = pallas_impl._infer_static_argnums(signature)
     donate_argnums_tuple = tuple(donate_argnums or ())
-    output_shardings = _named_shardings(
-        mesh, PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)
+    output_partition_specs_tuple = tuple(
+        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)
+    output_shardings = _named_shardings(mesh, output_partition_specs_tuple)
     jit_fn = jax.jit(fn,
                      static_argnums=static_argnums,
                      donate_argnums=donate_argnums_tuple,
@@ -148,7 +150,7 @@ def build_pcp_streaming_callable(
             "donate_argnums":
             donate_argnums_tuple,
             "output_partition_specs":
-            tuple(map(str, PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)),
+            tuple(map(str, output_partition_specs_tuple)),
         },
     )
     return _PcpStreamingJaxCallable(
@@ -169,6 +171,7 @@ def pcp_streaming_jax_op(
     donate_argnums: Sequence[int] | None,
     mesh: jax.sharding.Mesh,
     input_partition_specs: Sequence[PartitionSpec],
+    output_partition_specs: Sequence[PartitionSpec] | None = None,
 ):
     """Register a PCP streaming custom op with explicit output sharding.
 
@@ -183,6 +186,7 @@ def pcp_streaming_jax_op(
         donate_argnums=donate_argnums,
         mesh=mesh,
         input_partition_specs=input_partition_specs,
+        output_partition_specs=output_partition_specs,
     )
 
     # Kernel-iteration mode registers the op against a dispatcher indirection

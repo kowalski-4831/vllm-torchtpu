@@ -160,9 +160,10 @@ def compute_pcp_local_slot_ids_from_metadata(
         raise ValueError("pcp_size must be positive.")
     if interleave_size <= 0:
         raise ValueError("interleave_size must be positive.")
-    if page_size != interleave_size:
-        raise NotImplementedError("PCP slot id reconstruction requires "
-                                  "page_size == interleave_size.")
+    if interleave_size > page_size or page_size % interleave_size != 0:
+        raise NotImplementedError(
+            "PCP slot id reconstruction requires page_size to be divisible "
+            f"by interleave_size: {page_size=} {interleave_size=}.")
 
     kv_lens = jnp.asarray(kv_lens, dtype=jnp.int32)
     cu_q_lens = jnp.asarray(cu_q_lens, dtype=jnp.int32)
@@ -316,9 +317,13 @@ def sharded_pcp_ragged_paged_attention(
     if not update_kv_cache:
         raise NotImplementedError(
             "PCP streaming RPA requires update_kv_cache=True.")
-    if cp_kv_cache_interleave_size != kv_cache.shape[1]:
-        raise NotImplementedError("PCP streaming RPA currently requires "
-                                  "cp_kv_cache_interleave_size == page_size.")
+    if (cp_kv_cache_interleave_size > kv_cache.shape[1]
+            or kv_cache.shape[1] % cp_kv_cache_interleave_size != 0):
+        raise NotImplementedError(
+            "PCP streaming RPA requires page_size to be divisible by "
+            "cp_kv_cache_interleave_size: "
+            f"page_size={kv_cache.shape[1]} "
+            f"{cp_kv_cache_interleave_size=}.")
     if q.shape[0] % pcp_size != 0:
         raise ValueError("PCP streaming RPA requires q tokens to be evenly "
                          f"sharded across PCP ranks: {q.shape[0]=} "
@@ -410,6 +415,9 @@ def sharded_pcp_ragged_paged_attention(
             pcp_axis_name=PCP_AXIS_NAME,
         )
         output = output[:, :, :q_per_kv, :]
+        valid_output_rows = (slot_ids >= 0).reshape((slot_ids.shape[0], ) +
+                                                    (1, ) * (output.ndim - 1))
+        output = jnp.where(valid_output_rows, output, jnp.zeros_like(output))
         output = output.reshape(q_local.shape)
         return output, kv_cache
 

@@ -25,12 +25,15 @@ class KVParallelLayout:
     full_attn_tp_size: int
     linear_attn_pcp_size: int
     linear_attn_tp_size: int
+    cp_kv_cache_interleave_size: int = 1
 
     def __post_init__(self) -> None:
         check_positive("full_attn_pcp_size", self.full_attn_pcp_size)
         check_positive("full_attn_tp_size", self.full_attn_tp_size)
         check_positive("linear_attn_pcp_size", self.linear_attn_pcp_size)
         check_positive("linear_attn_tp_size", self.linear_attn_tp_size)
+        check_positive("cp_kv_cache_interleave_size",
+                       self.cp_kv_cache_interleave_size)
         check_power_of_two("full_attn", self.full_attn_tp_size)
         check_power_of_two("linear_attn", self.linear_attn_tp_size)
 
@@ -58,6 +61,7 @@ class KVParallelLayout:
             "full_attn_tp_size": self.full_attn_tp_size,
             "linear_attn_pcp_size": self.linear_attn_pcp_size,
             "linear_attn_tp_size": self.linear_attn_tp_size,
+            "cp_kv_cache_interleave_size": self.cp_kv_cache_interleave_size,
         }
 
     @classmethod
@@ -67,6 +71,8 @@ class KVParallelLayout:
             full_attn_tp_size=int(data["full_attn_tp_size"]),
             linear_attn_pcp_size=int(data["linear_attn_pcp_size"]),
             linear_attn_tp_size=int(data["linear_attn_tp_size"]),
+            cp_kv_cache_interleave_size=int(
+                data.get("cp_kv_cache_interleave_size", 1)),
         )
 
 

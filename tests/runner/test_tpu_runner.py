@@ -1329,6 +1329,37 @@ class TestAttentionMetadataBuilder:
         assert torch.equal(meta.mamba_state_indices,
                            torch.tensor([0, 6, 0, 0], dtype=torch.int32))
 
+    def test_unified_mamba_state_indices_use_cp_adjusted_block_size(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_block_pool = True
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(2, 8)],
+            dtypes=[torch.bfloat16],
+            page_size_padded=256,
+        )
+        with patch(
+                "vllm_torchtpu.layers.common.attention_metadata."
+                "get_total_cp_world_size",
+                return_value=4):
+            builder = self._make_builder(runner, spec=mamba_spec)
+
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([64, 65, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert builder.target_block_size == 64
+        assert torch.equal(meta.mamba_state_indices,
+                           torch.tensor([0, 5, 0, 0], dtype=torch.int32))
+
 
 class TestCompactMambaSlotPool:
     """Unit tests for the compact-mamba recurrent-slot allocator

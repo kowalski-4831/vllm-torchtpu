@@ -213,12 +213,13 @@ def layout(mod: Any, tp_size: int, pcp_size: int = 1):
     )
 
 
-def fa_pcp_source_layout(mod: Any, pcp_size: int):
+def fa_pcp_source_layout(mod: Any, pcp_size: int, interleave_size: int = 1):
     return mod.KVParallelLayout(
         full_attn_pcp_size=pcp_size,
-        full_attn_tp_size=pcp_size,
+        full_attn_tp_size=1,
         linear_attn_pcp_size=1,
         linear_attn_tp_size=1,
+        cp_kv_cache_interleave_size=interleave_size,
     )
 
 
@@ -396,6 +397,8 @@ def build_block_size_case(
 def build_fa_pcp_case(
         mod: Any,
         *,
+        source_block_size: int = 2,
+        interleave_size: int | None = None,
         destination_tp_size: int = 2,
         destination_tp_rank: int = 1,
         destination_block_size: int = 4,
@@ -403,7 +406,6 @@ def build_fa_pcp_case(
 ):
     layer_name = "model.layers.0.self_attn"
     source_pcp_size = 4
-    source_block_size = 2
     live_head_bytes = 10
     total_num_kv_heads = 2
     destination_num_heads = total_num_kv_heads // destination_tp_size
@@ -448,7 +450,12 @@ def build_fa_pcp_case(
     metadata = mod.ConnectorMetadataV2(
         req_id=3,
         block_size=source_block_size,
-        kv_source_layout=fa_pcp_source_layout(mod, pcp_size=source_pcp_size),
+        kv_source_layout=fa_pcp_source_layout(
+            mod,
+            pcp_size=source_pcp_size,
+            interleave_size=(source_block_size
+                             if interleave_size is None else interleave_size),
+        ),
         kv_caches=source_regions_by_rank,
         fa_block_ids=(100, 101),
         mamba_block_ids=(),

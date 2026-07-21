@@ -38,10 +38,10 @@ class PcpReshardingPolicy:
     ) -> None:
         if source_layout.linear_attn_pcp_size != 1:
             raise ValueError("linear attention PCP is not supported")
-        if PcpReshardingPolicy.is_enabled(source_layout):
-            if source_layout.full_attn_pcp_size != source_layout.full_attn_tp_size:
-                raise ValueError("source full attention PCP requires "
-                                 "full_attn_pcp_size == full_attn_tp_size")
+        if (PcpReshardingPolicy.is_enabled(source_layout)
+                and source_layout.full_attn_tp_size != 1):
+            raise ValueError(
+                "source full attention PCP requires full_attn_tp_size == 1")
         if (destination_layout.full_attn_pcp_size != 1
                 or destination_layout.linear_attn_pcp_size != 1):
             raise ValueError("decode-side PCP layout is not supported")
@@ -127,38 +127,72 @@ class PcpReshardingPolicy:
         token_transfers: list[PcpTokenTransfer] = []
         source_block_size = source_region.lowering_units_per_block
         destination_block_size = destination_region.lowering_units_per_block
+        interleave_size = (
+            metadata.kv_source_layout.cp_kv_cache_interleave_size)
+        if (interleave_size > source_block_size
+                or source_block_size % interleave_size != 0):
+            raise ValueError(
+                "PCP source block_size must be divisible by interleave_size: "
+                f"{source_block_size=} {interleave_size=}")
         source_token_offset = metadata.fa_token_offset
         destination_token_offset = destination.fa_token_offset
         source_window_start = source_token_offset
         source_window_end = source_token_offset + source_num_tokens
+        pcp_size = metadata.kv_source_layout.full_attn_pcp_size
+        source_capacity = (len(metadata.fa_block_ids) * source_block_size *
+                           pcp_size)
+        if source_window_end > source_capacity:
+            raise ValueError("source block ids do not cover num_tokens")
+
+        chunks_per_source_block = source_block_size // interleave_size
         for block_ref in pull_meta.fa_block_refs_by_rank.get(p_rank, ()):
-            block_start = block_ref.logical_block_index * source_block_size
-            block_end = block_start + source_block_size
-            logical_token_start = max(block_start, source_window_start)
-            logical_token_end = min(block_end, source_window_end)
-            if logical_token_start >= logical_token_end:
-                continue
+            if block_ref.logical_block_index % pcp_size != p_rank:
+                raise ValueError("PCP block ref rank does not match p_rank")
+            source_block_index = (block_ref.logical_block_index // pcp_size)
+            for source_chunk_index in range(chunks_per_source_block):
+                local_chunk_index = (
+                    source_block_index * chunks_per_source_block +
+                    source_chunk_index)
+                global_chunk_index = local_chunk_index * pcp_size + p_rank
+                global_chunk_start = global_chunk_index * interleave_size
+                if global_chunk_start >= source_window_end:
+                    return tuple(token_transfers)
+                global_chunk_end = global_chunk_start + interleave_size
+                logical_token_start = max(global_chunk_start,
+                                          source_window_start)
+                logical_token_end = min(global_chunk_end, source_window_end)
+                if logical_token_start >= logical_token_end:
+                    continue
 
-            destination_logical_token = (
-                destination_token_offset +
-                (logical_token_start - source_token_offset))
-            destination_block_index = (destination_logical_token //
-                                       destination_block_size)
-            if destination_block_index >= len(destination.fa_block_ids):
-                raise ValueError(
-                    "destination block ids do not cover num_tokens")
-            destination_token = (destination_logical_token %
-                                 destination_block_size)
-            destination_block = destination.fa_block_ids[
-                destination_block_index]
-
-            token_transfers.append(
-                PcpTokenTransfer(
-                    source_block=block_ref.block_id,
-                    source_token=logical_token_start - block_start,
-                    destination_block=destination_block,
-                    destination_token=destination_token,
-                    num_tokens=logical_token_end - logical_token_start,
-                ))
+                transfer_cursor = logical_token_start
+                while transfer_cursor < logical_token_end:
+                    destination_logical_token = (
+                        destination_token_offset +
+                        (transfer_cursor - source_token_offset))
+                    destination_block_index = (destination_logical_token //
+                                               destination_block_size)
+                    if destination_block_index >= len(
+                            destination.fa_block_ids):
+                        raise ValueError(
+                            "destination block ids do not cover num_tokens")
+                    destination_token = (destination_logical_token %
+                                         destination_block_size)
+                    destination_block = destination.fa_block_ids[
+                        destination_block_index]
+                    num_tokens = min(
+                        logical_token_end - transfer_cursor,
+                        destination_block_size - destination_token,
+                    )
+                    source_token = (source_chunk_index * interleave_size +
+                                    transfer_cursor - global_chunk_start)
+                    token_transfers.append(
+                        PcpTokenTransfer(
+                            source_block=block_ref.block_id,
+                            source_token=source_token,
+                            destination_block=destination_block,
+                            destination_token=destination_token,
+                            num_tokens=num_tokens,
+                        ))
+                    transfer_cursor += num_tokens
 
         return tuple(token_transfers)

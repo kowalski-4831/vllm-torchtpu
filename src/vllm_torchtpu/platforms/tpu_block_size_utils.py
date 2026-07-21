@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -141,11 +142,40 @@ def _hybrid_mamba_page_size_bytes(vllm_config: VllmConfig) -> int | None:
         model_config.architecture,
         model_config=model_config,
     )
-    return MambaSpec(
-        shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
-        dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+    dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+    full_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
+    parallel_config = vllm_config.parallel_config
+    pcp_size = int(
+        getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    if pcp_size > 1:
+        # PCP-local GDN state is equivalent to adding PCP to the model's
+        # head-sharding factor. Shape calculators used here must therefore
+        # derive their sharded state dimensions from tensor_parallel_size.
+        shape_config = copy.deepcopy(vllm_config)
+        shape_config.parallel_config.tensor_parallel_size *= pcp_size
+        shapes = model_cls.get_mamba_state_shape_from_config(shape_config)
+    else:
+        shapes = full_shapes
+    page_size_bytes = MambaSpec(
+        shapes=shapes,
+        dtypes=dtypes,
         block_size=-1,
     ).page_size_bytes
+    if pcp_size > 1:
+        full_page_size_bytes = MambaSpec(
+            shapes=full_shapes,
+            dtypes=dtypes,
+            block_size=-1,
+        ).page_size_bytes
+        if page_size_bytes * pcp_size != full_page_size_bytes:
+            raise ValueError(
+                "PCP-local Mamba state size must be exactly 1/pcp_size of "
+                "the TP-local state: "
+                f"architecture={model_config.architecture!r}, "
+                f"pcp_size={pcp_size}, full_page_size_bytes="
+                f"{full_page_size_bytes}, local_page_size_bytes="
+                f"{page_size_bytes}")
+    return page_size_bytes
 
 
 def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
