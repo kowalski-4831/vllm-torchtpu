@@ -55,6 +55,7 @@ def vllm_config():
     vllm_config.cache_config.mamba_page_size_padded = None
     vllm_config.cache_config.mamba_block_size = None
     vllm_config.cache_config.cache_dtype = "auto"
+    vllm_config.kv_transfer_config = None
     vllm_config.parallel_config = MagicMock()
     vllm_config.parallel_config.tensor_parallel_size = 1
     return vllm_config
@@ -167,6 +168,34 @@ def test_user_block_size_at_or_above_fit_is_honored(vllm_config):
     # kernel block: 2304.
     assert vllm_config.cache_config.block_size == 2304
     assert vllm_config.cache_config.mamba_block_size == 2304
+    logs = _format_logs(mock_logger_info)
+    assert "(source=user_block_size)" in logs
+
+
+def test_user_block_size_below_fit_honored_for_kv_transfer(vllm_config):
+    # With kv_transfer configured the unified block pool never engages, so
+    # mamba state is not served from attention-shaped slots and the fit
+    # size stops being a floor: the reshard decode geometry (1024-token
+    # pages, fit 1056) relies on the explicit user block size winning.
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = (
+        "Qwen3_5MoeForConditionalGeneration")
+    vllm_config.kv_transfer_config = object()
+    vllm_config.cache_config.block_size = 1024
+    vllm_config.cache_config.user_specified_block_size = True
+    vllm_config.cache_config.mamba_block_size = 1024
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.cache_config.cache_dtype = "fp8"
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeQwenMambaModel, None)), patch(
+                   "vllm_torchtpu.platforms.tpu_block_size_utils.logger.info"
+               ) as mock_logger_info:
+        update_tpu_block_size_and_slot_config(vllm_config,
+                                              FakeBatchedRPAAttentionBackend)
+
+    assert vllm_config.cache_config.block_size == 1024
+    assert vllm_config.cache_config.mamba_block_size == 1024
     logs = _format_logs(mock_logger_info)
     assert "(source=user_block_size)" in logs
 

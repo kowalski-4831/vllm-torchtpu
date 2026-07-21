@@ -33,6 +33,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
+from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -78,6 +79,95 @@ def test_async_sub_indices_skips_new_req():
     cur, src = _sub_indices({"r1": 0}, ["r0", "r1"], [3, 4], spec_k=3)
     assert cur == [3, 4, 5, 6]
     assert src == [0, 1, 2, 3]
+
+
+def test_get_finished_kv_transfers_drains_invalid_block_ids():
+    connector = MagicMock()
+    connector.get_finished.return_value = ({"sent"}, {"loaded"})
+    connector.get_block_ids_with_load_errors.return_value = {41, 43}
+    connector.get_block_ids_with_load_errors_group_index.return_value = 2
+    connector.build_connector_worker_meta.return_value = {"jobs": []}
+    runner = SimpleNamespace()
+    scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
+
+    with patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
+               return_value=True), patch(
+                   "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+                   return_value=connector):
+        result = TPUModelRunner.get_finished_kv_transfers(
+            runner, scheduler_output)
+
+    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2)
+    connector.get_finished.assert_called_once_with({"finished"})
+    connector.get_block_ids_with_load_errors.assert_called_once_with()
+    connector.get_block_ids_with_load_errors_group_index.assert_called_once_with(
+    )
+    connector.clear_connector_metadata.assert_called_once_with()
+
+
+def test_no_forward_output_preserves_invalid_block_ids():
+    runner = SimpleNamespace(
+        maybe_setup_kv_connector=MagicMock(),
+        get_finished_kv_transfers=MagicMock(return_value=(set(),
+                                                          {"failed-load"},
+                                                          None, {41, 43}, 2)),
+    )
+    scheduler_output = SimpleNamespace()
+    vllm_config = SimpleNamespace()
+
+    with patch(
+            "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+            return_value=False):
+        if not tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
+            with pytest.raises(RuntimeError,
+                               match="cache-group-scoped KV load failure"):
+                TPUModelRunner.kv_connector_no_forward(runner,
+                                                       scheduler_output,
+                                                       vllm_config)
+            return
+        output = TPUModelRunner.kv_connector_no_forward(
+            runner, scheduler_output, vllm_config)
+
+    assert output.kv_connector_output.finished_recving == {"failed-load"}
+    assert output.kv_connector_output.invalid_block_ids == {41, 43}
+    assert output.kv_connector_output.invalid_block_group_index == 2
+
+
+def test_build_kv_connector_output_supports_vllm_023():
+    with patch.object(
+            tpu_runner,
+            "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
+            False,
+    ), patch.object(tpu_runner, "KVConnectorOutput") as output_cls:
+        tpu_runner._build_kv_connector_output(
+            finished_sending={"sent"},
+            finished_recving=None,
+            kv_connector_worker_meta=None,
+            invalid_block_ids=set(),
+            invalid_block_group_index=None,
+        )
+
+    output_cls.assert_called_once_with(
+        finished_sending={"sent"},
+        finished_recving=None,
+        kv_connector_worker_meta=None,
+        invalid_block_ids=set(),
+    )
+
+
+def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
+    with patch.object(
+            tpu_runner,
+            "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
+            False,
+    ), pytest.raises(RuntimeError, match="cache-group-scoped KV load failure"):
+        tpu_runner._build_kv_connector_output(
+            finished_sending=None,
+            finished_recving={"failed-load"},
+            kv_connector_worker_meta=None,
+            invalid_block_ids={41, 43},
+            invalid_block_group_index=2,
+        )
 
 
 class DummyMamba(MambaBase):
