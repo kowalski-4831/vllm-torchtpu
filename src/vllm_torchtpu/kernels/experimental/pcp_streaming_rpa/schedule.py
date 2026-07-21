@@ -60,6 +60,62 @@ def _cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _validate_page_interleave_size(page_size: int, interleave_size: int,
+                                   context: str) -> None:
+    if interleave_size <= 0:
+        raise ValueError("interleave_size must be positive.")
+    if interleave_size > page_size or page_size % interleave_size != 0:
+        raise NotImplementedError(
+            f"{context} requires page_size to be divisible by "
+            f"interleave_size, got {page_size=} {interleave_size=}.")
+
+
+def _pcp_kv_steps_for_token_count(token_count: int, *, page_size: int,
+                                  pcp_size: int, interleave_size: int) -> int:
+    if token_count <= 0:
+        return 0
+    last_pos = token_count - 1
+    virtual_page_size = page_size * pcp_size
+    full_virtual_pages = last_pos // virtual_page_size
+    rem = last_pos - full_virtual_pages * virtual_page_size
+    ranks_in_last_page = min(pcp_size, rem // interleave_size + 1)
+    return full_virtual_pages * pcp_size + ranks_in_last_page
+
+
+def _pcp_kv_steps_for_last_pos(last_pos: int, *, page_size: int, pcp_size: int,
+                               interleave_size: int) -> int:
+    return _pcp_kv_steps_for_token_count(last_pos + 1,
+                                         page_size=page_size,
+                                         pcp_size=pcp_size,
+                                         interleave_size=interleave_size)
+
+
+def _pcp_local_page_global_start(local_page_idx: int, src_rank: int, *,
+                                 page_size: int, pcp_size: int,
+                                 interleave_size: int) -> int:
+    return (local_page_idx * pcp_size * page_size + src_rank * interleave_size)
+
+
+def _pcp_local_page_valid_len(kv_len: int, local_page_idx: int, src_rank: int,
+                              *, page_size: int, pcp_size: int,
+                              interleave_size: int) -> int:
+    base = _pcp_local_page_global_start(local_page_idx,
+                                        src_rank,
+                                        page_size=page_size,
+                                        pcp_size=pcp_size,
+                                        interleave_size=interleave_size)
+    if kv_len <= base:
+        return 0
+    delta = kv_len - base
+    cycle = pcp_size * interleave_size
+    chunks_per_page = page_size // interleave_size
+    full_chunks = min(chunks_per_page, delta // cycle)
+    if full_chunks >= chunks_per_page:
+        return page_size
+    partial = min(interleave_size, max(delta - full_chunks * cycle, 0))
+    return full_chunks * interleave_size + partial
+
+
 def _q_global_last_for_strided_tile(q_global_start: int, q_tile_len: int, *,
                                     pcp_size: int,
                                     interleave_size: int) -> int:
@@ -233,7 +289,7 @@ def generate_pcp_streaming_schedule_from_metadata_host(
 
     This runtime helper is intentionally narrow for the metadata-driven path:
     active query spans packed from index 0, one lane, one KV page per ring step
-    for multi-request chunks, and page_size == interleave_size. The static
+    for multi-request chunks, and page_size divisible by interleave_size. The static
     schedule shape is padded from the compile bucket size, not the live query
     length. It converts inputs to NumPy and is not safe for JAX tracers.
     """
@@ -395,7 +451,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     shapes remain static from the compile bucket. The current schedule covers
     KV pages that overlap the active query cycle; the history schedule covers
     earlier KV pages. Callers must keep the narrow metadata path constraints:
-    num_lanes=1, kv_pages_per_block=1, and page_size==interleave_size.
+    num_lanes=1, kv_pages_per_block=1, and page_size divisible by
+    interleave_size.
     """
     import jax.numpy as jnp
 
@@ -416,10 +473,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         raise NotImplementedError(
             "PCP streaming JAX metadata schedule only supports "
             "kv_pages_per_block == 1.")
-    if page_size != interleave_size:
-        raise NotImplementedError(
-            "PCP streaming JAX metadata schedule requires "
-            "page_size == interleave_size.")
+    _validate_page_interleave_size(page_size, interleave_size,
+                                   "PCP streaming JAX metadata schedule")
     if q_block_size % interleave_size != 0:
         raise NotImplementedError(
             "PCP streaming JAX metadata schedule requires q_block_size to be "
@@ -472,8 +527,39 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     pcp_size_i32 = jnp.asarray(pcp_size, dtype=jnp.int32)
     interleave_size_i32 = jnp.asarray(interleave_size, dtype=jnp.int32)
     cycle_i32 = pcp_size_i32 * interleave_size_i32
+    virtual_page_size_i32 = page_size_i32 * pcp_size_i32
+    chunks_per_page_i32 = page_size_i32 // interleave_size_i32
     group_chunks = max(1, q_block_size // interleave_size)
     group_chunks_i32 = jnp.asarray(group_chunks, dtype=jnp.int32)
+
+    def _kv_steps_for_token_count(token_count):
+        last_pos = token_count - 1
+        full_virtual_pages = last_pos // virtual_page_size_i32
+        rem = last_pos - full_virtual_pages * virtual_page_size_i32
+        ranks_in_last_page = jnp.minimum(pcp_size_i32,
+                                         rem // interleave_size_i32 + 1)
+        return jnp.where(
+            token_count > 0,
+            full_virtual_pages * pcp_size_i32 + ranks_in_last_page, 0)
+
+    def _local_page_global_start(local_page_idx, src_rank):
+        return (local_page_idx * virtual_page_size_i32 +
+                src_rank * interleave_size_i32)
+
+    def _local_page_valid_len(kv_len, local_page_idx, src_rank):
+        base = _local_page_global_start(local_page_idx, src_rank)
+        delta = kv_len - base
+        full_chunks = jnp.minimum(
+            chunks_per_page_i32,
+            jnp.maximum(delta, 0) // cycle_i32,
+        )
+        partial = jnp.minimum(
+            interleave_size_i32,
+            jnp.maximum(delta - full_chunks * cycle_i32, 0),
+        )
+        valid_len = full_chunks * interleave_size_i32 + jnp.where(
+            full_chunks < chunks_per_page_i32, partial, 0)
+        return jnp.where(kv_len > base, valid_len, 0)
 
     def _rank_request_layout(q_len, q_global_base, consumer_rank: int):
         rank_chunk_offset = jnp.asarray(consumer_rank * interleave_size,
@@ -631,7 +717,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         q_len = jnp.where(req_active, q_len_raw, 0)
         kv_len = jnp.where(req_active, kv_lens[req_idx], 0)
         q_global_base = kv_len - q_len
-        num_kv_pages = (kv_len + page_size_i32 - 1) // page_size_i32
+        num_kv_pages = _kv_steps_for_token_count(kv_len)
 
         for tile_idx in range(max_q_tiles):
             q_global_starts = []
@@ -657,7 +743,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
                     pcp_size_i32 * interleave_size_i32 +
                     ((q_tile_size_for_last - 1) % interleave_size_i32))
                 effective_kv_pages = jnp.minimum(
-                    num_kv_pages, q_global_last // page_size_i32 + 1)
+                    num_kv_pages, _kv_steps_for_token_count(q_global_last + 1))
                 effective_kv_pages = jnp.where(
                     jnp.logical_and(req_active, q_tile_size > 0),
                     effective_kv_pages,
@@ -730,8 +816,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
             step_has_tile_2d,
             global_page[:, None] < plan_effective_by_rank,
         )
-        page_valid_len = jnp.minimum(page_size_i32,
-                                     plan_kv_len - global_page * page_size_i32)
+        page_valid_len = _local_page_valid_len(plan_kv_len, local_page_idx,
+                                               src_rank)
         kv_valid_len = jnp.where(valid_page,
                                  jnp.maximum(page_valid_len[:, None], 0), 0)
         is_first = jnp.logical_and(valid_page, step_offset[:, None] == 0)
@@ -741,7 +827,8 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         )
         q_global_start = plan_q_global_start
         kv_global_start = jnp.broadcast_to(
-            global_page[:, None] * page_size_i32, (max_steps, pcp_size))
+            _local_page_global_start(local_page_idx, src_rank)[:, None],
+            (max_steps, pcp_size))
         q_hbm_offset = plan_q_hbm_offset
         q_tile_size = plan_q_size
 
@@ -840,11 +927,8 @@ def _validate_inputs(
             "kv_pages_per_block exceeds packed schedule capacity: "
             f"{kv_pages_per_block} > "
             f"{ScheduleField.MAX_KV_PAGES_PER_BLOCK}.")
-    if page_size != interleave_size:
-        raise NotImplementedError(
-            "PCP streaming schedule currently requires "
-            f"page_size == interleave_size, got {page_size} != "
-            f"{interleave_size}.")
+    _validate_page_interleave_size(page_size, interleave_size,
+                                   "PCP streaming schedule")
     if cu_q_lens.ndim != 1 or cu_q_lens.size == 0:
         raise ValueError("cu_q_lens must be a non-empty 1D array.")
     if block_tables.ndim != 2:
@@ -979,11 +1063,8 @@ def _single_aligned_request_params(
     if not pad_kv_pages_to_pcp_group:
         raise NotImplementedError("PCP streaming vectorized schedule requires "
                                   "pad_kv_pages_to_pcp_group=True.")
-    if page_size != interleave_size:
-        raise NotImplementedError(
-            "PCP streaming vectorized schedule requires "
-            f"page_size == interleave_size, got {page_size} != "
-            f"{interleave_size}.")
+    _validate_page_interleave_size(page_size, interleave_size,
+                                   "PCP streaming vectorized schedule")
     if bq_sz % interleave_size != 0:
         raise NotImplementedError(
             "PCP streaming vectorized schedule requires bq_sz to be a "
@@ -1122,6 +1203,7 @@ def _fill_pcp_streaming_schedule_rows_vectorized(
     block_tables: np.ndarray,
     page_size: int,
     pcp_size: int,
+    interleave_size: int,
     kv_pages_per_block: int,
 ) -> None:
     if num_steps <= 0:
@@ -1130,7 +1212,6 @@ def _fill_pcp_streaming_schedule_rows_vectorized(
     kv_page_seq_idx = np.arange(num_steps, dtype=np.int32)
     src_rank = kv_page_seq_idx % pcp_size
     local_page_start = (kv_page_seq_idx // pcp_size) * kv_pages_per_block
-    global_page = local_page_start * pcp_size + src_rank
 
     page_offsets = np.arange(kv_pages_per_block, dtype=np.int32)
     page_global = (
@@ -1145,9 +1226,19 @@ def _fill_pcp_streaming_schedule_rows_vectorized(
     page_indices = np.where(valid_pages, block_tables[req_id, safe_page_idx],
                             0).astype(np.int32)
 
-    page_valid = np.minimum(page_size, kv_len - page_global * page_size)
-    kv_valid_len = np.where(valid_pages, np.maximum(page_valid, 0),
-                            0).sum(axis=1).astype(np.int32)
+    page_valid = np.zeros_like(page_global, dtype=np.int32)
+    for page_offset in range(kv_pages_per_block):
+        for row_idx in range(num_steps):
+            if valid_pages[row_idx, page_offset]:
+                page_valid[row_idx, page_offset] = (_pcp_local_page_valid_len(
+                    kv_len,
+                    int(local_page_idx[row_idx, page_offset]),
+                    int(src_rank[row_idx]),
+                    page_size=page_size,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                ))
+    kv_valid_len = page_valid.sum(axis=1).astype(np.int32)
 
     rows = packed_schedule[start_step:start_step + num_steps, consumer_rank,
                            lane, :]
@@ -1169,7 +1260,15 @@ def _fill_pcp_streaming_schedule_rows_vectorized(
     rows[:, ScheduleField.IS_LAST_KV] = is_last.astype(np.int32)
     rows[:, ScheduleField.LOAD_Q] = is_first.astype(np.int32)
     rows[:, ScheduleField.Q_GLOBAL_START] = q_global_start
-    rows[:, ScheduleField.KV_GLOBAL_START] = global_page * page_size
+    rows[:, ScheduleField.KV_GLOBAL_START] = [
+        _pcp_local_page_global_start(
+            int(local_page_start[i]),
+            int(src_rank[i]),
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+        ) for i in range(num_steps)
+    ]
     rows[:, ScheduleField.KV_VALID_LEN] = kv_valid_len
     rows[:, ScheduleField.Q_HBM_OFFSET] = q_hbm_offset
     rows[:, ScheduleField.Q_TILE_SIZE] = q_tile_size
@@ -1231,7 +1330,12 @@ def _generate_pcp_streaming_schedule_single_aligned(
     )
 
     kv_len = int(kv_lens[0])
-    num_kv_pages = _cdiv(kv_len, page_size)
+    num_kv_pages = _pcp_kv_steps_for_token_count(
+        kv_len,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
     actual_steps = np.zeros(pcp_size, dtype=np.int32)
     tile_plans: list[list[tuple[int, int, int, int, int, int]]] = []
     actual_max_steps = 0
@@ -1251,8 +1355,15 @@ def _generate_pcp_streaming_schedule_single_aligned(
                 q_tile_size,
                 pcp_size=pcp_size,
                 interleave_size=interleave_size)
-            effective_kv_pages = min(num_kv_pages,
-                                     q_global_last // page_size + 1)
+            effective_kv_pages = min(
+                num_kv_pages,
+                _pcp_kv_steps_for_last_pos(
+                    q_global_last,
+                    page_size=page_size,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                ),
+            )
             if kv_pages_per_block == 1:
                 scheduled_steps = effective_kv_pages
                 if pad_kv_pages_to_pcp_group:
@@ -1305,6 +1416,7 @@ def _generate_pcp_streaming_schedule_single_aligned(
                 block_tables=block_tables,
                 page_size=page_size,
                 pcp_size=pcp_size,
+                interleave_size=interleave_size,
                 kv_pages_per_block=kv_pages_per_block,
             )
 
@@ -1361,11 +1473,8 @@ def _validate_lockstep_compact_requests(
         raise NotImplementedError(
             "PCP streaming lockstep schedule only supports "
             "kv_pages_per_block == 1.")
-    if page_size != interleave_size:
-        raise NotImplementedError(
-            "PCP streaming lockstep schedule requires "
-            f"page_size == interleave_size, got {page_size} != "
-            f"{interleave_size}.")
+    _validate_page_interleave_size(page_size, interleave_size,
+                                   "PCP streaming lockstep schedule")
     if bq_sz % interleave_size != 0:
         raise NotImplementedError(
             "PCP streaming lockstep schedule requires bq_sz to be a "
@@ -1385,7 +1494,15 @@ def _validate_lockstep_compact_requests(
             raise ValueError("q_start_offset must be non-negative.")
         if kv_len < q_start + q_len:
             raise ValueError("kv_lens must include all scheduled Q tokens.")
-        required_local_pages = _cdiv(_cdiv(kv_len, page_size), pcp_size)
+        required_local_pages = _cdiv(
+            _pcp_kv_steps_for_token_count(
+                kv_len,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+            ),
+            pcp_size,
+        )
         if required_local_pages > block_tables.shape[1]:
             raise ValueError("block_tables does not cover requested KV page: "
                              f"{req_idx=} {required_local_pages=} "
@@ -1444,7 +1561,12 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
         q_len = int(q_lens[req_idx])
         q_global_base = int(q_start_offsets[req_idx])
         kv_len = int(kv_lens[req_idx])
-        num_kv_pages = _cdiv(kv_len, page_size)
+        num_kv_pages = _pcp_kv_steps_for_token_count(
+            kv_len,
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+        )
 
         rank_tiles = []
         for consumer_rank in range(pcp_size):
@@ -1476,8 +1598,15 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
                         q_tile_size,
                         pcp_size=pcp_size,
                         interleave_size=interleave_size)
-                    effective_kv_pages = min(num_kv_pages,
-                                             q_global_last // page_size + 1)
+                    effective_kv_pages = min(
+                        num_kv_pages,
+                        _pcp_kv_steps_for_last_pos(
+                            q_global_last,
+                            page_size=page_size,
+                            pcp_size=pcp_size,
+                            interleave_size=interleave_size,
+                        ),
+                    )
                     q_tiles_by_rank.append(
                         (q_global_start, q_tile_size, q_hbm_offset))
                 else:
@@ -1522,7 +1651,13 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
             src_rank = step_offset % pcp_size
             global_page = step_offset
             local_page_idx = global_page // pcp_size
-            kv_global_start = global_page * page_size
+            kv_global_start = _pcp_local_page_global_start(
+                local_page_idx,
+                src_rank,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+            )
             for consumer_rank in range(pcp_size):
                 q_global_start, q_tile_size, q_hbm_offset = q_tiles_by_rank[
                     consumer_rank]
@@ -1532,8 +1667,14 @@ def _generate_pcp_streaming_schedule_lockstep_compact(
                 kv_page_idx = 0
                 if valid_page:
                     kv_page_idx = int(block_tables[req_idx, local_page_idx])
-                    kv_valid_len = max(
-                        min(page_size, kv_len - kv_global_start), 0)
+                    kv_valid_len = _pcp_local_page_valid_len(
+                        kv_len,
+                        local_page_idx,
+                        src_rank,
+                        page_size=page_size,
+                        pcp_size=pcp_size,
+                        interleave_size=interleave_size,
+                    )
 
                 row = packed_schedule[start_step + step_offset, consumer_rank,
                                       0, :]

@@ -106,6 +106,76 @@ def test_full_attention_4pcp_to_2tp_e2e_smoke():
     }
 
 
+def test_full_attention_splits_by_smaller_destination_block_size():
+    mod = utils.load_v2_module()
+    planner = mod.ContiguousHeadTPTransferPlanner()
+    metadata, topology, destination = utils.build_fa_pcp_case(
+        mod,
+        source_block_size=4,
+        interleave_size=2,
+        destination_block_size=2,
+        destination_block_ids=tuple(range(200, 216)),
+    )
+
+    pull_meta = planner.build_pull_meta(metadata, topology)
+    plans = planner.lower(metadata, topology, destination, pull_meta)
+
+    assert tuple(plans) == (0, 1, 2, 3)
+    for p_rank, plan in plans.items():
+        assert len(plan.ops) == 4
+        assert [op.num_segments for op in plan.ops] == [2, 2, 2, 2]
+        assert [(op.src_addr, op.dst_addr) for op in plan.ops] == [
+            (10_000 + p_rank * 1_000 + 100 * 80 + chunk * 40 + 10,
+             100_000 + (200 + chunk * 4 + p_rank) * 40) for chunk in range(4)
+        ]
+
+
+def test_full_attention_splits_interleave_across_destination_blocks():
+    mod = utils.load_v2_module()
+    planner = mod.ContiguousHeadTPTransferPlanner()
+    metadata, topology, destination = utils.build_fa_pcp_case(
+        mod,
+        source_block_size=4,
+        interleave_size=4,
+        destination_block_size=2,
+        destination_block_ids=tuple(range(200, 216)),
+    )
+
+    pull_meta = planner.build_pull_meta(metadata, topology)
+    plans = planner.lower(metadata, topology, destination, pull_meta)
+
+    assert tuple(plans) == (0, 1, 2, 3)
+    for p_rank, plan in plans.items():
+        assert len(plan.ops) == 4
+        assert [op.num_segments for op in plan.ops] == [2, 2, 2, 2]
+        expected_addresses = []
+        for source_block_index in range(2):
+            for half in range(2):
+                source_addr = (10_000 + p_rank * 1_000 +
+                               (100 + source_block_index) * 80 + half * 40 +
+                               10)
+                destination_block = (200 + source_block_index * 8 +
+                                     p_rank * 2 + half)
+                destination_addr = 100_000 + destination_block * 40
+                expected_addresses.append((source_addr, destination_addr))
+        assert [(op.src_addr, op.dst_addr)
+                for op in plan.ops] == expected_addresses
+
+
+def test_full_attention_rejects_non_divisible_interleave():
+    mod = utils.load_v2_module()
+    planner = mod.ContiguousHeadTPTransferPlanner()
+    metadata, topology, destination = utils.build_fa_pcp_case(
+        mod,
+        source_block_size=4,
+        interleave_size=3,
+    )
+
+    pull_meta = planner.build_pull_meta(metadata, topology)
+    with pytest.raises(ValueError, match="divisible by interleave_size"):
+        planner.lower(metadata, topology, destination, pull_meta)
+
+
 def test_full_attention_4pcp_to_2tp_offsets_external_token_window():
     mod = utils.load_v2_module()
     planner = mod.ContiguousHeadTPTransferPlanner()
@@ -191,7 +261,17 @@ def test_full_attention_4pcp_to_1tp_builds_pull_meta():
                 linear_attn_tp_size=1,
             ),
             lambda mod: utils.layout(mod, tp_size=2),
-            "source full attention PCP requires full_attn_pcp_size == full_attn_tp_size",
+            "source full attention PCP requires full_attn_tp_size == 1",
+        ),
+        (
+            lambda mod: mod.KVParallelLayout(
+                full_attn_pcp_size=4,
+                full_attn_tp_size=4,
+                linear_attn_pcp_size=1,
+                linear_attn_tp_size=1,
+            ),
+            lambda mod: utils.layout(mod, tp_size=2),
+            "source full attention PCP requires full_attn_tp_size == 1",
         ),
         (
             lambda mod: mod.KVParallelLayout(

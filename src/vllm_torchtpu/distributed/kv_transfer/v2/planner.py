@@ -159,8 +159,9 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             raise ValueError(
                 "topology.block_size must match destination.block_size, got "
                 f"{topology.block_size} and {destination.block_size}")
-        ContiguousHeadTPTransferPlanner._validate_block_size_relation(
-            metadata.block_size, destination.block_size)
+        if not PcpReshardingPolicy.is_enabled(metadata.kv_source_layout):
+            ContiguousHeadTPTransferPlanner._validate_block_size_relation(
+                metadata.block_size, destination.block_size)
 
         plans = {
             p_rank: self._lower_rank(metadata, destination, pull_meta, p_rank)
@@ -415,8 +416,6 @@ class ContiguousHeadTPTransferPlanner(TPTransferPlanner):
             destination_region = destination.kv_caches[layer_name]
             if pcp_enabled and source_region.layer_type == LayerType.FULL_ATTN:
                 self._validate_full_attention_layout_pair(
-                    source_region, destination_region)
-                self._validate_region_block_size_relation(
                     source_region, destination_region)
                 head_mappings = pull_meta.fa_head_mappings_by_rank.get(
                     p_rank, ())

@@ -269,6 +269,7 @@ def test_main_skips_concurrent_mixed_when_concurrency_is_one(monkeypatch):
         mixed_lines=72,
         mixed_rounds=1,
         concurrent_requests=1,
+        expect_pcp_source=False,
     )
 
     def fake_mixed(_url, _model, namespace, _line_count, _rounds, _max_tokens,
@@ -290,8 +291,10 @@ def test_main_skips_concurrent_mixed_when_concurrency_is_one(monkeypatch):
     monkeypatch.setattr(smoke, "run_mixed_query_correctness", fake_mixed)
     monkeypatch.setattr(smoke, "run_concurrent_mixed_query_correctness",
                         fake_concurrent)
-    monkeypatch.setattr(smoke, "check_planner_logs",
-                        lambda _run_dir, _offsets: 0)
+    monkeypatch.setattr(
+        smoke,
+        "check_planner_logs",
+        lambda _run_dir, _offsets, *, expect_pcp_source=False: 0)
 
     assert smoke.main() == 0
     assert seen["mixed"] == "p4d2-v2-correctness-1234-mixed"

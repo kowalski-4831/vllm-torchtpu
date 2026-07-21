@@ -5,6 +5,7 @@ import socket
 import sys
 import threading
 import types
+from dataclasses import replace
 
 import pytest
 
@@ -1482,6 +1483,7 @@ def test_v2_decode_worker_installs_client_engine_without_starting_server(
     handshake = worker.get_handshake_metadata()
     assert handshake is not None
     assert handshake.remote_metadata.tp_rank == 3
+    assert handshake.transfer_rank == 3
     assert handshake.remote_metadata.regions[0].region_id == (
         "model.layers.0.self_attn")
     assert handshake.fa_group_indices == (0, )
@@ -1524,6 +1526,85 @@ def _strided_port_probe_rows(workers):
         "worker_id": worker._local_worker_id(),
         "listen_port": worker._strided_listen_port(),
     } for worker in workers)
+
+
+def test_v2_pcp_source_layout_includes_interleave_size(monkeypatch):
+    mod = _load_v2_module(monkeypatch)
+    worker = _strided_port_probe_worker(mod,
+                                        dp_rank=0,
+                                        tp_rank=0,
+                                        tp_size=1,
+                                        pcp_rank=0,
+                                        pcp_size=4,
+                                        kv_transfer_port=9100,
+                                        host_ip=_local_test_host())
+    worker.vllm_config.parallel_config.cp_kv_cache_interleave_size = 256
+    worker.vllm_config.model_config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(text_config=types.SimpleNamespace(
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+        )))
+
+    layout = worker._local_kv_source_layout()
+
+    assert layout.full_attn_pcp_size == 4
+    assert layout.full_attn_tp_size == 1
+    assert layout.linear_attn_pcp_size == 1
+    assert layout.linear_attn_tp_size == 4
+    assert layout.cp_kv_cache_interleave_size == 256
+
+
+def test_v2_pcp_source_layout_rejects_mixed_tp(monkeypatch):
+    mod = _load_v2_module(monkeypatch)
+    worker = _strided_port_probe_worker(mod,
+                                        dp_rank=0,
+                                        tp_rank=0,
+                                        tp_size=2,
+                                        pcp_rank=0,
+                                        pcp_size=2,
+                                        kv_transfer_port=9100,
+                                        host_ip=_local_test_host())
+
+    with pytest.raises(
+            ValueError,
+            match="source full attention PCP requires full_attn_tp_size == 1"):
+        worker._local_kv_source_layout()
+
+
+@pytest.mark.parametrize(
+    ("pcp_rank", "expected_key_heads", "expected_value_heads"),
+    (
+        (0, (0, 1, 2, 3), tuple(range(0, 8))),
+        (1, (4, 5, 6, 7), tuple(range(8, 16))),
+        (2, (8, 9, 10, 11), tuple(range(16, 24))),
+        (3, (12, 13, 14, 15), tuple(range(24, 32))),
+    ),
+)
+def test_v2_pcp_source_uses_effective_linear_head_ranges(
+        monkeypatch, pcp_rank, expected_key_heads, expected_value_heads):
+    mod = _load_v2_module(monkeypatch)
+    worker = _strided_port_probe_worker(mod,
+                                        dp_rank=0,
+                                        tp_rank=0,
+                                        tp_size=1,
+                                        pcp_rank=pcp_rank,
+                                        pcp_size=4,
+                                        kv_transfer_port=9100,
+                                        host_ip=_local_test_host())
+    worker.vllm_config.model_config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(text_config=types.SimpleNamespace(
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+        )))
+
+    assert worker._local_mamba_keyhead_range() == expected_key_heads
+    assert worker._local_mamba_valuehead_range() == expected_value_heads
 
 
 def test_v2_strided_listen_ports_are_unique_for_tp4_without_pcp(monkeypatch):
@@ -1587,6 +1668,56 @@ def test_v2_strided_listen_ports_are_unique_for_pcp4_tp1(monkeypatch):
         "dp0-pcp2-tp0",
         "dp0-pcp3-tp0",
     ], detail
+
+
+def test_v2_pcp_producer_metadata_uses_global_token_capacity(monkeypatch):
+    mod = _load_v2_module(monkeypatch)
+    scheduler = mod.TPUConnectorV2Scheduler(
+        types.SimpleNamespace(
+            kv_transfer_config=types.SimpleNamespace(is_kv_producer=True),
+            cache_config=types.SimpleNamespace(block_size=4),
+            parallel_config=types.SimpleNamespace(tensor_parallel_size=1,
+                                                  data_parallel_rank=0),
+        ))
+    source_layout = mod.KVParallelLayout(
+        full_attn_pcp_size=4,
+        full_attn_tp_size=1,
+        linear_attn_pcp_size=1,
+        linear_attn_tp_size=1,
+    )
+    scheduler.set_xfer_handshake_metadata({
+        rank:
+        replace(_single_layer_handshake(mod, tp_rank=rank),
+                kv_source_layout=source_layout)
+        for rank in range(4)
+    })
+
+    metadata = scheduler._producer_source_metadata(((7, ), ), {"uuid": 123})
+
+    assert metadata.fa_num_tokens == 16
+    assert metadata.kv_source_layout == source_layout
+    assert set(metadata.kv_caches) == {0, 1, 2, 3}
+
+
+def test_v2_pcp_external_tokens_use_global_token_capacity(monkeypatch):
+    mod = _load_v2_module(monkeypatch)
+    source_metadata = replace(
+        _single_layer_source_metadata(mod),
+        kv_source_layout=mod.KVParallelLayout(
+            full_attn_pcp_size=4,
+            full_attn_tp_size=1,
+            linear_attn_pcp_size=1,
+            linear_attn_tp_size=1,
+        ),
+        fa_num_tokens=16,
+    )
+
+    clipped = mod.TPUConnectorV2Scheduler._source_metadata_for_external_tokens(
+        source_metadata,
+        num_external_tokens=12,
+    )
+
+    assert clipped.fa_num_tokens == 12
 
 
 def _single_layer_source_metadata(mod):

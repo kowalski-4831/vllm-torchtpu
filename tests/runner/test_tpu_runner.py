@@ -33,6 +33,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
+from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -80,6 +81,95 @@ def test_async_sub_indices_skips_new_req():
     assert src == [0, 1, 2, 3]
 
 
+def test_get_finished_kv_transfers_drains_invalid_block_ids():
+    connector = MagicMock()
+    connector.get_finished.return_value = ({"sent"}, {"loaded"})
+    connector.get_block_ids_with_load_errors.return_value = {41, 43}
+    connector.get_block_ids_with_load_errors_group_index.return_value = 2
+    connector.build_connector_worker_meta.return_value = {"jobs": []}
+    runner = SimpleNamespace()
+    scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
+
+    with patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
+               return_value=True), patch(
+                   "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+                   return_value=connector):
+        result = TPUModelRunner.get_finished_kv_transfers(
+            runner, scheduler_output)
+
+    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2)
+    connector.get_finished.assert_called_once_with({"finished"})
+    connector.get_block_ids_with_load_errors.assert_called_once_with()
+    connector.get_block_ids_with_load_errors_group_index.assert_called_once_with(
+    )
+    connector.clear_connector_metadata.assert_called_once_with()
+
+
+def test_no_forward_output_preserves_invalid_block_ids():
+    runner = SimpleNamespace(
+        maybe_setup_kv_connector=MagicMock(),
+        get_finished_kv_transfers=MagicMock(return_value=(set(),
+                                                          {"failed-load"},
+                                                          None, {41, 43}, 2)),
+    )
+    scheduler_output = SimpleNamespace()
+    vllm_config = SimpleNamespace()
+
+    with patch(
+            "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+            return_value=False):
+        if not tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
+            with pytest.raises(RuntimeError,
+                               match="cache-group-scoped KV load failure"):
+                TPUModelRunner.kv_connector_no_forward(runner,
+                                                       scheduler_output,
+                                                       vllm_config)
+            return
+        output = TPUModelRunner.kv_connector_no_forward(
+            runner, scheduler_output, vllm_config)
+
+    assert output.kv_connector_output.finished_recving == {"failed-load"}
+    assert output.kv_connector_output.invalid_block_ids == {41, 43}
+    assert output.kv_connector_output.invalid_block_group_index == 2
+
+
+def test_build_kv_connector_output_supports_vllm_023():
+    with patch.object(
+            tpu_runner,
+            "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
+            False,
+    ), patch.object(tpu_runner, "KVConnectorOutput") as output_cls:
+        tpu_runner._build_kv_connector_output(
+            finished_sending={"sent"},
+            finished_recving=None,
+            kv_connector_worker_meta=None,
+            invalid_block_ids=set(),
+            invalid_block_group_index=None,
+        )
+
+    output_cls.assert_called_once_with(
+        finished_sending={"sent"},
+        finished_recving=None,
+        kv_connector_worker_meta=None,
+        invalid_block_ids=set(),
+    )
+
+
+def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
+    with patch.object(
+            tpu_runner,
+            "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
+            False,
+    ), pytest.raises(RuntimeError, match="cache-group-scoped KV load failure"):
+        tpu_runner._build_kv_connector_output(
+            finished_sending=None,
+            finished_recving={"failed-load"},
+            kv_connector_worker_meta=None,
+            invalid_block_ids={41, 43},
+            invalid_block_group_index=2,
+        )
+
+
 class DummyMamba(MambaBase):
 
     def __init__(self):
@@ -102,6 +192,18 @@ class DummyMamba(MambaBase):
     @property
     def mamba_type(self):
         return "dummy"
+
+
+class _FakeReserveSpec:
+    """Offloading-spec stand-in resolved via kv_connector_extra_config by
+    utils.estimate_kv_connector_hbm_reserve (same lookup as vLLM's
+    OffloadingSpecFactory)."""
+
+    RESERVE_BYTES = 1024 * 1024 * 1024  # 1 GiB
+
+    @classmethod
+    def estimate_hbm_reserve_bytes(cls, vllm_config):
+        return cls.RESERVE_BYTES
 
 
 class TestTPURunner:
@@ -165,6 +267,11 @@ class TestTPURunner:
         self.runner._maybe_set_compact_mamba_num_blocks_override = (
             TPUModelRunner._maybe_set_compact_mamba_num_blocks_override.
             __get__(self.runner))
+        # Both override paths read the budget through this helper; bind the
+        # real one so the mock runner exercises the actual budget math
+        # (compute_hbm_budget minus the KV-connector HBM reserve).
+        self.runner._available_kv_cache_hbm = (
+            TPUModelRunner._available_kv_cache_hbm.__get__(self.runner))
         # Compact-mamba state starts unset (matches real __init__).
         self.runner._mamba_num_blocks = None
         self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
@@ -246,6 +353,67 @@ class TestTPURunner:
 
         with pytest.raises(ValueError, match="does not fit"):
             self.runner._update_mamba_page_size_padded(layers)
+
+    @patch('vllm_torchtpu.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        return_value=4096)
+    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
+           return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
+    def test_kv_connector_reserve_shrinks_num_blocks_override(
+            self, mock_mem_info, mock_get_page_size):
+        """The KV-connector HBM reserve (e.g. the offload H2D staging pool)
+        must come out of the budget the block-count overrides size against,
+        or the pinned blocks fill the reserve back up and defeat the
+        worker-side subtraction. End-to-end through the same
+        kv_connector_extra_config spec lookup the worker uses."""
+        kv_tc = MagicMock()
+        kv_tc.kv_connector_extra_config = {
+            "spec_name": _FakeReserveSpec.__name__,
+            "spec_module_path": _FakeReserveSpec.__module__,
+        }
+        self.runner.vllm_config.kv_transfer_config = kv_tc
+
+        layers = {}
+        mock_attn = MagicMock(spec=Attention)
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        layers['attn_0'] = mock_attn
+        for i in range(3):
+            layers[f'mamba_{i}'] = DummyMamba()
+
+        self.runner._update_mamba_page_size_padded(layers)
+
+        # Same sizing as test_update_mamba_page_size_padded, but avail is
+        # reduced by the 1 GiB reserve:
+        #   avail = 10 GiB * 0.9 - 1 GiB = 8,589,934,592
+        #   attn_num_blocks = (8,589,934,592 - 3 * 17 * 66560) // 4096
+        #                   = 2,096,323  (vs 2,358,467 with no reserve)
+        assert self.runner.cache_config.num_gpu_blocks_override == 2096323
+
+    def test_maybe_setup_kv_connector_fences_preemptions_before_bind(self):
+        """Upstream parity: handle_preemptions must run before
+        bind_connector_metadata / start_load_kv so connectors with async
+        saves (OffloadingConnector jobs_to_flush) can fence in-flight
+        stores before the forward overwrites their source blocks."""
+        self.runner.maybe_setup_kv_connector = (
+            TPUModelRunner.maybe_setup_kv_connector.__get__(self.runner))
+        connector = MagicMock()
+        scheduler_output = MagicMock()
+        meta = scheduler_output.kv_connector_metadata
+
+        with patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+                   return_value=True), \
+                patch('vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group',
+                      return_value=connector):
+            self.runner.maybe_setup_kv_connector(scheduler_output)
+
+        connector.handle_preemptions.assert_called_once_with(meta)
+        connector.bind_connector_metadata.assert_called_once_with(meta)
+        connector.start_load_kv.assert_called_once_with(None)
+        names = [c[0] for c in connector.mock_calls]
+        assert names.index('handle_preemptions') < names.index(
+            'bind_connector_metadata') < names.index('start_load_kv')
 
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
@@ -1160,6 +1328,37 @@ class TestAttentionMetadataBuilder:
         # GDN op scans the full target_num_reqs every step.
         assert torch.equal(meta.mamba_state_indices,
                            torch.tensor([0, 6, 0, 0], dtype=torch.int32))
+
+    def test_unified_mamba_state_indices_use_cp_adjusted_block_size(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_block_pool = True
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(2, 8)],
+            dtypes=[torch.bfloat16],
+            page_size_padded=256,
+        )
+        with patch(
+                "vllm_torchtpu.layers.common.attention_metadata."
+                "get_total_cp_world_size",
+                return_value=4):
+            builder = self._make_builder(runner, spec=mamba_spec)
+
+        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([64, 65, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+
+        meta = builder.build(common_prefix_len=0,
+                             common_attn_metadata=self._make_cm(4))
+
+        assert builder.target_block_size == 64
+        assert torch.equal(meta.mamba_state_indices,
+                           torch.tensor([0, 5, 0, 0], dtype=torch.int32))
 
 
 class TestCompactMambaSlotPool:

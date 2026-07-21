@@ -183,6 +183,8 @@ def apply_tpu_patches() -> None:
                                _patch_vllm_disable_compile_ranges,
                                _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
+
+    from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
     _register_custom_ops()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
@@ -190,6 +192,7 @@ def apply_tpu_patches() -> None:
     _patch_disable_sequence_parallel_moe()
     _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
+    _patch_vllm_hybrid_pcp_block_sizes()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()
@@ -874,6 +877,16 @@ class TpuPlatform(Platform):
                     and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
+            is_hybrid_offloading = (kv_transfer_config.kv_connector
+                                    == "OffloadingConnector" and is_hybrid)
+            if (is_hybrid_offloading
+                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                # Hybrid CPU offloading transfers whole pool rows; the
+                # typed-view layout has no uniform per-block row to copy.
+                raise ValueError(
+                    "CPU offloading (OffloadingConnector) on hybrid "
+                    "attention+Mamba models requires the unified block "
+                    "pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
