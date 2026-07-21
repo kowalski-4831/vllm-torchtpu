@@ -38,7 +38,6 @@ from vllm.v1.executor.ray_utils import _wait_until_pg_ready
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
-from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
 from vllm_torchtpu.runner.tpu_runner import AsyncTPUModelRunnerOutput
@@ -191,8 +190,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             assert pp_size == len(
                 nodes_with_device
             ), f"Cannot use PP across hosts, please set --pipeline-parallel-size to 1 or {len(nodes_with_device)}"
-            num_devices_per_pp_rank = ShardingConfigManager.get(
-                self.vllm_config).total_devices
+            num_devices_per_pp_rank = self.parallel_config.world_size // pp_size
             placement_group_specs = [{
                 device_str: num_devices_per_pp_rank
             } for _ in range(pp_size)]

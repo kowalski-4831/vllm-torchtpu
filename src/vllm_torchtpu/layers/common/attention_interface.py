@@ -18,7 +18,6 @@ import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.sharding import ShardingAxisName
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
 
@@ -303,18 +302,17 @@ def sharded_ragged_paged_attention(
 ):
     """Shards along KV heads."""
 
-    qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
-    kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
-                      ShardingAxisName.ATTN_HEAD, None, None)
+    qkv_spec = P(None, "model", None)
+    kv_cache_spec = P(None, None, "model", None, None)
     in_specs = (
         qkv_spec,  # q
         qkv_spec,  # k
         qkv_spec,  # v
         kv_cache_spec,  # kv cache
-        P(ShardingAxisName.ATTN_DATA),  # kv_lens
-        P(ShardingAxisName.ATTN_DATA),  # page_indices
-        P(ShardingAxisName.ATTN_DATA),  # cu_q_lens
-        P(ShardingAxisName.ATTN_DATA),  # distribution
+        P(None),  # kv_lens
+        P(None),  # page_indices
+        P(None),  # cu_q_lens
+        P(None),  # distribution
     )
     out_specs = (qkv_spec, kv_cache_spec)
 
@@ -334,7 +332,7 @@ def sharded_ragged_paged_attention(
             raise NotImplementedError(
                 "Attention sink support is only available when head_dim==64")
 
-        in_specs += (P(ShardingAxisName.ATTN_HEAD), )
+        in_specs += (P("model"), )
         args += (attention_sink, )
 
     # Speculative decoding draft-only VMEM relief: cap the KV-fetch block on the local path.

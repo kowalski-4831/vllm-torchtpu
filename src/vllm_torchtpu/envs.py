@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     SKIP_JAX_PRECOMPILE: bool = False
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     MODEL_IMPL_TYPE: str = "vllm"
-    NEW_MODEL_DESIGN: bool = False
     PHASED_PROFILING_DIR: str = ""
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
@@ -141,9 +140,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MODEL_IMPL_TYPE":
     env_with_choices("MODEL_IMPL_TYPE", "vllm",
                      ["vllm", "flax_nnx", "jetpack"]),
-    # Enable new experimental model design
-    "NEW_MODEL_DESIGN":
-    lambda: bool(int(os.getenv("NEW_MODEL_DESIGN") or "0")),
     # Directory to store phased profiling output
     "PHASED_PROFILING_DIR":
     lambda: os.getenv("PHASED_PROFILING_DIR", ""),

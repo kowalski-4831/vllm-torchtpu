@@ -102,6 +102,44 @@ class TestTpuRayDistributedExecutorV2:
         assert executor.parallel_config.placement_group == mock_placement_group
         mock_ray.util.placement_group.assert_called_once()
 
+    def test_initialize_ray_cluster_pipeline_parallelism(
+            self, mock_wait_until_pg_ready, mock_get_ip, mock_platform,
+            mock_ray):
+        mock_platform.ray_device_key = "TPU"
+        mock_platform.device_name = "tpu"
+        self.parallel_config.pipeline_parallel_size = 2
+        self.parallel_config.world_size = 8
+
+        mock_ray.is_initialized.return_value = True
+        mock_ray.nodes.return_value = [{
+            "NodeID": "node_1",
+            "Resources": {
+                "TPU": 4
+            }
+        }, {
+            "NodeID": "node_2",
+            "Resources": {
+                "TPU": 4
+            }
+        }]
+        mock_ray.get_runtime_context.return_value.get_node_id.return_value = \
+            "node_1"
+        mock_placement_group = MagicMock()
+        mock_ray.util.placement_group.return_value = mock_placement_group
+
+        executor = RayDistributedExecutorV2(self.vllm_config)
+        executor.vllm_config = self.vllm_config
+        executor.parallel_config = self.parallel_config
+        executor._initialize_ray_cluster()
+
+        mock_ray.util.placement_group.assert_called_once_with(
+            [{
+                "TPU": 4,
+                "node:127.0.0.1": 0.001
+            }, {
+                "TPU": 4
+            }], strategy="PACK")
+
     def test_initialize_ray_cluster_reuses_existing_pg(
             self, mock_wait_until_pg_ready, mock_get_ip, mock_platform,
             mock_ray):
