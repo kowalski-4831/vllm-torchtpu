@@ -93,15 +93,11 @@ class TestTpuPlatform:
 
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
-    )
-    @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_hybrid_block_size(self, mock_vllm_envs,
                                                        mock_prepare_env,
-                                                       mock_sharding,
                                                        mock_apply_patches,
                                                        vllm_config):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
@@ -140,15 +136,12 @@ class TestTpuPlatform:
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"})
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
-    )
-    @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_hybrid_derives_block_size_with_env(
-            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
-            mock_apply_patches, vllm_config):
+            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
+            vllm_config):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 123  # already set
@@ -208,16 +201,13 @@ class TestTpuPlatform:
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
-    )
-    @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_validates_mamba_apc_modes(
-            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
-            mock_apply_patches, vllm_config, mamba_cache_mode,
-            speculative_config, async_scheduling, message):
+            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
+            vllm_config, mamba_cache_mode, speculative_config,
+            async_scheduling, message):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 256
@@ -254,16 +244,12 @@ class TestTpuPlatform:
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
-    )
-    @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_accepts_tpu_disagg_connectors(
-            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
-            mock_apply_patches, vllm_config, connector_name,
-            expects_mamba_patch):
+            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
+            vllm_config, connector_name, expects_mamba_patch):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = connector_name
@@ -289,15 +275,12 @@ class TestTpuPlatform:
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"})
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
-    )
-    @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_accepts_v2_connector_with_unified_pool(
-            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
-            mock_apply_patches, vllm_config):
+            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
+            vllm_config):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = "TPUConnectorV2"
@@ -320,15 +303,12 @@ class TestTpuPlatform:
 
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
-    )
-    @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_language_model_only_multimodal_keeps_chunked_mm_input(
-            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
-            mock_apply_patches, vllm_config):
+            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
+            vllm_config):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=True, limit_per_prompt={"image": 1})
@@ -351,15 +331,12 @@ class TestTpuPlatform:
 
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
-    )
-    @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_multimodal_forces_disable_chunked_mm_input(
-            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
-            mock_apply_patches, vllm_config):
+            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
+            vllm_config):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=False, limit_per_prompt={"image": 1})

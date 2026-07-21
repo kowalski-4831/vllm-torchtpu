@@ -18,7 +18,6 @@ from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -510,9 +509,9 @@ class TpuPlatform(Platform):
     additional_env_vars: list[str] = [
         "PHASED_PROFILING_DIR", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
-        "NEW_MODEL_DESIGN", "ENABLE_QUANTIZED_MATMUL_KERNEL",
-        "REQUANTIZE_BLOCK_SIZE", "REQUANTIZE_WEIGHT_DTYPE",
-        "MOE_REQUANTIZE_BLOCK_SIZE", "MOE_REQUANTIZE_WEIGHT_DTYPE",
+        "ENABLE_QUANTIZED_MATMUL_KERNEL", "REQUANTIZE_BLOCK_SIZE",
+        "REQUANTIZE_WEIGHT_DTYPE", "MOE_REQUANTIZE_BLOCK_SIZE",
+        "MOE_REQUANTIZE_WEIGHT_DTYPE",
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
@@ -667,14 +666,6 @@ class TpuPlatform(Platform):
         return {}
 
     @classmethod
-    def _initialize_sharding_config(cls, vllm_config: VllmConfig) -> None:
-        # Store the parsed sharding config keyed by vllm_config (not as an
-        # attribute on it) so vLLM's replace()/compute_hash() machinery never
-        # sees it. Read it back via ShardingConfigManager.get(vllm_config).
-        sharding_config = ShardingConfigManager.initialize(vllm_config)
-        logger.info(f"Initialized sharding configuration: {sharding_config}")
-
-    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         apply_tpu_patches()
         _apply_model_specific_patches(
@@ -684,7 +675,6 @@ class TpuPlatform(Platform):
             raise NotImplementedError(
                 "Pathways is not supported by torchtpu-vllm. "
                 "Unset VLLM_TPU_USING_PATHWAYS.")
-        cls._initialize_sharding_config(vllm_config)
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
