@@ -715,7 +715,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 
 
 @functools.lru_cache(maxsize=None)
-def _pool_state_ops(ssm_ntok: int, n_v: int, d_k: int, d_v: int):
+def _pool_state_ops(ssm_ntok: int, n_v: int, d_k: int, d_v: int, split: int):
     """StateOps reading/writing the ssm f32 token-range of the pool.
     Cached per geometry so the delta-rule jit sees one stable static
     instance across steps."""
@@ -729,7 +729,8 @@ def _pool_state_ops(ssm_ntok: int, n_v: int, d_k: int, d_v: int):
                                                tok0=0,
                                                ntok=ssm_ntok,
                                                out_dtype=jnp.float32,
-                                               out_lanes=d_v)
+                                               out_lanes=d_v,
+                                               split=split)
         return gathered.reshape(idx.shape[0], n_v, d_k, d_v)
 
     def _write(pool, states, idx):
@@ -739,7 +740,8 @@ def _pool_state_ops(ssm_ntok: int, n_v: int, d_k: int, d_v: int):
                                                 idx.shape[0], rows, d_v),
                                             idx,
                                             tok0=0,
-                                            ntok=ssm_ntok)
+                                            ntok=ssm_ntok,
+                                            split=split)
 
     return ragged_gated_delta_rule_wrapper.jax_impl.StateOps(read=_read,
                                                              write=_write)
@@ -763,20 +765,33 @@ def run_jax_gdn_attention_pooled_local(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    pool_block_tokens: int,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
     ``recurrent_state`` is the attention-shaped pool holding the f32 ssm
     region at token offset 0 and the conv region in the tokens right after
-    it. All pool knowledge lives here: conv state is gathered/scattered
-    through `pool_adapters` around the stock conv kernel, and the ssm
-    region is threaded into the stock delta-rule via pluggable `StateOps`
-    — the model kernels are unmodified.
+    it. All pool knowledge lives here: for the chunked impls, conv state
+    is gathered/scattered through `pool_adapters` around the stock conv
+    kernel and the ssm region is threaded into the stock delta-rule via
+    pluggable `StateOps`; the fused V3 kernel instead streams both regions
+    in place through a `v3_state_source` copy-plan — the model kernels'
+    math is unmodified either way.
     """
     max_reqs = seq_lens.shape[0]
     query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
     has_initial_state = (seq_lens - query_lens) > 0
+
+    # Backends with a fixed kernel block (batched RPA) get the pool born
+    # at kernel granularity; a manager block is `split` consecutive kernel
+    # blocks (upstream map_to_kernel_blocks). State regions address
+    # manager-block token ranges; the adapters route them (split kwarg) —
+    # the pool itself is never reshaped (an XLA reshape of the pool
+    # materializes as a pool-sized relayout copy per step).
+    assert pool_block_tokens % recurrent_state.shape[1] == 0, (
+        pool_block_tokens, recurrent_state.shape)
+    split = pool_block_tokens // recurrent_state.shape[1]
 
     conv_dim = conv_weight.shape[0]
     lanes = recurrent_state.shape[-1]
@@ -786,9 +801,9 @@ def run_jax_gdn_attention_pooled_local(
     conv_bytes = (kernel_size - 1) * conv_dim * 2
     assert ssm_bytes % tok_bytes == 0, (ssm_bytes, tok_bytes)
     ssm_ntok = ssm_bytes // tok_bytes
-    assert ssm_ntok <= recurrent_state.shape[1], (
+    assert ssm_ntok <= pool_block_tokens, (
         "ssm state does not fit the attention page", ssm_ntok,
-        recurrent_state.shape)
+        pool_block_tokens)
     conv_data_rows = conv_bytes // (2 * lanes)
 
     # The conv slot occupies whole tokens right after the ssm region,
@@ -797,16 +812,73 @@ def run_jax_gdn_attention_pooled_local(
     conv_ntok = 1
     while (conv_ntok * tok_bytes < conv_bytes or ssm_ntok % conv_ntok != 0):
         conv_ntok *= 2
-    assert ssm_ntok + conv_ntok <= recurrent_state.shape[1], (
+    assert ssm_ntok + conv_ntok <= pool_block_tokens, (
         "mamba slot exceeds the attention page", ssm_ntok, conv_ntok,
-        recurrent_state.shape)
+        pool_block_tokens)
     conv_pool, conv_tok0 = recurrent_state, ssm_ntok
     conv_slot_rows = (conv_ntok * tok_bytes) // (2 * lanes)
+
+    if (config.ragged_gated_delta_rule_impl ==
+            RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD):
+        # Fused conv+GDN kernel: both state regions stream directly
+        # between the pool and the kernel's double-buffered pipeline (one
+        # contiguous DMA per slot per region) — no external gather/scatter
+        # round trip. The kernel masks fresh slots via has_initial_state,
+        # so a newly-allocated block's bytes are never read, and padded
+        # slots move no bytes in either direction.
+        plan = pool_adapters.v3_state_source(
+            recurrent_state,
+            split=split,
+            ssm_ntok=ssm_ntok,
+            conv_tok0=conv_tok0,
+            conv_ntok=conv_ntok,
+            conv_dim=conv_dim,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
+            mixed_qkv,
+            b,
+            a,
+            None,
+            None,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            state_source=recurrent_state,
+            state_plan=plan,
+        )
+        return recurrent_state, output
+
+    def _write_conv(pool, new_conv):
+        rows = new_conv.reshape(-1, conv_data_rows, lanes)
+        pad = conv_slot_rows - conv_data_rows
+        if pad:
+            rows = jnp.pad(rows, ((0, 0), (0, pad), (0, 0)))
+        return pool_adapters.scatter_region(pool,
+                                            rows.astype(jnp.bfloat16),
+                                            state_indices,
+                                            tok0=conv_tok0,
+                                            ntok=conv_ntok,
+                                            split=split)
 
     conv_gathered = pool_adapters.gather_region(conv_pool,
                                                 state_indices,
                                                 tok0=conv_tok0,
                                                 ntok=conv_ntok,
+                                                split=split,
                                                 out_dtype=jnp.bfloat16)
     conv_state = conv_gathered[:, :conv_data_rows, :].reshape(
         -1, kernel_size - 1, conv_dim)
@@ -824,26 +896,13 @@ def run_jax_gdn_attention_pooled_local(
         kernel_size=kernel_size,
     )
 
-    new_conv_rows = new_conv_state.reshape(-1, conv_data_rows, lanes)
-    pad_rows = conv_slot_rows - conv_data_rows
-    if pad_rows:
-        new_conv_rows = jnp.pad(new_conv_rows, ((0, 0), (0, pad_rows), (0, 0)))
-    recurrent_state = pool_adapters.scatter_region(
-        conv_pool,
-        new_conv_rows.astype(jnp.bfloat16),
-        state_indices,
-        tok0=conv_tok0,
-        ntok=conv_ntok,
-    )
+    recurrent_state = _write_conv(conv_pool, new_conv_state)
 
-    if config.ragged_gated_delta_rule_impl in (
-            RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD,
-            RaggedGatedDeltaRuleImpl.REF,
-    ):
+    if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.REF:
         raise NotImplementedError(
-            "the fused GDN V3 kernel and the ref impl read recurrent state "
-            "natively and are not wired to the unified block pool; use "
-            "chunked_jax_pd.")
+            "the ref impl reads recurrent state natively and is not wired "
+            "to the unified block pool; use chunked_jax_pd or "
+            "chunked_kernel_v3_pd.")
 
     wrapper_config = config.ragged_gated_delta_rule_impl.to_config()
     new_recurrent_state, output = ragged_gated_delta_rule_wrapper.ragged_gated_delta_rule_wrapper(
@@ -863,7 +922,7 @@ def run_jax_gdn_attention_pooled_local(
         config=wrapper_config,
         chunk_size=64,
         has_initial_state=has_initial_state,
-        state_ops=_pool_state_ops(ssm_ntok, n_v, d_k, d_v),
+        state_ops=_pool_state_ops(ssm_ntok, n_v, d_k, d_v, split),
     )
 
     return new_recurrent_state, output
@@ -887,6 +946,7 @@ def run_jax_gdn_attention_pooled(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -961,6 +1021,7 @@ def run_jax_gdn_attention_pooled(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
         config=config,
     )
     mapped_fn = jax.shard_map(

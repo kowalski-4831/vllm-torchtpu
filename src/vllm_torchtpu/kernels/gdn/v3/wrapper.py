@@ -101,7 +101,15 @@ def inner_kernel(
         cfg=cfg,
     )
 
-    conv_state_slot_ref[...] = new_conv_state
+    if cfg.state_plan is None:
+        conv_state_slot_ref[...] = new_conv_state
+    else:
+        # External source tiles: encode the state through the region's
+        # typed view; copy_out pushes the raw bytes back to the source.
+        for idx in range(cfg.seq_tile_size):
+            vmem_ldst.store_state_region(conv_state_slot_ref.at[idx],
+                                         cfg.state_plan.conv,
+                                         new_conv_state[idx])
     if carry_conv_scratch_ref is not None:
         carry_conv_scratch_ref[...] = new_conv_state
 
@@ -166,8 +174,14 @@ def inner_kernel(
 
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-    recurrent_slot_ref[...] = new_recurrent_state.astype(
-        recurrent_slot_ref.dtype)
+    if cfg.state_plan is None:
+        recurrent_slot_ref[...] = new_recurrent_state.astype(
+            recurrent_slot_ref.dtype)
+    else:
+        for idx in range(cfg.seq_tile_size):
+            vmem_ldst.store_state_region(recurrent_slot_ref.at[idx],
+                                         cfg.state_plan.recurrent,
+                                         new_recurrent_state[idx])
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state
@@ -195,6 +209,11 @@ def outer_kernel(
 ):
     """Setup memory allocations and emit pipeline for running inner_kernel."""
     del conv_state_out_ref, recurrent_state_out_ref
+
+    if cfg.state_plan is not None:
+        # Both state regions stream from the single external source ref,
+        # which rides the conv-state input slot.
+        recurrent_state_ref = conv_state_ref
 
     qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc = (
         memory_ref.create_allocs(
@@ -255,7 +274,7 @@ def outer_kernel(
 
 
 @jax.jit(
-    donate_argnames=("conv_state", "recurrent_state"),
+    donate_argnames=("conv_state", "recurrent_state", "state_source"),
     static_argnames=(
         "n_kq",
         "n_v",
@@ -266,14 +285,15 @@ def outer_kernel(
         "mixed_tile_size",
         "zero_initialize_out",
         "compute_precision",
+        "state_plan",
     ),
 )
 def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]
-    conv_state: jax.Array,  # [num_seqs + 1, kernel_size - 1, dim_size]
-    recurrent_state: jax.Array,  # [num_seqs + 1, nv, dk, dv]
+    conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, dim_size]
+    recurrent_state: jax.Array | None,  # [num_seqs + 1, nv, dk, dv]
     conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     a_log: jax.Array,  # [n_v]
@@ -288,12 +308,15 @@ def fused_conv1d_gdn(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    state_source: jax.Array | None = None,
+    state_plan: config.StateSourcePlan | None = None,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
-) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
+) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array,
+                                                           jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
     Args:
@@ -305,11 +328,11 @@ def fused_conv1d_gdn(
             kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
             from the last sequence invocation. The first slot is a null block used for
             padded or invalid tokens. It may contain garbage data if it is a first
-            invocation of a sequence.
+            invocation of a sequence. None when `state_source` carries the states.
         recurrent_state: Recurrent state cache tensor of shape [num_seqs + 1, n_v,
             d_k, d_v]. The first slot is a null block used for padded or invalid
             tokens. It may contain garbage data if it is a first invocation of a
-            sequence.
+            sequence. None when `state_source` carries the states.
         conv_weight: Convolution weight tensor of shape [kernel_size - 1, dim_size].
         conv_bias: Optional convolution bias tensor of shape [dim_size].
         a_log: a_log tensor of shape [n_v].
@@ -325,6 +348,13 @@ def fused_conv1d_gdn(
         d_k: Key/query dimension.
         d_v: Value dimension.
         kernel_size: Convolution kernel size.
+        state_source: Optional indexed external state source (e.g. the unified
+            KV pool) replacing the dense state tensors: both state regions are
+            streamed between it and the kernel pipeline per `state_plan`, with
+            `state_indices` addressing source block windows. Donated and
+            returned in place of the dense states.
+        state_plan: Static copy-plan describing the source's state regions.
+            Must be set iff `state_source` is set.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -334,18 +364,25 @@ def fused_conv1d_gdn(
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
-            recurrent state cache tensors.
+            recurrent state cache tensors. With a state source: the updated
+            source (aliased in place) instead of the state pair.
         out: Fused output tensor.
     """
     # TODO(kyuyeunk): Support bf16
     act_out_dtype = qkv.dtype
-    conv_out_dtype = conv_state.dtype
-    recurrent_out_dtype = recurrent_state.dtype
+    pooled = state_plan is not None
+    if pooled:
+        assert conv_state is None and recurrent_state is None
+        assert state_source is not None
+    else:
+        assert state_source is None
+        conv_out_dtype = conv_state.dtype
+        recurrent_out_dtype = recurrent_state.dtype
+        conv_state = conv_state.astype(jnp.float32)
 
     qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
-    conv_state = conv_state.astype(jnp.float32)
 
     # Step 1: Validate inputs.
     num_seqs = state_indices.size
@@ -379,8 +416,9 @@ def fused_conv1d_gdn(
     # Step 3: States and weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
-    conv_state_shape = conv_state.shape
-    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+    if not pooled:
+        conv_state_shape = conv_state.shape
+        conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
@@ -399,10 +437,12 @@ def fused_conv1d_gdn(
 
     def call_kernel(
         in_conv_state: jax.Array,
-        in_recurrent_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
         in_act: jax.Array | None,
         mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        # With a state source, it rides the conv-state slot and the dense
+        # recurrent-state input is absent.
         if mode == config.GDNMode.BATCHED:
             tile_size = decode_tile_size
         else:
@@ -422,9 +462,12 @@ def fused_conv1d_gdn(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,
                 compute=compute_precision,
-                recurrent_state=in_recurrent_state.dtype,
-                conv_state=in_conv_state.dtype,
+                recurrent_state=(jnp.float32.dtype
+                                 if pooled else in_recurrent_state.dtype),
+                conv_state=(jnp.float32.dtype
+                            if pooled else in_conv_state.dtype),
             ),
+            state_plan=state_plan,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
@@ -450,11 +493,13 @@ def fused_conv1d_gdn(
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
         # Step 7: Handle case where write needs to be done in existing out.
+        # Flat aliasing indices account for the absent recurrent-state
+        # input in source mode (None contributes no leaves).
         in_out_spec = None
-        input_output_aliases = {
-            len(metadata_obj) + 3: 1,
-            len(metadata_obj) + 4: 2
-        }
+        num_state_inputs = 1 if pooled else 2
+        input_output_aliases = {len(metadata_obj) + 3: 1}
+        if not pooled:
+            input_output_aliases[len(metadata_obj) + 4] = 2
         out_shape = cfg.get_out_shape()
 
         if in_act is None and zero_initialize_out:
@@ -462,7 +507,7 @@ def fused_conv1d_gdn(
         if in_act is not None:
             out_shape = in_act
             in_out_spec = hbm_spec
-            input_output_aliases[len(metadata_obj) + 5] = 0
+            input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -473,11 +518,11 @@ def fused_conv1d_gdn(
                 hbm_spec,
                 hbm_spec,
                 hbm_spec,
-                hbm_spec,
+                None if pooled else hbm_spec,
                 in_out_spec,
                 weights_spec,
             ),
-            out_specs=(hbm_spec, hbm_spec, hbm_spec),
+            out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
             scratch_shapes=cfg.get_scratch_shape_dict(),
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
@@ -496,6 +541,14 @@ def fused_conv1d_gdn(
             in_act,
             weights,
         )
+
+    if pooled:
+        out_act, out_source, _ = call_kernel(state_source, None, None,
+                                             config.GDNMode.BATCHED)
+        out_act, out_source, _ = call_kernel(out_source, None, out_act,
+                                             config.GDNMode.PER_SEQ)
+        out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+        return out_source, out_act
 
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         conv_state, recurrent_state, None, config.GDNMode.BATCHED)
