@@ -6,8 +6,8 @@ import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    update_tpu_block_size_and_slot_config
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    _ceil_power_of_two, update_tpu_block_size_and_slot_config)
 
 
 class FakeBatchedRPAAttentionBackend:
@@ -55,6 +55,7 @@ def vllm_config():
     vllm_config.cache_config.mamba_page_size_padded = None
     vllm_config.cache_config.mamba_block_size = None
     vllm_config.cache_config.cache_dtype = "auto"
+    vllm_config.kv_transfer_config = None
     vllm_config.parallel_config = MagicMock()
     vllm_config.parallel_config.tensor_parallel_size = 1
     return vllm_config
@@ -203,3 +204,39 @@ def test_user_block_size_below_fit_still_gets_fit(vllm_config):
     assert vllm_config.cache_config.block_size == 1056
     logs = _format_logs(mock_logger_info)
     assert "(source=mamba_state_fit)" in logs
+
+
+def test_disagg_fit_block_size_rounds_up_to_power_of_two(vllm_config):
+    # Disaggregated P/D: the fit size is rounded up to a power of two so the
+    # prefill/decode block sizes nest for the KV connector.
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = (
+        "Qwen3_5MoeForConditionalGeneration")
+    vllm_config.cache_config.block_size = 256
+    vllm_config.cache_config.mamba_block_size = 256
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.cache_config.cache_dtype = "fp8"
+    vllm_config.kv_transfer_config = MagicMock()
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeQwenMambaModel, None)), patch(
+                   "vllm_torchtpu.platforms.tpu_block_size_utils.logger.info"
+               ) as mock_logger_info:
+        update_tpu_block_size_and_slot_config(vllm_config,
+                                              FakeBatchedRPAAttentionBackend)
+
+    # fit 1056 -> aligned 1280 -> next power of two 2048.
+    assert vllm_config.cache_config.block_size == 2048
+    logs = _format_logs(mock_logger_info)
+    assert "(source=mamba_state_fit_pow2)" in logs
+
+
+def test_ceil_power_of_two_outputs_pairwise_nest():
+    # Any two power-of-two block sizes nest (larger % smaller == 0), which is
+    # what lets independently-derived per-TP disagg block sizes satisfy the
+    # connector's divisibility constraint.
+    outs = sorted({_ceil_power_of_two(f) for f in range(1, 4097)})
+    for x in outs:
+        assert x & (x - 1) == 0  # power of two
+    for i in range(len(outs) - 1):
+        assert outs[i + 1] % outs[i] == 0
