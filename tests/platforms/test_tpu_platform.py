@@ -333,16 +333,12 @@ class TestTpuPlatform:
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._initialize_sharding_config"
-    )
-    @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_gates_hybrid_offloading_on_pool(
-            self, mock_vllm_envs, mock_prepare_env, mock_sharding,
-            mock_apply_patches, vllm_config, monkeypatch, is_hybrid, pool_env,
-            expect_error):
+            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
+            vllm_config, monkeypatch, is_hybrid, pool_env, expect_error):
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = is_hybrid
         vllm_config.cache_config.block_size = 256

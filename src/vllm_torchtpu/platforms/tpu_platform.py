@@ -599,6 +599,9 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        assert "sharding" not in vllm_config.additional_config, (
+            "Legacy additional_config['sharding'] is no longer supported. "
+            "Use --data-parallel-size and --enable-expert-parallel instead.")
         apply_tpu_patches()
         _apply_model_specific_patches(
             getattr(vllm_config, "model_config", None))
