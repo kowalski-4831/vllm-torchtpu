@@ -71,6 +71,50 @@ class TestTpuCompilerCache:
 
         assert disabled != enabled
 
+    def test_tpu_hash_covers_native_compile_env(self):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+
+        with patch(
+                "vllm_torchtpu.compilation.tpu_compiler."
+                "_iter_runtime_cache_key_files",
+                return_value=[]):
+            with patch.dict(os.environ, {"XLA_FLAGS": "--xla_dump_to=/tmp/a"}):
+                first = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ, {"XLA_FLAGS": "--xla_dump_to=/tmp/b"}):
+                second = compute_tpu_compilation_hash(self._config())
+
+        assert first != second
+
+    def test_tpu_hash_covers_compiler_versions(self):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+
+        versions = {
+            "torch-tpu": "1",
+            "jax": "1",
+            "jaxlib": "1",
+            "libtpu": "1",
+        }
+        with patch(
+                "vllm_torchtpu.compilation.tpu_compiler."
+                "_iter_runtime_cache_key_files",
+                return_value=[]):
+            with patch(
+                    "vllm_torchtpu.compilation.tpu_compiler."
+                    "importlib_metadata.version",
+                    side_effect=versions.get):
+                base = compute_tpu_compilation_hash(self._config())
+
+            for package in versions:
+                changed_versions = {**versions, package: "2"}
+                with patch(
+                        "vllm_torchtpu.compilation.tpu_compiler."
+                        "importlib_metadata.version",
+                        side_effect=changed_versions.get):
+                    changed = compute_tpu_compilation_hash(self._config())
+                assert base != changed
+
     def test_tpu_hash_covers_effective_data_parallel_size(self):
         from vllm_torchtpu.compilation.tpu_compiler import \
             compute_tpu_compilation_hash

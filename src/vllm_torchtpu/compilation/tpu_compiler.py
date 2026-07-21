@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import pickle
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable
 
@@ -53,6 +54,7 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
     "LIBTPU_INIT_ARGS",
     "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
     "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+    "XLA_FLAGS",
 )
 
 _RUNTIME_CACHE_KEY_PATHS = (
@@ -138,14 +140,15 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
 
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
-    import torch_tpu
-
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
     factors = {
         "torch": torch.__version__,
-        "torch_tpu": getattr(torch_tpu, "__version__", "unknown"),
+        "torch_tpu": importlib_metadata.version("torch-tpu"),
+        "jax": importlib_metadata.version("jax"),
+        "jaxlib": importlib_metadata.version("jaxlib"),
+        "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {
             name: os.getenv(name)
