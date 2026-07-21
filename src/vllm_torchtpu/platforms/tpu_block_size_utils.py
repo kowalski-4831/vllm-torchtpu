@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -21,14 +22,19 @@ def unified_block_pool_enabled(vllm_config: "VllmConfig") -> bool:
     blocks).
 
     Opt-in only, via TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL. Never engages for
-    kv-transfer deployments: the KV connector addresses the typed-view
-    layout by byte offsets and does not understand the pool, so the same
+    P/D kv-transfer deployments: those connectors address the typed-view
+    layout by byte offsets and do not understand the pool, so the same
     env keeps those deployments on the typed-view layout (see
-    unified_kv_layout_enabled).
+    unified_kv_layout_enabled). The OffloadingConnector is the exception:
+    its TPU spec transfers whole pool rows (dtype-agnostic block copies),
+    which is exactly the pool layout — hybrid CPU offloading REQUIRES the
+    pool (see TPUCPUOffloadingSpec).
     """
     from vllm_torchtpu import envs as tpu_envs
+    kv_transfer_config = vllm_config.kv_transfer_config
     return (tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-            and vllm_config.kv_transfer_config is None)
+            and (kv_transfer_config is None
+                 or kv_transfer_config.kv_connector == "OffloadingConnector"))
 
 
 def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
@@ -66,6 +72,12 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _ceil_power_of_two(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
 
 
 def _align_block_to_backend(block_size: int, supported) -> int:
@@ -130,11 +142,40 @@ def _hybrid_mamba_page_size_bytes(vllm_config: VllmConfig) -> int | None:
         model_config.architecture,
         model_config=model_config,
     )
-    return MambaSpec(
-        shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
-        dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+    dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+    full_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
+    parallel_config = vllm_config.parallel_config
+    pcp_size = int(
+        getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    if pcp_size > 1:
+        # PCP-local GDN state is equivalent to adding PCP to the model's
+        # head-sharding factor. Shape calculators used here must therefore
+        # derive their sharded state dimensions from tensor_parallel_size.
+        shape_config = copy.deepcopy(vllm_config)
+        shape_config.parallel_config.tensor_parallel_size *= pcp_size
+        shapes = model_cls.get_mamba_state_shape_from_config(shape_config)
+    else:
+        shapes = full_shapes
+    page_size_bytes = MambaSpec(
+        shapes=shapes,
+        dtypes=dtypes,
         block_size=-1,
     ).page_size_bytes
+    if pcp_size > 1:
+        full_page_size_bytes = MambaSpec(
+            shapes=full_shapes,
+            dtypes=dtypes,
+            block_size=-1,
+        ).page_size_bytes
+        if page_size_bytes * pcp_size != full_page_size_bytes:
+            raise ValueError(
+                "PCP-local Mamba state size must be exactly 1/pcp_size of "
+                "the TP-local state: "
+                f"architecture={model_config.architecture!r}, "
+                f"pcp_size={pcp_size}, full_page_size_bytes="
+                f"{full_page_size_bytes}, local_page_size_bytes="
+                f"{page_size_bytes}")
+    return page_size_bytes
 
 
 def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
@@ -170,13 +211,21 @@ def _derive_tpu_block_slot_config(
         )
         user_specified = getattr(vllm_config.cache_config,
                                  "user_specified_block_size", False)
-        if user_specified and input_block_size >= mamba_fit_block_size:
+        if user_specified and (input_block_size >= mamba_fit_block_size
+                               or vllm_config.kv_transfer_config is not None):
             # An explicit block size that already contains the mamba slot
             # is honored: the fit size is a floor, not a mandate.
             # Disaggregated deployments rely on this to run one shared,
             # TP-independent block size on both roles (the KV connector
             # requires prefill/decode block sizes to nest, which the
             # per-role fit sizes do not guarantee).
+            # The fit floor only binds when the unified block pool serves
+            # mamba state from attention-shaped slots; the pool never
+            # engages for kv-transfer deployments (see
+            # unified_block_pool_enabled), where state is materialized per
+            # mamba group with its own padded page. A below-fit user block
+            # is therefore legal there — reshard geometries such as the
+            # Stage-3 1024-token decode page depend on this.
             final_block_size = _align_block_to_backend(input_block_size,
                                                        supported)
             block_size_source = "user_block_size"
@@ -191,6 +240,16 @@ def _derive_tpu_block_slot_config(
             final_block_size = _align_block_to_backend(mamba_fit_block_size,
                                                        supported)
             block_size_source = "mamba_state_fit"
+            if vllm_config.kv_transfer_config is not None:
+                # Disaggregated P/D: the KV connector requires the prefill
+                # and decode block sizes to nest (one a multiple of the
+                # other), which the per-TP fit sizes do not guarantee.
+                # Rounding up to a power of two restores that: power-of-two
+                # sizes always nest, and each role derives one independently
+                # (decode's lower TP yields the larger, block-containing
+                # size). The extra padding lives only in state blocks.
+                final_block_size = _ceil_power_of_two(final_block_size)
+                block_size_source = "mamba_state_fit_pow2"
 
     fa_physical_slot_bytes = _tpu_attention_slot_size_bytes(
         vllm_config, backend_cls, final_block_size)

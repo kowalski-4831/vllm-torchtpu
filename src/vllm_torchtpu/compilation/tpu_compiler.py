@@ -9,8 +9,10 @@ pipeline. Each shape bucket gets its own compiled executable.
 import copy
 import hashlib
 import importlib.util
+import json
 import os
 import pickle
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +24,7 @@ from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, utils
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -32,22 +34,40 @@ Range = tuple[int, int]
 
 _tpu_backend = TpuBackend()
 
+_TPU_COMPILE_ENV_IGNORED = {
+    # Startup, diagnostics, and orchestration only; these do not affect the
+    # compiled model or custom-kernel lowering.
+    "DP_SCHED_BUFFER_PREFILL",
+    "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS",
+    "DP_SCHED_ENABLED",
+    "PHASED_PROFILING_DIR",
+    "PYTHON_TRACER_LEVEL",
+    "RAY_USAGE_STATS_ENABLED",
+    "SKIP_JAX_PRECOMPILE",
+    "TPU_NAME",
+    "TPU_WORKER_ID",
+    "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
+    "VLLM_XLA_CHECK_RECOMPILATION",
+}
+
+_NATIVE_TPU_COMPILE_ENV_VARS = (
+    "LIBTPU_INIT_ARGS",
+    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+    "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+    "XLA_FLAGS",
+)
+
 _RUNTIME_CACHE_KEY_PATHS = (
-    "vllm_torchtpu/layers/vllm/fused_moe.py",
-    "vllm_torchtpu/layers/common/fused_moe_gmm.py",
-    "vllm_torchtpu/kernels/megablox",
-    "vllm_torchtpu/kernels/sparse_core",
+    # Pallas implementations execute behind torch custom-op boundaries, so
+    # Dynamo's traced-file validation cannot see their source changes.
+    "vllm_torchtpu/kernels",
+    "vllm_torchtpu/layers/common",
     "vllm_torchtpu/layers/vllm/attention.py",
-    "vllm_torchtpu/layers/common/attention_interface.py",
-    "vllm_torchtpu/kernels/ragged_paged_attention/v3",
-    "vllm_torchtpu/kernels/experimental/batched_rpa",
-    "vllm_torchtpu/layers/vllm/custom_ops/gdn_attention_op.py",
-    "vllm_torchtpu/layers/common/gdn_attention.py",
-    "vllm_torchtpu/layers/common/ragged_gated_delta_rule_wrapper.py",
-    "vllm_torchtpu/layers/common/ragged_gated_delta_rule_ref.py",
-    "vllm_torchtpu/kernels/gdn",
-    "vllm_torchtpu/kernels/causal_conv1d",
-    "vllm_torchtpu/kernels/experimental/pcp_streaming_rpa",
+    "vllm_torchtpu/layers/vllm/custom_ops",
+    "vllm_torchtpu/layers/vllm/fused_moe.py",
+    "vllm_torchtpu/layers/vllm/linear_common.py",
+    "vllm_torchtpu/layers/vllm/quantization",
+    "vllm_torchtpu/layers/vllm/vision_attention.py",
 )
 
 
@@ -102,6 +122,81 @@ def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
             # Outside the repo root: never part of the hashed set anyway.
             continue
     return relpaths
+
+
+def _tpu_compile_env_factors() -> dict[str, Any]:
+    """Return TorchTPU plugin env values that can affect compilation."""
+    factors = {}
+    for name, getter in envs.environment_variables.items():
+        if name in _TPU_COMPILE_ENV_IGNORED:
+            continue
+        try:
+            factors[name] = getter()
+        except Exception as exc:
+            logger.warning("Skipping TPU compile environment variable %s: %s",
+                           name, exc)
+    return factors
+
+
+def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
+    """Hash TPU-specific factors used by both AOT and piecewise caches."""
+    cache_config = vllm_config.cache_config
+    scheduler_config = vllm_config.scheduler_config
+    spec = vllm_config.speculative_config
+    factors = {
+        "torch": torch.__version__,
+        "torch_tpu": importlib_metadata.version("torch-tpu"),
+        "jax": importlib_metadata.version("jax"),
+        "jaxlib": importlib_metadata.version("jaxlib"),
+        "libtpu": importlib_metadata.version("libtpu"),
+        "env": _tpu_compile_env_factors(),
+        "native_env": {
+            name: os.getenv(name)
+            for name in _NATIVE_TPU_COMPILE_ENV_VARS
+        },
+        "parallel": {
+            "effective_data_parallel_size":
+            utils.get_dp_size(vllm_config.parallel_config),
+        },
+        # Upstream intentionally omits several runtime/derived cache fields,
+        # but TPU AOT graphs embed the KV tensor extent and request metadata
+        # shapes. Include both the sizing inputs and the resolved block count.
+        "kv_cache": {
+            "gpu_memory_utilization": cache_config.gpu_memory_utilization,
+            "num_gpu_blocks": cache_config.num_gpu_blocks,
+            "num_gpu_blocks_override": cache_config.num_gpu_blocks_override,
+        },
+        "scheduler": {
+            "max_model_len": vllm_config.model_config.max_model_len,
+            "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,
+            "max_num_seqs": scheduler_config.max_num_seqs,
+        },
+        "speculative": {
+            "model":
+            getattr(spec, "model", None),
+            "draft_tensor_parallel_size":
+            getattr(spec, "draft_tensor_parallel_size", None),
+            "num_speculative_tokens":
+            getattr(spec, "num_speculative_tokens", None),
+        },
+    }
+
+    repo_root = Path(__file__).resolve().parents[2]
+    hash_obj = hashlib.sha256(
+        json.dumps(factors, sort_keys=True, separators=(",", ":")).encode())
+    for path in _iter_runtime_cache_key_files(repo_root):
+        relpath = path.relative_to(repo_root).as_posix()
+        hash_obj.update(relpath.encode())
+        try:
+            hash_obj.update(path.read_bytes())
+        except OSError as exc:
+            logger.warning(
+                "[TpuCompilerAdaptor] Failed to read cache key source %s: %s",
+                path,
+                exc,
+            )
+
+    return hash_obj.hexdigest()[:10]
 
 
 # TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source
@@ -169,60 +264,7 @@ class TpuCompilerAdaptor(CompilerInterface):
 
     def compute_hash(self, vllm_config: VllmConfig) -> str:
         """Hash TPU runtime sources that sit behind custom-op boundaries."""
-        import torch_tpu
-
-        repo_root = Path(__file__).resolve().parents[2]
-        hash_obj = hashlib.sha256()
-
-        hash_obj.update(f"torch={torch.__version__}".encode())
-        hash_obj.update(
-            f"torch_tpu={getattr(torch_tpu, '__version__', 'unknown')}".encode(
-            ))
-        # Kernel choice (default vs batched RPA) no longer needs to be in the
-        # cache key — each Impl registers under a distinct op name
-        # (`pallas::rpa_kernel_*` vs `pallas::rpa_kernel_batched_*`), so the
-        # FX graph already discriminates.
-
-        # KV-cache budget inputs. The compiled FX graphs embed the resolved
-        # num_gpu_blocks as a literal, but num_gpu_blocks isn't known until
-        # after profile_run computes the KV-cache budget from these env+config
-        # values. Hashing them catches changes that would otherwise produce a
-        # stale-cache "tensor X vs Y expanded size" error on first execution
-        # instead of a clean recompile.
-        hash_obj.update(
-            f"kv_headroom_mib={envs.TPU_KV_CACHE_HEADROOM_MIB}".encode())
-        hash_obj.update(
-            f"gpu_mem_util={vllm_config.cache_config.gpu_memory_utilization}".
-            encode())
-        hash_obj.update(
-            f"max_num_batched_tokens="
-            f"{vllm_config.scheduler_config.max_num_batched_tokens}".encode())
-        hash_obj.update(
-            f"num_gpu_blocks_override="
-            f"{vllm_config.cache_config.num_gpu_blocks_override}".encode())
-        spec = vllm_config.speculative_config
-        hash_obj.update(f"spec_draft="
-                        f"{getattr(spec, 'model', None)}".encode())
-        hash_obj.update(
-            f"spec_draft_tp="
-            f"{getattr(spec, 'draft_tensor_parallel_size', None)}".encode())
-        hash_obj.update(
-            f"spec_num_tokens="
-            f"{getattr(spec, 'num_speculative_tokens', None)}".encode())
-
-        for path in _iter_runtime_cache_key_files(repo_root):
-            relpath = path.relative_to(repo_root).as_posix()
-            hash_obj.update(relpath.encode())
-            try:
-                hash_obj.update(path.read_bytes())
-            except OSError as exc:
-                logger.warning(
-                    "[TpuCompilerAdaptor] Failed to read cache key source %s: %s",
-                    path,
-                    exc,
-                )
-
-        return hash_obj.hexdigest()[:10]
+        return compute_tpu_compilation_hash(vllm_config)
 
     def compile(
         self,

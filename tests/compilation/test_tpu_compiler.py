@@ -14,10 +14,159 @@
 
 import importlib
 import os
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
 class TestTpuCompilerCache:
+
+    @staticmethod
+    def _config(*, max_num_seqs=16, num_gpu_blocks=1024):
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(
+                gpu_memory_utilization=0.9,
+                num_gpu_blocks=num_gpu_blocks,
+                num_gpu_blocks_override=None,
+            ),
+            model_config=SimpleNamespace(max_model_len=4096),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048,
+                max_num_seqs=max_num_seqs,
+            ),
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            speculative_config=None,
+        )
+
+    def test_tpu_hash_covers_derived_shapes(self):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+
+        with patch(
+                "vllm_torchtpu.compilation.tpu_compiler."
+                "_iter_runtime_cache_key_files",
+                return_value=[]):
+            base = compute_tpu_compilation_hash(self._config())
+            different_batch = compute_tpu_compilation_hash(
+                self._config(max_num_seqs=32))
+            different_kv = compute_tpu_compilation_hash(
+                self._config(num_gpu_blocks=2048))
+
+        assert base != different_batch
+        assert base != different_kv
+
+    def test_tpu_hash_covers_plugin_compile_env(self):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+
+        with patch(
+                "vllm_torchtpu.compilation.tpu_compiler."
+                "_iter_runtime_cache_key_files",
+                return_value=[]):
+            with patch.dict(os.environ, {"ONEHOT_MOE_PERMUTE_THRESHOLD": "0"}):
+                disabled = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ,
+                            {"ONEHOT_MOE_PERMUTE_THRESHOLD": "4096"}):
+                enabled = compute_tpu_compilation_hash(self._config())
+
+        assert disabled != enabled
+
+    def test_tpu_hash_covers_native_compile_env(self):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+
+        with patch(
+                "vllm_torchtpu.compilation.tpu_compiler."
+                "_iter_runtime_cache_key_files",
+                return_value=[]):
+            with patch.dict(os.environ, {"XLA_FLAGS": "--xla_dump_to=/tmp/a"}):
+                first = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ, {"XLA_FLAGS": "--xla_dump_to=/tmp/b"}):
+                second = compute_tpu_compilation_hash(self._config())
+
+        assert first != second
+
+    def test_tpu_hash_covers_compiler_versions(self):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+
+        versions = {
+            "torch-tpu": "1",
+            "jax": "1",
+            "jaxlib": "1",
+            "libtpu": "1",
+        }
+        with patch(
+                "vllm_torchtpu.compilation.tpu_compiler."
+                "_iter_runtime_cache_key_files",
+                return_value=[]):
+            with patch(
+                    "vllm_torchtpu.compilation.tpu_compiler."
+                    "importlib_metadata.version",
+                    side_effect=versions.get):
+                base = compute_tpu_compilation_hash(self._config())
+
+            for package in versions:
+                changed_versions = {**versions, package: "2"}
+                with patch(
+                        "vllm_torchtpu.compilation.tpu_compiler."
+                        "importlib_metadata.version",
+                        side_effect=changed_versions.get):
+                    changed = compute_tpu_compilation_hash(self._config())
+                assert base != changed
+
+    def test_tpu_hash_covers_effective_data_parallel_size(self):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+
+        with patch(
+                "vllm_torchtpu.compilation.tpu_compiler."
+                "_iter_runtime_cache_key_files",
+                return_value=[]):
+            with patch.dict(os.environ, {"TORCH_TPU_DP_SIZE": "1"}):
+                dp1 = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ, {"TORCH_TPU_DP_SIZE": "4"}):
+                dp4 = compute_tpu_compilation_hash(self._config())
+
+        assert dp1 != dp4
+
+    def test_runtime_hash_covers_custom_op_boundaries(self):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        source_root = Path(tpu_compiler.__file__).resolve().parents[2]
+        hashed = {
+            path.relative_to(source_root).as_posix()
+            for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
+        }
+        custom_op_boundaries = {
+            path.relative_to(source_root).as_posix()
+            for path in (source_root / "vllm_torchtpu").rglob("*.py")
+            if "pallas.jax_op" in path.read_text()
+        }
+        assert custom_op_boundaries <= hashed
+        assert {
+            "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
+            "vllm_torchtpu/kernels/pool_adapters.py",
+        } <= hashed
+
+    def test_aot_hash_includes_tpu_compiler_hash(self):
+        from vllm.compilation import caching
+
+        from vllm_torchtpu import _patch_vllm_aot_compile_cache_key
+
+        def upstream_factors(_):
+            return ["upstream"]
+
+        with patch.object(caching, "aot_compile_hash_factors",
+                          upstream_factors):
+            _patch_vllm_aot_compile_cache_key()
+            with patch(
+                    "vllm_torchtpu.compilation.tpu_compiler."
+                    "compute_tpu_compilation_hash",
+                    return_value="tpu"):
+                factors = caching.aot_compile_hash_factors(self._config())
+
+        assert factors == ["upstream", "tpu"]
 
     def test_env_override_mapping(self):
         """Verify that VLLM_XLA_CACHE_PATH sets the corresponding native variables."""

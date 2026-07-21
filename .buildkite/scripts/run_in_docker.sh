@@ -99,6 +99,7 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e MODEL_IMPL_TYPE="${MODEL_IMPL_TYPE:-}" \
+  -e RUN_EVALPLUS="${RUN_EVALPLUS:-}" \
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" \
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \

@@ -622,7 +622,10 @@ def run_concurrent_mixed_query_correctness(
     return requests, failures
 
 
-def check_planner_logs(run_dir: str, offsets: dict[Path, int]) -> int:
+def check_planner_logs(run_dir: str,
+                       offsets: dict[Path, int],
+                       *,
+                       expect_pcp_source: bool = False) -> int:
     if not run_dir:
         print("PLANNER_LOG_CHECK_SKIPPED no RUN_DIR")
         return 1
@@ -632,10 +635,6 @@ def check_planner_logs(run_dir: str, offsets: dict[Path, int]) -> int:
     required = [
         "TPUConnectorV2 logical pull meta built",
         "TPUConnectorV2 physical lowering summary",
-        "d_tp_rank=0 | p_ranks=(0, 1)",
-        "d_tp_rank=1 | p_ranks=(2, 3)",
-        "fa_heads_by_rank={0: (0,)}",
-        "fa_heads_by_rank={2: (1,)}",
         "mamba_state0_q_key_heads_by_rank=",
         "mamba_state0_k_key_heads_by_rank=",
         "mamba_state0_v_value_heads_by_rank=",
@@ -645,6 +644,20 @@ def check_planner_logs(run_dir: str, offsets: dict[Path, int]) -> int:
         "mamba_state0_v_ops_by_value_head=",
         "mamba_state1_ops_by_value_head=",
     ]
+    if expect_pcp_source:
+        required.extend([
+            "d_tp_rank=0 | p_ranks=(0, 1, 2, 3)",
+            "d_tp_rank=1 | p_ranks=(0, 1, 2, 3)",
+            "fa_heads_by_rank={0: (0,), 1: (0,), 2: (0,), 3: (0,)}",
+            "fa_heads_by_rank={0: (1,), 1: (1,), 2: (1,), 3: (1,)}",
+        ])
+    else:
+        required.extend([
+            "d_tp_rank=0 | p_ranks=(0, 1)",
+            "d_tp_rank=1 | p_ranks=(2, 3)",
+            "fa_heads_by_rank={0: (0,)}",
+            "fa_heads_by_rank={2: (1,)}",
+        ])
     for marker in required:
         if marker not in log_text:
             failures += 1
@@ -666,10 +679,13 @@ def check_planner_logs(run_dir: str, offsets: dict[Path, int]) -> int:
                             r" \| p_ranks=\((?P<p_ranks>[^)]*)\)"
                             r" \| total_ops=(?P<total_ops>\d+)"
                             r" \| ops_by_p_rank=\{(?P<ops_by_p_rank>[^}]*)\}")
-    expected_p_ranks = {
+    expected_p_ranks = ({
+        "0": ("0", "1", "2", "3"),
+        "1": ("0", "1", "2", "3"),
+    } if expect_pcp_source else {
         "0": ("0", "1"),
         "1": ("2", "3"),
-    }
+    })
     seen_by_rank: defaultdict[str, set[int]] = defaultdict(set)
     for match in summary_re.finditer(log_text):
         d_tp_rank = match.group("d_tp_rank")
@@ -769,6 +785,7 @@ def parse_args() -> argparse.Namespace:
                         type=int,
                         default=env_int("P4D2_CORRECTNESS_TIMEOUT", 600))
     parser.add_argument("--quick-probe-only", action="store_true")
+    parser.add_argument("--expect-pcp-source", action="store_true")
     parser.add_argument("--skip-short-qa", action="store_true")
     parser.add_argument("--short-repeat-lines",
                         type=int,
@@ -881,7 +898,11 @@ def main() -> int:
             total_requests += requests
             failures += suite_failures
 
-    failures += check_planner_logs(args.run_dir, offsets)
+    failures += check_planner_logs(
+        args.run_dir,
+        offsets,
+        expect_pcp_source=args.expect_pcp_source,
+    )
 
     print("\n=== P4D2 TPUCONNECTORV2 CORRECTNESS SUMMARY ===")
     print(f"RUN_DIR {args.run_dir}")

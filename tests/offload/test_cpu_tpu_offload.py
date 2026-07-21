@@ -14,14 +14,27 @@ Covers the pieces that don't require a real TPU:
   used by `_h2d_task` / `_d2h_task`.
 - `transfer_async` H2D chunking math: `chunks_total = ceil(len(src_ids)
   / chunk_size)` at the boundary cases.
-- `tpu_worker._estimate_kv_connector_hbm_reserve` dynamic spec resolution
+- `wait()` flush semantics: D2H blocks on dma_done; H2D drains the chunk
+  pipeline (force-dispatching parked scatters past the scatter-now gate,
+  re-buffering TransferResults for exactly-once reporting via
+  `get_finished`), unparks orphaned last-chunk scatters of aborted
+  requests, and times out instead of hanging on a stalled DMA.
+- `utils.estimate_kv_connector_hbm_reserve` dynamic spec resolution
   (no kv_connector / missing metadata / unimportable module → 0).
+- `expand_hybrid_pool_block_ids` grouped row mapping for the unified
+  block pool (attention + mamba segments, partial first offloaded block,
+  null-prefixed mamba segments, empty groups).
+- `_expand_transfer_ids` non-hybrid flat path: the partial-first-block
+  skip must not shift the compactly-written source expansion (regression).
+- `TPUCPUOffloadingSpec.__init__` consistency assert: model_config.is_hybrid
+  must agree with MambaSpec presence in kv_cache_groups.
 
 Heavy dependencies (real Pallas kernels, torch_tpu DMA, vllm config
 plumbing) are mocked at construction time so the tests run on a host
 without a TPU.
 """
 import os
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -90,12 +103,17 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
     def _make_vllm_config(num_layers=32,
                           num_kv_heads=8,
                           head_size=128,
-                          block_size=16):
+                          block_size=16,
+                          is_hybrid=False,
+                          num_attn_layers=None):
         cfg = MagicMock()
         cfg.model_config.get_num_layers.return_value = num_layers
         cfg.model_config.get_num_kv_heads.return_value = num_kv_heads
         cfg.model_config.get_head_size.return_value = head_size
         cfg.model_config.dtype = "bfloat16"
+        cfg.model_config.is_hybrid = is_hybrid
+        cfg.model_config.get_num_layers_by_block_type.return_value = (
+            num_attn_layers if num_attn_layers is not None else num_layers)
         cfg.cache_config.block_size = block_size
         cfg.cache_config.cache_dtype = "auto"  # resolved via model_dtype
         return cfg
@@ -127,6 +145,22 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
             reserve_2048 = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(cfg)
         # 1500 rounds up to 2048
         self.assertEqual(reserve_1500, reserve_2048)
+
+    def test_hybrid_uses_attention_layer_count(self):
+        """Hybrid (unified block pool) staging is one buffer per attention
+        layer position at the pool page. The pool cap is NOT specialized
+        for hybrid — launch configs set KV_H2D_POOL_MAX_BLOCKS lower
+        (recipes use 512) since hybrid pool pages are MiB-scale."""
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
+        num_layers, num_attn = 60, 15
+        dense = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
+            self._make_vllm_config(num_layers=num_layers))
+        hybrid = TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes(
+            self._make_vllm_config(num_layers=num_layers,
+                                   is_hybrid=True,
+                                   num_attn_layers=num_attn))
+        # Same pool cap: only the layer count differs (60 vs 15 buffers).
+        self.assertEqual(dense * num_attn, hybrid * num_layers)
 
     def test_raiden_defaults_to_zero_reserve(self):
         from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
@@ -271,6 +305,7 @@ class TestMultiChunkH2D(unittest.TestCase):
         h._h2d_buffer_free = threading.Event()
         h._h2d_buffer_free.set()
         h._pending_scatters = []
+        h._flushed_results = []
         h._dma_worker = MagicMock()
         h.transfer_type = ("CPU", "GPU")
         h.total_block_size_in_bytes = 1
@@ -341,22 +376,486 @@ class TestMultiChunkH2D(unittest.TestCase):
             "(the request is still in WAITING_FOR_REMOTE_KVS).")
 
 
-class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
-    """tpu_worker._estimate_kv_connector_hbm_reserve dynamically resolves
-    the configured spec via kv_connector_extra_config without hardcoding
-    connector or spec class names."""
+class TestWaitFlushDrain(unittest.TestCase):
+    """`wait()` is the connector's flush primitive, and the scheduler
+    legitimately names H2D *load* jobs in it (it flushes ALL pending jobs
+    once every tracked request has finished, and on reset_cache). There
+    may be no future engine step to run `get_finished` /
+    `flush_pending_scatters` afterwards, so the H2D handler must drain
+    its chunk pipeline inside `wait()` itself (regression: this used to
+    be an `AssertionError` crash on the H2D path).
+
+    Same TPU-free construction pattern as TestMultiChunkH2D: `__init__`
+    is bypassed and `_start_h2d_dma` is stubbed to signal `dma_done`
+    immediately. The stub also clears `_h2d_buffer_free`, mirroring the
+    real worker task, so the tests verify the drain releases the buffer.
+    """
+
+    def _make_h2d_handler(self):
+        import threading
+        from collections import deque
+
+        from vllm_torchtpu.offload.cpu_tpu import \
+            SingleDirectionOffloadingHandler
+
+        h = SingleDirectionOffloadingHandler.__new__(
+            SingleDirectionOffloadingHandler)
+        h.tpu_to_cpu = False
+        h.src_tensors = []
+        h.dst_tensors = []
+        h._transfer_map = {}
+        h._transfers = deque()
+        h._req_id_by_job_id = {}
+        h._h2d_buffer_free = threading.Event()
+        h._h2d_buffer_free.set()
+        h._pending_scatters = []
+        h._flushed_results = []
+        h._dma_worker = MagicMock()
+        h.transfer_type = ("CPU", "GPU")
+        h.total_block_size_in_bytes = 1
+        h._dispatched_chunks: list[int] = []
+
+        def fake_start(t):
+            h._dispatched_chunks.append(t.chunks_done)
+            ev = threading.Event()
+            ev.set()
+            t.dma_done = ev
+            # Mirror the real _h2d_task: the DMA claims the buffer; only
+            # a scatter dispatch (flush_pending_scatters) releases it.
+            h._h2d_buffer_free.clear()
+            t.device_buffer = [MagicMock()]
+            t.dst_ids_i32 = MagicMock()
+            t.dst_ids_i32.to = lambda dtype: MagicMock()
+
+        h._start_h2d_dma = fake_start
+        return h
 
     @staticmethod
-    def _make_worker(kv_transfer_config):
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker
-        worker = TPUWorker.__new__(TPUWorker)
-        worker.vllm_config = MagicMock()
-        worker.vllm_config.kv_transfer_config = kv_transfer_config
-        return worker
+    def _make_transfer(job_id: int, chunks_total: int, req_id: str = "req-A"):
+        import numpy as np
+
+        from vllm_torchtpu.offload.cpu_tpu import Transfer
+        n_ids = 2 * chunks_total
+        return Transfer(
+            job_id=job_id,
+            num_bytes=0,
+            n=n_ids,
+            dma_done=None,
+            src_ids=np.arange(n_ids, dtype=np.int64),
+            dst_ids=np.arange(n_ids, dtype=np.int64),
+            chunks_total=chunks_total,
+            chunks_done=0,
+            req_id=req_id,
+        )
+
+    def _submit(self, h, t):
+        h._transfer_map[t.job_id] = t
+        h._transfers.append(t)
+        h._start_h2d_dma(t)
+
+    def test_h2d_wait_drains_chunked_transfer(self):
+        """wait() must complete a multi-chunk load without any engine
+        step's get_finished/flush cycle, and the TransferResult must
+        still be reported by the NEXT get_finished — exactly once."""
+        h = self._make_h2d_handler()
+        t = self._make_transfer(job_id=1, chunks_total=4)
+        self._submit(h, t)
+
+        h.wait({1})
+
+        self.assertNotIn(1, h._transfer_map)
+        self.assertEqual(h._dispatched_chunks, list(range(t.chunks_total)))
+        self.assertEqual(h._pending_scatters, [])
+        self.assertTrue(h._h2d_buffer_free.is_set())
+
+        results = h.get_finished()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].job_id, 1)
+        self.assertTrue(results[0].success)
+        # Exactly once: the re-buffered result must not be re-emitted.
+        self.assertEqual(h.get_finished(), [])
+
+    def test_h2d_wait_unparks_orphaned_last_chunk_scatter(self):
+        """A last-chunk scatter parks in the same get_finished() that
+        pops its transfer from `_transfer_map`. If the owning request is
+        then aborted (never promoted, so never in `scatter_now_req_ids`),
+        the parked scatter holds `_h2d_buffer_free` with no map entry
+        left — wait() must still force-dispatch it even though none of
+        the named jobs are in `_transfer_map` anymore."""
+        h = self._make_h2d_handler()
+        t = self._make_transfer(job_id=1, chunks_total=1)
+        self._submit(h, t)
+
+        # Engine step: result reported, last-chunk scatter parked behind
+        # the scatter-now gate (req never promoted → empty set).
+        results = h.get_finished()
+        self.assertEqual([r.job_id for r in results], [1])
+        h.flush_pending_scatters(set())
+        self.assertEqual(len(h._pending_scatters), 1)
+        self.assertFalse(h._h2d_buffer_free.is_set())
+
+        h.wait({1})
+
+        self.assertEqual(h._pending_scatters, [])
+        self.assertTrue(h._h2d_buffer_free.is_set())
+        # The result was already consumed above; wait() must not
+        # resurrect it.
+        self.assertEqual(h.get_finished(), [])
+
+    def test_h2d_wait_times_out_on_stalled_dma(self):
+        """A DMA that never completes must not hang the engine: wait()
+        returns after the timeout and leaves the job in `_transfer_map`
+        for a later get_finished to report."""
+        import threading
+
+        h = self._make_h2d_handler()
+        t = self._make_transfer(job_id=1, chunks_total=1)
+        h._transfer_map[1] = t
+        h._transfers.append(t)
+        t.dma_done = threading.Event()  # never set — stalled DMA
+
+        with patch(
+                "vllm_torchtpu.offload.cpu_tpu._RAIDEN_OFFLOAD_WAIT_TIMEOUT_S",
+                0.05):
+            h.wait({1})  # must return, not hang
+
+        self.assertIn(1, h._transfer_map)
+
+    def test_h2d_wait_ignores_unknown_jobs(self):
+        h = self._make_h2d_handler()
+        h.wait({999})  # must not raise or hang
+        self.assertTrue(h._h2d_buffer_free.is_set())
+
+    def test_d2h_wait_blocks_until_dma_done(self):
+        """D2H wait blocks on each named transfer's dma_done (set only
+        after the host-pool scatter, so set ⇒ fully landed) and skips
+        job ids it doesn't know about."""
+        import threading
+
+        from vllm_torchtpu.offload.cpu_tpu import (
+            SingleDirectionOffloadingHandler, Transfer)
+
+        h = SingleDirectionOffloadingHandler.__new__(
+            SingleDirectionOffloadingHandler)
+        h.tpu_to_cpu = True
+        h._transfer_map = {}
+
+        ev = threading.Event()
+        t = Transfer(job_id=1, num_bytes=0, n=1, dma_done=ev)
+        h._transfer_map[1] = t
+
+        # Signal completion from a worker-like thread shortly after wait
+        # starts blocking.
+        threading.Timer(0.02, ev.set).start()
+        start = time.monotonic()
+        h.wait({1, 999})  # 999 unknown → skipped
+        self.assertGreaterEqual(time.monotonic() - start, 0.015)
+        self.assertTrue(ev.is_set())
+
+    def test_force_flush_dispatches_real_scatter_data(self):
+        """force=True must dispatch a gated last-chunk scatter (the
+        non-force flush with an empty scatter-now set keeps it parked),
+        actually writing the staged data into the KV cache rows."""
+        from vllm_torchtpu.offload.cpu_tpu import _PendingScatter
+
+        h = self._make_h2d_handler()
+        kv_cache = torch.zeros(8, 4)
+        h.dst_tensors = [kv_cache]
+
+        t = self._make_transfer(job_id=1, chunks_total=1, req_id="req-A")
+        staged = torch.full((2, 4), 5.0)
+        h._pending_scatters.append(
+            _PendingScatter(
+                transfer=t,
+                device_buffer=[staged],
+                dst_ids_i32=torch.tensor([2, 3], dtype=torch.int32),
+                is_last_chunk=True,
+            ))
+        h._h2d_buffer_free.clear()
+
+        h.flush_pending_scatters(set())  # gated: req-A not promoted
+        self.assertEqual(len(h._pending_scatters), 1)
+        self.assertFalse(h._h2d_buffer_free.is_set())
+        self.assertTrue(torch.all(kv_cache == 0))
+
+        h.flush_pending_scatters(set(), force=True)
+        self.assertEqual(h._pending_scatters, [])
+        self.assertTrue(h._h2d_buffer_free.is_set())
+        self.assertTrue(torch.equal(kv_cache[2:4], staged))
+        self.assertTrue(torch.all(kv_cache[:2] == 0))
+        self.assertTrue(torch.all(kv_cache[4:] == 0))
+
+
+class TestExpandHybridPoolBlockIds(unittest.TestCase):
+    """Grouped row mapping for hybrid unified-block-pool transfers.
+
+    GPU block IDs pass through unchanged (pool rows ARE scheduler blocks);
+    CPU rows are derived per group from sequentially-consumed CPU blocks,
+    honoring the partial-first-block skip (block_indices[g] % factor)."""
+
+    @staticmethod
+    def _expand(gpu, group_sizes, block_indices, cpu, factor):
+        import numpy as np
+
+        from vllm_torchtpu.offload.cpu_tpu import expand_hybrid_pool_block_ids
+        gpu_rows, cpu_rows = expand_hybrid_pool_block_ids(
+            np.array(gpu, dtype=np.int64),
+            group_sizes,
+            block_indices,
+            np.array(cpu, dtype=np.int64),
+            factor,
+        )
+        return list(gpu_rows), list(cpu_rows)
+
+    def test_factor_1_attention_plus_mamba_tail(self):
+        # Qwen3.5-like load: 3 attention blocks + 1 mamba boundary-state
+        # block (mamba block table null-prefixed, so its segment starts at
+        # logical position 3).
+        gpu_rows, cpu_rows = self._expand(
+            gpu=[5, 9, 2, 40],
+            group_sizes=[3, 1],
+            block_indices=[0, 3],
+            cpu=[10, 11, 12, 20],
+            factor=1,
+        )
+        self.assertEqual(gpu_rows, [5, 9, 2, 40])
+        self.assertEqual(cpu_rows, [10, 11, 12, 20])
+
+    def test_factor_2_partial_first_offloaded_block(self):
+        # Resume mid-offloaded-block: skip=1 row of the first CPU block.
+        _, cpu_rows = self._expand(
+            gpu=[7, 8, 9],
+            group_sizes=[3],
+            block_indices=[1],
+            cpu=[5, 6],
+            factor=2,
+        )
+        self.assertEqual(cpu_rows, [5 * 2 + 1, 6 * 2 + 0, 6 * 2 + 1])
+
+    def test_factor_2_null_prefixed_mamba_segment(self):
+        _, cpu_rows = self._expand(
+            gpu=[1, 2, 3, 4, 77],
+            group_sizes=[4, 1],
+            block_indices=[0, 3],
+            cpu=[7, 8, 9],
+            factor=2,
+        )
+        self.assertEqual(cpu_rows, [14, 15, 16, 17, 9 * 2 + 1])
+
+    def test_stored_key_gap_stays_factor_aligned(self):
+        # Store with an already-stored middle key: the gpu segment covers
+        # keys K0 (2 rows) and K2 (2 rows) with K1 skipped; K1 consumes
+        # neither gpu rows nor a CPU block, so alignment is preserved.
+        _, cpu_rows = self._expand(
+            gpu=[11, 12, 15, 16],
+            group_sizes=[4],
+            block_indices=[0],
+            cpu=[3, 9],
+            factor=2,
+        )
+        self.assertEqual(cpu_rows, [6, 7, 18, 19])
+
+    def test_empty_group_consumes_nothing(self):
+        _, cpu_rows = self._expand(
+            gpu=[1, 2],
+            group_sizes=[2, 0],
+            block_indices=[0, 0],
+            cpu=[3, 4],
+            factor=1,
+        )
+        self.assertEqual(cpu_rows, [3, 4])
+
+    def test_unused_cpu_blocks_assert(self):
+        with self.assertRaises(AssertionError):
+            self._expand(gpu=[1, 2],
+                         group_sizes=[2],
+                         block_indices=[0],
+                         cpu=[3, 4, 5],
+                         factor=1)
+
+    def test_too_few_cpu_blocks_assert(self):
+        with self.assertRaises(AssertionError):
+            self._expand(gpu=[1, 2],
+                         group_sizes=[2],
+                         block_indices=[0],
+                         cpu=[3],
+                         factor=1)
+
+
+class TestExpandTransferIdsFlat(unittest.TestCase):
+    """Non-hybrid `_expand_transfer_ids` flat path.
+
+    `expand_block_ids` writes compactly with the skip already applied, so
+    the source expansion must be consumed as-is — slicing off the leading
+    `src_skip` entries again would drop valid rows and read uninitialized
+    tail memory (regression test)."""
+
+    @staticmethod
+    def _expand(src, dst, tpu_to_cpu, src_factor, dst_factor):
+        from vllm_torchtpu.offload.cpu_tpu import _expand_transfer_ids
+        src_ids, dst_ids = _expand_transfer_ids((src, dst), tpu_to_cpu,
+                                                src_factor, dst_factor, None)
+        return list(src_ids), list(dst_ids)
+
+    def test_h2d_partial_first_cpu_block(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        # 3 GPU blocks from 2 CPU blocks at factor 2: skip row 0 of CPU
+        # block 5, then rows 11, 12, 13 map onto GPU blocks 7, 8, 9.
+        src_ids, dst_ids = self._expand(
+            CPULoadStoreSpec([5, 6]),
+            GPULoadStoreSpec([7, 8, 9], group_sizes=[3], block_indices=[1]),
+            tpu_to_cpu=False,
+            src_factor=2,
+            dst_factor=1,
+        )
+        self.assertEqual(src_ids, [11, 12, 13])
+        self.assertEqual(dst_ids, [7, 8, 9])
+
+    def test_d2h_full_blocks(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        src_ids, dst_ids = self._expand(
+            GPULoadStoreSpec([1, 2, 3, 4], group_sizes=[4], block_indices=[0]),
+            CPULoadStoreSpec([3, 7]),
+            tpu_to_cpu=True,
+            src_factor=1,
+            dst_factor=2,
+        )
+        self.assertEqual(src_ids, [1, 2, 3, 4])
+        self.assertEqual(dst_ids, [6, 7, 14, 15])
+
+
+class TestHybridTransferAsyncMapping(unittest.TestCase):
+    """`transfer_async` in hybrid pool mode must route grouped GPU specs
+    through expand_hybrid_pool_block_ids. Uses the same __new__-based
+    handler construction as TestMultiChunkH2D to avoid TPU deps."""
+
+    def _make_h2d_handler(self, cpu_factor=1, num_groups=2):
+        import threading
+        from collections import deque
+
+        from vllm_torchtpu.offload.cpu_tpu import \
+            SingleDirectionOffloadingHandler
+
+        h = SingleDirectionOffloadingHandler.__new__(
+            SingleDirectionOffloadingHandler)
+        h.tpu_to_cpu = False
+        h.src_tensors = []
+        h.dst_tensors = []
+        h.src_block_size_factor = cpu_factor
+        h.dst_block_size_factor = 1
+        h._hybrid_num_groups = num_groups
+        h._transfer_map = {}
+        h._transfers = deque()
+        h._req_id_by_job_id = {}
+        h._h2d_buffer_free = threading.Event()
+        h._h2d_buffer_free.set()
+        h._pending_scatters = []
+        h._flushed_results = []
+        h._dma_worker = MagicMock()
+        h.transfer_type = ("CPU", "GPU")
+        h.total_block_size_in_bytes = 1
+        h._h2d_max_padded = 1024
+        h._start_h2d_dma = lambda t: None
+        return h
+
+    def test_h2d_load_maps_grouped_gpu_spec(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        h = self._make_h2d_handler(cpu_factor=1, num_groups=2)
+        src = CPULoadStoreSpec([10, 11, 12, 20])
+        dst = GPULoadStoreSpec([5, 9, 2, 40],
+                               group_sizes=[3, 1],
+                               block_indices=[0, 3])
+        self.assertTrue(h.transfer_async(1, (src, dst)))
+        t = h._transfer_map[1]
+        self.assertEqual(list(t.src_ids), [10, 11, 12, 20])
+        self.assertEqual(list(t.dst_ids), [5, 9, 2, 40])
+
+    def test_ungrouped_spec_asserts_in_hybrid_mode(self):
+        from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        class _FlatGpuSpec(BlockIDsLoadStoreSpec):
+
+            @staticmethod
+            def medium() -> str:
+                return "GPU"
+
+        h = self._make_h2d_handler(cpu_factor=1, num_groups=2)
+        src = CPULoadStoreSpec([0])
+        dst = _FlatGpuSpec([1])
+        with self.assertRaises(AssertionError):
+            h.transfer_async(3, (src, dst))
+
+
+class TestHybridSpecConsistencyAssert(unittest.TestCase):
+    """TPUCPUOffloadingSpec.__init__ cross-checks model_config.is_hybrid
+    against MambaSpec presence in kv_cache_groups: the hybrid handler
+    mapping and the HBM reserve estimate key on the former, the transfer
+    specs on the latter, so a disagreement must fail at construction."""
+
+    @staticmethod
+    def _make_spec(is_hybrid: bool, with_mamba_group: bool):
+        from vllm.v1.kv_cache_interface import MambaSpec
+        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.is_hybrid = is_hybrid
+        kv_cache_config = MagicMock()
+        attn_group = MagicMock()
+        attn_group.kv_cache_spec = object()
+        groups = [attn_group]
+        if with_mamba_group:
+            mamba_group = MagicMock()
+            mamba_group.kv_cache_spec = MagicMock(spec=MambaSpec)
+            groups.append(mamba_group)
+        kv_cache_config.kv_cache_groups = groups
+
+        # Bypass the base spec's block-size / eviction-policy plumbing;
+        # only the hybrid consistency check is under test.
+        with patch.object(CPUOffloadingSpec, "__init__",
+                          lambda self, *a, **k: None):
+            return TPUCPUOffloadingSpec(vllm_config, kv_cache_config)
+
+    def test_hybrid_with_mamba_group_ok(self):
+        spec = self._make_spec(is_hybrid=True, with_mamba_group=True)
+        self.assertTrue(spec.is_hybrid_model)
+
+    def test_dense_without_mamba_group_ok(self):
+        spec = self._make_spec(is_hybrid=False, with_mamba_group=False)
+        self.assertFalse(spec.is_hybrid_model)
+
+    def test_hybrid_without_mamba_group_asserts(self):
+        with self.assertRaises(AssertionError):
+            self._make_spec(is_hybrid=True, with_mamba_group=False)
+
+    def test_dense_with_mamba_group_asserts(self):
+        with self.assertRaises(AssertionError):
+            self._make_spec(is_hybrid=False, with_mamba_group=True)
+
+
+class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
+    """utils.estimate_kv_connector_hbm_reserve dynamically resolves
+    the configured spec via kv_connector_extra_config without hardcoding
+    connector or spec class names. Shared by tpu_worker budgeting and the
+    runner's num_gpu_blocks_override paths."""
+
+    @staticmethod
+    def _reserve(kv_transfer_config):
+        from vllm_torchtpu import utils
+        vllm_config = MagicMock()
+        vllm_config.kv_transfer_config = kv_transfer_config
+        return utils.estimate_kv_connector_hbm_reserve(vllm_config)
 
     def test_no_kv_connector_returns_zero(self):
-        worker = self._make_worker(kv_transfer_config=None)
-        self.assertEqual(worker._estimate_kv_connector_hbm_reserve(), 0)
+        self.assertEqual(self._reserve(kv_transfer_config=None), 0)
 
     def test_missing_spec_metadata_returns_zero(self):
         """A kv_connector without spec_name / spec_module_path keys
@@ -365,8 +864,7 @@ class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
         shrunk."""
         kv_tc = MagicMock()
         kv_tc.kv_connector_extra_config = {}
-        worker = self._make_worker(kv_transfer_config=kv_tc)
-        self.assertEqual(worker._estimate_kv_connector_hbm_reserve(), 0)
+        self.assertEqual(self._reserve(kv_transfer_config=kv_tc), 0)
 
     def test_unimportable_spec_module_returns_zero(self):
         kv_tc = MagicMock()
@@ -374,8 +872,7 @@ class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
             "spec_name": "Nonexistent",
             "spec_module_path": "does.not.exist.module",
         }
-        worker = self._make_worker(kv_transfer_config=kv_tc)
-        self.assertEqual(worker._estimate_kv_connector_hbm_reserve(), 0)
+        self.assertEqual(self._reserve(kv_transfer_config=kv_tc), 0)
 
     def test_spec_without_estimate_method_returns_zero(self):
         """Even if the spec class resolves, returning 0 when it doesn't
@@ -387,8 +884,7 @@ class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
             "spec_name": "TestEstimateKvConnectorHbmReserve",
             "spec_module_path": "tests.offload.test_cpu_tpu_offload",
         }
-        worker = self._make_worker(kv_transfer_config=kv_tc)
-        self.assertEqual(worker._estimate_kv_connector_hbm_reserve(), 0)
+        self.assertEqual(self._reserve(kv_transfer_config=kv_tc), 0)
 
 
 class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
@@ -451,6 +947,54 @@ class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
         mgr.h2d.assert_called_once_with([1, 2], [3, 5], [1, 1])
         mgr.d2h.assert_not_called()
         self.assertEqual(handler._pending[8], (fut, 2 * 64))
+
+
+class TestRaidenHybridPoolMapping(unittest.TestCase):
+    """`_RaidenOffloadingHandler` in hybrid pool mode routes grouped GPU
+    specs through expand_hybrid_pool_block_ids, matching the torch
+    handler's row mapping exactly."""
+
+    def _make_handler(self, tpu_to_cpu: bool, cpu_factor=1, num_groups=2):
+        from vllm_torchtpu.offload.cpu_tpu import _RaidenOffloadingHandler
+
+        mgr = MagicMock(spec=["d2h", "h2d"])
+        handler = _RaidenOffloadingHandler(
+            mgr,
+            tpu_to_cpu=tpu_to_cpu,
+            src_block_size_factor=1 if tpu_to_cpu else cpu_factor,
+            dst_block_size_factor=cpu_factor if tpu_to_cpu else 1,
+            bytes_per_kernel_block=64,
+            hybrid_num_groups=num_groups,
+        )
+        return handler, mgr
+
+    def test_d2h_store_grouped_mapping(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        handler, mgr = self._make_handler(tpu_to_cpu=True)
+        mgr.d2h.return_value = MagicMock()
+        src = GPULoadStoreSpec([5, 9, 2, 40],
+                               group_sizes=[3, 1],
+                               block_indices=[0, 3])
+        dst = CPULoadStoreSpec([10, 11, 12, 20])
+        with patch("vllm_torchtpu.offload.cpu_tpu._tpu_sync"):
+            self.assertTrue(handler.transfer_async(1, (src, dst)))
+        mgr.d2h.assert_called_once_with([5, 9, 2, 40], [10, 11, 12, 20],
+                                        [1, 1, 1, 1])
+
+    def test_h2d_load_grouped_mapping_factor_2(self):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        handler, mgr = self._make_handler(tpu_to_cpu=False,
+                                          cpu_factor=2,
+                                          num_groups=1)
+        mgr.h2d.return_value = MagicMock()
+        src = CPULoadStoreSpec([5, 6])
+        dst = GPULoadStoreSpec([7, 8, 9], group_sizes=[3], block_indices=[1])
+        self.assertTrue(handler.transfer_async(2, (src, dst)))
+        mgr.h2d.assert_called_once_with([11, 12, 13], [7, 8, 9], [1, 1, 1])
 
 
 if __name__ == "__main__":

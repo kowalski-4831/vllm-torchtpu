@@ -25,6 +25,7 @@ def execute_pcp_streaming_reference(
     schedule: PcpStreamingSchedule,
     *,
     sm_scale: float,
+    interleave_size: int | None = None,
 ) -> np.ndarray:
     """Run the PCP streaming schedule with NumPy online softmax.
 
@@ -33,6 +34,8 @@ def execute_pcp_streaming_reference(
         kv_cache_by_rank: [pcp_size, pages, page_size, kv_heads, 2, head_dim].
         schedule: Host-side PCP streaming schedule.
         sm_scale: Attention softmax scale.
+        interleave_size: Number of consecutive global tokens assigned to one
+            PCP rank before rotating to the next rank. Defaults to page_size.
 
     Returns:
         Rank-local packed output with the same shape as q_by_rank.
@@ -40,6 +43,9 @@ def execute_pcp_streaming_reference(
     validate_pcp_streaming_schedule(schedule)
 
     pcp_size, _, kv_heads, q_per_kv, head_dim = q_by_rank.shape
+    page_size = kv_cache_by_rank.shape[2]
+    if interleave_size is None:
+        interleave_size = page_size
     if pcp_size != schedule.pcp_size:
         raise ValueError("q_by_rank first dimension must match schedule.")
     output = np.zeros_like(q_by_rank, dtype=np.float32)
@@ -101,9 +107,12 @@ def execute_pcp_streaming_reference(
                                          0, :].astype(np.float32)
                     v = kv_cache_by_rank[src_rank, page_idx, :kv_valid_len, :,
                                          1, :].astype(np.float32)
-                    kv_pos = kv_global_start + np.arange(kv_valid_len)
+                    local_kv_pos = np.arange(kv_valid_len)
+                    kv_pos = (kv_global_start +
+                              (local_kv_pos // interleave_size) *
+                              schedule.pcp_size * interleave_size +
+                              local_kv_pos % interleave_size)
                 else:
-                    page_size = kv_cache_by_rank.shape[2]
                     page_ids = schedule.kv_page_indices[consumer_rank, step,
                                                         lane]
                     k_pages = []
@@ -123,17 +132,19 @@ def execute_pcp_streaming_reference(
                     k = np.concatenate(k_pages, axis=0).astype(np.float32)
                     v = np.concatenate(v_pages, axis=0).astype(np.float32)
                     local_kv_pos = np.arange(kv_valid_len)
-                    kv_pos = (kv_global_start + (local_kv_pos // page_size) *
-                              schedule.pcp_size * page_size +
-                              local_kv_pos % page_size)
+                    kv_page_offset = local_kv_pos // page_size
+                    kv_token_offset = local_kv_pos % page_size
+                    kv_pos = (kv_global_start +
+                              kv_page_offset * schedule.pcp_size * page_size +
+                              (kv_token_offset // interleave_size) *
+                              schedule.pcp_size * interleave_size +
+                              kv_token_offset % interleave_size)
 
                 scores = np.einsum("thqd,shd->thqs", q_tile, k) * sm_scale
                 q_rows = np.arange(q_tile_size)
-                page_size = kv_cache_by_rank.shape[2]
-                q_pos = (
-                    q_global_start +
-                    (q_rows // page_size) * schedule.pcp_size * page_size +
-                    q_rows % page_size)
+                q_pos = (q_global_start + (q_rows // interleave_size) *
+                         schedule.pcp_size * interleave_size +
+                         q_rows % interleave_size)
                 mask = q_pos[:, None] >= kv_pos[None, :]
                 scores = np.where(mask[:, None, None, :], scores, -np.inf)
 

@@ -33,10 +33,10 @@ def _build_expected_pcp_local_slot_ids(
         raise ValueError("PCP slot ids require pcp_size > 1.")
     if interleave_size <= 0:
         raise ValueError("PCP slot ids require interleave_size > 0.")
-    if block_size != interleave_size:
+    if interleave_size > block_size or block_size % interleave_size != 0:
         raise NotImplementedError(
-            "Native PCP prefill slot ids currently require "
-            f"block_size == interleave_size, got {block_size=} "
+            "Native PCP prefill slot ids require block_size to be divisible "
+            f"by interleave_size, got {block_size=} "
             f"{interleave_size=}.")
     if padded_num_tokens % pcp_size:
         raise ValueError(
@@ -211,7 +211,8 @@ def test_update_local_paged_kv_cache_accepts_equivalent_tail_layout(
 
 def test_compute_pcp_local_slot_ids_from_metadata_matches_runner_reference():
     pcp_size = 4
-    interleave_size = page_size = 4
+    page_size = 4
+    interleave_size = 2
     local_padded_tokens = 16
     target_num_reqs = 4
     local_kv_cache_num_blocks = 8
@@ -491,9 +492,12 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
     )
 
     np.testing.assert_array_equal(np.asarray(captured["slot_ids"]), expected)
+    assert np.any(expected < 0)
+    expected_output = np.zeros((local_padded_tokens, 2, 128), dtype=np.float32)
+    expected_output[expected >= 0] = 5
     np.testing.assert_array_equal(
         np.asarray(output),
-        np.full((local_padded_tokens, 2, 128), 5),
+        expected_output,
     )
     assert new_cache.shape == (local_kv_cache_num_blocks, page_size, 2, 1, 128)
 

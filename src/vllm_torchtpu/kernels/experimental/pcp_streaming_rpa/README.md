@@ -100,7 +100,8 @@ transfer for all local KV heads.
 The production path is intentionally narrow:
 
 - Full attention only; sliding-window attention is not supported here.
-- `cp_kv_cache_interleave_size == page_size`.
+- `cp_kv_cache_interleave_size <= page_size`, and `page_size` must be
+  divisible by `cp_kv_cache_interleave_size`.
 - `q_block_size` must be a multiple of the interleave size.
 - The metadata schedule path supports `num_lanes == 1` and
   `kv_pages_per_block == 1`.

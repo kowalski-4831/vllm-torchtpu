@@ -73,13 +73,6 @@ MAX_NUM_BATCHED_TOKENS=$(( ISL / DP_SIZE > 1024 ? ISL / DP_SIZE : 1024 ))
 MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
 
-# Isolate the compile cache per server config. vLLM's AOT compile cache key omits
-# max_num_seqs.
-_CACHE_KEY="${SHARDING}_mml${MAX_MODEL_LEN}_mnbt${MAX_NUM_BATCHED_TOKENS}_mns${MAX_NUM_SEQS}"
-_DEFAULT_CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/vllm"
-export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$_DEFAULT_CACHE_ROOT/$_CACHE_KEY}"
-mkdir -p "$VLLM_CACHE_ROOT"
-
 # Increase API-server frontend wait time since cold init may take long.
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 

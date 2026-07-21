@@ -142,6 +142,43 @@ def _substitute_placeholder_token(
 
 logger = init_logger(__name__)
 
+_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
+    "invalid_block_group_index" in getattr(KVConnectorOutput,
+                                           "__dataclass_fields__", {}))
+
+
+def _build_kv_connector_output(
+    *,
+    finished_sending: set[str] | None,
+    finished_recving: set[str] | None,
+    kv_connector_worker_meta: Any | None,
+    invalid_block_ids: set[int],
+    invalid_block_group_index: int | None,
+) -> KVConnectorOutput:
+    """Build a connector output across the vLLM 0.23 API boundary.
+
+    vLLM 0.23 supports invalid block IDs only for a single KV cache group and
+    does not expose ``invalid_block_group_index``. Newer vLLM versions support
+    group-scoped recovery for hybrid caches. Do not pass the newer keyword to
+    0.23, but fail closed if a hybrid load actually fails: silently dropping
+    the group would make overlapping block IDs ambiguous to its scheduler.
+    """
+    kwargs: dict[str, Any] = {
+        "finished_sending": finished_sending,
+        "finished_recving": finished_recving,
+        "kv_connector_worker_meta": kv_connector_worker_meta,
+        "invalid_block_ids": invalid_block_ids,
+    }
+    if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
+        kwargs["invalid_block_group_index"] = invalid_block_group_index
+    elif invalid_block_group_index is not None:
+        raise RuntimeError(
+            "Installed vLLM does not support cache-group-scoped KV load "
+            "failure recovery; upgrade vLLM before recovering a failed "
+            f"hybrid KV load (group={invalid_block_group_index})")
+    return KVConnectorOutput(**kwargs)
+
+
 # Smallest output size
 MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
@@ -520,6 +557,12 @@ class TPUModelRunner(GPUModelRunner):
             return
         kv_connector = get_kv_transfer_group()
         assert scheduler_output.kv_connector_metadata is not None
+        # Upstream parity (gpu_model_runner calls this before every forward;
+        # base-class default is a no-op): lets connectors with async saves
+        # fence in-flight stores whose source blocks the scheduler is about
+        # to reuse (OffloadingConnector jobs_to_flush) before the forward
+        # overwrites them.
+        kv_connector.handle_preemptions(scheduler_output.kv_connector_metadata)
         kv_connector.bind_connector_metadata(
             scheduler_output.kv_connector_metadata)
         # forward_context is unused by TPUConnector; pass None.
@@ -536,10 +579,14 @@ class TPUModelRunner(GPUModelRunner):
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
-            return None, None, None
+            return None, None, None, set(), None
         kv_connector = get_kv_transfer_group()
         finished_sending, finished_recving = kv_connector.get_finished(
             scheduler_output.finished_req_ids)
+        invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+        invalid_block_group_index = (
+            kv_connector.get_block_ids_with_load_errors_group_index()
+            if invalid_block_ids else None)
         # vLLM >=0.21 job model: store completions (and load completions) are
         # reported to the scheduler via the worker meta's `completed_jobs`,
         # NOT via finished_sending. Without plumbing this, the
@@ -551,7 +598,8 @@ class TPUModelRunner(GPUModelRunner):
         # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
-        return finished_sending, finished_recving, worker_meta
+        return (finished_sending, finished_recving, worker_meta,
+                invalid_block_ids, invalid_block_group_index)
 
     def kv_connector_no_forward(self, scheduler_output,
                                 vllm_config) -> ModelRunnerOutput:
@@ -561,12 +609,15 @@ class TPUModelRunner(GPUModelRunner):
         self.maybe_setup_kv_connector(
             scheduler_output,
             wait_for_completion=dist_utils.get_raiden_inline_load())
-        finished_sending, finished_recving, worker_meta = (
-            self.get_finished_kv_transfers(scheduler_output))
-        kv_connector_output = KVConnectorOutput(
+        (finished_sending, finished_recving, worker_meta, invalid_block_ids,
+         invalid_block_group_index
+         ) = self.get_finished_kv_transfers(scheduler_output)
+        kv_connector_output = _build_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             kv_connector_worker_meta=worker_meta,
+            invalid_block_ids=invalid_block_ids,
+            invalid_block_group_index=invalid_block_group_index,
         )
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -1071,6 +1122,23 @@ class TPUModelRunner(GPUModelRunner):
                                                 int(uniform_page_size_bytes),
                                                 group_size)
 
+    def _available_kv_cache_hbm(self) -> int:
+        """KV-cache HBM budget for the block-count override paths.
+
+        Matches `TPUWorker.determine_available_memory()`: the
+        `utils.compute_hbm_budget` result (which reserves the
+        `gpu_memory_utilization` cap and `TPU_KV_CACHE_HEADROOM_MIB`
+        headroom) minus `utils.estimate_kv_connector_hbm_reserve` (HBM a
+        connector allocates after profile_run, such as the offload H2D
+        staging pool). Sizing overrides against this budget keeps them from
+        filling the connector reserve back up with KV blocks and defeating
+        the worker-side subtraction.
+        """
+        budget = utils.compute_hbm_budget(
+            [self.device], self.cache_config.gpu_memory_utilization)
+        return budget.available - utils.estimate_kv_connector_hbm_reserve(
+            self.vllm_config)
+
     def _maybe_set_compact_mamba_num_blocks_override(
             self, attn_page_size_bytes: int,
             unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
@@ -1132,12 +1200,7 @@ class TPUModelRunner(GPUModelRunner):
         if group_size <= 0:
             return
 
-        gpu_mem_util = cache_config.gpu_memory_utilization
-        # Shares utils.compute_hbm_budget() with
-        # TPUWorker.determine_available_memory(), so the pinned block counts
-        # match the KV-cache budget vLLM is given (incl. the headroom knob).
-        budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
-        avail = budget.available
+        avail = self._available_kv_cache_hbm()
         if avail <= 0:
             return
 
@@ -1388,12 +1451,9 @@ class TPUModelRunner(GPUModelRunner):
         OOM. Pinning to `num_blocks_tpu` preserves the headroom the
         single-step formula silently removes.
 
-        `avail` comes from `utils.compute_hbm_budget`, the same helper
-        `TPUWorker.determine_available_memory()` uses, so it reserves both the
-        `gpu_memory_utilization` cap and the `TPU_KV_CACHE_HEADROOM_MIB`
-        headroom, and the block count pinned here matches the KV-cache budget
-        the worker hands vLLM. No safety margin is applied beyond those two
-        knobs.
+        `avail` comes from `_available_kv_cache_hbm`, so the block count
+        pinned here matches the KV-cache budget
+        `TPUWorker.determine_available_memory()` hands vLLM.
 
         Skipped only if the user has explicitly set `num_gpu_blocks_override`.
 
@@ -1415,11 +1475,7 @@ class TPUModelRunner(GPUModelRunner):
         if cache_config.num_gpu_blocks_override is not None:
             return
 
-        gpu_mem_util = cache_config.gpu_memory_utilization
-        # Shares utils.compute_hbm_budget() with
-        # TPUWorker.determine_available_memory(), so the pinned block count
-        # matches the KV-cache budget vLLM is given.
-        avail = utils.compute_hbm_budget([self.device], gpu_mem_util).available
+        avail = self._available_kv_cache_hbm()
         if avail <= 0:
             return
 
@@ -2743,8 +2799,9 @@ class TPUModelRunner(GPUModelRunner):
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
         self.maybe_wait_for_kv_save()
-        finished_sending, finished_recving, kv_worker_meta = (
-            self.get_finished_kv_transfers(scheduler_output))
+        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
+         invalid_block_group_index
+         ) = self.get_finished_kv_transfers(scheduler_output)
 
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
@@ -2792,11 +2849,14 @@ class TPUModelRunner(GPUModelRunner):
 
         kv_connector_output = (
             None if (finished_sending is None and finished_recving is None
-                     and kv_worker_meta is None) else KVConnectorOutput(
-                         finished_sending=finished_sending,
-                         finished_recving=finished_recving,
-                         kv_connector_worker_meta=kv_worker_meta,
-                     ))
+                     and kv_worker_meta is None and not invalid_block_ids) else
+            _build_kv_connector_output(
+                finished_sending=finished_sending,
+                finished_recving=finished_recving,
+                kv_connector_worker_meta=kv_worker_meta,
+                invalid_block_ids=invalid_block_ids,
+                invalid_block_group_index=invalid_block_group_index,
+            ))
 
         next_tokens_tpu = None
         copy_state = None

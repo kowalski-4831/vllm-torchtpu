@@ -34,6 +34,15 @@ LAUNCH_TIMEOUT_SECONDS = 420
 
 CASES = (
     {
+        "name": "bf16_split_interleave",
+        "kv_dtype": "bfloat16",
+        "num_kv_heads": 1,
+        "q_per_kv": 1,
+        "k_scale": None,
+        "v_scale": None,
+        "interleave_size": 32,
+    },
+    {
         "name": "bf16_single",
         "kv_dtype": "bfloat16",
         "num_kv_heads": 1,
@@ -226,7 +235,8 @@ def _run_case(torch, sync, mesh, case: dict[str, object]) -> dict[str, object]:
         sm_scale=1.0 / math.sqrt(HEAD_DIM),
         soft_cap=None,
         skip_kv_update=False,
-        cp_kv_cache_interleave_size=PAGE_SIZE,
+        cp_kv_cache_interleave_size=int(case.get("interleave_size",
+                                                 PAGE_SIZE)),
         max_model_len=GLOBAL_TOKENS,
         q_block_size=LOCAL_TOKENS,
         q_compute_size=64,
