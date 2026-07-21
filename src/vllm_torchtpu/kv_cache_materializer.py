@@ -107,9 +107,10 @@ def format_kv_cache_layout_summary(
 def _pool_attention_geometry(
     kv_cache_config: KVCacheConfig,
     attn_groups: Sequence[Sequence[AttentionGroup]],
-) -> tuple[AttentionSpec, Any] | None:
-    """(attention spec, backend) of the unified pool, or None when the
-    config has no hybrid attention+mamba sharing."""
+    kernel_block_size_by_gid: dict[int, int],
+) -> tuple[AttentionSpec, Any, int] | None:
+    """(attention spec, backend, kernel block size) of the unified pool,
+    or None when the config has no hybrid attention+mamba sharing."""
     has_mamba = any(
         isinstance(group.kv_cache_spec, MambaSpec)
         for group in kv_cache_config.kv_cache_groups)
@@ -120,14 +121,16 @@ def _pool_attention_geometry(
             spec = group.kv_cache_spec
             if isinstance(spec, AttentionSpec) and not isinstance(
                     spec, EncoderOnlyAttentionSpec):
-                return spec, group.backend
+                kernel_block_size = kernel_block_size_by_gid.get(
+                    group.kv_cache_group_id, spec.block_size)
+                return spec, group.backend, kernel_block_size
     return None
 
 
 def allocate_raw_kv_cache_tensors(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
-    pool_geometry: tuple[AttentionSpec, Any] | None = None,
+    pool_geometry: tuple[AttentionSpec, Any, int] | None = None,
     cache_dtype: str | torch.dtype = "auto",
 ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
     layer_to_raw: dict[str, torch.Tensor] = {}
@@ -143,13 +146,21 @@ def allocate_raw_kv_cache_tensors(
             # regions through it, so the buffer carries the tiled layout
             # every compiled graph expects and no reshape or relayout
             # ever touches it.
-            spec, attn_backend = pool_geometry
+            spec, attn_backend, kernel_block_size = pool_geometry
+            assert spec.block_size % kernel_block_size == 0, (
+                spec.block_size, kernel_block_size)
+            split = spec.block_size // kernel_block_size
             assert kv_cache_tensor.size % pool_page_bytes == 0, (
                 kv_cache_tensor.size, pool_page_bytes)
             num_blocks = kv_cache_tensor.size // pool_page_bytes
+            # Born at the attention KERNEL's block granularity (a manager
+            # block = `split` consecutive kernel blocks, upstream's
+            # map_to_kernel_blocks contract), so the kernel consumes the
+            # pool natively; the mamba adapters take the manager view via
+            # a free leading-dim reshape inside the compiled graph.
             shape = attn_backend.get_kv_cache_shape(
-                num_blocks,
-                spec.block_size,
+                num_blocks * split,
+                kernel_block_size,
                 spec.num_kv_heads,
                 spec.head_size,
                 cache_dtype_str=cache_dtype,
@@ -166,11 +177,13 @@ def allocate_raw_kv_cache_tensors(
                 raw = torch.zeros(tuple(shape),
                                   dtype=spec.dtype,
                                   device=device)
-            # Fit-size block sizing guarantees the attention page IS the
-            # pool page (the mamba slot fits inside it).
-            fa_page_bytes = raw.numel() * raw.element_size() // num_blocks
-            assert fa_page_bytes == pool_page_bytes, (fa_page_bytes,
-                                                      pool_page_bytes)
+            # Fit-size block sizing guarantees the attention manager page
+            # IS the pool page (the mamba slot fits inside it).
+            fa_page_bytes = (raw.numel() * raw.element_size() //
+                             (num_blocks * split))
+            assert fa_page_bytes * split == pool_page_bytes, (fa_page_bytes,
+                                                              split,
+                                                              pool_page_bytes)
         else:
             raw = torch.zeros(kv_cache_tensor.size,
                               dtype=torch.int8,
@@ -399,7 +412,8 @@ def materialize_kv_cache_tensors(
                     )
         return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=[])
 
-    pool_geometry = (_pool_attention_geometry(kv_cache_config, attn_groups)
+    pool_geometry = (_pool_attention_geometry(kv_cache_config, attn_groups,
+                                              kernel_block_size_by_gid)
                      if unified_block_pool else None)
     layer_to_raw, raw_tensors = allocate_raw_kv_cache_tensors(
         kv_cache_config,

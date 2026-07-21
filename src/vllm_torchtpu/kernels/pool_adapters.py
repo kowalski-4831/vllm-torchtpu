@@ -29,10 +29,15 @@ grid step moves only the region's bytes. Scatters alias the pool in place
 (`input_output_aliases`); the unwritten complement is preserved via the
 HBM alias, with no read-modify-write.
 """
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels import typed_ldst
+from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
 
 
 def _pool_geometry(pool):
@@ -79,8 +84,19 @@ def gather_region(pool,
                   tok0: int,
                   ntok: int,
                   out_dtype,
-                  out_lanes: int | None = None):
+                  out_lanes: int | None = None,
+                  split: int = 1):
     """Per-request typed read of a pool token-range.
+
+    ``split`` > 1 addresses a MANAGER-block token range on a pool born at
+    kernel granularity (a manager block is `split` consecutive kernel
+    blocks; ``state_indices`` are manager ids): whole-kernel-block ranges
+    go through one DMA window per request; a range inside a single kernel
+    block goes through the plain path at the kernel-block offset. Ranges
+    that straddle kernel blocks partially are unsupported (no current
+    region shape needs them).
+
+    Plain path (split == 1): per-request typed read of a pool token-range.
 
     pool: (num_blocks, block_size, heads2, lanes) KV dtype.
     state_indices: (num_reqs,) int32 block ids.
@@ -90,6 +106,28 @@ def gather_region(pool,
     pay no XLA lane-crossing relayout; the remaining outside reshape is
     lane-preserving (free).
     """
+    if split > 1:
+        kernel_bs = pool.shape[1]
+        if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
+            return _gather_window(pool,
+                                  state_indices,
+                                  split=split,
+                                  kb0=tok0 // kernel_bs,
+                                  nblocks=ntok // kernel_bs,
+                                  out_dtype=out_dtype,
+                                  out_lanes=out_lanes)
+        kb, local0 = divmod(tok0, kernel_bs)
+        if local0 + ntok > kernel_bs:
+            raise NotImplementedError(
+                "region partially straddles kernel blocks: "
+                f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}")
+        return gather_region(pool,
+                             state_indices * split + kb,
+                             tok0=local0,
+                             ntok=ntok,
+                             out_dtype=out_dtype,
+                             out_lanes=out_lanes)
+
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
     assert tok0 % ntok == 0 and tok0 + ntok <= block_size
@@ -110,19 +148,9 @@ def gather_region(pool,
     pad = (0, ) * (len(payload) + 1)
 
     def _kernel(sidx_ref, pool_ref, o_ref):
-        block = pool_ref.at[0]
-        if not same_dtype:
-            block = block.bitcast(jnp.dtype(out_dtype))
-        arr = block[...].reshape(out_rows // lane_split, lanes)
-        if lane_split > 1:
-            # In-kernel lane split: 128-aligned lane slices stacked on a
-            # new sublane axis preserve the row-major element order.
-            arr = jnp.stack([
-                arr[:, i * o_lanes:(i + 1) * o_lanes]
-                for i in range(lane_split)
-            ],
-                            axis=1).reshape(out_rows, o_lanes)
-        o_ref[...] = arr[None]
+        o_ref[...] = typed_ldst.load_typed(pool_ref.at[0],
+                                           view_dtype=out_dtype,
+                                           lane_split=lane_split)[None]
 
     return pl.pallas_call(
         _kernel,
@@ -140,14 +168,158 @@ def gather_region(pool,
     )(state_indices, pool)
 
 
-def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int):
-    """Per-request typed write of a pool token-range (in place).
+def _gather_window(pool,
+                   mgr_indices,
+                   *,
+                   split: int,
+                   kb0: int,
+                   nblocks: int,
+                   out_dtype,
+                   out_lanes: int | None = None):
+    """Typed read of `nblocks` whole kernel blocks inside each request's
+    manager block, one grid step and ONE DMA window per request.
+
+    The pool is born at kernel granularity; a manager block is `split`
+    consecutive kernel blocks (upstream map_to_kernel_blocks), so the
+    window (split, block_size, ...) indexed by the manager id is always
+    aligned (element offset = mgr * split). Reading the whole manager
+    window costs a little extra DMA but restores the single-window-per-
+    request shape whose per-window setup dominates the region cost.
+    """
+    assert 0 <= kb0 and kb0 + nblocks <= split, (kb0, nblocks, split)
+    na = mgr_indices.shape[0]
+    block_size, payload, lanes = _pool_geometry(pool)
+    same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(out_dtype)
+    out_payload = (payload if same_dtype else _bitcast_payload(
+        payload, pool.dtype, out_dtype))
+    rows_pb = _out_rows(out_payload, block_size)
+    if not payload and not same_dtype:
+        rows_pb = _rescale_rows(block_size, pool.dtype, out_dtype)
+    lane_split = 1
+    if out_lanes is not None and out_lanes != lanes:
+        assert lanes % out_lanes == 0, (lanes, out_lanes)
+        lane_split = lanes // out_lanes
+        rows_pb *= lane_split
+    o_lanes = lanes // lane_split
+    pad = (0, ) * (len(payload) + 1)
+
+    def _kernel(sidx_ref, pool_ref, o_ref):
+        for j in range(nblocks):
+            o_ref[0, j * rows_pb:(j + 1) *
+                  rows_pb, :] = (typed_ldst.load_typed(pool_ref.at[kb0 + j],
+                                                       view_dtype=out_dtype,
+                                                       lane_split=lane_split))
+
+    return pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(na, ),
+            in_specs=[
+                pl.BlockSpec((split, block_size) + payload + (lanes, ),
+                             lambda i, s: (s[i], 0) + pad)
+            ],
+            out_specs=pl.BlockSpec((1, nblocks * rows_pb, o_lanes),
+                                   lambda i, s: (i, 0, 0)),
+        ),
+        out_shape=jax.ShapeDtypeStruct((na, nblocks * rows_pb, o_lanes),
+                                       out_dtype),
+    )(mgr_indices, pool)
+
+
+def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int,
+                    nblocks: int):
+    """Typed write of `nblocks` whole kernel blocks inside each request's
+    manager block (in place), one grid step per request; vals is the
+    gather shape. The aliased output window covers the whole
+    manager block, so the non-region kernel blocks are copied through
+    from the aliased input to satisfy the full-write rule.
+    """
+    assert 0 <= kb0 and kb0 + nblocks <= split, (kb0, nblocks, split)
+    na = mgr_indices.shape[0]
+    block_size, payload, lanes = _pool_geometry(pool)
+    same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(vals.dtype)
+    val_payload = (payload if same_dtype else _bitcast_payload(
+        payload, pool.dtype, vals.dtype))
+    rows_pb = _out_rows(val_payload, block_size)
+    if not payload and not same_dtype:
+        rows_pb = _rescale_rows(block_size, pool.dtype, vals.dtype)
+    v_lanes = vals.shape[-1]
+    lane_split = 1
+    if v_lanes != lanes:
+        assert lanes % v_lanes == 0, (lanes, v_lanes)
+        lane_split = lanes // v_lanes
+    v_rows_pb = rows_pb * lane_split
+    assert vals.shape == (na, nblocks * v_rows_pb,
+                          v_lanes), (vals.shape, nblocks, v_rows_pb, v_lanes)
+    pad = (0, ) * (len(payload) + 1)
+
+    def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
+        for j in range(split):
+            if kb0 <= j < kb0 + nblocks:
+                typed_ldst.store_typed(
+                    pool_out_ref.at[j],
+                    val_ref[0, (j - kb0) * v_rows_pb:(j - kb0 + 1) *
+                            v_rows_pb, :],
+                    lane_split=lane_split)
+            else:
+                # full-write rule: pass the untouched kernel blocks through
+                pool_out_ref.at[j][...] = pool_in_ref.at[j][...]
+
+    return pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(na, ),
+            in_specs=[
+                pl.BlockSpec((1, nblocks * v_rows_pb, v_lanes), lambda i, s:
+                             (i, 0, 0)),
+                pl.BlockSpec((split, block_size) + payload + (lanes, ),
+                             lambda i, s: (s[i], 0) + pad),
+            ],
+            out_specs=pl.BlockSpec((split, block_size) + payload + (lanes, ),
+                                   lambda i, s: (s[i], 0) + pad),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={2: 0},
+    )(mgr_indices, vals, pool)
+
+
+def scatter_region(pool,
+                   vals,
+                   state_indices,
+                   *,
+                   tok0: int,
+                   ntok: int,
+                   split: int = 1):
+    """Per-request typed write of a pool token-range (in place); mirrors
+    ``gather_region`` including the ``split`` manager-range routing.
 
     pool: (num_blocks, block_size, heads2, lanes) KV dtype (aliased;
     unwritten bytes preserved).
     vals: (num_reqs, rows, lanes) — the gather_region shape.
     returns: the updated pool.
     """
+    if split > 1:
+        kernel_bs = pool.shape[1]
+        if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
+            return _scatter_window(pool,
+                                   vals,
+                                   state_indices,
+                                   split=split,
+                                   kb0=tok0 // kernel_bs,
+                                   nblocks=ntok // kernel_bs)
+        kb, local0 = divmod(tok0, kernel_bs)
+        if local0 + ntok > kernel_bs:
+            raise NotImplementedError(
+                "region partially straddles kernel blocks: "
+                f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}")
+        return scatter_region(pool,
+                              vals,
+                              state_indices * split + kb,
+                              tok0=local0,
+                              ntok=ntok)
+
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
     assert tok0 % ntok == 0 and tok0 + ntok <= block_size
@@ -171,18 +343,9 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int):
     def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
         # The output block covers exactly the region and is fully written;
         # the complement is preserved via the HBM alias.
-        block = pool_out_ref.at[0]
-        if not same_dtype:
-            block = block.bitcast(jnp.dtype(vals.dtype))
-        arr = val_ref[0]
-        if lane_split > 1:
-            arr = arr.reshape(out_rows, lane_split, v_lanes)
-            arr = jnp.concatenate([arr[:, i, :] for i in range(lane_split)],
-                                  axis=-1)
-        if not payload and not same_dtype:
-            block[...] = arr.reshape(out_rows, lanes)
-        else:
-            block[...] = arr.reshape((ntok, ) + val_payload + (lanes, ))
+        typed_ldst.store_typed(pool_out_ref.at[0],
+                               val_ref[0],
+                               lane_split=lane_split)
 
     return pl.pallas_call(
         _kernel,
@@ -231,3 +394,74 @@ def copy_blocks(pool, src_indices, dst_indices):
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
     )(src_indices, dst_indices, pool)
+
+
+def v3_state_source(pool, *, split: int, ssm_ntok: int, conv_tok0: int,
+                    conv_ntok: int, conv_dim: int, n_v: int, d_k: int,
+                    d_v: int,
+                    kernel_size: int) -> gdn_v3_config.StateSourcePlan:
+    """Static copy-plan letting the fused GDN V3 kernel stream the mamba
+    state regions directly between this pool and its double-buffered
+    pipeline — the exact bytes ``gather_region``/``scatter_region`` move
+    for these regions, without the external round trip.
+
+    The ssm region is the whole kernel blocks at the start of the manager
+    window (one contiguous DMA per slot), viewed f32 with the ``d_v``
+    lane split; the conv region is ``conv_ntok`` token rows inside a
+    single kernel block, viewed bf16 with the tail rows zero-padded.
+    Arguments mirror the region geometry computed by the pooled GDN
+    caller; ``pool`` contributes only its shape and dtype.
+    """
+    block_size, payload, lanes = _pool_geometry(pool)
+    tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
+
+    assert lanes % d_v == 0, (lanes, d_v)
+    ssm_rows = n_v * d_k
+    # The caller sizes the ssm region to exactly the f32 state bytes, so
+    # the kernel's write covers the whole region (no padding rows).
+    assert ssm_ntok * tok_bytes == ssm_rows * d_v * 4, (ssm_ntok, tok_bytes,
+                                                        n_v, d_k, d_v)
+    if ssm_ntok % block_size == 0:
+        ssm_nblocks, ssm_nrows = ssm_ntok // block_size, block_size
+    else:
+        assert ssm_ntok < block_size, (ssm_ntok, block_size)
+        ssm_nblocks, ssm_nrows = 1, ssm_ntok
+    ssm = gdn_v3_config.StateRegion(
+        kb0=0,
+        nblocks=ssm_nblocks,
+        row0=0,
+        nrows=ssm_nrows,
+        view_dtype=jnp.dtype(jnp.float32),
+        lane_split=lanes // d_v,
+        rows_used=ssm_rows,
+    )
+
+    kb0, row0 = divmod(conv_tok0, block_size)
+    if row0 + conv_ntok > block_size:
+        raise NotImplementedError(
+            "conv region partially straddles kernel blocks: "
+            f"tok0={conv_tok0} ntok={conv_ntok} kernel_block={block_size}")
+    assert conv_tok0 + conv_ntok <= split * block_size, (conv_tok0, conv_ntok,
+                                                         split, block_size)
+    assert (kernel_size - 1) * conv_dim % lanes == 0, (kernel_size, conv_dim,
+                                                       lanes)
+    # The kernel regroups conv rows into (kernel_size - 1, conv_dim) via
+    # 128-aligned lane concat, which needs whole rows per conv row.
+    assert conv_dim % lanes == 0, (conv_dim, lanes)
+    conv_rows = (kernel_size - 1) * conv_dim // lanes
+    assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (conv_rows,
+                                                            conv_ntok,
+                                                            tok_bytes)
+    conv = gdn_v3_config.StateRegion(
+        kb0=kb0,
+        nblocks=1,
+        row0=row0,
+        nrows=conv_ntok,
+        view_dtype=jnp.dtype(jnp.bfloat16),
+        lane_split=1,
+        rows_used=conv_rows,
+    )
+
+    return gdn_v3_config.StateSourcePlan(stride=split,
+                                         conv=conv,
+                                         recurrent=ssm)
