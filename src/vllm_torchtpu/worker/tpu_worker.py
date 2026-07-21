@@ -490,6 +490,7 @@ class TPUWorker(WorkerBase):
         self.model_runner.prewarm_kv_offload_shape(p)
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
