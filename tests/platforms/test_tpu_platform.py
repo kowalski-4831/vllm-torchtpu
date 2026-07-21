@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -57,6 +58,32 @@ def test_debug_tpu_local_rank_offset_env(monkeypatch):
     monkeypatch.setenv(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "not-an-int")
     with pytest.raises(ValueError, match=DEBUG_TPU_LOCAL_RANK_OFFSET_ENV):
         _debug_tpu_local_rank_offset()
+
+
+def test_prepare_singlehost_tpu_env_skips_distributed_bootstrap_for_tp1(
+        monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "1")
+
+    TpuPlatform._prepare_singlehost_tpu_env(1)
+
+    assert "WORLD_SIZE" not in os.environ
+
+
+def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(
+        monkeypatch):
+    """A DP engine must not clear the slice env it inherited from the parent."""
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES",
+                       ",".join(f"localhost:{p}" for p in range(1000, 1008)))
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2,2,1,2")
+
+    with patch.object(TpuPlatform, "_get_tpu_topology",
+                      return_value="2,2,1,2"):
+        TpuPlatform._prepare_singlehost_tpu_env(8)
+
+    assert os.environ["WORLD_SIZE"] == "8"
+    assert len(os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
+    assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
 
 
 class TestTpuPlatform:

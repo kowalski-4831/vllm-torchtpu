@@ -482,14 +482,17 @@ class TpuPlatform(Platform):
     def _prepare_singlehost_tpu_env(cls, world_size: int) -> None:
         """Set TORCH_TPU_* env vars needed by PjRt initialization.
 
-        TPUWorker.init_device() always sets WORLD_SIZE in the env, which
-        causes PjRt to require TORCH_TPU_SLICEBUILDER_ADDRESSES and
-        TORCH_TPU_TOPOLOGY. For world_size > 1, topology is looked up
-        via PCI scan using world_size (not auto-detected chip count) so
-        slicebuilder and topology match the actual number of workers.
+        For world_size > 1, topology is looked up via PCI scan using
+        world_size (not auto-detected chip count) so slicebuilder and topology
+        match the actual number of workers. A single TPU does not need the
+        distributed PjRt bootstrap.
         """
         os.environ.setdefault("TORCH_TPU_XPROF_SESSION_ID",
                               str(time.time_ns()))
+
+        if world_size == 1:
+            os.environ.pop("WORLD_SIZE", None)
+            return
 
         sb_addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
         sb_count = len(sb_addresses.split(",")) if sb_addresses else 0
@@ -500,11 +503,7 @@ class TpuPlatform(Platform):
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
                 f"localhost:{p}" for p in sb_ports)
 
-        if world_size == 1:
-            os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1"
-        else:
-            os.environ["TORCH_TPU_TOPOLOGY"] = \
-                cls._get_tpu_topology(world_size)
+        os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(world_size)
 
     @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
@@ -794,8 +793,14 @@ class TpuPlatform(Platform):
                 cls._prepare_singlehost_tpu_env(
                     parallel_config.world_size_across_dp)
             else:
-                os.environ.pop("TORCH_TPU_DP_SIZE", None)
-                torch_tpu_world_size = parallel_config.world_size
+                # vLLM hands each DP engine a ParallelConfig with
+                # data_parallel_size collapsed to 1, so the inherited
+                # TORCH_TPU_DP_SIZE is the only record of how wide the slice
+                # really is. Keep sizing the bootstrap by the whole slice.
+                dp_slice_size = int(
+                    os.environ.pop("TORCH_TPU_DP_SIZE", "1") or 1)
+                torch_tpu_world_size = (parallel_config.world_size *
+                                        dp_slice_size)
                 if pcp_size > 1:
                     logger.info(
                         "Preparing TorchTPU bootstrap env for native PCP "
