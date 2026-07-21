@@ -13,11 +13,38 @@
 # limitations under the License.
 """Tests for TPUWorker"""
 
+import os
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm_torchtpu.worker.tpu_worker import TPUWorker
+from vllm_torchtpu.worker.tpu_worker import (TPUWorker,
+                                             _configure_tpu_process_env)
+
+
+def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(
+        monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+
+    _configure_tpu_process_env(rank=0,
+                               local_rank=0,
+                               world_size=1,
+                               local_world_size=1)
+
+    assert os.environ["RANK"] == "0"
+    assert os.environ["LOCAL_RANK"] == "0"
+    assert os.environ["LOCAL_WORLD_SIZE"] == "1"
+    assert "WORLD_SIZE" not in os.environ
+
+    _configure_tpu_process_env(rank=1,
+                               local_rank=1,
+                               world_size=8,
+                               local_world_size=8)
+
+    assert os.environ["RANK"] == "1"
+    assert os.environ["LOCAL_RANK"] == "1"
+    assert os.environ["LOCAL_WORLD_SIZE"] == "8"
+    assert os.environ["WORLD_SIZE"] == "8"
 
 
 def _make_vllm_config(profiler_torch_dir=None):

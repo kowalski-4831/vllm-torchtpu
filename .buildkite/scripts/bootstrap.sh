@@ -84,18 +84,6 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
   fi
 fi
 
-# Benchmark / Perf jobs should use PRIORITY_BENCHMARK (unless it is a nightly run).
-PERF_PRIORITY="$PRIORITY_BENCHMARK"
-if [[ "${NIGHTLY:-0}" == "1" ]]; then
-  PERF_PRIORITY="$PRIORITY_NIGHTLY"
-fi
-
-# Integration jobs should use PRIORITY_INTEGRATION (unless it is a nightly run).
-INTEGRATION_PRIORITY="$PRIORITY_INTEGRATION"
-if [[ "${NIGHTLY:-0}" == "1" ]]; then
-  INTEGRATION_PRIORITY="$PRIORITY_NIGHTLY"
-fi
-
 echo "--- Starting Buildkite Bootstrap"
 
 # Since Buildkite prepends uploaded steps (inserts in reverse order),
@@ -103,10 +91,10 @@ echo "--- Starting Buildkite Bootstrap"
 # are displayed and queued in correct order: Build -> Tests.
 
 echo "Uploading Perf and Eval Pipeline"
-upload_with_priority .buildkite/pipeline_perf.yml "$PERF_PRIORITY"
+upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
 
 echo "Uploading Integration Tests Pipeline"
-upload_with_priority .buildkite/pipeline_integration.yml "$INTEGRATION_PRIORITY"
+upload_with_priority .buildkite/pipeline_integration.yml "$JOB_PRIORITY"
 
 echo "Uploading Unit Tests Pipeline"
 upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
