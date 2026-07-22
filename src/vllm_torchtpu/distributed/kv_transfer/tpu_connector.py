@@ -106,6 +106,15 @@ def _stage3_state_req_id(req_id: str, tag: str, ordinal: int) -> str:
     return f"{req_id}{_STAGE3_STATE_REQ_SUFFIXES[tag]}{ordinal}"
 
 
+def _is_stage3_state_req_id(req_id: str) -> bool:
+    """Whether ``req_id`` is in the connector-private sibling namespace."""
+    for suffix in _STAGE3_STATE_REQ_SUFFIXES.values():
+        marker = req_id.rfind(suffix)
+        if marker >= 0 and req_id[marker + len(suffix):].isdigit():
+            return True
+    return False
+
+
 def _stage3_state_uuid(uuid: int, tag: str, ordinal: int) -> int:
     salt = _STAGE3_STATE_UUID_SALTS[tag] ^ ((ordinal + 1) << 44)
     return (int(uuid) ^ salt) or (salt + 7)
@@ -1192,6 +1201,20 @@ class TPURaidenConnectorWorker:
         self._stage3_state_source_to_dest: dict[str, str] = {}
         self._stage3_state_pending: dict[str, set[str]] = {}
         self._stage3_fa_done_awaiting_state: set[str] = set()
+        # Producer-side sibling lifecycle. Native Raiden reports each GDN
+        # state transfer under its connector-private derived request ID, but
+        # vLLM knows only the base request. Keep those IDs entirely below the
+        # connector boundary and expose the base send terminal only after FA
+        # and every state sibling are terminal. The UUID table also lets each
+        # PCP rank cast the required D5 completion vote for every sibling.
+        self._stage3_state_send_source_to_base: dict[str, str] = {}
+        self._stage3_state_send_uuids: dict[str, int] = {}
+        self._stage3_state_send_pending: dict[str, set[str]] = {}
+        self._stage3_state_send_terminals: set[str] = set()
+        self._stage3_state_send_terminal_cleanup: set[str] = set()
+        self._stage3_fa_send_terminals: set[str] = set()
+        self._stage3_failed_send_bases: set[str] = set()
+        self._stage3_cancelled_send_bases: set[str] = set()
         # vLLM independently randomizes the internal request ID on the
         # prefill and decode engines. D5 and the controller/native transfer
         # use the producer ID, while every scheduler-facing lifecycle table
@@ -1306,9 +1329,9 @@ class TPURaidenConnectorWorker:
             raw_tensors=raw_tensors,
             mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
             gdn_geometry=rpm.GdnHeadGeometry(
-                local_key_heads=self._local_head_count(
+                local_key_heads=self._local_gdn_head_count(
                     self._model_config_int("linear_num_key_heads", 0)),
-                local_value_heads=self._local_head_count(
+                local_value_heads=self._local_gdn_head_count(
                     self._model_config_int("linear_num_value_heads", 0)),
                 key_head_dim=self._model_config_int("linear_key_head_dim", 1),
                 value_head_dim=self._model_config_int(
@@ -1609,6 +1632,25 @@ class TPURaidenConnectorWorker:
                              f"tp_size={tp_size}")
         return total_heads // tp_size
 
+    def _local_gdn_head_count(self, total_heads: int) -> int:
+        """Return the GDN head count stored by this TP/PCP worker.
+
+        GDN cache specs are localized across PCP as well as TP.  Full-
+        attention head geometry is only TP-local, so keep this adjustment
+        specific to GDN admission.
+        """
+        tp_local_heads = self._local_head_count(total_heads)
+        if tp_local_heads <= 0:
+            return 0
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        pcp_size = int(
+            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        if tp_local_heads % pcp_size:
+            raise ValueError(
+                f"TP-local GDN heads={tp_local_heads} must be divisible by "
+                f"pcp_size={pcp_size}")
+        return tp_local_heads // pcp_size
+
     def process_send_load(self,
                           metadata: TPUConnectorMetadata,
                           wait_for_completion: bool = False,
@@ -1700,13 +1742,15 @@ class TPURaidenConnectorWorker:
                 f"rank={transfer_rank}, parallelism={parallelism}")
 
         now = time.perf_counter()
-        for req_id in [
-                req_id for req_id, registration in
-                self._stage3_terminal_sends.items()
-                if registration.expiration_time <= now
-        ]:
+        expired_terminal_req_ids = [
+            req_id
+            for req_id, registration in self._stage3_terminal_sends.items()
+            if registration.expiration_time <= now
+        ]
+        for req_id in expired_terminal_req_ids:
             self._stage3_terminal_sends.pop(req_id, None)
             self._stage3_reported_sends.discard(req_id)
+            self._stage3_prune_state_send_tracking(req_id)
 
         for req_id, req_meta in metadata.reqs_to_send.items():
             uuid = int(req_meta.uuid)
@@ -1839,10 +1883,11 @@ class TPURaidenConnectorWorker:
             if not local_ids:
                 # This PCP rank owns no physical page for the request. It has
                 # nevertheless published an empty D5 entry so controller
-                # lookup sees the complete source unit set; its local send is
-                # already terminal and must count toward PCP aggregation.
-                self._done_sending.add(req_id)
-                self._stage3_terminal_cleanup[req_id] = True
+                # lookup sees the complete source unit set. FA is locally
+                # terminal, but GDN state siblings can still carry this
+                # rank's head shards, so use the same sibling gate as a real
+                # FA native completion.
+                self._stage3_fa_send_terminals.add(req_id)
             logger.info(
                 "%s",
                 json.dumps(
@@ -1874,20 +1919,6 @@ class TPURaidenConnectorWorker:
                     sort_keys=True,
                 ),
             )
-            if not local_ids:
-                logger.info(
-                    "%s",
-                    json.dumps(
-                        {
-                            "event": "raiden_stage3_sender_complete",
-                            "req_id": req_id,
-                            "uuid": uuid,
-                            "num_tokens": num_tokens,
-                            "transfer_rank": transfer_rank,
-                        },
-                        sort_keys=True,
-                    ),
-                )
             logger.debug(
                 "TPURaidenConnectorWorker rank%d --> registered Stage-3 "
                 "send req_id=%s uuid=%d transfer_rank=%d/%d blocks=%s",
@@ -1966,17 +1997,41 @@ class TPURaidenConnectorWorker:
                 f"GDN state tag {tag!r} has invalid live bytes {live_bytes}")
         return live_bytes
 
+    def _stage3_state_regions(self, tag: str) -> tuple[Any, ...]:
+        """Return one uniform admitted live-region map for a state tag."""
+        manifest = self._raiden_manifest
+        pools = tuple(getattr(manifest, "pools", ()) or ())
+        matching = tuple(pool for pool in pools
+                         if str(getattr(pool, "tag", "")) == tag)
+        if not matching:
+            raise RuntimeError(
+                f"GDN state tag {tag!r} is absent from the pool manifest")
+
+        def signature(pool: Any) -> tuple[tuple[Any, ...], ...]:
+            return tuple((str(region.name), int(region.offset_bytes),
+                          int(region.stride_bytes), int(region.unit_bytes),
+                          int(region.num_units), int(region.units_per_stride))
+                         for region in pool.regions)
+
+        expected = signature(matching[0])
+        if any(signature(pool) != expected for pool in matching[1:]):
+            raise RuntimeError(
+                f"GDN state pools tagged {tag!r} disagree on live regions")
+        return tuple(matching[0].regions)
+
     def _stage3_register_state_blocks(self, facade: Any, req_id: str,
                                       uuid: int, transfer_rank: int,
                                       mamba_state_block_ids) -> None:
         """Producer: sibling D5 registrations for the GDN state classes.
 
-        The state is PCP-replicated, so rank 0 is the canonical declarer;
-        every other rank registers empty so the controller's full-rank-set
-        lookup holds. Under the uniform mamba layout the live recurrent state
-        is in each mamba group's first block-table slot; that block is
-        lifecycle-protected exactly like the FA blocks until the connector
-        reports the send terminal.
+        PCP GDN execution exchanges token shards for head shards.  Every PCP
+        rank therefore owns a distinct q/k/v and SSM head slice.  Each rank
+        declares its slice in compact-live byte space, and the controller
+        combines the complete rank set into the full non-PCP destination
+        state. Under the uniform mamba layout the live recurrent state is in
+        each mamba group's first block-table slot; that block is lifecycle-
+        protected exactly like the FA blocks until the connector reports the
+        send terminal.
         """
         if not self._stage3_state_group_count:
             return
@@ -1989,30 +2044,152 @@ class TPURaidenConnectorWorker:
                 "GDN state registration group count disagrees with the "
                 f"manifest: blocks={len(mamba_state_block_ids)}, "
                 f"groups={self._stage3_state_group_count}")
+        pending = self._stage3_state_send_pending.setdefault(req_id, set())
         for tag in _STAGE3_STATE_CLASS_TAGS:
             for ordinal, block_id in enumerate(mamba_state_block_ids):
                 derived_req_id = _stage3_state_req_id(req_id, tag, ordinal)
                 derived_uuid = _stage3_state_uuid(uuid, tag, ordinal)
-                state_pool_spans = []
-                if transfer_rank == 0:
-                    exact_tag = f"{tag}.g{ordinal}"
-                    from vllm_torchtpu.distributed.kv_transfer.v2.pool_byte_spans import \
-                        whole_slot_registration  # noqa: E501
-                    state_pool_spans = [
-                        whole_slot_registration(
-                            tag=exact_tag,
-                            block_id=int(block_id),
-                            live_bytes=self._stage3_state_live_bytes(
-                                exact_tag),
-                        )
-                    ]
+                existing_base = self._stage3_state_send_source_to_base.get(
+                    derived_req_id)
+                existing_uuid = self._stage3_state_send_uuids.get(
+                    derived_req_id)
+                if (existing_base is not None and existing_base != req_id
+                        or existing_uuid is not None
+                        and existing_uuid != derived_uuid):
+                    raise RuntimeError(
+                        "Conflicting GDN state send identity for derived "
+                        f"request {derived_req_id!r}")
+                exact_tag = f"{tag}.g{ordinal}"
+                from vllm_torchtpu.distributed.kv_transfer.v2.pool_byte_spans import \
+                    lower_gdn_state_shard_spans  # noqa: E501
+                registration = lower_gdn_state_shard_spans(
+                    tag=exact_tag,
+                    block_id=int(block_id),
+                    transfer_rank=transfer_rank,
+                    parallelism=self._raiden_transfer_parallelism(),
+                    regions=self._stage3_state_regions(exact_tag),
+                )
+                admitted_live_bytes = self._stage3_state_live_bytes(exact_tag)
+                if registration.declared_bytes != admitted_live_bytes:
+                    raise RuntimeError(
+                        "GDN state byte lowering disagrees with the admitted "
+                        f"manifest for {exact_tag}: lowered="
+                        f"{registration.declared_bytes}, admitted="
+                        f"{admitted_live_bytes}")
                 facade.register_request_blocks(
                     req_id=derived_req_id,
                     uuid=derived_uuid,
                     unit=self._raiden_work_unit,
                     block_ids=[],
-                    pool_spans=state_pool_spans,
+                    pool_spans=[registration],
                 )
+                self._stage3_state_send_source_to_base[derived_req_id] = (
+                    req_id)
+                self._stage3_state_send_uuids[derived_req_id] = derived_uuid
+                if derived_req_id not in self._stage3_state_send_terminals:
+                    pending.add(derived_req_id)
+
+    def _stage3_prune_state_send_tracking(self, base_req_id: str) -> None:
+        """Drops bounded producer sibling tombstones with the base tombstone."""
+        derived_req_ids = [
+            req_id
+            for req_id, base in self._stage3_state_send_source_to_base.items()
+            if base == base_req_id
+        ]
+        for req_id in derived_req_ids:
+            self._stage3_state_send_source_to_base.pop(req_id, None)
+            self._stage3_state_send_uuids.pop(req_id, None)
+            self._stage3_state_send_terminals.discard(req_id)
+            self._stage3_state_send_terminal_cleanup.discard(req_id)
+        self._stage3_state_send_pending.pop(base_req_id, None)
+        self._stage3_fa_send_terminals.discard(base_req_id)
+        self._stage3_failed_send_bases.discard(base_req_id)
+        self._stage3_cancelled_send_bases.discard(base_req_id)
+
+    def _stage3_record_producer_send_terminals(self, done_sending,
+                                               failed_sending) -> None:
+        """Records native terminals without exposing private sibling IDs."""
+        for req_id, failed in [
+            (str(req_id), False) for req_id in done_sending
+        ] + [(str(req_id), True) for req_id in failed_sending]:
+            base_req_id = self._stage3_state_send_source_to_base.get(req_id)
+            if base_req_id is not None:
+                if req_id not in self._stage3_state_send_terminals:
+                    self._stage3_state_send_terminals.add(req_id)
+                    self._stage3_state_send_terminal_cleanup.add(req_id)
+                    self._stage3_state_send_pending.get(base_req_id,
+                                                        set()).discard(req_id)
+                if failed:
+                    self._stage3_failed_send_bases.add(base_req_id)
+                continue
+            if _is_stage3_state_req_id(req_id):
+                # A stale connector-private terminal must never cross into
+                # vLLM, whose scheduler has no request under this ID.
+                logger.warning(
+                    "Ignoring unmapped Stage-3 producer state terminal "
+                    "req_id=%s", req_id)
+                continue
+            if req_id in self._stage3_registered_sends:
+                self._stage3_fa_send_terminals.add(req_id)
+                if failed:
+                    self._stage3_failed_send_bases.add(req_id)
+                continue
+            # Replayed native terminals after the base moved to its tombstone
+            # are harmless and must not become duplicate scheduler reports.
+            if (req_id not in self._stage3_terminal_sends
+                    and req_id not in self._stage3_reported_sends):
+                logger.warning(
+                    "Ignoring unmapped Stage-3 producer terminal req_id=%s",
+                    req_id)
+
+    def _stage3_complete_state_send_terminals(self, facade: Any) -> None:
+        """Casts this producer rank's D5 terminal vote for every sibling."""
+        for req_id in sorted(self._stage3_state_send_terminal_cleanup):
+            uuid = self._stage3_state_send_uuids.get(req_id)
+            if uuid is None:
+                raise RuntimeError(
+                    "GDN state terminal is missing its registered UUID: "
+                    f"req_id={req_id}")
+            facade.complete_request_blocks(
+                req_id=req_id,
+                uuid=uuid,
+                unit=self._raiden_work_unit,
+            )
+            self._stage3_state_send_terminal_cleanup.remove(req_id)
+
+    def _stage3_cancel_unclaimed_state_sends(self, facade: Any,
+                                             base_req_id: str) -> None:
+        """Retires unclaimed sibling D5 entries with an expired base send."""
+        pending = self._stage3_state_send_pending.get(base_req_id, set())
+        for req_id in sorted(pending):
+            uuid = self._stage3_state_send_uuids.get(req_id)
+            if uuid is None:
+                raise RuntimeError(
+                    "GDN state cancellation is missing its registered UUID: "
+                    f"req_id={req_id}")
+            if facade.cancel_request_blocks_if_unclaimed(req_id=req_id,
+                                                         uuid=uuid):
+                pending.remove(req_id)
+                self._stage3_state_send_terminals.add(req_id)
+
+    def _stage3_ready_producer_send_terminals(
+            self) -> tuple[set[str], set[str], set[str]]:
+        """Collapses FA plus all state siblings onto scheduler-visible bases."""
+        ready = {
+            req_id
+            for req_id in self._stage3_fa_send_terminals
+            if not self._stage3_state_send_pending.get(req_id) and not any(
+                self._stage3_state_send_source_to_base.get(derived_req_id) ==
+                req_id
+                for derived_req_id in self._stage3_state_send_terminal_cleanup)
+        }
+        failed = ready & self._stage3_failed_send_bases
+        cancelled = ready & self._stage3_cancelled_send_bases
+        done = ready - failed - cancelled
+        self._stage3_fa_send_terminals.difference_update(ready)
+        self._stage3_failed_send_bases.difference_update(ready)
+        self._stage3_cancelled_send_bases.difference_update(ready)
+        return done, failed, cancelled
 
     def _submit_stage3_state_loads(self, facade: Any, destination_req_id: str,
                                    source_req_id: str, uuid: int,
@@ -2338,12 +2515,15 @@ class TPURaidenConnectorWorker:
     def _poll_finished(self, engine: "KVCacheManager") -> None:
         done_sending, done_recving, failed_recving = engine.poll_stats()
         sender_failures: set[str] = set()
+        cancelled_sends: set[str] = set()
         if self.is_producer and self._raiden_stage3_enabled():
             # The native manager's third tuple is named failed_recving for
             # historical pull semantics, but ReshardPush sender failures are
-            # reported there too. Treat them as terminal sends: they must
-            # release D5 state and must never be surfaced as receive success.
-            sender_failures = set(failed_recving)
+            # reported there too. Native completion is per transfer plan, so
+            # record the connector-private state siblings and collapse them
+            # with FA onto the one base ID known to vLLM.
+            self._stage3_record_producer_send_terminals(
+                done_sending, failed_recving)
             failed_recving = []
         elif self._raiden_stage3_enabled():
             # Stage-3 success requires both halves: the synchronous facade RPC
@@ -2449,9 +2629,13 @@ class TPURaidenConnectorWorker:
                 self._stage3_release_state_load(dest)
             self._stage3_terminal_loads.update(done_recving)
             self._stage3_terminal_loads.update(failed_recving)
-        native_terminal_sends = set(done_sending) | sender_failures
-        cancelled_sends: set[str] = set()
         if self.is_producer and self._raiden_stage3_enabled():
+            facade, _ = self._require_stage3_controller()
+            # Complete every derived D5 generation before making its base
+            # request scheduler-visible. A failed RPC retains the cleanup set
+            # and the FA terminal so the next poll retries without losing the
+            # eventual base completion.
+            self._stage3_complete_state_send_terminals(facade)
             now = time.perf_counter()
             expired_candidates = {
                 req_id
@@ -2459,20 +2643,28 @@ class TPURaidenConnectorWorker:
                 self._stage3_registered_sends.items()
                 if registration.expiration_time <= now
                 and req_id not in self._stage3_terminal_cleanup
-                and req_id not in native_terminal_sends
+                and req_id not in self._stage3_fa_send_terminals
             }
             if expired_candidates:
-                facade, _ = self._require_stage3_controller()
                 for req_id in expired_candidates:
                     registration = self._stage3_registered_sends[req_id]
                     if facade.cancel_request_blocks_if_unclaimed(
                             req_id=req_id, uuid=registration.uuid):
-                        cancelled_sends.add(req_id)
+                        # The base was never claimed. Cancel each unclaimed
+                        # sibling too; if a sibling was already claimed, keep
+                        # the base gated until that native terminal arrives.
+                        self._stage3_cancel_unclaimed_state_sends(
+                            facade, req_id)
+                        self._stage3_fa_send_terminals.add(req_id)
+                        self._stage3_cancelled_send_bases.add(req_id)
+            done_sending, sender_failures, cancelled_sends = (
+                self._stage3_ready_producer_send_terminals())
             if cancelled_sends:
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> safely cancelled "
                     "unclaimed Stage-3 sends=%s", self.tp_rank,
                     sorted(cancelled_sends))
+        native_terminal_sends = set(done_sending) | sender_failures
         terminal_sends = native_terminal_sends | cancelled_sends
         self._done_sending.update(terminal_sends)
         self._done_recving.update(done_recving)
