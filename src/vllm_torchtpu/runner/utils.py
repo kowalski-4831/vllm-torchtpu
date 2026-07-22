@@ -36,8 +36,8 @@ class InferencePhase(Enum):
 
 
 def _inject_dp_rank_into_filename(fname: str, dp_rank: int) -> str:
-    """Prefix `dp<N>_` to an xplane or trace filename."""
-    return f"dp{dp_rank}_{fname}"
+    """Prefix `rank<N>_` to an xplane or trace filename."""
+    return f"rank{dp_rank}_{fname}"
 
 
 def determine_phase_from_batch_composition_stats(

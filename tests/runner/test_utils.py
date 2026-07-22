@@ -325,7 +325,7 @@ def test_merge_profile_directories_single_rank(tmp_path, monkeypatch):
 
 
 def test_merge_profile_directories_mpmd(tmp_path, monkeypatch):
-    """MPMD: 4 ranks captured to their own sandboxes with identical filenames; each moves to the SAME canonical ts dir with dp{N}_ prefix."""
+    """MPMD: 4 ranks captured to their own sandboxes with identical filenames; each moves to the SAME canonical ts dir with rank{N}_ prefix."""
     monkeypatch.setenv("TORCH_TPU_DP_SIZE", "4")
     phase_dir = tmp_path / "prefill_heavy"
 
@@ -351,14 +351,14 @@ def test_merge_profile_directories_mpmd(tmp_path, monkeypatch):
 
     dst = phase_dir / "plugins" / "profile" / canonical_ts
     for rank in range(4):
-        assert (dst / f"dp{rank}_t1v-n-host-w-0.xplane.pb"
+        assert (dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
                 ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"dp_rank_{rank}"
         assert not (rank_dir / "plugins").exists()
 
 
 def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
-    """TP multi-worker (TP=4, DP=1): world_size=4 with no DP env vars; each rank moves to canonical ts dir with dp{N}_ prefix."""
+    """TP multi-worker (TP=4, DP=1): world_size=4 with no DP env vars; each rank moves to canonical ts dir with rank{N}_ prefix."""
     monkeypatch.setenv("TORCH_TPU_DP_SIZE", "1")
     monkeypatch.delenv("TPU_MULTIPROCESS_DP", raising=False)
     phase_dir = tmp_path / "prefill_heavy"
@@ -386,7 +386,7 @@ def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
 
     dst = phase_dir / "plugins" / "profile" / canonical_ts
     for rank in range(4):
-        assert (dst / f"dp{rank}_t1v-n-host-w-0.xplane.pb"
+        assert (dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
                 ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"dp_rank_{rank}"
         assert not (rank_dir / "plugins").exists()
