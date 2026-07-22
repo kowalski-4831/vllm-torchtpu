@@ -67,6 +67,7 @@ def _build_worker(vllm_config, rank=0):
                     return_value=None,
                 ):
         mock_envs.MODEL_IMPL_TYPE = "vllm"
+        mock_envs.PHASED_PROFILING_DIR = ""
 
         worker = TPUWorker.__new__(TPUWorker)
         # Set attributes that WorkerBase.__init__ would normally set.
