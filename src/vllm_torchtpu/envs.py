@@ -150,7 +150,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP":
     lambda: int(os.getenv("PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP", "0")),
     "PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD":
-    lambda: int(os.getenv("PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD", "-1")),
+    lambda: int(os.getenv("PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD", "-1")
+                ),
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL":
     lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),

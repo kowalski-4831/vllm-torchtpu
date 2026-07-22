@@ -136,9 +136,12 @@ class PhaseBasedProfiler:
         profile_dir: str,
         worker_rank: int = 0,
         world_size: int = 1,
-        num_steps_to_profile_for: int = PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
-        num_decode_steps_to_skip: int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
-        decode_kv_len_threshold: int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+        num_steps_to_profile_for:
+        int = PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
+        num_decode_steps_to_skip:
+        int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
+        decode_kv_len_threshold:
+        int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
     ):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: Optional[str] = None
@@ -341,12 +344,10 @@ class PhaseBasedProfiler:
 
         # Check if we are in a multi-worker environment (DP > 1, TP > 1, world_size > 1, or rank > 0).
         dp_size = int(os.getenv("TORCH_TPU_DP_SIZE", "1"))
-        is_multi_worker = (
-            dp_size > 1
-            or os.getenv("TPU_MULTIPROCESS_DP") == "1"
-            or getattr(self, "world_size", 1) > 1
-            or self.worker_rank > 0
-        )
+        is_multi_worker = (dp_size > 1
+                           or os.getenv("TPU_MULTIPROCESS_DP") == "1"
+                           or getattr(self, "world_size", 1) > 1
+                           or self.worker_rank > 0)
 
         try:
             os.makedirs(dst_ts_dir, exist_ok=True)
@@ -356,8 +357,7 @@ class PhaseBasedProfiler:
                     continue
                 for fname in os.listdir(src_ts_dir):
                     new_fname = (_inject_dp_rank_into_filename(
-                        fname, self.worker_rank)
-                                 if is_multi_worker else fname)
+                        fname, self.worker_rank) if is_multi_worker else fname)
                     shutil.move(
                         os.path.join(src_ts_dir, fname),
                         os.path.join(dst_ts_dir, new_fname),

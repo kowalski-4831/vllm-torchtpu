@@ -390,4 +390,3 @@ def test_merge_profile_directories_tp_multiworker(tmp_path, monkeypatch):
                 ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"dp_rank_{rank}"
         assert not (rank_dir / "plugins").exists()
-
