@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
-                                                   gmm_v2)
+                                                   gmm_v2, interleave_lane)
 
 _GroupConfig = collections.namedtuple(
     "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"])
@@ -266,6 +266,8 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
                                  rhs_scale=rhs_scale,
                                  rhs_bias=rhs_bias,
                                  group_offset=group_offset)
+    raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
+    raw_expected = interleave_lane(raw_gate, raw_up)
     expected = apply_act_fn(raw_expected.astype(jnp.float32),
                             fuse_act).astype(lhs.dtype)
 
