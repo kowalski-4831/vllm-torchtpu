@@ -92,7 +92,8 @@ def _require_tpu_devices(min_count, reason):
     return devices
 
 
-def test_make_async_remote_copy_can_push_hbm_to_destination_vmem():
+def test_make_async_remote_copy_can_push_hbm_to_destination_vmem(
+        release_jax_backend):
     devices = _require_tpu_devices(
         2, "PCP remote-copy smoke test requires at least two TPU devices.")
     num_devices = len(devices)

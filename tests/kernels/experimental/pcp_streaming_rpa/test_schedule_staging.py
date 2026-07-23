@@ -77,7 +77,8 @@ def _require_tpu_devices(min_count, reason):
     return devices
 
 
-def test_packed_schedule_step_can_be_staged_from_hbm_to_vmem():
+def test_packed_schedule_step_can_be_staged_from_hbm_to_vmem(
+        release_jax_backend):
     _require_tpu_devices(1, "Schedule staging smoke test requires TPU.")
     schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[12],

@@ -178,7 +178,7 @@ def _require_tpu_devices(min_count, reason):
     return devices
 
 
-def test_staged_schedule_can_drive_remote_kv_page_push():
+def test_staged_schedule_can_drive_remote_kv_page_push(release_jax_backend):
     pcp_size = 4
     _require_tpu_devices(
         pcp_size,

@@ -202,7 +202,8 @@ def _require_tpu_devices(min_count, reason):
     return devices
 
 
-def test_ring_circulated_kv_can_be_consumed_with_online_softmax():
+def test_ring_circulated_kv_can_be_consumed_with_online_softmax(
+        release_jax_backend):
     _require_tpu_devices(
         PCP_SIZE,
         "PCP ring streaming compute smoke test requires four TPU devices.",

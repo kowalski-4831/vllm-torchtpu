@@ -133,7 +133,7 @@ def _require_tpu_devices(min_count, reason):
     return devices
 
 
-def test_vmem_pages_can_circulate_through_ring():
+def test_vmem_pages_can_circulate_through_ring(release_jax_backend):
     _require_tpu_devices(
         PCP_SIZE, "PCP ring circulation smoke test requires four TPU devices.")
     local_pages = jnp.arange(
