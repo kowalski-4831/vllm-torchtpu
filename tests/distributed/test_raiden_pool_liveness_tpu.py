@@ -23,6 +23,7 @@ available.
 import ctypes
 import subprocess
 import sys
+from collections import Counter
 
 import pytest
 
@@ -60,6 +61,33 @@ def _require_tpu_and_raiden():
 def _pattern_bytes(seed: int, nbytes: int) -> bytes:
     # Deterministic non-trivial pattern; avoids 0x00/0xff runs.
     return bytes((seed * 131 + i * 7 + (i >> 8)) % 251 for i in range(nbytes))
+
+
+def _live_extents(entry) -> list[tuple[int, int]]:
+    """Per-block live byte intervals from the declared regions, coalesced.
+
+    Mirrors raiden's region expansion (pool_layout.cc): each RegionSpec is
+    num_units strided runs of units_per_stride*unit_bytes contiguous bytes.
+    Region-era D2H/H2D copies exactly these intervals and nothing else.
+    """
+    runs = []
+    for region in entry.regions:
+        run_bytes = region.units_per_stride * region.unit_bytes
+        for stride_idx in range(region.num_units):
+            start = region.offset_bytes + stride_idx * region.stride_bytes
+            runs.append((start, run_bytes))
+    runs.sort()
+    coalesced: list[tuple[int, int]] = []
+    for start, size in runs:
+        if coalesced and coalesced[-1][0] + coalesced[-1][1] == start:
+            coalesced[-1] = (coalesced[-1][0], coalesced[-1][1] + size)
+        else:
+            coalesced.append((start, size))
+    return coalesced
+
+
+def _extent_bytes(block: bytes, extents) -> bytes:
+    return b"".join(block[off:off + size] for off, size in extents)
 
 
 def _device_bytes(tensor) -> bytes:
@@ -175,31 +203,70 @@ def _run_pool_bytes_live_in_both_directions():
     #   1. raiden H2D lands in the buffers torch reads (same storage), and
     #   2. raiden D2H returns exactly the physical bytes written (round trip),
     # with strict logical-byte equality asserted where the layout permits.
+    #
+    # Region era (raiden 97f755a): D2H/H2D moves exactly the declared live
+    # regions of each block, never the whole pitch — dead pitch bytes stay
+    # untouched on the device. The pool with live < stride here (fa: 512 KiB
+    # live in a 1 MiB pitch) therefore keeps its initial device bytes in the
+    # dead half. Two full-pitch H2D passes with different patterns make the
+    # assertion initial-state-independent: between passes, exactly the live
+    # bytes change, so per block
+    #   multiset(pass1 bytes) + multiset(pattern2 live bytes)
+    #     == multiset(pass2 bytes) + multiset(pattern1 live bytes).
     patterns = {}
     for pool_idx, entry in enumerate(manifest.pools):
         storage = manifest.storages[entry.storage_index]
         stride = entry.block_stride_bytes
+        extents = _live_extents(entry)
+        assert sum(size for _, size in extents) == entry.live_bytes_per_block
         before = _device_bytes(storage)
-        pattern = _pattern_bytes(pool_idx + 1, storage.nbytes)
-        patterns[pool_idx] = pattern
-        for block_id in range(entry.num_blocks):
-            ref = manager.get_block_ref(pool_idx, block_id)
-            assert ref["block_stride_bytes"] == stride
-            assert ref["tag"] == entry.tag
-            chunk = pattern[block_id * stride:(block_id + 1) * stride]
-            ctypes.memmove(ref["ptr"], chunk, stride)
-        manager.h2d_pool_blocks(pool_idx, list(range(entry.num_blocks))).wait()
-        now = _device_bytes(storage)
-        assert now != before, (
+
+        def _write_and_h2d(pattern,
+                           *,
+                           pool_idx=pool_idx,
+                           entry=entry,
+                           stride=stride):
+            for block_id in range(entry.num_blocks):
+                ref = manager.get_block_ref(pool_idx, block_id)
+                assert ref["block_stride_bytes"] == stride
+                assert ref["tag"] == entry.tag
+                chunk = pattern[block_id * stride:(block_id + 1) * stride]
+                ctypes.memmove(ref["ptr"], chunk, stride)
+            manager.h2d_pool_blocks(pool_idx,
+                                    list(range(entry.num_blocks))).wait()
+            return _device_bytes(storage)
+
+        pattern_first = _pattern_bytes(pool_idx + 1, storage.nbytes)
+        pattern_second = _pattern_bytes(pool_idx + 101, storage.nbytes)
+        patterns[pool_idx] = pattern_second
+        after_first = _write_and_h2d(pattern_first)
+        assert after_first != before, (
             f"pool {pool_idx} ({entry.tag}): raiden H2D did not change the "
             "typed KV cache buffer — dead storage")
-        assert sorted(now) == sorted(pattern), (
-            f"pool {pool_idx} ({entry.tag}): device bytes are not a "
-            "permutation of the written pattern — raiden wrote foreign bytes")
+        after_second = _write_and_h2d(pattern_second)
+        # Storage-granular multiset identity: gdn.conv bf16 tiling permutes
+        # bytes ACROSS block boundaries, so per-block multisets are not
+        # preserved — but the whole-storage multiset is, for every layout.
+        live_first = b"".join(
+            _extent_bytes(pattern_first[b * stride:(b + 1) * stride], extents)
+            for b in range(entry.num_blocks))
+        live_second = b"".join(
+            _extent_bytes(pattern_second[b * stride:(b + 1) * stride], extents)
+            for b in range(entry.num_blocks))
+        assert (
+            Counter(after_first) +
+            Counter(live_second) == Counter(after_second) + Counter(live_first)
+        ), (f"pool {pool_idx} ({entry.tag}): the bytes that changed between "
+            "H2D passes are not exactly the live-region pattern bytes — "
+            "raiden wrote foreign bytes")
         if entry.tag == rpm.TAG_GDN_SSM:
-            assert now == pattern, (
-                f"pool {pool_idx} ({entry.tag}): fp32 state buffers are "
-                "physically linear, byte order must match exactly")
+            for block_id in range(entry.num_blocks):
+                blk = slice(block_id * stride, (block_id + 1) * stride)
+                assert (
+                    _extent_bytes(after_second[blk], extents) == _extent_bytes(
+                        pattern_second[blk], extents)
+                ), (f"pool {pool_idx} ({entry.tag}): fp32 state buffers are "
+                    "physically linear, live bytes must match exactly")
 
     # --- Per-block H2D granularity on the fa pool (block-contained tiling) --
     pool_idx = next(i for i, e in enumerate(manifest.pools)
@@ -207,6 +274,7 @@ def _run_pool_bytes_live_in_both_directions():
     entry = manifest.pools[pool_idx]
     storage = manifest.storages[entry.storage_index]
     stride = entry.block_stride_bytes
+    fa_extents = _live_extents(entry)
     before = _device_bytes(storage)
     pattern_b = _pattern_bytes(97, storage.nbytes)
     ctypes.memmove(
@@ -218,13 +286,30 @@ def _run_pool_bytes_live_in_both_directions():
         "single-block fa H2D touched logical blocks below the target")
     assert after[3 * stride:] == before[3 * stride:], (
         "single-block fa H2D touched logical blocks above the target")
-    assert sorted(after[2 * stride:3 * stride]) == sorted(
-        pattern_b[2 * stride:3 * stride]), (
-            "single-block fa H2D did not deliver the target block's bytes")
+    blk2 = slice(2 * stride, 3 * stride)
+    assert (
+        Counter(before[blk2]) +
+        Counter(_extent_bytes(pattern_b[blk2], fa_extents)) == Counter(
+            after[blk2]) +
+        Counter(_extent_bytes(patterns[pool_idx][blk2], fa_extents))), (
+            "single-block fa H2D did not deliver exactly the target block's "
+            "live-region bytes")
 
-    # --- Raiden D2H round trip: exactly the physical bytes written ----------
+    # --- Raiden D2H round trip: exactly the live physical bytes written -----
+    # Region-era D2H fills only the live regions of the mirror; the clobbered
+    # dead intervals must stay clobbered (a whole-pitch copy would revive
+    # them with device padding bytes).
     for pool_idx, entry in enumerate(manifest.pools):
         stride = entry.block_stride_bytes
+        extents = _live_extents(entry)
+        dead = []
+        cursor = 0
+        for off, size in extents:
+            if cursor < off:
+                dead.append((cursor, off - cursor))
+            cursor = off + size
+        if cursor < stride:
+            dead.append((cursor, stride - cursor))
         expected = bytearray(patterns[pool_idx])
         if entry.tag == rpm.TAG_FA:
             expected[2 * stride:3 * stride] = pattern_b[2 * stride:3 * stride]
@@ -237,10 +322,16 @@ def _run_pool_bytes_live_in_both_directions():
             ref = manager.get_block_ref(pool_idx, block_id)
             host = ctypes.string_at(ref["ptr"], stride)
             want = bytes(expected[block_id * stride:(block_id + 1) * stride])
-            assert host == want, (
-                f"pool {pool_idx} ({entry.tag}) block {block_id}: raiden D2H "
-                "bytes do not round-trip the bytes written through the pool "
-                "surface")
+            assert (
+                _extent_bytes(host, extents) == _extent_bytes(want, extents)
+            ), (f"pool {pool_idx} ({entry.tag}) block {block_id}: raiden D2H "
+                "bytes do not round-trip the live bytes written through the "
+                "pool surface")
+            assert _extent_bytes(host, dead) == bytes(
+                sum(size for _, size in dead)
+            ), (f"pool {pool_idx} ({entry.tag}) block {block_id}: raiden D2H "
+                "wrote into dead pitch intervals — copies are not "
+                "region-granular")
 
 
 def test_pool_bytes_live_in_both_directions():
