@@ -120,12 +120,15 @@ class TPUWorker(WorkerBase):
         self.profile_dir: str | None = None
         self.profile_context = None
         torch_profiler_dir = self.vllm_config.profiler_config.torch_profiler_dir
+        phased_profiling_dir = self.vllm_config.additional_config.get(
+            "phased_profiling_dir", "")
         # Phased profiling takes precedence over standard Torch profiling
         # to prevent conflicting PyTorch profiler contexts.
-        if envs.PHASED_PROFILING_DIR and torch_profiler_dir:
+        if phased_profiling_dir and torch_profiler_dir:
             logger.warning(
-                "Both PHASED_PROFILING_DIR and VLLM_TORCH_PROFILER_DIR are set. "
-                "Disabling manual profiling (VLLM_TORCH_PROFILER_DIR) in favor of phased profiling."
+                "Both additional_config['phased_profiling_dir'] and "
+                "profiler_config.torch_profiler_dir are set. Disabling manual "
+                "profiling (torch_profiler_dir) in favor of phased profiling."
             )
             torch_profiler_dir = None
         pp_size = self.parallel_config.pipeline_parallel_size

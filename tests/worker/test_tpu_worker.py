@@ -47,7 +47,7 @@ def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(
     assert os.environ["WORLD_SIZE"] == "8"
 
 
-def _make_vllm_config(profiler_torch_dir=None):
+def _make_vllm_config(profiler_torch_dir=None, phased_profiling_dir=""):
     """Build a minimal mock VllmConfig for TPUWorker.__init__."""
     cfg = MagicMock()
     cfg.model_config.dtype = torch.bfloat16
@@ -55,6 +55,7 @@ def _make_vllm_config(profiler_torch_dir=None):
     cfg.parallel_config.pipeline_parallel_size = 1
     cfg.compilation_config.compile_ranges_endpoints = []
     cfg.profiler_config.torch_profiler_dir = profiler_torch_dir
+    cfg.additional_config = {"phased_profiling_dir": phased_profiling_dir}
     return cfg
 
 
@@ -67,7 +68,6 @@ def _build_worker(vllm_config, rank=0):
                     return_value=None,
                 ):
         mock_envs.MODEL_IMPL_TYPE = "vllm"
-        mock_envs.PHASED_PROFILING_DIR = ""
 
         worker = TPUWorker.__new__(TPUWorker)
         # Set attributes that WorkerBase.__init__ would normally set.
@@ -102,6 +102,15 @@ class TestProfilerDir:
     def test_no_profiler_when_not_set(self):
         """profile_dir is None when config is not set."""
         cfg = _make_vllm_config(profiler_torch_dir=None)
+        worker = _build_worker(cfg)
+        assert worker.profile_dir is None
+
+    def test_phased_profiling_disables_manual_profiler(self):
+        """additional_config['phased_profiling_dir'] takes precedence over
+        profiler_config.torch_profiler_dir to avoid conflicting profiler
+        contexts."""
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir",
+                                phased_profiling_dir="/phased/profiler/dir")
         worker = _build_worker(cfg)
         assert worker.profile_dir is None
 
