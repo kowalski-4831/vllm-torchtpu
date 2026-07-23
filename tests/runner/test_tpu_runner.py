@@ -175,7 +175,9 @@ class TestInitPhasedProfiling:
     """Verify _init_phased_profiling reads from additional_config/profiler_config
     instead of PHASED_PROFILER_* env vars."""
 
-    def _fake_runner(self, additional_config, max_iterations=0,
+    def _fake_runner(self,
+                     additional_config,
+                     max_iterations=0,
                      delay_iterations=0):
         return SimpleNamespace(
             vllm_config=SimpleNamespace(
@@ -227,11 +229,12 @@ class TestInitPhasedProfiling:
         ) as mock_profiler_cls:
             TPUModelRunner._init_phased_profiling(runner)
 
-        assert (mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"]
-                == runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
-        assert (mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"]
-                == runner_utils_module.
-                PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
+        assert (
+            mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"] ==
+            runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+        assert (
+            mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"] ==
+            runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
 
 
 class DummyMamba(MambaBase):

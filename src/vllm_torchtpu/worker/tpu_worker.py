@@ -128,8 +128,7 @@ class TPUWorker(WorkerBase):
             logger.warning(
                 "Both additional_config['phased_profiling_dir'] and "
                 "profiler_config.torch_profiler_dir are set. Disabling manual "
-                "profiling (torch_profiler_dir) in favor of phased profiling."
-            )
+                "profiling (torch_profiler_dir) in favor of phased profiling.")
             torch_profiler_dir = None
         pp_size = self.parallel_config.pipeline_parallel_size
         if torch_profiler_dir and pp_size == 1 and self.rank < 1 and (
