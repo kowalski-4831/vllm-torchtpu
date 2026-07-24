@@ -13,6 +13,6 @@ SERVER_READY_WAIT_MIN=120
 GPU_MEMORY_UTILIZATION=0.9
 
 # Extra arguments for vllm serve
-EXTRA_SERVE_ARGS="--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=true
 EVAL_TOLERANCE="0.02"

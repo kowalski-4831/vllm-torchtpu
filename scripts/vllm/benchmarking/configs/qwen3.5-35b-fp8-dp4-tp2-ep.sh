@@ -12,6 +12,6 @@ GPU_MEMORY_UTILIZATION=0.9
 BENCHMARK_TEMPERATURE=0
 export USE_MOE_SPARSE_CORE=1
 export VLLM_ENGINE_READY_TIMEOUT_S=1800
-EXTRA_SERVE_ARGS="--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=true
 EVAL_TOLERANCE="0.02"
