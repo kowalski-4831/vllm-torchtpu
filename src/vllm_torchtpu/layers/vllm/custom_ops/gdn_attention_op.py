@@ -333,7 +333,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             output_partition_specs = (
                 PartitionSpec(None, None, "pcp"),  # new_conv_state
                 PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
-                PartitionSpec(),  # output
+                PartitionSpec("pcp"),  # output
             )
             gdn_jax_op = pcp_streaming_jax_op(
                 op_name,
@@ -347,8 +347,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):
                 num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens * pcp_size,
-                             local_num_v_heads * self.head_v_dim)
+                out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
                 return torch.empty_like(conv_state), torch.empty_like(
                     recurrent_state), torch.empty(out_shape,
                                                   dtype=mixed_qkv.dtype,
@@ -402,9 +401,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
                 conv_bias, A_log, dt_bias, state_indices, query_start_loc,
                 request_distribution, seq_lens)
-            if pcp_streaming:
-                outputs = outputs.reshape(-1,
-                                          local_num_v_heads * self.head_v_dim)
 
             conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
@@ -597,14 +593,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                             "GDN op returned an incompatible output shape.")
                     start = get_pcp_rank() * num_tokens
                     core_attn_out = core_attn_out[start:start + num_tokens]
-                if use_pcp_streaming:
-                    local_core_attn_out = torch.empty(
-                        tuple(core_attn_out.shape),
-                        dtype=core_attn_out.dtype,
-                        device=core_attn_out.device,
-                    )
-                    local_core_attn_out.copy_(core_attn_out)
-                    core_attn_out = local_core_attn_out
+
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
