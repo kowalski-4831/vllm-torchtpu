@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
 from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -169,6 +170,72 @@ def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
             invalid_block_ids={41, 43},
             invalid_block_group_index=2,
         )
+
+
+class TestInitPhasedProfiling:
+    """Verify _init_phased_profiling reads from additional_config/profiler_config
+    instead of PHASED_PROFILER_* env vars."""
+
+    def _fake_runner(self,
+                     additional_config,
+                     max_iterations=0,
+                     delay_iterations=0):
+        return SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                additional_config=additional_config,
+                profiler_config=SimpleNamespace(
+                    max_iterations=max_iterations,
+                    delay_iterations=delay_iterations)),
+            parallel_config=SimpleNamespace(rank=2, world_size=4),
+        )
+
+    def test_disabled_when_dir_not_set(self):
+        runner = self._fake_runner(additional_config={})
+        TPUModelRunner._init_phased_profiling(runner)
+        assert runner.phased_profiling_dir == ""
+        assert runner.phase_based_profiler is None
+
+    def test_enabled_uses_config_values(self):
+        runner = self._fake_runner(
+            additional_config={
+                "phased_profiling_dir": "/tmp/phased",
+                "phased_profiler_decode_only_kv_len_threshold": 128,
+            },
+            max_iterations=20,
+            delay_iterations=3,
+        )
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner._init_phased_profiling(runner)
+
+        assert runner.phased_profiling_dir == "/tmp/phased"
+        mock_profiler_cls.assert_called_once_with(
+            "/tmp/phased",
+            worker_rank=2,
+            world_size=4,
+            num_steps_to_profile_for=20,
+            num_decode_steps_to_skip=3,
+            decode_kv_len_threshold=128,
+        )
+
+    def test_falls_back_to_default_num_steps_when_max_iterations_unset(self):
+        runner = self._fake_runner(
+            additional_config={"phased_profiling_dir": "/tmp/phased"},
+            max_iterations=0,
+            delay_iterations=0,
+        )
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner._init_phased_profiling(runner)
+
+        assert (
+            mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"] ==
+            runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+        assert (
+            mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"] ==
+            runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
 
 
 class DummyMamba(MambaBase):

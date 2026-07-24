@@ -53,7 +53,6 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
@@ -538,22 +537,31 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
 
     def _init_phased_profiling(self) -> None:
-        """Initializes the phase-based profiler if the environment variable is set."""
-        self.phased_profiling_dir = tpu_envs.PHASED_PROFILING_DIR
+        """Initializes the phase-based profiler if configured via
+        additional_config['phased_profiling_dir']."""
+        additional_config = self.vllm_config.additional_config
+        self.phased_profiling_dir = additional_config.get(
+            runner_utils.PHASED_PROFILING_DIR_KEY, "")
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
+            profiler_config = self.vllm_config.profiler_config
             global_rank = getattr(self.parallel_config, "rank", 0) or 0
             world_size = getattr(self.parallel_config, "world_size", 1) or 1
+            decode_kv_len_threshold = additional_config.get(
+                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
             self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
                 self.phased_profiling_dir,
                 worker_rank=global_rank,
                 world_size=world_size,
-                num_steps_to_profile_for=tpu_envs.
-                PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
-                num_decode_steps_to_skip=tpu_envs.
-                PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
-                decode_kv_len_threshold=tpu_envs.
-                PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+                # max_iterations defaults to 0 ("no limit") for standard torch
+                # profiling; that's meaningless for the phased profiler, so
+                # fall back to its own default when unset.
+                num_steps_to_profile_for=(
+                    profiler_config.max_iterations
+                    or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
+                num_decode_steps_to_skip=profiler_config.delay_iterations,
+                decode_kv_len_threshold=decode_kv_len_threshold,
             )
 
     # ----- Backend hooks overridden from GPUModelRunner -----
