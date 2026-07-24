@@ -29,9 +29,11 @@ cleanup() {
     echo "🧹 Cleaning up containers on specified hosts..."
     for host in "${hosts_to_clean[@]}"; do
         echo "   -> Cleaning ${host}"
+        local docker_img_q
+        docker_img_q=$(printf '%q' "${DOCKER_IMAGE}")
         ssh -o StrictHostKeyChecking=no -o BatchMode=yes "${SSH_USER}@${host}" "sudo docker stop node" > /dev/null 2>&1 || true
         ssh -o StrictHostKeyChecking=no -o BatchMode=yes "${SSH_USER}@${host}" "sudo docker rm -f node" > /dev/null 2>&1 || true
-        ssh -o StrictHostKeyChecking=no -o BatchMode=yes "${SSH_USER}@${host}" "sudo docker rmi ${DOCKER_IMAGE}" > /dev/null 2>&1 || true
+        ssh -o StrictHostKeyChecking=no -o BatchMode=yes "${SSH_USER}@${host}" "sudo docker rmi ${docker_img_q}" > /dev/null 2>&1 || true
     done
 }
 
@@ -122,12 +124,19 @@ echo "Worker Node SSH IPs: ${WORKER_SSH_IPS[*]}"
 echo "---------------------------------"
 
 # Note the use of HEAD_INTERNAL_IP here. This is passed to the script for Ray.
-BASE_CMD="sudo bash ${REMOTE_SCRIPT_PATH} \
-    '${DOCKER_IMAGE}' \
-    '${HEAD_INTERNAL_IP}' \
+# Safely escape arguments for remote SSH execution to prevent command injection
+REMOTE_SCRIPT_PATH_Q=$(printf '%q' "${REMOTE_SCRIPT_PATH}")
+DOCKER_IMAGE_Q=$(printf '%q' "${DOCKER_IMAGE}")
+HEAD_INTERNAL_IP_Q=$(printf '%q' "${HEAD_INTERNAL_IP}")
+HF_CACHE_PATH_Q=$(printf '%q' "${HF_CACHE_PATH}")
+HF_TOKEN_Q=$(printf '%q' "${HF_TOKEN}")
+
+BASE_CMD="sudo bash ${REMOTE_SCRIPT_PATH_Q} \
+    ${DOCKER_IMAGE_Q} \
+    ${HEAD_INTERNAL_IP_Q} \
     %ROLE% \
-    '${HF_CACHE_PATH}' \
-    -e HF_TOKEN='${HF_TOKEN}' \
+    ${HF_CACHE_PATH_Q} \
+    -e HF_TOKEN=${HF_TOKEN_Q} \
     -e TPU_MULTIHOST_BACKEND=ray \
     -e JAX_PLATFORMS=''"
 
