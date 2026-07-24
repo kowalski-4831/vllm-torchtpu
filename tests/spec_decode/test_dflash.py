@@ -52,6 +52,7 @@ def _make_proposer(draft_tp: int | None = 1) -> DFlashProposer:
             data_parallel_size=1,
             tensor_parallel_size=1,
             is_moe_model=False,
+            use_sequence_parallel_moe=False,
         ),
     )
     runner = mock.MagicMock()
@@ -200,14 +201,16 @@ def _make_chunk(num_reqs,
                 position_ids,
                 aux_hidden_states=None,
                 seq_lens=None):
-    if seq_lens is None:
-        seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device)
+    query_start_loc = torch.from_numpy(query_start_loc_np).to(
+        device) if query_start_loc_np is not None else None
 
     return DraftChunkInputs(
         input_ids=None,
         position_ids=position_ids,
         query_start_loc_np=query_start_loc_np,
-        attn_ctx=SimpleNamespace(seq_lens=seq_lens, use_max_model_len=True),
+        attn_ctx=SimpleNamespace(seq_lens=seq_lens,
+                                 query_start_loc=query_start_loc,
+                                 use_max_model_len=True),
         start_index=start_index,
         num_reqs=num_reqs,
         aux_hidden_states=aux_hidden_states,
@@ -322,6 +325,7 @@ def test_propose_unit(device):
         empty_slot_mappings=torch.zeros(128, dtype=torch.int32, device=device),
         _build_attention_metadata=mock.MagicMock(return_value=({}, None)),
         mesh=None,
+        _is_async_drafter=True,
     )
 
     chunk = _make_chunk(num_reqs=2,
