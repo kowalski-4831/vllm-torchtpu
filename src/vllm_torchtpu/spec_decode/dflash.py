@@ -303,11 +303,10 @@ class DFlashProposer:
             return
 
         target_hidden = chunk.aux_hidden_states
-        if isinstance(target_hidden, (list, tuple)):
-            target_hidden = target_hidden[0] if len(
-                target_hidden) == 1 else torch.cat(target_hidden, dim=-1)
-
-        num_tokens = target_hidden.shape[0]
+        aux_hidden = target_hidden[0] if isinstance(target_hidden,
+                                                    (list,
+                                                     tuple)) else target_hidden
+        num_tokens = aux_hidden.shape[0]
 
         positions = chunk.position_ids[:num_tokens]
 
@@ -383,15 +382,27 @@ class DFlashProposer:
             draft_logits_per_chunk.append(draft_tokens_chunk)
 
         # 3. Extract K tokens from logits
-        # Concat valid items on device (creating a single graph node)
-        all_logits_dev = torch.cat([
-            logits[:chunk.num_reqs]
-            for logits, chunk in zip(draft_logits_per_chunk, chunks)
-        ],
-                                   dim=0)
-
         if return_device:
-            return all_logits_dev
+            if len(draft_logits_per_chunk) == 1:
+                return draft_logits_per_chunk[0]
+            sliced_chunks = [
+                logits if logits.shape[0] == chunk.num_reqs else
+                logits[:chunk.num_reqs]
+                for logits, chunk in zip(draft_logits_per_chunk, chunks)
+            ]
+            return torch.cat(sliced_chunks, dim=0)
+
+        # Single synchronization and transfer to the host (return_device=False)
+        if len(draft_logits_per_chunk) == 1:
+            chunk = chunks[0]
+            all_logits_dev = draft_logits_per_chunk[0][:chunk.num_reqs]
+        else:
+            sliced_chunks = [
+                logits if logits.shape[0] == chunk.num_reqs else
+                logits[:chunk.num_reqs]
+                for logits, chunk in zip(draft_logits_per_chunk, chunks)
+            ]
+            all_logits_dev = torch.cat(sliced_chunks, dim=0)
 
         # Single synchronization and transfer to the host
         all_logits_host = all_logits_dev.cpu().tolist()
@@ -595,7 +606,8 @@ class DFlashProposer:
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _tpu_precompute_and_update_kv_cache(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor]
+        | torch.Tensor,
         positions: torch.Tensor,
         draft_attn_metadata: "AttentionMetadata",
         kv_caches: list[torch.Tensor],
@@ -609,7 +621,12 @@ class DFlashProposer:
         RoPE across all layers simultaneously in a single vectorized operation.
         """
         self_model = self.draft_model.model
-        target_hidden = hidden_states
+        if isinstance(hidden_states, (list, tuple)):
+            target_hidden = hidden_states[0] if len(
+                hidden_states) == 1 else torch.cat(hidden_states, dim=-1)
+        else:
+            target_hidden = hidden_states
+
         if hasattr(self.draft_model, "combine_hidden_states"):
             target_hidden = self.draft_model.combine_hidden_states(
                 target_hidden)
@@ -651,8 +668,8 @@ class DFlashProposer:
         positions_repeated = positions.repeat(L)
         nq = self_model.layers[0].self_attn.num_heads
         dummy_q = torch.zeros((L * num_ctx, nq, hd),
-                              device=hidden_states.device,
-                              dtype=hidden_states.dtype)
+                              device=target_hidden.device,
+                              dtype=target_hidden.dtype)
         dummy_q_roped_flat, roped_k_flat = self_model.layers[
             0].self_attn.rotary_emb(positions_repeated, dummy_q, all_k_flat2)
         roped_k_all = roped_k_flat.view(L, num_ctx, nkv, hd)
