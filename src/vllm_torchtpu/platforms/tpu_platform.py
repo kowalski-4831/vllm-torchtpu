@@ -187,6 +187,7 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
+    tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_vllm_disable_compile_ranges()

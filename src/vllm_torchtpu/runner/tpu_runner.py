@@ -540,12 +540,15 @@ class TPUModelRunner(GPUModelRunner):
         additional_config['phased_profiling_dir']."""
         additional_config = self.vllm_config.additional_config
         self.phased_profiling_dir = additional_config.get(
-            "phased_profiling_dir", "")
+            runner_utils.PHASED_PROFILING_DIR_KEY, "")
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
             profiler_config = self.vllm_config.profiler_config
             global_rank = getattr(self.parallel_config, "rank", 0) or 0
             world_size = getattr(self.parallel_config, "world_size", 1) or 1
+            decode_kv_len_threshold = additional_config.get(
+                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
             self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
                 self.phased_profiling_dir,
                 worker_rank=global_rank,
@@ -557,9 +560,7 @@ class TPUModelRunner(GPUModelRunner):
                     profiler_config.max_iterations
                     or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
                 num_decode_steps_to_skip=profiler_config.delay_iterations,
-                decode_kv_len_threshold=additional_config.get(
-                    "phased_profiler_decode_only_kv_len_threshold",
-                    runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD),
+                decode_kv_len_threshold=decode_kv_len_threshold,
             )
 
     # ----- Backend hooks overridden from GPUModelRunner -----
