@@ -213,3 +213,60 @@ def test_propose_draft_token_ids_ngram_dispatches_correctly():
     assert result is None
     assert manager._draft_token_ids == [[5], [6]]
     mock_drafter.propose.assert_called_once_with([[1], [2]], "NTS", "TIDS")
+
+
+def _fresh_metadata_manager(device, input_ids):
+    mock_runner = MagicMock()
+    mock_runner.device = device
+    mock_runner.arange_np = np.arange(100, dtype=np.int32)
+    mock_runner.num_tokens_paddings = [8, 16, 32, 64]
+    mock_runner.input_ids_cpu = input_ids
+    return SpeculativeDecodingManager(mock_runner)
+
+
+def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
+    # Same (num_draft_tokens, cu_num_scheduled_tokens, padded_num_reqs) ->
+    # the 7 index tensors are reused (same device objects, no re-transfer),
+    # while draft_token_ids is re-extracted from the CURRENT input_ids_cpu.
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                             dtype=torch.int32)
+    manager = _fresh_metadata_manager(device, input_ids)
+    nd = np.array([3, 2], dtype=np.int32)
+    cu = np.array([4, 7], dtype=np.int32)
+
+    m1 = manager.get_spec_decode_metadata(nd, cu, 4)
+    # New step: same layout, different token values.
+    manager.runner.input_ids_cpu = input_ids + 100
+    m2 = manager.get_spec_decode_metadata(nd.copy(), cu.copy(), 4)
+
+    for f in ("draft_lengths", "target_logits_indices", "bonus_logits_indices",
+              "final_logits_indices", "segment_ids", "group_indices"):
+        assert getattr(m2, f) is getattr(m1, f), f"{f} not reused"
+    assert m2.draft_token_ids is not m1.draft_token_ids
+    # Values must equal an uncached build on the same inputs.
+    ref = _fresh_metadata_manager(device,
+                                  input_ids + 100).get_spec_decode_metadata(
+                                      nd, cu, 4)
+    assert torch.equal(m2.draft_token_ids.cpu(), ref.draft_token_ids.cpu())
+
+
+def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
+    # Any change in the key inputs must rebuild, with values matching an
+    # uncached build.
+    input_ids = torch.arange(1, 21, dtype=torch.int32)
+    manager = _fresh_metadata_manager(device, input_ids)
+    m1 = manager.get_spec_decode_metadata(np.array([3, 2], dtype=np.int32),
+                                          np.array([4, 7], dtype=np.int32), 4)
+    nd2 = np.array([2, 2], dtype=np.int32)
+    cu2 = np.array([3, 6], dtype=np.int32)
+    m2 = manager.get_spec_decode_metadata(nd2, cu2, 4)
+    assert m2.final_logits_indices is not m1.final_logits_indices
+    ref = _fresh_metadata_manager(device, input_ids).get_spec_decode_metadata(
+        nd2, cu2, 4)
+    for f in ("draft_token_ids", "draft_lengths", "target_logits_indices",
+              "bonus_logits_indices", "final_logits_indices", "segment_ids",
+              "group_indices"):
+        assert torch.equal(
+            getattr(m2, f).cpu(),
+            getattr(ref, f).cpu()), f"{f} differs from uncached build"
+    assert np.array_equal(m2.draft_lengths_cpu, nd2)
