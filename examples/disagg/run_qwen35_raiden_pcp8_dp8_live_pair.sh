@@ -423,7 +423,6 @@ configure_role_environment() {
   export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
   export TPU_RAIDEN_QWEN35_ADMISSION=1
   export TPU_KV_RESHARD_TRANSPORT=raiden
-  export TPU_KV_RESHARD_DST_PAGE_TOKENS=4096
   export TPU_RAIDEN_TRANSFER_PARALLELISM=8
 
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
@@ -938,17 +937,13 @@ for event in submitted:
         break
 details["source_request_id"] = main_req_id
 
-suffix_to_tag = {
-    "": "fa",
-    "#gc0": "gdn.conv.g0",
-    "#gc1": "gdn.conv.g1",
-    "#gc2": "gdn.conv.g2",
-    "#gs0": "gdn.ssm.g0",
-    "#gs1": "gdn.ssm.g1",
-    "#gs2": "gdn.ssm.g2",
-}
-required_ids = ({main_req_id + suffix for suffix in suffix_to_tag}
-                if isinstance(main_req_id, str) else set())
+# T3.1 sibling collapse: ONE transfer carries FA plus all six GDN state
+# classes under the base request id — one arm, one dispatch, seven tags.
+expected_tags = ["fa",
+                 "gdn.conv.g0", "gdn.ssm.g0",
+                 "gdn.conv.g1", "gdn.ssm.g1",
+                 "gdn.conv.g2", "gdn.ssm.g2"]
+required_ids = ({main_req_id} if isinstance(main_req_id, str) else set())
 armed = [e for e in decode_controller_events
          if e.get("event") == "raiden_pool_reshard_receivers_armed"
          and e.get("req_id") in required_ids]
@@ -963,15 +958,15 @@ checks["fa_conv_ssm_senders_dispatched"] = bool(required_ids) and set(dispatch_b
 ordering_ok = bool(required_ids) and set(dispatch_by_id) == required_ids
 tags_ok = ordering_ok
 if ordering_ok:
-    for suffix, expected_tag in suffix_to_tag.items():
-        event = dispatch_by_id[main_req_id + suffix]
-        ack = event.get("receiver_arm_ack_monotonic_ns")
-        dispatch = event.get("sender_dispatch_monotonic_ns")
-        if (event.get("receiver_armed_before_sender_dispatch") is not True
-                or type(ack) is not int or type(dispatch) is not int or ack > dispatch):
-            ordering_ok = False
-        if event.get("transfer_pool_tags") != [expected_tag]:
-            tags_ok = False
+    event = dispatch_by_id[main_req_id]
+    ack = event.get("receiver_arm_ack_monotonic_ns")
+    dispatch = event.get("sender_dispatch_monotonic_ns")
+    if (event.get("receiver_armed_before_sender_dispatch") is not True
+            or type(ack) is not int or type(dispatch) is not int or ack > dispatch):
+        ordering_ok = False
+    event_tags = event.get("transfer_pool_tags")
+    if sorted(event_tags or []) != sorted(expected_tags):
+        tags_ok = False
 checks["all_receivers_armed_before_sender_dispatch"] = ordering_ok
 checks["fa_conv_ssm_pool_tags_exact"] = tags_ok
 details["receiver_armed_request_ids"] = sorted(x for x in armed_ids if isinstance(x, str))

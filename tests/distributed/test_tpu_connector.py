@@ -1265,12 +1265,10 @@ class TestTPURaidenConnectorWorker:
 
     @pytest.fixture(autouse=True)
     def _byte_lowering_defaults(self):
-        # Every producer worker gets the destination page geometry and
-        # measured FA token bytes required by registration-time lowering.
-        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_DST_PAGE_TOKENS",
-                   1024,
-                   create=True), \
-             patch.object(TPURaidenConnectorWorker, "_stage3_fa_token_bytes",
+        # Every producer worker gets the measured FA token bytes required by
+        # registration-time lowering. (T3.4: destination page geometry is
+        # controller-derived; no producer env exists.)
+        with patch.object(TPURaidenConnectorWorker, "_stage3_fa_token_bytes",
                           return_value=1024):
             yield
 
@@ -1637,19 +1635,15 @@ class TestTPURaidenConnectorWorker:
         worker._stage3_state_group_count = 1
         facade = _FakeRaidenControllerFacade()
 
-        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
-                   8,
-                   create=True):
-            worker._stage3_register_state_blocks(facade, "stateful", 123,
-                                                 transfer_rank, [17])
+        registrations = worker._stage3_state_pool_spans([17], transfer_rank,
+                                                         8)
 
-        assert len(facade.register_request_blocks_calls) == 2
-        conv_call, ssm_call = facade.register_request_blocks_calls
-        assert conv_call["req_id"] == "stateful#gc0"
-        assert ssm_call["req_id"] == "stateful#gs0"
-        assert conv_call["block_ids"] == ssm_call["block_ids"] == []
-        conv = conv_call["pool_spans"][0]
-        ssm = ssm_call["pool_spans"][0]
+        # T3.1 collapse: the state classes ride the base registration as
+        # additional PoolSpanRegistrations — no derived req-ids, no
+        # sibling facade calls.
+        assert len(facade.register_request_blocks_calls) == 0
+        assert len(registrations) == 2
+        conv, ssm = registrations
         assert conv.tag == "gdn.conv.g0"
         assert conv.block_ids == (17, )
         assert conv.declared_bytes == 96
@@ -1662,141 +1656,6 @@ class TestTPURaidenConnectorWorker:
         assert ssm.block_ids == (17, )
         assert ssm.declared_bytes == 64
         assert ssm.spans == (PoolByteSpan(0, 0, 0, transfer_rank * 64, 64), )
-
-    def test_stage3_producer_gates_base_on_state_siblings_and_cleans_d5(self):
-        worker = _make_raiden_worker(tp_rank=0,
-                                     tp_size=1,
-                                     is_producer=True,
-                                     dp_size=1,
-                                     pcp_size=8)
-        engine = _FakeRaidenEngine()
-        engine.poll_results = [
-            (["stateful"], [], []),
-            (["stateful#gc0"], [], []),
-            (["stateful#gs0"], [], []),
-        ]
-        facade = _FakeRaidenControllerFacade()
-        unit = SimpleNamespace(job_name="prefill", job_replica_id="rank0")
-        worker._raiden_transfer_engine = engine
-        worker._raiden_controller_facade = facade
-        worker._raiden_controller_address = "prefill-controller.test:27000"
-        worker._raiden_work_unit = unit
-
-        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
-                   "raiden",
-                   create=True), patch(
-                       f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
-                       8,
-                       create=True):
-            derived_uuids = _seed_stateful_stage3_producer(worker, facade)
-            # FA and the first state terminal are both insufficient. Private
-            # sibling IDs never cross the connector boundary.
-            assert worker.get_finished() == (set(), set())
-            assert worker.get_finished() == (set(), set())
-            assert worker.get_finished() == ({"stateful"}, set())
-
-        assert facade.complete_request_blocks_calls == [
-            {
-                "req_id": "stateful#gc0",
-                "uuid": derived_uuids["stateful#gc0"],
-                "unit": unit,
-            },
-            {
-                "req_id": "stateful#gs0",
-                "uuid": derived_uuids["stateful#gs0"],
-                "unit": unit,
-            },
-            {
-                "req_id": "stateful",
-                "uuid": 123,
-                "unit": unit,
-            },
-        ]
-        assert worker._stage3_registered_sends == {}
-        assert worker._stage3_state_send_pending["stateful"] == set()
-
-    def test_stage3_producer_state_failure_collapses_to_base_terminal(self):
-        worker = _make_raiden_worker(tp_rank=0,
-                                     tp_size=1,
-                                     is_producer=True,
-                                     dp_size=1,
-                                     pcp_size=8)
-        engine = _FakeRaidenEngine()
-        engine.poll_results = [
-            (["stateful", "stateful#gc0"], [], ["stateful#gs0"]),
-        ]
-        facade = _FakeRaidenControllerFacade()
-        worker._raiden_transfer_engine = engine
-        worker._raiden_controller_facade = facade
-        worker._raiden_controller_address = "prefill-controller.test:27000"
-        worker._raiden_work_unit = SimpleNamespace(job_name="prefill")
-
-        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
-                   "raiden",
-                   create=True), patch(
-                       f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
-                       8,
-                       create=True), patch(f"{_MOD}.logger.error") as log:
-            _seed_stateful_stage3_producer(worker, facade)
-            assert worker.get_finished() == ({"stateful"}, set())
-
-        messages = [
-            call.args[0] % call.args[1:] for call in log.call_args_list
-        ]
-        assert any("failed_sending={'stateful'}" in message
-                   for message in messages)
-        completed_ids = {
-            call["req_id"]
-            for call in facade.complete_request_blocks_calls
-        }
-        assert completed_ids == {"stateful", "stateful#gc0", "stateful#gs0"}
-
-    def test_stage3_expiry_cancels_base_and_unclaimed_state_siblings(self):
-        worker = _make_raiden_worker(tp_rank=0,
-                                     tp_size=1,
-                                     is_producer=True,
-                                     dp_size=1,
-                                     pcp_size=8)
-        engine = _FakeRaidenEngine()
-        engine.poll_results = [([], [], [])]
-        facade = _FakeRaidenControllerFacade()
-        worker._raiden_transfer_engine = engine
-        worker._raiden_controller_facade = facade
-        worker._raiden_controller_address = "prefill-controller.test:27000"
-        worker._raiden_work_unit = SimpleNamespace(job_name="prefill")
-
-        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
-                   "raiden",
-                   create=True), patch(
-                       f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
-                       8,
-                       create=True):
-            derived_uuids = _seed_stateful_stage3_producer(worker, facade)
-            registration = worker._stage3_registered_sends["stateful"]
-            worker._stage3_registered_sends["stateful"] = (
-                _Stage3RegisteredSend(
-                    uuid=registration.uuid,
-                    local_block_ids=registration.local_block_ids,
-                    num_tokens=registration.num_tokens,
-                    expiration_time=time.perf_counter() - 1.0,
-                ))
-            assert worker.get_finished() == ({"stateful"}, set())
-
-        assert facade.cancel_request_blocks_calls == [
-            {
-                "req_id": "stateful",
-                "uuid": 123,
-            },
-            {
-                "req_id": "stateful#gc0",
-                "uuid": derived_uuids["stateful#gc0"],
-            },
-            {
-                "req_id": "stateful#gs0",
-                "uuid": derived_uuids["stateful#gs0"],
-            },
-        ]
-        assert facade.complete_request_blocks_calls == []
 
     def test_v3_stage3_producer_registers_rank_stripe_and_releases_on_done(
             self):
@@ -1854,7 +1713,6 @@ class TestTPURaidenConnectorWorker:
             parallelism=8,
             interleave_tokens=256,
             page_tokens=4096,
-            dst_page_tokens=1024,
             token_bytes=1024,
             block_ids=[100, 101],
         )
