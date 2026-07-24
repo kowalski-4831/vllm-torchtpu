@@ -60,12 +60,15 @@ def run_jax_gdn_attention_local(
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
+    slot_read_offsets: Optional[jnp.ndarray] = None,
+    *,
     n_kq: int,
     n_v: int,
     d_k: int,
     d_v: int,
     kernel_size: int,
     dp_enabled: bool,
+    num_spec_tokens: int = 0,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the local JAX GDN attention mechanism with combined QKV tensors.
@@ -96,6 +99,13 @@ def run_jax_gdn_attention_local(
           from a reused mamba slot, mirroring GPU's
           ``initial_state[~has_initial_state, ...] = 0`` in
           ``gdn_linear_attn._forward_core``.
+        slot_read_offsets: Optional tensor of shape `(num_blocks,)` — per
+          physical slot mamba read offset for speculative decoding. Gathered
+          per sequence (`slot_read_offsets[state_indices]`) so the kernel
+          resumes each verify window from the checkpoint of the last
+          accepted token. Required iff `num_spec_tokens > 0`.
+        num_spec_tokens: Number of speculative draft tokens (0 disables the
+          spec-decode windowed mode).
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Dimension of key.
@@ -119,7 +129,21 @@ def run_jax_gdn_attention_local(
     query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
     has_initial_state = (seq_lens - query_lens) > 0
 
+    if num_spec_tokens > 0:
+        assert (config.ragged_gated_delta_rule_impl ==
+                RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD), (
+                    "Mamba state rollback for speculative decoding is only "
+                    "supported by the fused v3 GDN kernel "
+                    "(RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd).")
+        assert slot_read_offsets is not None
+
     if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
+        read_offsets = None
+        if num_spec_tokens > 0:
+            # Per-sequence read offsets: `state_indices` holds the base slot
+            # of each request's checkpoint group, `slot_read_offsets` is the
+            # per-slot offset buffer updated after each verify step.
+            read_offsets = slot_read_offsets[state_indices]
         return gdn_v3_wrapper.fused_conv1d_gdn(
             mixed_qkv,
             b,
@@ -134,11 +158,13 @@ def run_jax_gdn_attention_local(
             state_indices,
             distribution,
             seq_lens,
+            read_offsets,
             n_kq=n_kq,
             n_v=n_v,
             d_k=d_k,
             d_v=d_v,
             kernel_size=kernel_size,
+            num_spec_tokens=num_spec_tokens,
         )
 
     out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
@@ -214,6 +240,8 @@ def run_jax_gdn_attention(
     query_start_loc: jnp.ndarray,
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
+    slot_read_offsets: Optional[jnp.ndarray] = None,
+    *,
     n_kq: int,
     n_v: int,
     d_k: int,
@@ -221,6 +249,7 @@ def run_jax_gdn_attention(
     kernel_size: int,
     mesh: jax.sharding.Mesh,
     dp_enabled: bool,
+    num_spec_tokens: int = 0,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
@@ -279,6 +308,10 @@ def run_jax_gdn_attention(
         P(None),  # distribution
         P(None),  # seq_lens
     )
+    if slot_read_offsets is not None:
+        # Per-slot buffer, replicated like the other per-sequence inputs
+        # (query_start_loc / state_indices / seq_lens).
+        in_specs = in_specs + (P(None), )
 
     out_specs = (
         (
@@ -298,6 +331,7 @@ def run_jax_gdn_attention(
         d_v=d_v,
         kernel_size=kernel_size,
         dp_enabled=dp_enabled,
+        num_spec_tokens=num_spec_tokens,
         config=config,
     )
 
@@ -309,6 +343,7 @@ def run_jax_gdn_attention(
         check_vma=False,
     )
 
+    extra_args = (() if slot_read_offsets is None else (slot_read_offsets, ))
     (new_conv_state, new_recurrent_state), output = mapped_fn(
         j_mixed_qkv,
         j_b,
@@ -323,6 +358,7 @@ def run_jax_gdn_attention(
         state_indices,
         distribution,
         seq_lens,
+        *extra_args,
     )
 
     return (new_conv_state, new_recurrent_state), output

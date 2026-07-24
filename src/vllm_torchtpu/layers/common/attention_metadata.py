@@ -24,6 +24,8 @@ from vllm_torchtpu.layers.common.sequence_layout import (
         "query_start_loc",
         "request_distribution",
         "mamba_state_indices",
+        "mamba_slot_read_offsets",
+        "mamba_request_distribution",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -51,6 +53,26 @@ class AttentionMetadata(object):
     # attention groups, non-mamba models, and Mamba modes whose native fallback
     # addresses block_tables[:, 0].
     mamba_state_indices: jax.Array | None = None
+    # (mamba_num_blocks,) int32 — per-*slot* read offset for speculative
+    # decoding with mamba layers. `mamba_slot_read_offsets[base_slot]` is
+    # `num_accepted - 1` from the request's most recent verify step: the GDN
+    # kernel reads the request's initial state from `base_slot + offset`
+    # (the checkpoint of the last accepted token) and writes fresh
+    # checkpoints starting at `base_slot`. Indexed by physical slot (not
+    # batch position) so the value survives requests being rescheduled or
+    # condensed. Updated on device after each sampling step; None unless the
+    # model has mamba layers *and* speculative decoding is enabled.
+    mamba_slot_read_offsets: jax.Array | None = None
+    # (3,) int32 — GDN-specific request distribution, same format as
+    # `request_distribution` but with the first segment covering all
+    # *windowed* sequences (plain decodes and speculative verify windows of
+    # up to num_spec + 1 tokens) instead of only 1-token decodes. The
+    # persistent batch is ordered [decode][verify][prefill/mixed] so both
+    # segmentations hold at once: ragged paged attention keeps its 1-token
+    # decode front segment while the GDN kernel runs its windowed mode over
+    # the first two groups. None unless the model has mamba layers and spec
+    # decoding is enabled.
+    mamba_request_distribution: jax.Array | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -81,6 +103,10 @@ class AttentionMetadataBuilderContext:
     # target_num_reqs). Only the mamba group's builder reads it; None when the
     # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
     mamba_state_indices: torch.Tensor | None = None
+    # Spec decode with mamba layers only; see the AttentionMetadata fields of
+    # the same names. Only the mamba group's builder reads them.
+    mamba_slot_read_offsets: torch.Tensor | None = None
+    mamba_request_distribution: torch.Tensor | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
 
@@ -172,6 +198,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         else:
             mamba_state_indices = None
 
+        if self.is_mamba_group:
+            mamba_slot_read_offsets = ctx.mamba_slot_read_offsets
+            mamba_request_distribution = ctx.mamba_request_distribution
+        else:
+            mamba_slot_read_offsets = None
+            mamba_request_distribution = None
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -179,6 +212,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             query_start_loc=ctx.query_start_loc,
             request_distribution=ctx.request_distribution,
             mamba_state_indices=mamba_state_indices,
+            mamba_slot_read_offsets=mamba_slot_read_offsets,
+            mamba_request_distribution=mamba_request_distribution,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
