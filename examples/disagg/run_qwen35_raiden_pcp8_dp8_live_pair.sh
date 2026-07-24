@@ -695,7 +695,6 @@ PY
     --compilation-config "${compilation_config}"
     --no-enable-prefix-caching
     --no-async-scheduling
-    --block-size 4096
     --tensor-parallel-size 1
   )
 

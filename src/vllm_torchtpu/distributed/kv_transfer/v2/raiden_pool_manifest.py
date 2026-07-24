@@ -353,8 +353,8 @@ def _gdn_ssm_regions(*, ssm_shape: Sequence[int],
 def _group_spec_for_layer(kv_cache_groups: Sequence[Any],
                           layer_name: str) -> Any:
     for group in kv_cache_groups:
-        if layer_name in getattr(group, "layer_names", ()):
-            return getattr(group, "kv_cache_spec", None)
+        if layer_name in group.layer_names:
+            return group.kv_cache_spec
     raise ManifestError(f"layer {layer_name} is in no kv cache group")
 
 
@@ -553,9 +553,9 @@ def build_qwen35_pool_manifest(
 
         if tag == TAG_FA:
             spec = _group_spec_for_layer(kv_cache_groups, layer_name)
-            block_size = int(getattr(spec, "block_size"))
-            num_kv_heads = int(getattr(spec, "num_kv_heads"))
-            head_size = int(getattr(spec, "head_size"))
+            block_size = int(spec.block_size)
+            num_kv_heads = int(spec.num_kv_heads)
+            head_size = int(spec.head_size)
             if len(shape) < 2:
                 raise ManifestError(
                     f"full-attention cache {layer_name} needs a paged shape: "

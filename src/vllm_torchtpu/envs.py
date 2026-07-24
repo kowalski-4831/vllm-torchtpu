@@ -15,10 +15,6 @@ if TYPE_CHECKING:
     SKIP_JAX_PRECOMPILE: bool = False
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     MODEL_IMPL_TYPE: str = "vllm"
-    PHASED_PROFILING_DIR: str = ""
-    PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR: int = 15
-    PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP: int = 0
-    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD: int = -1
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
     NUM_SLICES: int = 1
@@ -143,16 +139,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MODEL_IMPL_TYPE":
     env_with_choices("MODEL_IMPL_TYPE", "vllm",
                      ["vllm", "flax_nnx", "jetpack"]),
-    # Directory to store phased profiling output
-    "PHASED_PROFILING_DIR":
-    lambda: os.getenv("PHASED_PROFILING_DIR", ""),
-    "PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR":
-    lambda: int(os.getenv("PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR", "15")),
-    "PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP":
-    lambda: int(os.getenv("PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP", "0")),
-    "PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD":
-    lambda: int(os.getenv("PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD", "-1")
-                ),
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL":
     lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),

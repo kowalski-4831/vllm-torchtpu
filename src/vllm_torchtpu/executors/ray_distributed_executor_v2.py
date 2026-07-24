@@ -122,8 +122,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
         # The TCPStore server runs on rank 0's node, so all workers
         # must be able to reach this address.
         dist_ip = bundle_assignments[0]["node_ip"]
-        distributed_init_method = get_distributed_init_method(
-            dist_ip, get_open_port())
+        port = self._select_tcpstore_port(
+            self.parallel_config.data_parallel_rank_local,
+            self.parallel_config.data_parallel_master_port,
+        )
+        distributed_init_method = get_distributed_init_method(dist_ip, port)
 
         # Step 4: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
@@ -189,19 +192,20 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
             self.ray_worker_handles.append(handle)
 
-        # Step 6: Discover GPU/TPU IDs assigned to each worker via Ray runtime context.
-        worker_node_and_tpu_ids = ray.get([
-            h.actor.get_node_and_gpu_ids.remote()
+        # Step 6: Discover physical TPU IDs assigned to each worker via Ray.
+        worker_node_and_physical_tpu_ids = ray.get([
+            h.actor.get_node_and_physical_gpu_ids.remote()
             for h in self.ray_worker_handles
         ])
 
         node_workers: dict[str, list[int]] = defaultdict(list)
-        node_tpus: dict[str, list[int]] = defaultdict(list)
-        for i, (node_id, tpu_ids) in enumerate(worker_node_and_tpu_ids):
+        node_physical_tpu_ids: dict[str, list[int]] = defaultdict(list)
+        for i, (node_id, physical_tpu_ids
+                ) in enumerate(worker_node_and_physical_tpu_ids):
             node_workers[node_id].append(i)
-            node_tpus[node_id].extend(tpu_ids)
-        for node_id, tpu_ids in node_tpus.items():
-            node_tpus[node_id] = sorted(tpu_ids)
+            node_physical_tpu_ids[node_id].extend(physical_tpu_ids)
+        for node_id, physical_tpu_ids in node_physical_tpu_ids.items():
+            node_physical_tpu_ids[node_id] = sorted(physical_tpu_ids)
 
         # Step 7: Prepare the environment variables for TorchTPU/XLA.
         # This includes construction of slice builder addresses, topology lookup,
@@ -242,9 +246,10 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         # Initialize workers with correct environment variables and local_rank.
         init_worker_refs = []
-        for i, (node_id, _) in enumerate(worker_node_and_tpu_ids):
+        for i, (node_id, _) in enumerate(worker_node_and_physical_tpu_ids):
             local_rank = node_workers[node_id].index(i)
             node_rank = node_id_to_rank[node_id]
+            assigned_physical_tpu_ids = sorted(node_physical_tpu_ids[node_id])
 
             worker_env_vars = {
                 "LOCAL_WORLD_SIZE": str(len(node_workers[node_id])),
@@ -265,7 +270,15 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
             init_worker_refs.append(
                 self.ray_worker_handles[i].actor.initialize_worker.remote(
-                    local_rank, worker_env_vars, self.driver_env_vars))
+                    local_rank,
+                    worker_env_vars,
+                    self.driver_env_vars,
+                    assigned_physical_gpu_ids=assigned_physical_tpu_ids,
+                ))
+        if len(node_physical_tpu_ids) == 1:
+            node_id_0 = worker_node_and_physical_tpu_ids[0][0]
+            self.vllm_config.parallel_config.assigned_physical_gpu_ids = sorted(
+                node_physical_tpu_ids[node_id_0])
         ray.get(init_worker_refs)
 
         # Step 8: Collect response MQ handles

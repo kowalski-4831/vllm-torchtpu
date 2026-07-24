@@ -42,8 +42,8 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
-                                                        FusedMoEMethodBase)
+from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
+                                                  RoutedExperts)
 from vllm.model_executor.layers.linear import (
     LinearBase, UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method)
@@ -251,7 +251,7 @@ def _process_fp8_linear_weights(
         weight_scale_inv=weight_scale_inv,
         block_quant=block_quant,
         weight_block_size=weight_block_size,
-        logical_widths=getattr(layer, "logical_widths", None),
+        logical_widths=layer.logical_widths,
         out_dtype=torch.float32,
     )
     weight, weight_scale = quantize_tensor(
@@ -345,7 +345,7 @@ def _quantize_and_format_moe_weights(
 
 
 def _process_fp8_moe_weights(
-    layer: FusedMoE,
+    layer: RoutedExperts,
     *,
     weight_block_size: Optional[tuple[int, int]] = None,
     activation: str,
@@ -417,8 +417,8 @@ def _process_fp8_moe_weights(
     unpadded_intermediate = (
         layer.moe_config.intermediate_size_per_partition_unpadded)
     if padded_intermediate != unpadded_intermediate:
-        full_intermediate = unpadded_intermediate * layer.tp_size
-        local_start = padded_intermediate * layer.tp_rank
+        full_intermediate = unpadded_intermediate * layer.moe_config.tp_size
+        local_start = padded_intermediate * layer.moe_config.tp_rank
         local_real = max(
             0, min(padded_intermediate, full_intermediate - local_start))
         if local_real < padded_intermediate:
@@ -439,7 +439,7 @@ def _process_fp8_moe_weights(
 
 
 def _quantize_bf16_moe_weights(
-    layer: FusedMoE,
+    layer: RoutedExperts,
     *,
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
@@ -476,6 +476,26 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
     reuse its dequant/requant runtime path.
     """
 
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        activation_scheme: str = "dynamic",
+        ignored_layers: list[str] | None = None,
+        weight_block_size: list[int] | None = None,
+        store_dtype: str | None = None,
+    ) -> None:
+        if store_dtype is not None:
+            raise NotImplementedError(
+                "FP8 store_dtype is not supported by the TPU quantization "
+                "path")
+        super().__init__(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=activation_scheme,
+            ignored_layers=ignored_layers,
+            weight_block_size=weight_block_size,
+            store_dtype=store_dtype,
+        )
+
     @classmethod
     def get_name(cls) -> str:
         return FP8
@@ -485,6 +505,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         weight_block_size = config.get("weight_block_size")
         activation_scheme = config.get("activation_scheme", "dynamic")
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        store_dtype = cls.get_from_keys_or(config, ["store_dtype"], None)
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config,
                                                   ["modules_to_not_convert"],
@@ -494,6 +515,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             activation_scheme=activation_scheme,
             weight_block_size=weight_block_size,
             ignored_layers=ignored_layers,
+            store_dtype=store_dtype,
         )
 
     def get_quant_method(
@@ -501,7 +523,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
                     prefix=prefix,
                     ignored_layers=self.ignored_layers,
@@ -649,7 +671,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         For BF16 checkpoints (online quantization): quantize BF16 → FP8
         directly using the same requantization path.
         """
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
         activation_str = _get_activation_str(layer.activation)
@@ -710,7 +732,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
     def apply_monolithic(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
@@ -718,7 +740,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
         # Step 1: Routing
-        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        custom_routing_fn = layer.custom_routing_function
         if custom_routing_fn is not None:
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
@@ -732,7 +754,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                scoring_fn=layer.scoring_func,
                 layer=layer,
             )
 

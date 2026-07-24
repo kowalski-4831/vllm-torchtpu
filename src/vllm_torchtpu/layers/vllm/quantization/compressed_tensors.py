@@ -39,7 +39,7 @@ from compressed_tensors.quantization import (QuantizationArgs,
                                              QuantizationStrategy,
                                              QuantizationType)
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \
@@ -93,16 +93,16 @@ def _build_fp8_config(
 
 def _get_moe_scheme_dict(
     quant_config: "VllmCompressedTensorsConfig",
-    layer: FusedMoE,
+    layer: RoutedExperts,
     layer_name: str,
 ) -> Optional[dict]:
     """Resolve the compressed-tensors scheme for a fused MoE experts layer.
 
-    RoutedExperts/FusedMoE fuses each expert's separate gate_proj/up_proj/
+    RoutedExperts fuses each expert's separate gate_proj/up_proj/
     down_proj Linears into one module, so config_groups targets (often just
     "Linear") don't match the fused layer's own prefix directly. Mirrors
     vLLM's CompressedTensorsMoEMethod.get_moe_method: populate
-    target_scheme_map["FusedMoE"] from target_scheme_map["Linear"], then
+    target_scheme_map["RoutedExperts"] from target_scheme_map["Linear"], then
     probe one expert's unfused per-projection paths and require them to
     agree on a single scheme.
     """
@@ -149,7 +149,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             scheme_dict = _get_moe_scheme_dict(self, layer, prefix)
         else:
             scheme_dict = self.get_scheme_dict(layer, prefix)
@@ -157,7 +157,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         input_quant = (scheme_dict.get("input_activations")
                        if scheme_dict else None)
 
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             if weight_quant is None:
                 return VllmUnquantizedFusedMoEMethod(
                     self.get_moe_config(layer))

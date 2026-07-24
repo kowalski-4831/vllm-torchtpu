@@ -197,9 +197,8 @@ def gdn_attention_core_tpu_pcp_prefill(
 
 
 def _get_pcp_size(vllm_config: VllmConfig) -> int:
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-    return pcp_size if isinstance(pcp_size, int) and pcp_size > 1 else 1
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    return pcp_size if pcp_size > 1 else 1
 
 
 def _localize_gdn_mamba_spec_for_pcp(
@@ -245,6 +244,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Bound by the runner during KV-cache initialization; None until then
+        # (warmup/profiling runs check this).
+        self.kv_cache = None
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op()
         self.gdn_pcp_op = (self._build_gdn_op(
@@ -331,7 +333,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             output_partition_specs = (
                 PartitionSpec(None, None, "pcp"),  # new_conv_state
                 PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
-                PartitionSpec(),  # output
+                PartitionSpec("pcp"),  # output
             )
             gdn_jax_op = pcp_streaming_jax_op(
                 op_name,
@@ -345,8 +347,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):
                 num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens * pcp_size,
-                             local_num_v_heads * self.head_v_dim)
+                out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
                 return torch.empty_like(conv_state), torch.empty_like(
                     recurrent_state), torch.empty(out_shape,
                                                   dtype=mixed_qkv.dtype,
@@ -400,9 +401,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
                 conv_bias, A_log, dt_bias, state_indices, query_start_loc,
                 request_distribution, seq_lens)
-            if pcp_streaming:
-                outputs = outputs.reshape(-1,
-                                          local_num_v_heads * self.head_v_dim)
 
             conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
@@ -512,7 +510,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        kv_cache = getattr(self, "kv_cache", None)
+        kv_cache = self.kv_cache
         local_num_v_heads = self.num_v_heads // self.tp_size
 
         # During warmup or memory profiling, the kv_cache might not be allocated yet
@@ -577,7 +575,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         attn_metadata.request_distribution,
                         attn_metadata.seq_lens)
                 else:
-                    gdn_pcp_op = getattr(self, "gdn_pcp_op", None)
+                    gdn_pcp_op = self.gdn_pcp_op
                     if gdn_pcp_op is None:
                         raise RuntimeError(
                             "GDN PCP prefill op was not initialized during model "
@@ -595,14 +593,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                             "GDN op returned an incompatible output shape.")
                     start = get_pcp_rank() * num_tokens
                     core_attn_out = core_attn_out[start:start + num_tokens]
-                if use_pcp_streaming:
-                    local_core_attn_out = torch.empty(
-                        tuple(core_attn_out.shape),
-                        dtype=core_attn_out.dtype,
-                        device=core_attn_out.device,
-                    )
-                    local_core_attn_out.copy_(core_attn_out)
-                    core_attn_out = local_core_attn_out
+
         # ============================================================
         # Part 3: Output Projection
         # ============================================================

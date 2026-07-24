@@ -100,8 +100,9 @@ class SpeculativeDecodingManager:
       num_rejected_tokens_np: Per-request count of draft tokens rejected
         this step (host-seed path only; the device paths derive this
         on-device).
-      scheduler_output: vLLM SchedulerOutput; needed by eagle3 for partial
-        prefill next-token lookup.
+      scheduler_output: vLLM SchedulerOutput; carries the per-step spec
+        token budget for ngram and the partial-prefill next-token lookup
+        for eagle3.
       return_device: return the raw ``[num_reqs, K]`` device tensor
         instead of caching a host list for take_draft_token_ids.
       next_tokens_per_chunk: on-device rejection-sampler output (spec
@@ -127,6 +128,7 @@ class SpeculativeDecodingManager:
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
             self._draft_token_ids = self.runner.drafter.propose(
+                scheduler_output.num_spec_tokens_to_schedule,
                 sampled_token_ids[:num_reqs],
                 self.runner.input_batch.num_tokens_no_spec,
                 self.runner.input_batch.token_ids_cpu,

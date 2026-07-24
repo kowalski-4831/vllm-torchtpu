@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
 from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -48,6 +49,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
                                              if spec_k is None else object())),
         speculative_config=(None if spec_k is None else SimpleNamespace(
             num_speculative_tokens=spec_k)),
+        _last_sequence_layout_plan=None,
         input_batch=SimpleNamespace(req_ids=req_ids))
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
         fake,
@@ -168,6 +170,72 @@ def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
             invalid_block_ids={41, 43},
             invalid_block_group_index=2,
         )
+
+
+class TestInitPhasedProfiling:
+    """Verify _init_phased_profiling reads from additional_config/profiler_config
+    instead of PHASED_PROFILER_* env vars."""
+
+    def _fake_runner(self,
+                     additional_config,
+                     max_iterations=0,
+                     delay_iterations=0):
+        return SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                additional_config=additional_config,
+                profiler_config=SimpleNamespace(
+                    max_iterations=max_iterations,
+                    delay_iterations=delay_iterations)),
+            parallel_config=SimpleNamespace(rank=2, world_size=4),
+        )
+
+    def test_disabled_when_dir_not_set(self):
+        runner = self._fake_runner(additional_config={})
+        TPUModelRunner._init_phased_profiling(runner)
+        assert runner.phased_profiling_dir == ""
+        assert runner.phase_based_profiler is None
+
+    def test_enabled_uses_config_values(self):
+        runner = self._fake_runner(
+            additional_config={
+                "phased_profiling_dir": "/tmp/phased",
+                "phased_profiler_decode_only_kv_len_threshold": 128,
+            },
+            max_iterations=20,
+            delay_iterations=3,
+        )
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner._init_phased_profiling(runner)
+
+        assert runner.phased_profiling_dir == "/tmp/phased"
+        mock_profiler_cls.assert_called_once_with(
+            "/tmp/phased",
+            worker_rank=2,
+            world_size=4,
+            num_steps_to_profile_for=20,
+            num_decode_steps_to_skip=3,
+            decode_kv_len_threshold=128,
+        )
+
+    def test_falls_back_to_default_num_steps_when_max_iterations_unset(self):
+        runner = self._fake_runner(
+            additional_config={"phased_profiling_dir": "/tmp/phased"},
+            max_iterations=0,
+            delay_iterations=0,
+        )
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner._init_phased_profiling(runner)
+
+        assert (
+            mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"] ==
+            runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+        assert (
+            mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"] ==
+            runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
 
 
 class DummyMamba(MambaBase):
@@ -655,6 +723,7 @@ class TestTPURunner:
         owner.head_size = 128
         owner.kv_sharing_target_layer_name = None
         owner.sliding_window = None
+        owner.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         shared = MagicMock(spec=Attention)
         shared.attn_type = AttentionType.DECODER
@@ -662,6 +731,7 @@ class TestTPURunner:
         shared.head_size = 128
         shared.kv_sharing_target_layer_name = "layer.0"
         shared.sliding_window = None
+        shared.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         mock_get_layers.return_value = {
             "layer.0": owner,
@@ -679,14 +749,14 @@ class TestTPURunner:
         attn.num_kv_heads = 2
         attn.head_size = 128
         attn.sliding_window = attn_window
-        attn.impl = None
+        attn.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         target = MagicMock(spec=Attention)
         target.attn_type = AttentionType.DECODER
         target.num_kv_heads = 2
         target.head_size = 128
         target.sliding_window = target_window
-        target.impl = None
+        target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
         return attn, target
 
     def test_validate_shared_layout_skips_sliding_window_when_hma_disabled(
@@ -1044,10 +1114,8 @@ class TestTPURunner:
         assert "attn.0" in created_caches
         assert created_caches["attn.0"].shape == (1, 16, 2, 1, 128)
 
-    def test_initialize_kv_cache_num_blocks_override_and_relaxed_divisibility(
-            self):
-        """Verify explicit num_blocks override on kv_cache_config and relaxed
-        divisibility when num_blocks is None and tensor_size is padded."""
+    def test_initialize_kv_cache_num_blocks_override(self):
+        """Verify explicit num_blocks override on kv_cache_config."""
         attn_spec = FullAttentionSpec(block_size=16,
                                       num_kv_heads=2,
                                       head_size=128,
@@ -1057,7 +1125,7 @@ class TestTPURunner:
             KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
         ]
 
-        # Case 1: num_blocks explicitly provided on kv_cache_config
+        # num_blocks explicitly provided on kv_cache_config
         kv_cache_config_explicit = KVCacheConfig(
             num_blocks=10,
             kv_cache_tensors=[
@@ -1091,28 +1159,27 @@ class TestTPURunner:
                                                    attn_spec.head_size,
                                                    attn_spec.dtype)
 
-        # Case 2: num_blocks is None, tensor_size has padding (not perfectly divisible)
-        kv_cache_config_implicit = KVCacheConfig(
+    def test_initialize_kv_cache_rejects_unresolved_num_blocks(self):
+        # num_blocks is resolved by the scheduler before reaching the runner;
+        # an unresolved config must fail loudly instead of being recomputed.
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=16384)
+        kv_cache_config = KVCacheConfig(
             num_blocks=None,
             kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 5 + 400, shared_by=["attn.0"]),
+                KVCacheTensor(size=16384 * 5, shared_by=["attn.0"]),
             ],
-            kv_cache_groups=kv_cache_groups,
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["attn.0"],
+                                 kv_cache_spec=attn_spec),
+            ],
         )
-        kv_cache_config_implicit.num_blocks = None
 
-        with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(5, 16, 2, 1, 128)) as mock_get_shape, patch(
-                    'vllm_torchtpu.utils.tpu_bind_kv_cache'
-                ), patch(
-                    'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                    return_value=False):
-            self.runner.initialize_kv_cache(kv_cache_config_implicit)
-            mock_get_shape.assert_called_once_with(5, attn_spec.block_size,
-                                                   attn_spec.num_kv_heads,
-                                                   attn_spec.head_size,
-                                                   attn_spec.dtype)
+        with pytest.raises(AssertionError, match="num_blocks"):
+            self.runner.initialize_kv_cache(kv_cache_config)
 
 
 class TestAttentionMetadataBuilder:

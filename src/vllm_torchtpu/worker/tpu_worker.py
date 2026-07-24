@@ -30,6 +30,7 @@ from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.utils import PHASED_PROFILING_DIR_KEY
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
@@ -120,13 +121,15 @@ class TPUWorker(WorkerBase):
         self.profile_dir: str | None = None
         self.profile_context = None
         torch_profiler_dir = self.vllm_config.profiler_config.torch_profiler_dir
+        phased_profiling_dir = self.vllm_config.additional_config.get(
+            PHASED_PROFILING_DIR_KEY, "")
         # Phased profiling takes precedence over standard Torch profiling
         # to prevent conflicting PyTorch profiler contexts.
-        if envs.PHASED_PROFILING_DIR and torch_profiler_dir:
+        if phased_profiling_dir and torch_profiler_dir:
             logger.warning(
-                "Both PHASED_PROFILING_DIR and VLLM_TORCH_PROFILER_DIR are set. "
-                "Disabling manual profiling (VLLM_TORCH_PROFILER_DIR) in favor of phased profiling."
-            )
+                "Both additional_config['phased_profiling_dir'] and "
+                "profiler_config.torch_profiler_dir are set. Disabling manual "
+                "profiling (torch_profiler_dir) in favor of phased profiling.")
             torch_profiler_dir = None
         pp_size = self.parallel_config.pipeline_parallel_size
         if torch_profiler_dir and pp_size == 1 and self.rank < 1 and (
@@ -165,9 +168,7 @@ class TPUWorker(WorkerBase):
         # prepare_tpu_environment() in tpu_platform.py).
         pc = self.parallel_config
         dp_size = utils.get_dp_size(pc)
-        pcp_size = getattr(pc, "prefill_context_parallel_size", 1)
-        if not isinstance(pcp_size, int):
-            pcp_size = 1
+        pcp_size = pc.prefill_context_parallel_size
         binding = get_tpu_worker_binding(pc,
                                          self.rank,
                                          self.local_rank,

@@ -26,7 +26,7 @@ from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
-    from vllm.inputs import ProcessorInputs
+    from vllm.multimodal.processing import ProcessorInputs
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams, SamplingType
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -187,6 +187,7 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
+    tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_vllm_disable_compile_ranges()
@@ -210,7 +211,7 @@ def apply_tpu_patches() -> None:
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
     if model_config is None:
         return False
-    hf_config = getattr(model_config, "hf_config", None)
+    hf_config = model_config.hf_config
     if hf_config is not None:
         model_type = getattr(hf_config, "model_type", "")
         if model_type and "qwen3_vl" in str(model_type).lower():
@@ -218,7 +219,7 @@ def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
         architectures = getattr(hf_config, "architectures", [])
         if any("qwen3vl" in str(arch).lower() for arch in architectures):
             return True
-    model_name = getattr(model_config, "model", "")
+    model_name = model_config.model
     if "qwen3-vl" in str(model_name).lower() or "qwen3vl" in str(
             model_name).lower():
         return True
@@ -435,15 +436,13 @@ class TpuPlatform(Platform):
     dist_backend: str = "tpu_dist"
     device_control_env_var: str = "TPU_VISIBLE_CHIPS"
     simple_compile_backend: str = "tpu"
+    _is_hybrid: bool = False
 
     supported_quantization: list[str] = [
         "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4"
     ]
 
     additional_env_vars: list[str] = [
-        "PHASED_PROFILING_DIR", "PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR",
-        "PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP",
-        "PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD",
         "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
         "ENABLE_QUANTIZED_MATMUL_KERNEL", "REQUANTIZE_BLOCK_SIZE",
@@ -589,9 +588,8 @@ class TpuPlatform(Platform):
         """
         dp_metadata = kwargs.get("dp_metadata")
         if dp_metadata is not None:
-            t = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
-            if t is not None and getattr(t, "device", None) is not None \
-                    and t.device.type == "cpu":
+            t = dp_metadata.num_tokens_across_dp_cpu
+            if t.device.type == "cpu":
                 tpu_t = t.to("tpu")
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
@@ -607,8 +605,7 @@ class TpuPlatform(Platform):
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
         apply_tpu_patches()
-        _apply_model_specific_patches(
-            getattr(vllm_config, "model_config", None))
+        _apply_model_specific_patches(vllm_config.model_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -690,18 +687,15 @@ class TpuPlatform(Platform):
         # block_size with DEFAULT_BLOCK_SIZE if the user didn't pass one, so
         # `block_size is None` is never true by this point. The authoritative
         # signal is the `user_specified_block_size` flag pydantic sets.
-        block_size_was_unspecified = not getattr(
-            cache_config, "user_specified_block_size", cache_config.block_size
-            is None)
+        block_size_was_unspecified = not cache_config.user_specified_block_size
 
         from vllm_torchtpu.layers.vllm.attention import (
             PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
-        attn_backend = getattr(getattr(vllm_config, "attention_config", None),
-                               "backend", None)
-        selected_name = getattr(attn_backend, "name", None)
+        attn_backend = vllm_config.attention_config.backend
+        selected_name = attn_backend.name if attn_backend is not None else None
         backend_cls = (PallasBatchedRPAAttentionBackend if selected_name
                        == "CUSTOM" else PallasAttentionBackend)
-        is_hybrid = getattr(vllm_config.model_config, "is_hybrid", False)
+        is_hybrid = vllm_config.model_config.is_hybrid
         cls._is_hybrid = is_hybrid
         cls._speculative_enabled = vllm_config.speculative_config is not None
         if cls._speculative_enabled and \
@@ -717,7 +711,7 @@ class TpuPlatform(Platform):
         # typed-view layout, or the pool's seed copies); other cache modes
         # and speculative decoding must be rejected up front instead of
         # failing partway through warmup.
-        if is_hybrid and getattr(cache_config, "enable_prefix_caching", False):
+        if is_hybrid and cache_config.enable_prefix_caching:
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
@@ -937,7 +931,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
-        return getattr(cls, "_is_hybrid", False)
+        return cls._is_hybrid
 
 
 def _get_token_paddings(min_token_size: int, max_token_size: int,

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -40,13 +39,6 @@ class FakeQwenMambaModel:
     @staticmethod
     def get_mamba_state_dtype_from_config(_):
         return (torch.bfloat16, torch.float32)
-
-
-class FakeNonShardingMambaModel(FakeQwenMambaModel):
-
-    @staticmethod
-    def get_mamba_state_shape_from_config(_):
-        return ((3, 4096), (16, 128, 128))
 
 
 @pytest.fixture
@@ -202,22 +194,16 @@ def test_user_block_size_below_fit_is_rejected_for_kv_transfer(vllm_config):
                                               FakeBatchedRPAAttentionBackend)
 
 
-def test_hybrid_gdn_pcp_uses_effective_tp_for_block_slot(vllm_config):
+def test_hybrid_gdn_unified_pcp_uses_full_tp_state_for_block_slot(vllm_config):
     vllm_config.model_config.is_hybrid = True
     vllm_config.model_config.architecture = (
         "Qwen3_5MoeForConditionalGeneration")
-    vllm_config.model_config.hf_text_config = SimpleNamespace(
-        linear_num_key_heads=16,
-        linear_num_value_heads=32,
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-        linear_conv_kernel_dim=4,
-    )
     vllm_config.cache_config.block_size = 2112
     vllm_config.cache_config.mamba_block_size = 2112
     vllm_config.cache_config.mamba_cache_mode = "align"
     vllm_config.cache_config.mamba_page_size_padded = None
     vllm_config.cache_config.cache_dtype = "fp8"
+    vllm_config.kv_transfer_config = object()
     vllm_config.parallel_config.prefill_context_parallel_size = 4
 
     with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
@@ -228,32 +214,16 @@ def test_hybrid_gdn_pcp_uses_effective_tp_for_block_slot(vllm_config):
                                               FakeBatchedRPAAttentionBackend)
 
     assert vllm_config.parallel_config.tensor_parallel_size == 1
-    assert vllm_config.cache_config.block_size == 512
-    assert vllm_config.cache_config.mamba_block_size == 512
-    assert vllm_config.cache_config.mamba_page_size_padded == 524288
+    assert vllm_config.cache_config.block_size == 2048
+    assert vllm_config.cache_config.mamba_block_size == 2048
+    assert vllm_config.cache_config.mamba_page_size_padded == 2097152
 
     logs = _format_logs(mock_logger_info)
-    assert "mamba_raw_state_bytes=268288" in logs
-    assert ("mamba_fit_block_size=ceil(268288 / 1024) "
-            "rounded_to_16 = 272") in logs
-    assert "final_block_size=512 (source=mamba_state_fit)" in logs
-    assert "final_block_slot_bytes=round_up(524288, 16) = 524288" in logs
-
-
-def test_hybrid_gdn_pcp_rejects_non_sharding_shape_calculator(vllm_config):
-    vllm_config.model_config.is_hybrid = True
-    vllm_config.model_config.architecture = "FutureHybridForCausalLM"
-    vllm_config.cache_config.block_size = 256
-    vllm_config.cache_config.mamba_block_size = 256
-    vllm_config.cache_config.mamba_cache_mode = "align"
-    vllm_config.parallel_config.prefill_context_parallel_size = 4
-
-    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
-               return_value=(FakeNonShardingMambaModel, None)), pytest.raises(
-                   ValueError,
-                   match="PCP-local Mamba state size must be exactly"):
-        update_tpu_block_size_and_slot_config(vllm_config,
-                                              FakeBatchedRPAAttentionBackend)
+    assert "mamba_raw_state_bytes=1073152" in logs
+    assert ("mamba_fit_block_size=ceil(1073152 / 1024) "
+            "rounded_to_16 = 1056") in logs
+    assert "final_block_size=2048 (source=mamba_state_fit_pow2)" in logs
+    assert "final_block_slot_bytes=round_up(2097152, 16) = 2097152" in logs
 
 
 class FakePlainAttentionBackend(FakeBatchedRPAAttentionBackend):

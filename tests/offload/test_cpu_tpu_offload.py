@@ -9,7 +9,7 @@ Covers the pieces that don't require a real TPU:
 - `TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes` size formula scales
   proportionally with `KV_H2D_POOL_MAX_BLOCKS`.
 - `TPUCPUOffloadingSpec.prewarm_shapes` / `prewarm_shape` delegate to the
-  H2D handler when `_tpu_handlers` is populated; no-op before.
+  TPU offloading worker when it is populated; no-op before.
 - `Transfer` dataclass defaults and the error-capture wrapping pattern
   used by `_h2d_task` / `_d2h_task`.
 - `transfer_async` H2D chunking math: `chunks_total = ceil(len(src_ids)
@@ -182,30 +182,83 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
 
 class TestPrewarmDelegation(unittest.TestCase):
     """TPUCPUOffloadingSpec.prewarm_shapes / prewarm_shape forward to the
-    H2D handler. Before get_handlers() runs (_tpu_handlers is None) they
+    H2D handler. Before get_worker() runs (_tpu_worker is None) they
     are no-ops so the runner's collective_rpc doesn't crash."""
 
     def test_prewarm_shapes_none_when_handlers_not_built(self):
         from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         spec = TPUCPUOffloadingSpec.__new__(TPUCPUOffloadingSpec)
-        spec._tpu_handlers = None
+        spec._tpu_worker = None
         self.assertEqual(spec.prewarm_shapes, [])
         spec.prewarm_shape(2048)  # must not raise
 
     def test_prewarm_shapes_delegates_to_h2d_handler(self):
         from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         spec = TPUCPUOffloadingSpec.__new__(TPUCPUOffloadingSpec)
-        spec._tpu_handlers = MagicMock()
-        spec._tpu_handlers.cpu_to_gpu_handler.prewarm_shapes = [1, 2, 4, 8]
+        spec._tpu_worker = MagicMock()
+        spec._tpu_worker.prewarm_shapes = [1, 2, 4, 8]
         self.assertEqual(spec.prewarm_shapes, [1, 2, 4, 8])
 
     def test_prewarm_shape_forwards_argument(self):
         from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
         spec = TPUCPUOffloadingSpec.__new__(TPUCPUOffloadingSpec)
-        spec._tpu_handlers = MagicMock()
+        spec._tpu_worker = MagicMock()
         spec.prewarm_shape(512)
-        spec._tpu_handlers.cpu_to_gpu_handler.prewarm_shape.\
-            assert_called_once_with(512)
+        spec._tpu_worker.prewarm_shape.assert_called_once_with(512)
+
+
+class TestTPUCPUOffloadingWorker(unittest.TestCase):
+
+    def setUp(self):
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingWorker
+        self.handlers = MagicMock()
+        self.worker = TPUCPUOffloadingWorker(self.handlers)
+
+    def test_submit_routes_by_direction(self):
+        src_gpu = MagicMock()
+        dst_cpu = MagicMock()
+        src_cpu = MagicMock()
+        dst_gpu = MagicMock()
+        self.handlers.gpu_to_cpu_handler.transfer_async.return_value = True
+        self.handlers.cpu_to_gpu_handler.transfer_async.return_value = True
+
+        self.assertTrue(self.worker.submit_store(1, src_gpu, dst_cpu))
+        self.assertTrue(self.worker.submit_load(2, src_cpu, dst_gpu))
+
+        self.handlers.gpu_to_cpu_handler.transfer_async.assert_called_once_with(
+            1, (src_gpu, dst_cpu))
+        self.handlers.cpu_to_gpu_handler.transfer_async.assert_called_once_with(
+            2, (src_cpu, dst_gpu))
+
+    def test_completion_wait_and_shutdown_cover_both_directions(self):
+        store_result = MagicMock()
+        load_result = MagicMock()
+        self.handlers.gpu_to_cpu_handler.get_finished.return_value = [
+            store_result
+        ]
+        self.handlers.cpu_to_gpu_handler.get_finished.return_value = [
+            load_result
+        ]
+
+        self.assertEqual(self.worker.get_finished(),
+                         [store_result, load_result])
+        self.worker.wait({1, 2})
+        self.worker.shutdown()
+
+        self.handlers.gpu_to_cpu_handler.wait.assert_called_once_with({1, 2})
+        self.handlers.cpu_to_gpu_handler.wait.assert_called_once_with({1, 2})
+        self.handlers.gpu_to_cpu_handler.shutdown.assert_called_once_with()
+        self.handlers.cpu_to_gpu_handler.shutdown.assert_called_once_with()
+
+    def test_spec_returns_cached_worker(self):
+        from vllm.v1.kv_offload.base import OffloadingWorker
+
+        from vllm_torchtpu.offload.cpu_tpu import TPUCPUOffloadingSpec
+        spec = TPUCPUOffloadingSpec.__new__(TPUCPUOffloadingSpec)
+        spec._tpu_worker = self.worker
+
+        self.assertIsInstance(spec.get_worker(MagicMock()), OffloadingWorker)
+        self.assertIs(spec.get_worker(MagicMock()), self.worker)
 
 
 class TestTransferDataclass(unittest.TestCase):
