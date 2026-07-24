@@ -39,6 +39,7 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
@@ -308,7 +309,7 @@ class TPUModelRunner(GPUModelRunner):
 
             InputBatch.get_pooling_metadata = get_pooling_metadata
 
-        # Parent already set: vllm_config, *_config, device, pin_memory, dtype,
+        # Parent already set: vllm_config, *_config, device, dtype,
         # max_model_len, max_num_reqs, max_num_tokens, num_query_heads,
         # inputs_embeds_size, mm_registry, uses_mrope, supports_mm_inputs,
         # kv_caches, encoder_cache, shared_kv_cache_layers, requests,
@@ -466,18 +467,18 @@ class TPUModelRunner(GPUModelRunner):
         self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
                                                dtype=torch.int32,
                                                device="cpu",
-                                               pin_memory=self.pin_memory)
+                                               pin_memory=PIN_MEMORY)
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(self.max_num_tokens,
                                         dtype=torch.int32,
                                         device="cpu",
-                                        pin_memory=self.pin_memory)
+                                        pin_memory=PIN_MEMORY)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(self.max_num_tokens,
                                                dtype=torch.bool,
                                                device="cpu",
-                                               pin_memory=self.pin_memory)
+                                               pin_memory=PIN_MEMORY)
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
@@ -497,14 +498,15 @@ class TPUModelRunner(GPUModelRunner):
             (self.max_num_reqs, cdiv(self.vocab_size, 32)),
             dtype=torch.int32,
             device="cpu",
-            pin_memory=self.pin_memory)
-        self.require_structured_out_cpu = torch.zeros(
-            (self.max_num_reqs, 1),
-            dtype=torch.bool,
-            device="cpu",
-            pin_memory=self.pin_memory)
-        self.structured_decode_arange = torch.arange(
-            0, 32, device="cpu", pin_memory=self.pin_memory)
+            pin_memory=PIN_MEMORY)
+        self.require_structured_out_cpu = torch.zeros((self.max_num_reqs, 1),
+                                                      dtype=torch.bool,
+                                                      device="cpu",
+                                                      pin_memory=PIN_MEMORY)
+        self.structured_decode_arange = torch.arange(0,
+                                                     32,
+                                                     device="cpu",
+                                                     pin_memory=PIN_MEMORY)
         self.sample_from_logits_func = self.sample_from_logits
 
         # TPU async-scheduling state (passed between execute_model and

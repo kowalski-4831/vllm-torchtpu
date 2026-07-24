@@ -34,6 +34,8 @@ class MockParallelConfig:
         self.nnodes_within_dp = 1
         self.local_world_size = 4
         self.ray_runtime_env = {}
+        self.data_parallel_rank_local = None
+        self.data_parallel_master_port = 0
 
 
 class MockVllmConfig:
@@ -223,9 +225,9 @@ class TestTpuRayDistributedExecutorV2:
 
             # Mock worker actors
             mock_worker_actor_1 = MagicMock()
-            mock_worker_actor_1.get_node_and_gpu_ids.remote.return_value = "node_1_ref"
+            mock_worker_actor_1.get_node_and_physical_gpu_ids.remote.return_value = "node_1_ref"
             mock_worker_actor_2 = MagicMock()
-            mock_worker_actor_2.get_node_and_gpu_ids.remote.return_value = "node_2_ref"
+            mock_worker_actor_2.get_node_and_physical_gpu_ids.remote.return_value = "node_2_ref"
 
             # ray.remote(RayWorkerProc).options().remote() mocks
             mock_remote_class = MagicMock()
@@ -234,10 +236,10 @@ class TestTpuRayDistributedExecutorV2:
             ]
             mock_ray.remote.return_value = mock_remote_class
 
-            # Mock get_node_and_gpu_ids returns for each worker
+            # Mock physical TPU ID discovery for each worker.
             mock_ray.get.side_effect = [
                 # Discover GPU/TPU IDs (Step 6)
-                [("node_1", [0]), ("node_2", [0])],
+                [("node_1", [4]), ("node_2", [6])],
                 # Initialize workers (Step 7)
                 [None, None],
                 # Collect response MQ handles (Step 8)
@@ -259,6 +261,7 @@ class TestTpuRayDistributedExecutorV2:
             args_w0 = mock_worker_actor_1.initialize_worker.remote.call_args[0]
             local_rank_w0 = args_w0[0]
             worker_env_w0 = args_w0[1]
+            kwargs_w0 = mock_worker_actor_1.initialize_worker.remote.call_args.kwargs
 
             assert local_rank_w0 == 0
             assert worker_env_w0["LOCAL_WORLD_SIZE"] == "1"
@@ -270,12 +273,14 @@ class TestTpuRayDistributedExecutorV2:
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES"]
             assert "10.0.0.2:8070" in worker_env_w0[
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+            assert kwargs_w0["assigned_physical_gpu_ids"] == [4]
 
             # Worker 1 (Rank 1, Node 2)
             mock_worker_actor_2.initialize_worker.remote.assert_called_once()
             args_w1 = mock_worker_actor_2.initialize_worker.remote.call_args[0]
             local_rank_w1 = args_w1[0]
             worker_env_w1 = args_w1[1]
+            kwargs_w1 = mock_worker_actor_2.initialize_worker.remote.call_args.kwargs
 
             assert local_rank_w1 == 0
             assert worker_env_w1["LOCAL_WORLD_SIZE"] == "1"
@@ -283,5 +288,6 @@ class TestTpuRayDistributedExecutorV2:
             assert worker_env_w1["NODE_RANK"] == "1"
             assert worker_env_w1["MASTER_ADDR"] == "10.0.0.1"
             assert worker_env_w1["TORCH_TPU_TOPOLOGY"] == "2x2"
+            assert kwargs_w1["assigned_physical_gpu_ids"] == [6]
 
             executor.ray_worker_handles = []

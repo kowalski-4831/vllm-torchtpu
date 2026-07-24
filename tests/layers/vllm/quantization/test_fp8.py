@@ -30,7 +30,21 @@ import pytest
 import torch
 
 from vllm_torchtpu.layers.vllm.linear_common import _quantized_matmul_jax
-from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.vllm.quantization.fp8 import (VllmFp8Config,
+                                                        VllmFp8LinearMethodTPU)
+
+
+def test_fp8_config_accepts_default_store_dtype():
+    config = VllmFp8Config.from_config({"activation_scheme": "dynamic"})
+    assert config.store_dtype is None
+
+
+def test_fp8_config_rejects_store_dtype():
+    with pytest.raises(NotImplementedError, match="store_dtype"):
+        VllmFp8Config.from_config({
+            "activation_scheme": "dynamic",
+            "store_dtype": "mxfp4",
+        })
 
 
 class FakeQuant:

@@ -73,9 +73,10 @@ def get_experts_start(layer) -> int | None:
     """
     if not layer.moe_config.moe_parallel_config.use_ep:
         return None
-    base = layer.global_num_experts // layer.ep_size
-    remainder = layer.global_num_experts % layer.ep_size
-    return layer.ep_rank * base + min(layer.ep_rank, remainder)
+    base = layer.global_num_experts // layer.moe_config.ep_size
+    remainder = layer.global_num_experts % layer.moe_config.ep_size
+    return (layer.moe_config.ep_rank * base +
+            min(layer.moe_config.ep_rank, remainder))
 
 
 def validate_linear_ep_placement(layer) -> None:

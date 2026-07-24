@@ -26,7 +26,7 @@ scaling.
    - VllmMxfp4Config is registered with vLLM's quantization registry
 
 2. LAYER CREATION:
-   - For each FusedMoE layer, vLLM calls quant_config.get_quant_method(layer)
+   - For each RoutedExperts layer, vLLM calls quant_config.get_quant_method(layer)
    - VllmMxfp4Config.get_quant_method() returns VllmMxfp4MoEMethod
 
 3. WEIGHT CREATION:
@@ -50,10 +50,10 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
+                                                  RoutedExperts)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
-from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
-                                                        FusedMoEMethodBase)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import \
     Mxfp4MoeBackend as Mxfp4Backend
 from vllm.model_executor.layers.linear import (LinearBase,
@@ -127,8 +127,8 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
                 "using unquantized linear method.")
             return UnquantizedLinearMethod()
 
-        elif isinstance(layer, FusedMoE):
-            # FusedMoE is the main use case for MXFP4 (MoE models like GPT-OSS)
+        elif isinstance(layer, RoutedExperts):
+            # RoutedExperts is the main use case for MXFP4 (MoE models like GPT-OSS)
             moe_config = self.get_moe_config(layer)
             return VllmMxfp4MoEMethod(moe_config)
 
@@ -172,7 +172,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         return self._forward_monolithic_tpu
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
         assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
         activation_str = _get_activation_str(layer.activation)
@@ -255,7 +255,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
     def _forward_monolithic_tpu(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:

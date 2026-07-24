@@ -22,12 +22,11 @@ in-place indexing.
 Architecture
 ------------
 - `TPUCPUOffloadingSpec` subclasses `vllm.v1.kv_offload.cpu.spec.
-  CPUOffloadingSpec`; it overrides `get_handlers()` and exposes
+  CPUOffloadingSpec`; it overrides `get_worker()` and exposes
   `estimate_hbm_reserve_bytes(vllm_config) -> int` so the worker can
   reserve HBM for the H2D staging buffer before profile_run.
-- `CpuTpuOffloadingHandlers` holds one D2H and one H2D
-  `SingleDirectionOffloadingHandler` instance; the spec yields them per
-  the OffloadingConnector contract.
+- `TPUCPUOffloadingWorker` owns the D2H and H2D transfer handlers and
+  implements vLLM's explicit `submit_store` / `submit_load` contract.
 - Each handler owns a single background DMA worker thread plus (H2D only)
   a depth-1 device-side staging buffer; transfers serialize through them.
 - Oversized H2D loads (more than `KV_H2D_POOL_MAX_BLOCKS` blocks) are
@@ -87,7 +86,6 @@ import queue as _queue
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -97,15 +95,15 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (BlockIDsLoadStoreSpec, CanonicalKVCaches,
-                                     GPULoadStoreSpec, LoadStoreSpec)
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+                                     GPULoadStoreSpec, LoadStoreSpec,
+                                     OffloadingWorker, TransferResult)
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
-from vllm.v1.kv_offload.worker.worker import (OffloadingHandler,
-                                              TransferResult, TransferSpec)
 
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+TransferSpec = tuple[LoadStoreSpec, LoadStoreSpec]
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +125,7 @@ logger = init_logger(__name__)
 #         list and only dispatches HLOs for transfers whose `req_id` is
 #         in the set.
 #      b. Stash `req_id` on the handler keyed by `job_id` *before*
-#         calling `worker.transfer_async`, so the handler can tag the
+#         calling `worker.submit_load`, so the handler can tag the
 #         resulting `Transfer` for later lookup.
 #    All ranks reach this from the same `execute_model` broadcast
 #    (~µs jitter), so the scatter HLOs go onto libtpu in lockstep.
@@ -174,31 +172,26 @@ def _install_flush_pending_scatters_hook() -> None:
         # scheduler-side hook above — AttributeError here means the
         # scheduler hook failed to install (loud failure, by design).
         scatter_now = metadata.scatter_now_req_ids
-        for handler in self.worker.handlers:
-            if hasattr(handler, "flush_pending_scatters"):
-                handler.flush_pending_scatters(scatter_now)
+        assert isinstance(self.worker, TPUCPUOffloadingWorker)
+        self.worker.flush_pending_scatters(scatter_now)
 
         # Step 2: dispatch pending stores (deferred from prior step's
         # `prepare_store_kv`). Stores don't carry the req_id stash —
         # they're not subject to the scatter-now gate.
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
+        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+            success = self.worker.submit_store(job_id, src_spec, dst_spec)
             assert success
         self._unsubmitted_store_jobs.clear()
 
         # Step 3: dispatch new loads. Stash req_id on the appropriate
-        # H2D handler BEFORE calling `worker.transfer_async` so the
+        # H2D handler BEFORE calling `worker.submit_load` so the
         # handler can copy it onto the resulting Transfer.
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
-            # Find the handler that will receive this transfer.
-            src, dst = entry.transfer_spec
-            ttype = (src.medium(), dst.medium())
-            handler = self.worker.transfer_type_to_handler.get(ttype)
-            if handler is not None and hasattr(handler,
-                                               "_stash_req_id_for_job"):
-                handler._stash_req_id_for_job(job_id, entry.req_id)
-            success = self.worker.transfer_async(job_id, entry.transfer_spec)
+            assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            self.worker.stash_load_req_id(job_id, entry.req_id)
+            success = self.worker.submit_load(job_id, entry.src_spec,
+                                              entry.dst_spec)
             assert success
 
     start_kv_transfers_with_flush._tpu_flush_patched = True  # type: ignore[attr-defined]
@@ -523,7 +516,7 @@ class _PendingScatter:
 # ---------------------------------------------------------------------------
 
 
-class SingleDirectionOffloadingHandler(OffloadingHandler):
+class SingleDirectionOffloadingHandler:
     """Handles KV-cache transfers for one direction (D2H or H2D) on TPU."""
 
     def __init__(
@@ -558,8 +551,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.total_block_size_in_bytes = sum(self.block_size_in_bytes)
 
         self.tpu_to_cpu: bool = src_tensors[0].device.type != "cpu"
-        self.transfer_type = ("GPU", "CPU") if self.tpu_to_cpu else ("CPU",
-                                                                     "GPU")
         self._device: torch.device = (src_tensors[0].device if self.tpu_to_cpu
                                       else dst_tensors[0].device)
 
@@ -638,7 +629,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
     def _stash_req_id_for_job(self, job_id: int, req_id: str) -> None:
         """Called from monkey-patched `OffloadingConnectorWorker.
-        start_kv_transfers` immediately before `worker.transfer_async`,
+        start_kv_transfers_with_flush` immediately before `worker.submit_load`,
         so the downstream `self.transfer_async` can tag the Transfer
         with its owning req_id without a framework signature change.
         """
@@ -723,7 +714,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
     def prewarm_shape(self, p: int) -> None:  # noqa: ARG002
         return None
 
-    # -- OffloadingHandler interface -----------------------------------------
+    # -- Transfer interface --------------------------------------------------
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
         src_ids, dst_ids = _expand_transfer_ids(transfer_spec, self.tpu_to_cpu,
@@ -992,7 +983,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     transfer_size=t.num_bytes,
                     # TODO: elapsed_time() not yet implemented on TpuEvent.
                     transfer_time=1e-9,
-                    transfer_type=self.transfer_type,
                 ))
             del self._transfer_map[t.job_id]
         return results
@@ -1091,7 +1081,7 @@ _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S = float(
     os.environ.get("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", "30"))
 
 
-class _RaidenOffloadingHandler(OffloadingHandler):
+class _RaidenOffloadingHandler:
     """One-direction (D2H or H2D) KV offload via raiden's direct DMA.
 
     `transfer_async` issues `mgr.D2h`/`mgr.H2d` (kernel-block granular) and
@@ -1111,12 +1101,18 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         self.src_block_size_factor = src_block_size_factor
         self.dst_block_size_factor = dst_block_size_factor
         self._bytes_per_kernel_block = bytes_per_kernel_block
-        self.transfer_type = ("GPU", "CPU") if tpu_to_cpu else ("CPU", "GPU")
         self._pending: dict[int, tuple] = {}
         # Hybrid unified-block-pool mode: same grouped row mapping as the
         # torch handler (see _expand_transfer_ids). Raiden host slots stay
         # uniform because every pool row has identical bytes.
         self._hybrid_num_groups = hybrid_num_groups
+
+    @property
+    def prewarm_shapes(self) -> list[int]:
+        return []
+
+    def prewarm_shape(self, p: int) -> None:  # noqa: ARG002
+        return
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
         # src/dst are kernel-block IDs, expanded by the same mapping as the
@@ -1168,7 +1164,6 @@ class _RaidenOffloadingHandler(OffloadingHandler):
                     success=ok,
                     transfer_size=num_bytes,
                     transfer_time=1e-9,
-                    transfer_type=self.transfer_type,
                 ))
             # Completed: drop the future (its keep-alives release the buffers).
             del self._pending[job_id]
@@ -1202,6 +1197,9 @@ class _RaidenOffloadingHandler(OffloadingHandler):
                     sorted(remaining))
                 return
             time.sleep(0.0005)
+
+    def shutdown(self) -> None:
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1364,7 +1362,57 @@ class CpuTpuOffloadingHandlers:
 
 
 # ---------------------------------------------------------------------------
-# Spec: subclasses CPUOffloadingSpec, overrides get_handlers() for TPU
+# Worker: adapts TPU transfer handlers to vLLM's offloading worker contract
+# ---------------------------------------------------------------------------
+
+
+class TPUCPUOffloadingWorker(OffloadingWorker):
+
+    def __init__(self, handlers: CpuTpuOffloadingHandlers):
+        self.handlers = handlers
+
+    @property
+    def prewarm_shapes(self) -> list[int]:
+        return self.handlers.cpu_to_gpu_handler.prewarm_shapes
+
+    def prewarm_shape(self, p: int) -> None:
+        self.handlers.cpu_to_gpu_handler.prewarm_shape(p)
+
+    def submit_store(self, job_id: int, src_spec: GPULoadStoreSpec,
+                     dst_spec: LoadStoreSpec) -> bool:
+        return self.handlers.gpu_to_cpu_handler.transfer_async(
+            job_id, (src_spec, dst_spec))
+
+    def submit_load(self, job_id: int, src_spec: LoadStoreSpec,
+                    dst_spec: GPULoadStoreSpec) -> bool:
+        return self.handlers.cpu_to_gpu_handler.transfer_async(
+            job_id, (src_spec, dst_spec))
+
+    def get_finished(self) -> list[TransferResult]:
+        return (self.handlers.gpu_to_cpu_handler.get_finished() +
+                self.handlers.cpu_to_gpu_handler.get_finished())
+
+    def wait(self, job_ids: set[int]) -> None:
+        self.handlers.gpu_to_cpu_handler.wait(job_ids)
+        self.handlers.cpu_to_gpu_handler.wait(job_ids)
+
+    def shutdown(self) -> None:
+        self.handlers.gpu_to_cpu_handler.shutdown()
+        self.handlers.cpu_to_gpu_handler.shutdown()
+
+    def flush_pending_scatters(self, req_ids: set[str]) -> None:
+        handler = self.handlers.cpu_to_gpu_handler
+        assert isinstance(handler, SingleDirectionOffloadingHandler)
+        handler.flush_pending_scatters(req_ids)
+
+    def stash_load_req_id(self, job_id: int, req_id: str) -> None:
+        handler = self.handlers.cpu_to_gpu_handler
+        assert isinstance(handler, SingleDirectionOffloadingHandler)
+        handler._stash_req_id_for_job(job_id, req_id)
+
+
+# ---------------------------------------------------------------------------
+# Spec: subclasses CPUOffloadingSpec, overrides get_worker() for TPU
 # ---------------------------------------------------------------------------
 
 
@@ -1372,8 +1420,8 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
     """CPU offloading spec for TPU.
 
     Reuses CPUOffloadingSpec.__init__ (block-size calculation, eviction-policy
-    config) and get_manager() (LRU/ARC setup).  Only get_handlers() is
-    overridden to create TPU-specific transfer handlers.
+    config) and get_manager() (LRU/ARC setup). Only get_worker() is
+    overridden to create the TPU-specific transfer worker.
 
     Hybrid attention+Mamba models (e.g. Qwen 3.5) run on the unified block
     pool (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1, enforced by tpu_platform):
@@ -1387,7 +1435,7 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
     def __init__(self, vllm_config: VllmConfig,
                  kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
-        self._tpu_handlers: CpuTpuOffloadingHandlers | None = None
+        self._tpu_worker: TPUCPUOffloadingWorker | None = None
         # Hybrid without the unified block pool is rejected at config time
         # by TpuPlatform.check_and_update_config.
         self.is_hybrid_model: bool = _model_is_hybrid(vllm_config)
@@ -1403,20 +1451,20 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         """H2D Pallas-scatter shapes the runner should pre-compile.
 
         Delegates to the H2D handler, which is the actual owner of the
-        Pallas kernels. Returns [] if get_handlers() hasn't run yet —
+        Pallas kernels. Returns [] if get_worker() hasn't run yet —
         TpuMultiprocExecutor calls this AFTER register_kv_caches, so the
         handler is set by then; the guard is defensive.
         """
-        if self._tpu_handlers is None:
+        if self._tpu_worker is None:
             return []
-        return self._tpu_handlers.cpu_to_gpu_handler.prewarm_shapes
+        return self._tpu_worker.prewarm_shapes
 
     def prewarm_shape(self, p: int) -> None:
         """Pre-compile H2D Pallas scatter for block-count `p`. Delegates
-        to the H2D handler; no-op before get_handlers() has run."""
-        if self._tpu_handlers is None:
+        to the H2D handler; no-op before get_worker() has run."""
+        if self._tpu_worker is None:
             return
-        self._tpu_handlers.cpu_to_gpu_handler.prewarm_shape(p)
+        self._tpu_worker.prewarm_shape(p)
 
     @classmethod
     def estimate_hbm_reserve_bytes(cls, vllm_config: VllmConfig) -> int:
@@ -1477,12 +1525,11 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         num_layers = model_config.get_num_layers(parallel_config)
         return num_layers * max_padded * per_block_bytes
 
-    def get_handlers(
+    def get_worker(
         self,
         kv_caches: CanonicalKVCaches,
-    ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec],
-                        OffloadingHandler]]:
-        if self._tpu_handlers is None:
+    ) -> OffloadingWorker:
+        if self._tpu_worker is None:
             from vllm.v1.kv_cache_interface import AttentionSpec
 
             from vllm_torchtpu.layers.vllm.attention import \
@@ -1542,7 +1589,7 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
             )
             per_block_shape = tuple(full_5d_shape[1:])
 
-            self._tpu_handlers = CpuTpuOffloadingHandlers(
+            handlers = CpuTpuOffloadingHandlers(
                 gpu_block_size=gpu_block_size,
                 cpu_block_size=offloaded_block_size,
                 num_cpu_blocks=self.num_blocks,
@@ -1552,14 +1599,6 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
                 per_block_shape=per_block_shape,
                 hybrid_num_groups=hybrid_num_groups,
             )
+            self._tpu_worker = TPUCPUOffloadingWorker(handlers)
 
-        yield (
-            GPULoadStoreSpec,
-            CPULoadStoreSpec,
-            self._tpu_handlers.gpu_to_cpu_handler,
-        )
-        yield (
-            CPULoadStoreSpec,
-            GPULoadStoreSpec,
-            self._tpu_handlers.cpu_to_gpu_handler,
-        )
+        return self._tpu_worker

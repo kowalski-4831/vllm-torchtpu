@@ -26,7 +26,7 @@ from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
-    from vllm.inputs import ProcessorInputs
+    from vllm.multimodal.processing import ProcessorInputs
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams, SamplingType
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
