@@ -1268,7 +1268,8 @@ class TestTPURaidenConnectorWorker:
         # Every producer worker gets the measured FA token bytes required by
         # registration-time lowering. (T3.4: destination page geometry is
         # controller-derived; no producer env exists.)
-        with patch.object(TPURaidenConnectorWorker, "_stage3_fa_token_bytes",
+        with patch.object(TPURaidenConnectorWorker,
+                          "_stage3_fa_token_bytes",
                           return_value=1024):
             yield
 
@@ -1635,8 +1636,7 @@ class TestTPURaidenConnectorWorker:
         worker._stage3_state_group_count = 1
         facade = _FakeRaidenControllerFacade()
 
-        registrations = worker._stage3_state_pool_spans([17], transfer_rank,
-                                                         8)
+        registrations = worker._stage3_state_pool_spans([17], transfer_rank, 8)
 
         # T3.1 collapse: the state classes ride the base registration as
         # additional PoolSpanRegistrations — no derived req-ids, no
@@ -2141,6 +2141,8 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_transfer_engine = engine
         worker._raiden_controller_facade = facade
         worker._raiden_controller_address = "dest-controller.test:28000"
+        # P2: load submissions go to the SOURCE controller facade.
+        worker._new_raiden_controller_facade = MagicMock(return_value=facade)
         worker._raiden_work_unit = destination_unit
         worker._raiden_manifest = SimpleNamespace(tag_counts=lambda: {
             "fa": 15,
@@ -2189,7 +2191,7 @@ class TestTPURaidenConnectorWorker:
         assert call["src_controller_address"] == (
             "source-controller.test:27000")
         assert call["dst_controller_address"] == ("dest-controller.test:28000")
-        assert call["is_sender"] is False
+        assert call["is_sender"] is True
         assert call["use_block_chunks"] is True
         assert call["dst_mem_type"] == "HBM"
         # Pool selection is request data: the connector names manifest tags;
@@ -2245,6 +2247,8 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_transfer_engine = engine
         worker._raiden_controller_facade = facade
         worker._raiden_controller_address = "dest-controller.test:28000"
+        # P2: load submissions go to the SOURCE controller facade.
+        worker._new_raiden_controller_facade = MagicMock(return_value=facade)
         worker._raiden_work_unit = SimpleNamespace(job_name="decode",
                                                    job_replica_id="decode",
                                                    data_name="kv.fa",
@@ -2314,6 +2318,8 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_transfer_engine = engine
         worker._raiden_controller_facade = facade
         worker._raiden_controller_address = "dest-controller.test:28000"
+        # P2: load submissions go to the SOURCE controller facade.
+        worker._new_raiden_controller_facade = MagicMock(return_value=facade)
         worker._raiden_work_unit = SimpleNamespace(job_name="decode")
         worker._raiden_manifest = SimpleNamespace(tag_counts=lambda: {
             "fa": 15,

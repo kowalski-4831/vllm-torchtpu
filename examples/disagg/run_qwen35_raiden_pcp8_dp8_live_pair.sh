@@ -944,13 +944,18 @@ expected_tags = ["fa",
                  "gdn.conv.g1", "gdn.ssm.g1",
                  "gdn.conv.g2", "gdn.ssm.g2"]
 required_ids = ({main_req_id} if isinstance(main_req_id, str) else set())
-armed = [e for e in decode_controller_events
-         if e.get("event") == "raiden_pool_reshard_receivers_armed"
-         and e.get("req_id") in required_ids]
+# P2 topology: the SOURCE controller plans, arms the decode workers
+# directly, and dispatches; the decode controller is a metadata directory
+# and emits no arm event. Receiver arming is attested by the source
+# controller's dispatch event carrying the armed-before-dispatch flag.
 dispatched = [e for e in prefill_controller_events
               if e.get("event") == "raiden_pool_reshard_senders_dispatched"
               and e.get("req_id") in required_ids]
-armed_ids = {e.get("req_id") for e in armed}
+armed_ids = {
+    e.get("req_id")
+    for e in dispatched
+    if e.get("receiver_armed_before_sender_dispatch") is True
+}
 dispatch_by_id = {e.get("req_id"): e for e in dispatched}
 checks["fa_conv_ssm_receivers_armed"] = bool(required_ids) and armed_ids == required_ids
 checks["fa_conv_ssm_senders_dispatched"] = bool(required_ids) and set(dispatch_by_id) == required_ids

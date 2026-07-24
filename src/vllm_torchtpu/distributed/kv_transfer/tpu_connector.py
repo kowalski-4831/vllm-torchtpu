@@ -1170,19 +1170,21 @@ class TPURaidenConnectorWorker:
         self._stage3_reported_sends: set[str] = set()
         self._stage3_submitted_loads: dict[str, int] = {}
         self._stage3_submitted_load_tokens: dict[str, int] = {}
+        # Consumer-side facades for the producers' controllers, keyed by
+        # controller address: the consumer coordinates each load with the
+        # SOURCE controller directly (it plans, arms this worker, and
+        # dispatches its senders); the local controller is only the
+        # admission/metadata directory.
+        self._stage3_source_facades: dict[str, Any] = {}
         self._stage3_state_group_count = 0
         # GDN state-class sibling transfers: derived source req_id -> base
         # destination req_id; destination -> derived ids still pending; FA
         # completions parked until every state class lands.
-        # Producer-side sibling lifecycle. Native Raiden reports each GDN
-        # state transfer under its connector-private derived request ID, but
-        # vLLM knows only the base request. Keep those IDs entirely below the
-        # connector boundary and expose the base send terminal only after FA
-        # and every state sibling are terminal. The UUID table also lets each
-        # PCP rank cast the required D5 completion vote for every sibling.
-        self._stage3_fa_send_terminals: set[str] = set()
-        self._stage3_failed_send_bases: set[str] = set()
-        self._stage3_cancelled_send_bases: set[str] = set()
+        # Producer-side terminal outcomes, keyed by base request id. A
+        # request appears here once its single multi-tag transfer reached a
+        # native terminal (or was cancelled unclaimed) and is drained into
+        # the scheduler report exactly once.
+        self._stage3_send_outcomes: dict[str, str] = {}
         # vLLM independently randomizes the internal request ID on the
         # prefill and decode engines. D5 and the controller/native transfer
         # use the producer ID, while every scheduler-facing lifecycle table
@@ -1840,11 +1842,9 @@ class TPURaidenConnectorWorker:
             if not local_ids:
                 # This PCP rank owns no physical page for the request. It has
                 # nevertheless published an empty D5 entry so controller
-                # lookup sees the complete source unit set. FA is locally
-                # terminal, but GDN state siblings can still carry this
-                # rank's head shards, so use the same sibling gate as a real
-                # FA native completion.
-                self._stage3_fa_send_terminals.add(req_id)
+                # lookup sees the complete source unit set, and is terminal
+                # immediately: there is no native transfer to wait for.
+                self._stage3_send_outcomes.setdefault(req_id, "done")
             logger.info(
                 "%s",
                 json.dumps(
@@ -1977,8 +1977,7 @@ class TPURaidenConnectorWorker:
         return tuple(matching[0].regions)
 
     def _stage3_state_pool_spans(self, mamba_state_block_ids,
-                                 transfer_rank: int,
-                                 parallelism: int) -> list:
+                                 transfer_rank: int, parallelism: int) -> list:
         """Producer: the GDN state classes' span registrations.
 
         PCP GDN execution exchanges token shards for head shards.  Every PCP
@@ -2025,9 +2024,7 @@ class TPURaidenConnectorWorker:
 
     def _stage3_prune_state_send_tracking(self, base_req_id: str) -> None:
         """Drops producer terminal tracking with the base tombstone."""
-        self._stage3_fa_send_terminals.discard(base_req_id)
-        self._stage3_failed_send_bases.discard(base_req_id)
-        self._stage3_cancelled_send_bases.discard(base_req_id)
+        self._stage3_send_outcomes.pop(base_req_id, None)
 
     def _stage3_record_producer_send_terminals(self, done_sending,
                                                failed_sending) -> None:
@@ -2036,9 +2033,10 @@ class TPURaidenConnectorWorker:
             (str(req_id), False) for req_id in done_sending
         ] + [(str(req_id), True) for req_id in failed_sending]:
             if req_id in self._stage3_registered_sends:
-                self._stage3_fa_send_terminals.add(req_id)
                 if failed:
-                    self._stage3_failed_send_bases.add(req_id)
+                    self._stage3_send_outcomes[req_id] = "failed"
+                else:
+                    self._stage3_send_outcomes.setdefault(req_id, "done")
                 continue
             # Replayed native terminals after the base moved to its tombstone
             # are harmless and must not become duplicate scheduler reports.
@@ -2051,13 +2049,13 @@ class TPURaidenConnectorWorker:
     def _stage3_ready_producer_send_terminals(
             self) -> tuple[set[str], set[str], set[str]]:
         """Returns terminal base requests (T3.1: no sibling aggregation)."""
-        ready = set(self._stage3_fa_send_terminals)
-        failed = ready & self._stage3_failed_send_bases
-        cancelled = ready & self._stage3_cancelled_send_bases
-        done = ready - failed - cancelled
-        self._stage3_fa_send_terminals.difference_update(ready)
-        self._stage3_failed_send_bases.difference_update(ready)
-        self._stage3_cancelled_send_bases.difference_update(ready)
+        outcomes, self._stage3_send_outcomes = self._stage3_send_outcomes, {}
+        done = {r for r, outcome in outcomes.items() if outcome == "done"}
+        failed = {r for r, outcome in outcomes.items() if outcome == "failed"}
+        cancelled = {
+            r
+            for r, outcome in outcomes.items() if outcome == "cancelled"
+        }
         return done, failed, cancelled
 
     @staticmethod
@@ -2127,9 +2125,9 @@ class TPURaidenConnectorWorker:
 
     def _submit_stage3_loads(self, metadata: TPUConnectorMetadata,
                              engine: "KVCacheManager") -> None:
-        """Starts exactly one destination-controller transfer per request."""
+        """Starts exactly one source-controller transfer per request."""
         del engine  # Completion is observed through the manager in poll_stats.
-        facade, dst_controller_address = self._require_stage3_controller()
+        _, dst_controller_address = self._require_stage3_controller()
         if self._raiden_work_unit is None:
             raise RuntimeError(
                 "Stage-3 destination work unit is not registered")
@@ -2165,10 +2163,18 @@ class TPURaidenConnectorWorker:
                     req_meta.src_controller_address).strip()
                 if not src_controller_address:
                     raise ValueError("empty Stage-3 source controller address")
-                # The facade RPC returns only after the controller server has
-                # awaited its RaidenFuture (receiver arm + sender dispatch).
-                # Actual byte completion is deliberately *not* inferred from
-                # that acknowledgement; get_finished polls the local manager.
+                source_facade = self._stage3_source_facades.get(
+                    src_controller_address)
+                if source_facade is None:
+                    source_facade = self._new_raiden_controller_facade(
+                        src_controller_address)
+                    self._stage3_source_facades[src_controller_address] = (
+                        source_facade)
+                # The facade RPC returns only after the source controller
+                # server has awaited its RaidenFuture (receiver arm + sender
+                # dispatch). Actual byte completion is deliberately *not*
+                # inferred from that acknowledgement; get_finished polls the
+                # local manager.
                 controller_contacted = True
                 # T3.1 sibling collapse: ONE transfer carries the FA
                 # payload plus every GDN state class. Tag order fixes the
@@ -2178,8 +2184,8 @@ class TPURaidenConnectorWorker:
                 transfer_tags = list(_STAGE3_TRANSFER_POOL_TAGS)
                 dst_blocks = list(local_blocks)
                 dst_counts = [len(local_blocks)]
-                mamba_state_block_ids = getattr(
-                    req_meta, "mamba_state_block_ids", None)
+                mamba_state_block_ids = getattr(req_meta,
+                                                "mamba_state_block_ids", None)
                 if self._stage3_state_group_count:
                     if not mamba_state_block_ids or len(
                             mamba_state_block_ids
@@ -2188,13 +2194,12 @@ class TPURaidenConnectorWorker:
                             "GDN state load requires one destination state "
                             "block per mamba group")
                     for tag in _STAGE3_STATE_CLASS_TAGS:
-                        for ordinal, slot in enumerate(
-                                mamba_state_block_ids):
+                        for ordinal, slot in enumerate(mamba_state_block_ids):
                             transfer_tags.append(f"{tag}.g{ordinal}")
                             dst_blocks.append(int(slot))
                             dst_counts.append(1)
                 accepted = self._start_stage3_transfer_with_d5_retry(
-                    facade,
+                    source_facade,
                     src_units=src_units,
                     dst_units=[self._raiden_work_unit],
                     # D5 is keyed by the producer's internal request ID. The
@@ -2207,14 +2212,14 @@ class TPURaidenConnectorWorker:
                     src_controller_address=src_controller_address,
                     dst_controller_address=dst_controller_address,
                     uuid=uuid,
-                    is_sender=False,
+                    is_sender=True,
                     num_tokens=num_tokens,
                     transfer_pool_tags=transfer_tags,
                     dst_block_counts=dst_counts,
                 )
                 if accepted is not True:
                     raise RuntimeError(
-                        "destination controller rejected Stage-3 transfer")
+                        "source controller rejected Stage-3 transfer")
                 fa_accepted = True
             except Exception as exc:  # pylint: disable=broad-except
                 missing_d5 = "Missing producer block registration" in str(exc)
@@ -2415,7 +2420,7 @@ class TPURaidenConnectorWorker:
                 self._stage3_registered_sends.items()
                 if registration.expiration_time <= now
                 and req_id not in self._stage3_terminal_cleanup
-                and req_id not in self._stage3_fa_send_terminals
+                and req_id not in self._stage3_send_outcomes
             }
             if expired_candidates:
                 for req_id in expired_candidates:
@@ -2424,8 +2429,7 @@ class TPURaidenConnectorWorker:
                             req_id=req_id, uuid=registration.uuid):
                         # T3.1: one registration per request — the base
                         # cancellation is the whole cancellation.
-                        self._stage3_fa_send_terminals.add(req_id)
-                        self._stage3_cancelled_send_bases.add(req_id)
+                        self._stage3_send_outcomes[req_id] = "cancelled"
             done_sending, sender_failures, cancelled_sends = (
                 self._stage3_ready_producer_send_terminals())
             if cancelled_sends:
