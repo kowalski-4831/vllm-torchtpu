@@ -3,7 +3,6 @@
 # other modules are imported.
 import vllm_torchtpu.env_override  # noqa: F401
 from vllm_torchtpu import envs
-from vllm_torchtpu import tpu_info as ti
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -28,6 +27,59 @@ def _patch_vllm_aot_compile_cache_key() -> None:
     tpu_aot_compile_hash_factors._tpu_compiler_hash_patch = True
     caching.aot_compile_hash_factors = tpu_aot_compile_hash_factors
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
+
+
+def _patch_vllm_config_hash_ignore_diagnostics() -> None:
+    """Keep diagnostics-only ``additional_config`` keys out of cache keys.
+
+    ``VllmConfig.compute_hash()`` unconditionally folds
+    ``json.dumps(additional_config)`` into its result, and that hash feeds both
+    the AOT compile cache key (``caching.aot_compile_hash_factors``) and the
+    piecewise cache dir (``backends.py``). The phased profiler is configured
+    through ``additional_config``, so a per-run trace directory would force a
+    full recompile on every server start. Upstream takes the same care in
+    ``ProfilerConfig.compute_hash()`` ("this config will not affect the
+    computation graph"); this is the equivalent carve-out for the plugin-owned
+    keys, mirroring ``_TPU_COMPILE_ENV_IGNORED`` for env vars.
+    """
+    import copy
+
+    from vllm.config import VllmConfig
+
+    from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+
+    if getattr(VllmConfig, "_tpu_additional_config_hash_patch", False):
+        return
+
+    original = VllmConfig.compute_hash
+
+    def compute_hash(self) -> str:
+        additional_config = self.additional_config
+        if not isinstance(additional_config, dict):
+            return original(self)
+        filtered = {
+            key: value
+            for key, value in additional_config.items()
+            if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+        }
+        if filtered == additional_config:
+            return original(self)
+        # Hash a shallow copy with the filtered dict rather than mutating the
+        # live config: compute_hash() may run while other code holds the same
+        # VllmConfig, and a shallow copy shares every sub-config by reference
+        # (cheap, no re-validation -- __post_init__ is not re-run) while giving
+        # compute_hash its own additional_config to read.
+        proxy = copy.copy(self)
+        proxy.additional_config = filtered
+        return original(proxy)
+
+    VllmConfig._tpu_upstream_compute_hash = original
+    VllmConfig.compute_hash = compute_hash
+    VllmConfig._tpu_additional_config_hash_patch = True
+    logger.info(
+        "Applied TPU patch: exclude diagnostics-only additional_config keys "
+        "%s from the compile cache key.",
+        sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS))
 
 
 def _patch_vllm_tpu_group_custom_ops() -> None:
@@ -204,8 +256,7 @@ def _patch_moe_no_ep_tp_scope() -> None:
     model-internal DP.
     """
     from vllm.distributed import parallel_state
-    from vllm.model_executor.layers.fused_moe.layer import \
-        FusedMoEParallelConfig
+    from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
 
     if getattr(FusedMoEParallelConfig, "_tpu_no_ep_tp_scope_patch", False):
         return
@@ -307,7 +358,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
     from vllm.v1.engine.core import EngineCoreProc
 
-    original_run = getattr(EngineCoreProc, "_tpu_original_run_engine_core")
+    original_run = EngineCoreProc._tpu_original_run_engine_core
     return original_run(*args, **kwargs)
 
 
@@ -453,16 +504,4 @@ if "proxy" in envs.JAX_PLATFORMS:
     except Exception as e:
         logger.error(
             f"Error occurred while importing pathwaysutils or logging TPU info: {e}"
-        )
-else:
-    # Either running on TPU or CPU
-    try:
-        logger.info(f"TPU info: node_name={ti.get_node_name()} | "
-                    f"tpu_type={ti.get_tpu_type()} | "
-                    f"worker_id={ti.get_node_worker_id()} | "
-                    f"num_chips={ti.get_num_chips()} | "
-                    f"num_cores_per_chip={ti.get_num_cores_per_chip()}")
-    except Exception as e:
-        logger.error(
-            f"Error occurred while logging TPU info: {e}. Are you running on CPU?"
         )

@@ -63,9 +63,9 @@ class TpuDpScheduler(AsyncScheduler):
                               >= self._buffer_timeout_ms)
         return self._flushing
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if not self._buffer_prefill or self._should_flush_prefill():
-            return super().schedule()
+            return super().schedule(throttle_prefills)
 
         # Pause scheduling any new prefill req, which effectively holds and
         # buffers new reqs.
@@ -73,6 +73,6 @@ class TpuDpScheduler(AsyncScheduler):
         if prev_pause_state == PauseState.UNPAUSED:
             self._pause_state = PauseState.PAUSED_NEW
         try:
-            return super().schedule()
+            return super().schedule(throttle_prefills)
         finally:
             self._pause_state = prev_pause_state

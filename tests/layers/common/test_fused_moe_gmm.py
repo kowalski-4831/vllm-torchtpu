@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn
+from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
 from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
 
 
@@ -52,7 +52,9 @@ def _reference_fused_moe(hidden_states, w1, w2, w1_bias, w2_bias, topk_weights,
             if w1_bias is not None:
                 gate_up = gate_up + w1_bias[expert_id, 0].astype(jnp.float32)
 
-            activated = apply_act_fn(gate_up[None], activation)[0]
+            gate, up = jnp.split(gate_up, 2, axis=-1)
+            interleaved = interleave_lane(gate, up)
+            activated = apply_act_fn(interleaved, activation)
             proj = jnp.matmul(activated.astype(jnp.float32),
                               w2[expert_id].astype(jnp.float32))
             if w2_bias is not None:

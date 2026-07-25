@@ -39,6 +39,7 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
@@ -53,7 +54,6 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
@@ -187,11 +187,7 @@ SAMPLING_EPS = 1e-5
 
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
-    planner = getattr(runner, "sequence_layout_planner", None)
-    if planner is None:
-        planner = create_sequence_layout_planner(runner.vllm_config)
-        runner.sequence_layout_planner = planner
-    return planner
+    return runner.sequence_layout_planner
 
 
 def _validate_libtpu_version() -> None:
@@ -313,7 +309,7 @@ class TPUModelRunner(GPUModelRunner):
 
             InputBatch.get_pooling_metadata = get_pooling_metadata
 
-        # Parent already set: vllm_config, *_config, device, pin_memory, dtype,
+        # Parent already set: vllm_config, *_config, device, dtype,
         # max_model_len, max_num_reqs, max_num_tokens, num_query_heads,
         # inputs_embeds_size, mm_registry, uses_mrope, supports_mm_inputs,
         # kv_caches, encoder_cache, shared_kv_cache_layers, requests,
@@ -360,6 +356,11 @@ class TPUModelRunner(GPUModelRunner):
         self._unified_kv_layout: bool = unified_kv_layout_enabled(
             self.vllm_config)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
+        # Set by initialize_kv_cache; None until then (dummy runs check this).
+        self.kv_cache_config: KVCacheConfig | None = None
+        # Layout plan of the most recent prepared batch; None before the
+        # first execute_model.
+        self._last_sequence_layout_plan = None
 
         # EP-DP lockstep state, refreshed each step by execute_model /
         # execute_dummy_batch: the coordinated (max-across-ranks) token
@@ -466,18 +467,18 @@ class TPUModelRunner(GPUModelRunner):
         self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
                                                dtype=torch.int32,
                                                device="cpu",
-                                               pin_memory=self.pin_memory)
+                                               pin_memory=PIN_MEMORY)
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(self.max_num_tokens,
                                         dtype=torch.int32,
                                         device="cpu",
-                                        pin_memory=self.pin_memory)
+                                        pin_memory=PIN_MEMORY)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(self.max_num_tokens,
                                                dtype=torch.bool,
                                                device="cpu",
-                                               pin_memory=self.pin_memory)
+                                               pin_memory=PIN_MEMORY)
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
@@ -497,14 +498,15 @@ class TPUModelRunner(GPUModelRunner):
             (self.max_num_reqs, cdiv(self.vocab_size, 32)),
             dtype=torch.int32,
             device="cpu",
-            pin_memory=self.pin_memory)
-        self.require_structured_out_cpu = torch.zeros(
-            (self.max_num_reqs, 1),
-            dtype=torch.bool,
-            device="cpu",
-            pin_memory=self.pin_memory)
-        self.structured_decode_arange = torch.arange(
-            0, 32, device="cpu", pin_memory=self.pin_memory)
+            pin_memory=PIN_MEMORY)
+        self.require_structured_out_cpu = torch.zeros((self.max_num_reqs, 1),
+                                                      dtype=torch.bool,
+                                                      device="cpu",
+                                                      pin_memory=PIN_MEMORY)
+        self.structured_decode_arange = torch.arange(0,
+                                                     32,
+                                                     device="cpu",
+                                                     pin_memory=PIN_MEMORY)
         self.sample_from_logits_func = self.sample_from_logits
 
         # TPU async-scheduling state (passed between execute_model and
@@ -537,22 +539,31 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
 
     def _init_phased_profiling(self) -> None:
-        """Initializes the phase-based profiler if the environment variable is set."""
-        self.phased_profiling_dir = tpu_envs.PHASED_PROFILING_DIR
+        """Initializes the phase-based profiler if configured via
+        additional_config['phased_profiling_dir']."""
+        additional_config = self.vllm_config.additional_config
+        self.phased_profiling_dir = additional_config.get(
+            runner_utils.PHASED_PROFILING_DIR_KEY, "")
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
+            profiler_config = self.vllm_config.profiler_config
             global_rank = getattr(self.parallel_config, "rank", 0) or 0
             world_size = getattr(self.parallel_config, "world_size", 1) or 1
+            decode_kv_len_threshold = additional_config.get(
+                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
             self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
                 self.phased_profiling_dir,
                 worker_rank=global_rank,
                 world_size=world_size,
-                num_steps_to_profile_for=tpu_envs.
-                PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
-                num_decode_steps_to_skip=tpu_envs.
-                PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
-                decode_kv_len_threshold=tpu_envs.
-                PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+                # max_iterations defaults to 0 ("no limit") for standard torch
+                # profiling; that's meaningless for the phased profiler, so
+                # fall back to its own default when unset.
+                num_steps_to_profile_for=(
+                    profiler_config.max_iterations
+                    or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
+                num_decode_steps_to_skip=profiler_config.delay_iterations,
+                decode_kv_len_threshold=decode_kv_len_threshold,
             )
 
     # ----- Backend hooks overridden from GPUModelRunner -----
@@ -900,23 +911,21 @@ class TPUModelRunner(GPUModelRunner):
         # With fp8 KV cache the shared layer reads the target's cached K/V and
         # dequantizes with its OWN scales, so mismatched scales/dtype would
         # silently corrupt attention.
-        attn_impl = getattr(attn_module, "impl", None)
-        target_impl = getattr(target_module, "impl", None)
-        attn_quant = getattr(attn_impl, "kv_cache_quantized_dtype", None)
-        target_quant = getattr(target_impl, "kv_cache_quantized_dtype", None)
+        attn_quant = attn_module.impl.kv_cache_quantized_dtype
+        target_quant = target_module.impl.kv_cache_quantized_dtype
         # Trigger the check if EITHER side is fp8: the asymmetric case (only one
         # side quantized) is just as unsafe -- e.g. the shared layer reads the
         # target's packed fp8 bytes as bf16 -- and must error rather than
         # silently corrupt, so None != "fp8_e4m3" correctly fails below.
         if attn_quant or target_quant:
             attn_kv_layout = (
-                getattr(attn_module, "_k_scale_float", None),
-                getattr(attn_module, "_v_scale_float", None),
+                attn_module._k_scale_float,
+                attn_module._v_scale_float,
                 attn_quant,
             )
             target_kv_layout = (
-                getattr(target_module, "_k_scale_float", None),
-                getattr(target_module, "_v_scale_float", None),
+                target_module._k_scale_float,
+                target_module._v_scale_float,
                 target_quant,
             )
             if attn_kv_layout != target_kv_layout:
@@ -955,8 +964,7 @@ class TPUModelRunner(GPUModelRunner):
                 raise ValueError(
                     f"Shared KV layer {layer_name} must not have an "
                     "independent KV cache allocation.")
-        runner_only_attn_layers = getattr(self, "runner_only_attn_layers",
-                                          None)
+        runner_only_attn_layers = self.runner_only_attn_layers
         add_kv_sharing_layers_to_kv_cache_groups(
             self.shared_kv_cache_layers,
             kv_cache_config.kv_cache_groups,
@@ -1521,7 +1529,7 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_cur_input_indices_list = []
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
-        layout_plan = getattr(self, "_last_sequence_layout_plan", None)
+        layout_plan = self._last_sequence_layout_plan
 
         # 1+K for spec — `[bonus, draft_1..K]`), so a request's source span
         # starts at `position * stride`.
@@ -2483,7 +2491,7 @@ class TPUModelRunner(GPUModelRunner):
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
-            layout_plan = getattr(self, "_last_sequence_layout_plan", None)
+            layout_plan = self._last_sequence_layout_plan
             sample_hidden_states = (
                 sequence_layout_planner.maybe_select_logits_hidden_states(
                     hidden_states, layout_plan, logits_indices))
@@ -3117,7 +3125,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Only draft proposers expose _draft_attn_layer_names; NgramProposer
         # operates purely on token IDs. no draft attention layers to relocate.
-        spec_drafter = getattr(self, "drafter", None)
+        spec_drafter = self.drafter
         draft_attn_names = getattr(spec_drafter, "_draft_attn_layer_names",
                                    None) or set()
 
@@ -3154,8 +3162,7 @@ class TPUModelRunner(GPUModelRunner):
                    num_blocks: int,
                    use_max_model_len: bool = True,
                    dp_lockstep: bool = False) -> None:
-        kv_cache_initialized = getattr(self, "kv_cache_config",
-                                       None) is not None
+        kv_cache_initialized = self.kv_cache_config is not None
 
         if self.supports_mm_inputs:
             input_ids = None
@@ -3194,7 +3201,7 @@ class TPUModelRunner(GPUModelRunner):
                 kv_cache_initialized=kv_cache_initialized,
             )
 
-        if getattr(self, "kv_cache_config", None) is not None:
+        if self.kv_cache_config is not None:
             # Dummy compact-mamba slot ids (all null slot 0): the dummy run
             # only traces shapes/HBM, so the recurrent state read/written is
             # never consumed. Shape must match the GDN op's max_reqs
@@ -3831,14 +3838,14 @@ class TPUModelRunner(GPUModelRunner):
         # D2H / placeholder rollback on the torn-down synthetic request, and no
         # in-flight copy host buffer is freed mid-transfer (defensive: covers the
         # `if present:`-skip path). No-op in sync (always None).
-        if getattr(self, "_pre_async_results", None) is not None:
+        if self._pre_async_results is not None:
             try:
                 self._pre_async_results.wait_for_copy()
             except Exception:
                 pass
             self._pre_async_results = None
         try:
-            idx_map = getattr(self.input_batch, "req_id_to_index", {})
+            idx_map = self.input_batch.req_id_to_index
             present = {r for r in rids if r in self.requests or r in idx_map}
             if present:
                 so = SchedulerOutput.make_empty()
@@ -3862,7 +3869,7 @@ class TPUModelRunner(GPUModelRunner):
             except Exception:
                 pass
         try:
-            if getattr(self, "drafter", None) is not None:
+            if self.drafter is not None:
                 self.drafter.draft_chunks = None
         except Exception:
             pass
@@ -4136,6 +4143,8 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        assert kv_cache_config.num_blocks is not None, (
+            "KVCacheConfig.num_blocks must be resolved by the scheduler")
         kv_cache_config = copy.deepcopy(kv_cache_config)
         # Mirror GPUModelRunner.initialize_kv_cache: needed by inherited
         # _update_states -> _may_reorder_batch which reads kv_cache_config.
@@ -4168,17 +4177,15 @@ class TPUModelRunner(GPUModelRunner):
                     "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
                 )
 
-            block_size = getattr(spec, "block_size", None)
-            if block_size is not None:
-                if attn_block_size is None:
-                    attn_block_size = block_size
-                assert attn_block_size == block_size, "Block size across attention groups must be the same."
+            block_size = spec.block_size
+            if attn_block_size is None:
+                attn_block_size = block_size
+            assert attn_block_size == block_size, "Block size across attention groups must be the same."
 
-        block_sizes = []
-        for group in kv_cache_config.kv_cache_groups:
-            block_sizes.append(
-                getattr(group.kv_cache_spec, "block_size", attn_block_size)
-                or self.block_size)
+        block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+        ]
 
         self.may_reinitialize_input_batch(kv_cache_config, block_sizes)
 
@@ -4270,11 +4277,7 @@ class TPUModelRunner(GPUModelRunner):
                         raise NotImplementedError
                 num_blocks = tensor_size // total_group_page_size
             else:
-                num_blocks = getattr(kv_cache_config, "num_blocks", None)
-                if num_blocks is None:
-                    page_size_bytes = _per_layer_spec(
-                        shared_by[0]).page_size_bytes
-                    num_blocks = tensor_size // page_size_bytes
+                num_blocks = kv_cache_config.num_blocks
 
             for layer_name in shared_by:
                 kv_cache_spec = _per_layer_spec(layer_name)

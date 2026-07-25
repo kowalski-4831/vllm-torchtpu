@@ -30,7 +30,7 @@ and uses our native TorchTPU + Pallas kernels.
 == Execution Flow ==
 1. vLLM loads model with quantization=None (unquantized)
 2. get_tpu_quantization_config() returns VllmUnquantizedConfig
-3. For FusedMoE layers, VllmUnquantizedFusedMoEMethod.apply() is called
+3. For RoutedExperts layers, VllmUnquantizedFusedMoEMethod.apply() is called
 4. apply() routes to our TPU Pallas local-topk MoE kernels
 """
 
@@ -39,9 +39,9 @@ from typing import Any, Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (RoutedExperts,
+                                                  UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE, UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \
@@ -66,7 +66,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
     TPU-specific configuration for unquantized models.
 
     This config is registered under "tpu-unquantized" and provides
-    TPU-compatible methods for FusedMoE and Linear layers.
+    TPU-compatible methods for RoutedExperts and Linear layers.
     """
 
     @classmethod
@@ -113,7 +113,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             )
             return UnquantizedLinearMethod()
 
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             # For MoE layers, use our custom TPU implementation
             moe_config = self.get_moe_config(layer)
             return VllmUnquantizedFusedMoEMethod(moe_config)
@@ -131,7 +131,7 @@ def _get_activation_str(activation) -> str:
 
 class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """
-    TPU-native implementation of unquantized FusedMoE.
+    TPU-native implementation of unquantized RoutedExperts.
 
     Uses is_monolithic=True so vLLM's DefaultMoERunner calls
     apply_monolithic(layer, x, router_logits) directly, bypassing the
@@ -152,7 +152,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         return self._forward_monolithic_tpu
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
 
         # Pre-compute activation string: layer.activation is a MoEActivation
         # enum in v0.17.1 but the Pallas kernel expects a plain string.
@@ -234,7 +234,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def _forward_monolithic_tpu(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
@@ -242,7 +242,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         """Forward pass using TPU-native GMM kernel."""
         activation_str = layer._tpu_activation_str
         # Step 1: Routing
-        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        custom_routing_fn = layer.custom_routing_function
         if custom_routing_fn is not None:
             # custom_routing_fn bypasses select_experts, so apply the
             # random-routing profiling override here too (a no-op by default).
@@ -259,7 +259,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                scoring_fn=layer.scoring_func,
                 layer=layer,
             )
 

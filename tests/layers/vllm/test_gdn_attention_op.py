@@ -39,6 +39,7 @@ def _vllm_config(*,
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
             cp_kv_cache_interleave_size=interleave_size,
+            data_parallel_size=1,
         ),
         cache_config=SimpleNamespace(
             mamba_block_size=4096,
@@ -241,6 +242,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_forward_cuda_lora(self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 0
         attn.head_v_dim = 16
         attn.num_v_heads = 4
         attn.tp_size = 1
@@ -283,6 +285,10 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata.mamba_state_indices = None
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
+        # Non-spec path: the runner leaves these unset (None) unless
+        # speculative decoding is active.
+        mock_attn_metadata.mamba_request_distribution = None
+        mock_attn_metadata.mamba_slot_read_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -326,6 +332,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_forward_cuda_non_lora_gqa(self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 0
         attn.head_v_dim = 16
         attn.num_v_heads = 4
         attn.tp_size = 1
@@ -380,6 +387,10 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata.mamba_state_indices = None
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
+        # Non-spec path: the runner leaves these unset (None) unless
+        # speculative decoding is active.
+        mock_attn_metadata.mamba_request_distribution = None
+        mock_attn_metadata.mamba_slot_read_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -426,6 +437,7 @@ class TestVllmGatedDeltaNetAttention:
         """Compact mamba: when attn_metadata.mamba_state_indices is set, the op
         passes it through verbatim and ignores block_tables[:, 0]."""
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 0
         attn.head_v_dim = 16
         attn.num_v_heads = 4
         attn.tp_size = 1
@@ -467,6 +479,10 @@ class TestVllmGatedDeltaNetAttention:
             [3, 1], dtype=torch.int32)
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
+        # Non-spec path: the runner leaves these unset (None) unless
+        # speculative decoding is active.
+        mock_attn_metadata.mamba_request_distribution = None
+        mock_attn_metadata.mamba_slot_read_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -486,6 +502,7 @@ class TestVllmGatedDeltaNetAttention:
     def test_forward_uses_native_gdn_pcp_op_for_pcp_prefill(
             self, _mock_rank, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 0
         attn.head_v_dim = 16
         attn.num_v_heads = 4
         attn.tp_size = 1
@@ -540,6 +557,10 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata.query_start_loc = torch.tensor([0, 4],
                                                           dtype=torch.int32)
         mock_attn_metadata.request_distribution = torch.zeros(3)
+        # Non-spec path: the runner leaves these unset (None) unless
+        # speculative decoding is active.
+        mock_attn_metadata.mamba_request_distribution = None
+        mock_attn_metadata.mamba_slot_read_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -574,6 +595,7 @@ class TestVllmGatedDeltaNetAttention:
     def test_forward_pcp_prefill_requires_initialized_pcp_op(
             self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 0
         attn.head_v_dim = 16
         attn.num_v_heads = 4
         attn.tp_size = 1
@@ -617,6 +639,10 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata.sequence_layout_protocol = "pcp_streaming"
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
+        # Non-spec path: the runner leaves these unset (None) unless
+        # speculative decoding is active.
+        mock_attn_metadata.mamba_request_distribution = None
+        mock_attn_metadata.mamba_slot_read_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -633,6 +659,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_forward_cuda_non_lora_no_gqa(self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.num_spec = 0
         attn.head_v_dim = 16
         attn.num_v_heads = 4
         attn.tp_size = 1
@@ -680,6 +707,10 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata.mamba_state_indices = None
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
+        # Non-spec path: the runner leaves these unset (None) unless
+        # speculative decoding is active.
+        mock_attn_metadata.mamba_request_distribution = None
+        mock_attn_metadata.mamba_slot_read_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 

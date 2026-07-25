@@ -40,7 +40,6 @@ _TPU_COMPILE_ENV_IGNORED = {
     "DP_SCHED_BUFFER_PREFILL",
     "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS",
     "DP_SCHED_ENABLED",
-    "PHASED_PROFILING_DIR",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "SKIP_JAX_PRECOMPILE",
@@ -109,7 +108,7 @@ def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
     relpaths = []
     for mod_name in kernel_reload.default_reload_modules():
         spec = importlib.util.find_spec(mod_name)
-        origin = getattr(spec, "origin", None) if spec else None
+        origin = spec.origin if spec else None
         if not origin:
             logger.warning(
                 "[TpuCompilerAdaptor] Cannot resolve reload module %s; its "
@@ -173,11 +172,11 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         },
         "speculative": {
             "model":
-            getattr(spec, "model", None),
+            spec.model if spec is not None else None,
             "draft_tensor_parallel_size":
-            getattr(spec, "draft_tensor_parallel_size", None),
+            spec.draft_tensor_parallel_size if spec is not None else None,
             "num_speculative_tokens":
-            getattr(spec, "num_speculative_tokens", None),
+            spec.num_speculative_tokens if spec is not None else None,
         },
     }
 

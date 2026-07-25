@@ -22,10 +22,10 @@ from vllm_torchtpu.layers.vllm import moe_routing
 
 def _make_layer(*, use_ep, ep_size=1, ep_rank=0, global_num_experts=0):
     return SimpleNamespace(
-        moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(
-            use_ep=use_ep)),
-        ep_size=ep_size,
-        ep_rank=ep_rank,
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(use_ep=use_ep),
+            ep_size=ep_size,
+            ep_rank=ep_rank),
         global_num_experts=global_num_experts,
     )
 
@@ -70,11 +70,16 @@ def test_get_experts_start_returns_none_without_ep():
     assert moe_routing.get_experts_start(_make_layer(use_ep=False)) is None
 
 
-def test_validate_linear_ep_placement_accepts_linear_and_default():
+def test_validate_linear_ep_placement_accepts_linear():
     moe_routing.validate_linear_ep_placement(
         SimpleNamespace(expert_placement_strategy="linear"))
-    # missing attr -> default "linear"
-    moe_routing.validate_linear_ep_placement(SimpleNamespace())
+
+
+def test_validate_linear_ep_placement_requires_declared_strategy():
+    # An object that never declares its placement must fail loudly, not be
+    # assumed linear.
+    with pytest.raises(AttributeError):
+        moe_routing.validate_linear_ep_placement(SimpleNamespace())
 
 
 def test_validate_linear_ep_placement_rejects_round_robin():

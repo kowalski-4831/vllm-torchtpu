@@ -30,7 +30,21 @@ import pytest
 import torch
 
 from vllm_torchtpu.layers.vllm.linear_common import _quantized_matmul_jax
-from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.vllm.quantization.fp8 import (VllmFp8Config,
+                                                        VllmFp8LinearMethodTPU)
+
+
+def test_fp8_config_accepts_default_store_dtype():
+    config = VllmFp8Config.from_config({"activation_scheme": "dynamic"})
+    assert config.store_dtype is None
+
+
+def test_fp8_config_rejects_store_dtype():
+    with pytest.raises(NotImplementedError, match="store_dtype"):
+        VllmFp8Config.from_config({
+            "activation_scheme": "dynamic",
+            "store_dtype": "mxfp4",
+        })
 
 
 class FakeQuant:
@@ -170,6 +184,7 @@ class TestFp8LinearRuntimeQuant:
                                dtype=torch.float32)
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
         layer.weight_scale_inv = torch.nn.Parameter(scale_inv,
                                                     requires_grad=False)
@@ -200,6 +215,7 @@ class TestFp8LinearRuntimeQuant:
                                  dtype=torch.float32)
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
         layer.weight_scale_inv = torch.nn.Parameter(scale_inv,
                                                     requires_grad=False)
@@ -242,6 +258,7 @@ class TestFp8LinearRuntimeQuant:
         scale = torch.tensor([2.5], device=device, dtype=torch.float32)
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
 
@@ -334,6 +351,7 @@ class TestFp8LinearRuntimeQuant:
         block_h, block_w = 128, 128
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(torch.ones(out_dim,
                                                      in_dim,
                                                      device=device,

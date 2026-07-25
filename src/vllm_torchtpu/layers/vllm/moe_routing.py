@@ -77,7 +77,7 @@ def select_experts(
     """Compute local routed ids/weights for the non-EP path."""
     # Profiling-only override; a no-op unless FORCE_MOE_RANDOM_ROUTING is set.
     router_logits = maybe_force_random_routing(router_logits)
-    if layer is not None and getattr(layer, "use_grouped_topk", False):
+    if layer is not None and layer.use_grouped_topk:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk
         topk_weights, topk_ids = grouped_topk(
@@ -85,12 +85,11 @@ def select_experts(
             gating_output=router_logits,
             topk=topk,
             renormalize=renormalize,
-            num_expert_group=getattr(layer, "num_expert_group", 0),
-            topk_group=getattr(layer, "topk_group", 0),
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
             scoring_func=scoring_fn,
-            routed_scaling_factor=getattr(layer, "routed_scaling_factor", 1.0),
-            e_score_correction_bias=getattr(layer, "e_score_correction_bias",
-                                            None),
+            routed_scaling_factor=layer.routed_scaling_factor,
+            e_score_correction_bias=layer.e_score_correction_bias,
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
@@ -114,9 +113,10 @@ def get_experts_start(layer) -> int | None:
     """
     if not layer.moe_config.moe_parallel_config.use_ep:
         return None
-    base = layer.global_num_experts // layer.ep_size
-    remainder = layer.global_num_experts % layer.ep_size
-    return layer.ep_rank * base + min(layer.ep_rank, remainder)
+    base = layer.global_num_experts // layer.moe_config.ep_size
+    remainder = layer.global_num_experts % layer.moe_config.ep_size
+    return (layer.moe_config.ep_rank * base +
+            min(layer.moe_config.ep_rank, remainder))
 
 
 def validate_linear_ep_placement(layer) -> None:
@@ -125,7 +125,7 @@ def validate_linear_ep_placement(layer) -> None:
     The kernel relies on a contiguous-block ``expert_map``, which vLLM only
     produces when ``expert_placement_strategy == "linear"``.
     """
-    strategy = getattr(layer, "expert_placement_strategy", "linear")
+    strategy = layer.expert_placement_strategy
     if strategy != "linear":
         raise NotImplementedError(
             "fused MoE kernel currently requires linear EP placement; got "

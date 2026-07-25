@@ -24,7 +24,7 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    "vllm==0.23.0",
+    "vllm==0.25.1",
     "torch==2.11.0",
     "torch-tpu==0.1.1.dev20260714090201",
     # Required for N-gram speculative decoding
@@ -48,7 +48,7 @@ dependencies = [
     # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
     # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
     # bumping.
-    "libtpu==0.0.42.1",
+    "libtpu==0.0.43",
     "ray[default]",
     "ray[data]",
 ]
@@ -106,12 +106,6 @@ include = ["vllm_torchtpu*"]
 
 [tool.uv]
 keyring-provider = "subprocess"
-override-dependencies = [
-    # Restrict fastapi version due to https://github.com/vllm-project/vllm/pull/45629
-    # TODO(shobhitbehl): Remove this pin after the fix is released in vLLM 0.23.0 or later.
-    "fastapi<0.137",
-]
-
 
 [[tool.uv.index]]
 name = "torch-tpu-registry"

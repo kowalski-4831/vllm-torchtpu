@@ -328,27 +328,29 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         }
         self.collective_rpc("adjust_rank", args=(rerank_mapping, ))
 
-        # Get the set of TPU IDs used on each node.
-        worker_node_and_tpu_ids = []
+        # Get the set of physical TPU IDs used on each node.
+        worker_node_and_physical_tpu_ids = []
         for worker in self.workers:
-            worker_node_and_tpu_ids.append(
-                ray.get(worker.get_node_and_gpu_ids.remote()) \
-            ) # type: ignore
+            worker_node_and_physical_tpu_ids.append(
+                ray.get(worker.get_node_and_physical_gpu_ids.remote())
+            )  # type: ignore[attr-defined]
 
         node_workers = defaultdict(list)  # node id -> list of worker ranks
-        node_tpus = defaultdict(list)  # node id -> list of tpu ids
+        node_physical_tpu_ids = defaultdict(list)
 
-        for i, (node_id, tpu_ids) in enumerate(worker_node_and_tpu_ids):
+        for i, (node_id, physical_tpu_ids
+                ) in enumerate(worker_node_and_physical_tpu_ids):
             node_workers[node_id].append(i)
-            # `tpu_ids` can be a list of strings or integers.
-            # convert them to integers for consistency.
-            tpu_ids = [int(x) for x in tpu_ids]
-            node_tpus[node_id].extend(tpu_ids)
-        for node_id, tpu_ids in node_tpus.items():
-            node_tpus[node_id] = sorted(tpu_ids)
+            physical_tpu_ids = [
+                current_platform.device_control_id_to_physical_device_id(
+                    str(x)) for x in physical_tpu_ids
+            ]
+            node_physical_tpu_ids[node_id].extend(physical_tpu_ids)
+        for node_id, physical_tpu_ids in node_physical_tpu_ids.items():
+            node_physical_tpu_ids[node_id] = sorted(physical_tpu_ids)
         logger.info(
-            f"RayDistributedExecutor | node_workers={node_workers} | node_tpus={node_tpus}"
-        )
+            "RayDistributedExecutor | node_workers=%s | "
+            "node_physical_tpu_ids=%s", node_workers, node_physical_tpu_ids)
 
         all_ips = set(worker_ips + [driver_ip])
         n_ips = len(all_ips)
@@ -390,14 +392,14 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         master_addr = sorted_worker_metadata[rank_0_worker_index].ip
 
         all_args_to_update_environment_variables = []
-        total_chips = len(worker_node_and_tpu_ids)
+        total_chips = len(worker_node_and_physical_tpu_ids)
         topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(total_chips, None)
         if topology is None:
             raise ValueError(
                 f'Cannot find topology for {total_chips} chips. The supported number of chips are {list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}'
             )
         master_port = str(get_open_port())
-        for i, (node_id, _) in enumerate(worker_node_and_tpu_ids):
+        for i, (node_id, _) in enumerate(worker_node_and_physical_tpu_ids):
             node_rank = node_id_to_rank[node_id]
             args = {
                 "NNODES": str(num_nodes),
@@ -405,7 +407,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 "MASTER_ADDR": master_addr,
                 "MASTER_PORT": master_port,
                 "TORCH_TPU_TOPOLOGY": topology,
-                "LOCAL_WORLD_SIZE": str(len(node_tpus[node_id])),
+                "LOCAL_WORLD_SIZE": str(len(node_physical_tpu_ids[node_id])),
                 "TPU_NUM_HOSTS": str(num_nodes),
             }
             if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
@@ -446,7 +448,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         # Initialize the actual workers inside worker wrapper.
         all_kwargs = []
-        for rank, (node_id, _) in enumerate(worker_node_and_tpu_ids):
+        for rank, (node_id, _) in enumerate(worker_node_and_physical_tpu_ids):
             local_rank = node_workers[node_id].index(rank)
             ip = sorted_worker_metadata[rank].ip
             prev_ip = sorted_worker_metadata[rank - 1].ip if rank > 0 else ""
@@ -461,9 +463,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             # worker-specific config copy and restore the original GCS URI from `model_weights`.
             # This allows each worker to independently invoke `maybe_pull_model_tokenizer_for_runai`
             # and stream the model from GCS.
-            if node_id != driver_node_id and getattr(
-                    self.vllm_config, "model_config", None) and getattr(
-                        self.vllm_config.model_config, "model_weights", None):
+            if (node_id != driver_node_id and self.vllm_config.model_config
+                    and self.vllm_config.model_config.model_weights):
                 worker_vllm_config = copy.deepcopy(self.vllm_config)
                 worker_vllm_config.model_config.model = worker_vllm_config.model_config.model_weights
                 # Unset model_weights so maybe_pull_model_tokenizer_for_runai will pull the model.
@@ -471,6 +472,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
             kwargs = dict(
                 vllm_config=worker_vllm_config,
+                assigned_physical_gpu_ids=sorted(
+                    node_physical_tpu_ids[node_id]),
                 local_rank=local_rank,
                 rank=rank,
                 distributed_init_method=distributed_init_method,

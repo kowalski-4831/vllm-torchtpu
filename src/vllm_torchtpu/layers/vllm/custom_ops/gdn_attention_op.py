@@ -59,6 +59,7 @@ def gdn_attention_core_tpu(
     query_start_loc: jax.Array,
     distribution: jax.Array,
     seq_lens: jax.Array,
+    slot_read_offsets: jax.Array | None = None,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -68,12 +69,25 @@ def gdn_attention_core_tpu(
     kernel_size: int,
     config: GdnAttentionConfig,
     dp_enabled: bool,
+    num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    # Speculative decoding: vLLM's MambaSpec widens the conv state by
+    # `num_spec` columns per slot. The extra columns are unused on TPU
+    # (rollback keeps one full checkpoint per group slot instead of a
+    # rolling window); only the first kernel_size - 1 columns hold data, so
+    # slice them out for the kernel and write the result back into the same
+    # (donated) buffer afterwards.
+    state_len = conv_state.shape[1]
+    if state_len > kernel_size - 1:
+        conv_state_in = conv_state[:, :kernel_size - 1, :]
+    else:
+        conv_state_in = conv_state
+
     (new_conv_state, new_recurrent_state), output = run_jax_gdn_attention(
         mixed_qkv,
         b,
         a,
-        conv_state,
+        conv_state_in,
         recurrent_state,
         conv_weight,
         conv_bias,
@@ -83,6 +97,7 @@ def gdn_attention_core_tpu(
         query_start_loc,
         distribution,
         seq_lens,
+        slot_read_offsets,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -90,8 +105,18 @@ def gdn_attention_core_tpu(
         kernel_size=kernel_size,
         mesh=mesh,
         dp_enabled=dp_enabled,
+        num_spec_tokens=num_spec_tokens,
         config=config,
     )
+    if state_len > kernel_size - 1:
+        # Write the kernel result into the first kernel_size - 1 columns of the
+        # donated conv_state in place and leave the unused spec tail untouched.
+        # A concat here would materialize a fresh full-width array that no
+        # longer derives from the donated buffer, defeating the conv-cache
+        # input_output_alias (a full-width alloc + copy per GDN layer per step);
+        # the dynamic-update-slice keeps the write inside the donated buffer.
+        new_conv_state = conv_state.at[:, :kernel_size -
+                                       1, :].set(new_conv_state)
 
     return new_conv_state, new_recurrent_state, output
 
@@ -197,9 +222,8 @@ def gdn_attention_core_tpu_pcp_prefill(
 
 
 def _get_pcp_size(vllm_config: VllmConfig) -> int:
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-    return pcp_size if isinstance(pcp_size, int) and pcp_size > 1 else 1
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    return pcp_size if pcp_size > 1 else 1
 
 
 def _localize_gdn_mamba_spec_for_pcp(
@@ -245,6 +269,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Bound by the runner during KV-cache initialization; None until then
+        # (warmup/profiling runs check this).
+        self.kv_cache = None
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op()
         self.gdn_pcp_op = (self._build_gdn_op(
@@ -279,6 +306,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                   None)
         dp_enabled = (parallel_config is not None
                       and get_dp_size(parallel_config) > 1)
+        # Speculative decoding: verify windows run in the GDN kernel's SPEC
+        # mode, which checkpoints the state after every window position so
+        # rejected drafts can be rolled back by checkpoint selection (see
+        # TPUModelRunner.mamba_slot_read_offsets).
+        num_spec_tokens = self.num_spec
+        if pcp_streaming and num_spec_tokens > 0:
+            raise NotImplementedError(
+                "Speculative decoding is not supported with GDN PCP "
+                "streaming prefill.")
         if pcp_streaming:
             interleave_size = getattr(parallel_config,
                                       "cp_kv_cache_interleave_size", 0)
@@ -331,7 +367,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             output_partition_specs = (
                 PartitionSpec(None, None, "pcp"),  # new_conv_state
                 PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
-                PartitionSpec(),  # output
+                PartitionSpec("pcp"),  # output
             )
             gdn_jax_op = pcp_streaming_jax_op(
                 op_name,
@@ -345,8 +381,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):
                 num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens * pcp_size,
-                             local_num_v_heads * self.head_v_dim)
+                out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
                 return torch.empty_like(conv_state), torch.empty_like(
                     recurrent_state), torch.empty(out_shape,
                                                   dtype=mixed_qkv.dtype,
@@ -365,6 +400,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size=self.conv_kernel_size,
                 config=config,
                 dp_enabled=dp_enabled,
+                num_spec_tokens=num_spec_tokens,
             )
             gdn_jax_op = pallas.jax_op(op_name,
                                        wrapped_fn,
@@ -395,14 +431,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
             seq_lens: torch.Tensor,
+            slot_read_offsets: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            # The PCP op keeps its original 13-arg signature (spec decoding
+            # is rejected with PCP streaming at op-build time).
+            extra_args = (() if pcp_streaming else (slot_read_offsets, ))
             new_conv, new_rec, outputs = gdn_jax_op(
                 mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
                 conv_bias, A_log, dt_bias, state_indices, query_start_loc,
-                request_distribution, seq_lens)
-            if pcp_streaming:
-                outputs = outputs.reshape(-1,
-                                          local_num_v_heads * self.head_v_dim)
+                request_distribution, seq_lens, *extra_args)
 
             conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
@@ -512,7 +549,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        kv_cache = getattr(self, "kv_cache", None)
+        kv_cache = self.kv_cache
         local_num_v_heads = self.num_v_heads // self.tp_size
 
         # During warmup or memory profiling, the kv_cache might not be allocated yet
@@ -565,6 +602,23 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     )
                     state_indices = block_tables_2d[:, 0].to(torch.int32)
 
+                # Speculative decoding: the GDN kernel's windowed segment
+                # covers both 1-token decodes and speculative verify windows
+                # (the batch is ordered [decode][verify][prefill/mixed]);
+                # ragged paged attention keeps using `request_distribution`
+                # with its 1-token decode front segment.
+                request_distribution = attn_metadata.request_distribution
+                slot_read_offsets = getattr(attn_metadata,
+                                            "mamba_slot_read_offsets", None)
+                mamba_request_distribution = getattr(
+                    attn_metadata, "mamba_request_distribution", None)
+                if mamba_request_distribution is not None:
+                    request_distribution = mamba_request_distribution
+                if self.num_spec > 0:
+                    assert slot_read_offsets is not None, (
+                        "Speculative decoding with GDN layers requires "
+                        "mamba_slot_read_offsets in the attention metadata.")
+
                 # Execute the TorchTPU custom op
                 use_pcp_streaming = is_pcp_streaming_attention_metadata(
                     attn_metadata)
@@ -573,11 +627,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         mixed_qkv, b, a, conv_state, recurrent_state,
                         self.conv1d.weight, self.conv1d.bias, self.A_log,
                         self.dt_bias, state_indices,
-                        attn_metadata.query_start_loc,
-                        attn_metadata.request_distribution,
-                        attn_metadata.seq_lens)
+                        attn_metadata.query_start_loc, request_distribution,
+                        attn_metadata.seq_lens, slot_read_offsets)
                 else:
-                    gdn_pcp_op = getattr(self, "gdn_pcp_op", None)
+                    gdn_pcp_op = self.gdn_pcp_op
                     if gdn_pcp_op is None:
                         raise RuntimeError(
                             "GDN PCP prefill op was not initialized during model "
@@ -595,14 +648,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                             "GDN op returned an incompatible output shape.")
                     start = get_pcp_rank() * num_tokens
                     core_attn_out = core_attn_out[start:start + num_tokens]
-                if use_pcp_streaming:
-                    local_core_attn_out = torch.empty(
-                        tuple(core_attn_out.shape),
-                        dtype=core_attn_out.dtype,
-                        device=core_attn_out.device,
-                    )
-                    local_core_attn_out.copy_(core_attn_out)
-                    core_attn_out = local_core_attn_out
+
         # ============================================================
         # Part 3: Output Projection
         # ============================================================

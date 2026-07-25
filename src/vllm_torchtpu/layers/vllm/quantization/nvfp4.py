@@ -19,7 +19,7 @@ quantized-matmul kernels in **W4A16** mode (bf16 activations, fp4 weights
 dequantized per block inside the kernel).
 
 Design:
-  - Reuse upstream `ModelOptNvFp4{LinearMethod,FusedMoE}.create_weights` for
+  - Reuse upstream `ModelOptNvFp4{LinearMethod,RoutedExperts}.create_weights` for
     parameter registration (packed uint8 weight, E4M3 `weight_scale`, FP32
     `weight_scale_2` global, `input_scale`).
   - `process_weights_after_loading` (pure PyTorch, no JAX): fuse the E4M3 block
@@ -40,8 +40,8 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
-                                                        FusedMoEMethodBase)
+from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
+                                                  RoutedExperts)
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \
@@ -158,7 +158,7 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
             if self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             return VllmNvfp4LinearMethod(self, self.get_linear_config(layer))
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             if self.is_layer_excluded(prefix):
                 from vllm_torchtpu.layers.vllm.quantization.unquantized import \
                     VllmUnquantizedFusedMoEMethod
@@ -219,7 +219,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value})
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU NVFP4 MoE does not support bias."
         assert self.moe.is_act_and_mul, (
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
@@ -333,13 +333,13 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
 
     def apply_monolithic(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         activation_str = layer._tpu_activation_str
-        custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        custom_routing_fn = layer.custom_routing_function
         if custom_routing_fn is not None:
             # custom_routing_fn bypasses select_experts, so apply the
             # random-routing profiling override here too (a no-op by default).
@@ -356,7 +356,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                scoring_fn=layer.scoring_func,
             )
         return fused_moe_gmm(
             hidden_states=x,
@@ -374,6 +374,16 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
+class _NullInputQuantKernel:
+    """Placeholder kernel so upstream create_weights' expose_input_quant_key
+    is a no-op. TPU NVFP4 is W4A16: activations are not pre-quantized, so the
+    layer advertises no input_quant_key."""
+
+    @staticmethod
+    def input_quant_key():
+        return None
+
+
 class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
     """NVFP4 dense-linear for TPU (W4A16).
 
@@ -385,10 +395,12 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
 
     def __init__(self, quant_config: 'VllmNvfp4Config',
                  linear_config: VllmQuantLinearConfig):
-        # Skip ModelOptNvFp4LinearMethod.__init__ (it builds a GPU NVFP4 kernel).
+        # Skip ModelOptNvFp4LinearMethod.__init__ (it builds a GPU NVFP4 kernel
+        # unavailable on TPU). create_weights only needs kernel.input_quant_key.
         self.quant_config = quant_config
         self.linear_config = linear_config
         self.group_size = quant_config.group_size
+        self.kernel = _NullInputQuantKernel()
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
