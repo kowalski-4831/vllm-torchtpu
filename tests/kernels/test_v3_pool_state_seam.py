@@ -371,9 +371,6 @@ class TestPooledCallerV3:
         )
         pool_rt, out_rt = _run_roundtrip(jnp.copy(pool), idx, kwargs)
 
-        cfg = gdn_attention.GdnAttentionConfig(
-            ragged_gated_delta_rule_impl=gdn_attention.
-            RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD)
         new_pool, out = gdn_attention.run_jax_gdn_attention_pooled_local(
             mixed_qkv=kwargs["qkv"],
             b=kwargs["b"],
@@ -393,7 +390,7 @@ class TestPooledCallerV3:
             d_v=D_V,
             kernel_size=KERNEL_SIZE,
             pool_block_tokens=SPLIT * KBS,
-            config=cfg)
+        )
 
         np.testing.assert_allclose(np.asarray(out),
                                    np.asarray(out_rt),

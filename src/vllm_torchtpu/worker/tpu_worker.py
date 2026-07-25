@@ -83,9 +83,6 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu.platforms.tpu_platform import apply_tpu_patches
         apply_tpu_patches()
 
-        if envs.MODEL_IMPL_TYPE != "vllm":
-            raise ValueError("Only vLLM models are supported")
-
         super().__init__(vllm_config=vllm_config,
                          local_rank=local_rank,
                          rank=rank,
