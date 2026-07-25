@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     TPU_MULTIHOST_BACKEND: str = ""
     SKIP_JAX_PRECOMPILE: bool = False
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
-    MODEL_IMPL_TYPE: str = "vllm"
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
     NUM_SLICES: int = 1
@@ -35,11 +34,8 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
-    RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_kernel_v3_pd"
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
-    RAGGED_GATHER_VERSION: str = "v2"
-    RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False

@@ -15,7 +15,6 @@
 Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 
 """
-import dataclasses
 import functools
 import math
 from typing import Optional, Tuple
@@ -26,204 +25,11 @@ from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
-import vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper as ragged_gated_delta_rule_wrapper
 from vllm_torchtpu.kernels import pool_adapters
-from vllm_torchtpu.kernels.causal_conv1d import causal_conv1d
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
-from vllm_torchtpu.layers.common.ragged_gated_delta_rule_ref import \
-    ragged_gated_delta_rule as ragged_gated_delta_rule_ref
 from vllm_torchtpu.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
-
-RaggedGatedDeltaRuleImpl = ragged_gated_delta_rule_wrapper.RaggedGatedDeltaRuleImpl
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class GdnAttentionConfig:
-    ragged_gated_delta_rule_impl: RaggedGatedDeltaRuleImpl = (
-        RaggedGatedDeltaRuleImpl.REF)
-
-
-def run_jax_gdn_attention_local(
-    mixed_qkv: jnp.ndarray,
-    b: jnp.ndarray,
-    a: jnp.ndarray,
-    conv_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
-    conv_weight: jnp.ndarray,
-    conv_bias: Optional[jnp.ndarray],
-    A_log: jnp.ndarray,
-    dt_bias: jnp.ndarray,
-    query_start_loc: jnp.ndarray,
-    state_indices: jnp.ndarray,
-    distribution: jnp.ndarray,
-    seq_lens: jnp.ndarray,
-    slot_read_offsets: Optional[jnp.ndarray] = None,
-    *,
-    n_kq: int,
-    n_v: int,
-    d_k: int,
-    d_v: int,
-    kernel_size: int,
-    dp_enabled: bool,
-    num_spec_tokens: int = 0,
-    config: GdnAttentionConfig = GdnAttentionConfig(),
-) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    """Runs the local JAX GDN attention mechanism with combined QKV tensors.
-
-    Args:
-        mixed_qkv: Combined QKV tensor of shape `(num_tokens, dim)`.
-        b: B tensor of shape `(num_tokens, n_v)`.
-        a: A tensor of shape `(num_tokens, n_v)`.
-        conv_state: Combined convolutional state of shape `(num_blocks,
-          kernel_size - 1, dim)`. `num_blocks` is always equal or larger than
-          `max_seqs + 1`. The first block is a null_block and only used for
-          padded / invalid tokens.
-        recurrent_state: Recurrent state of shape `(num_blocks, n_v, d_k, d_v)`.
-        conv_weight: Combined convolutional weight of shape `(dim, 1,
-          kernel_size)`.
-        conv_bias: Optional combined convolutional bias of shape `(dim,)`.
-        A_log: Log of A parameter of shape `(n_v,)`.
-        dt_bias: Delta T bias of shape `(n_v,)`.
-        query_start_loc: Tensor of shape `(num_seqs + 1,)` with start locations of
-          each sequence.
-        state_indices: Tensor of shape `(max_reqs,)` mapping request index to
-          state index.
-        distribution: Tensor of shape `(3,)` int32 — `(decode_end, prefill_end,
-          mixed_end)`.
-        seq_lens: Tensor of shape `(max_reqs,)` with the total sequence length
-          per request (computed + scheduled). Used to derive
-          ``has_initial_state`` so brand-new prefills don't read stale state
-          from a reused mamba slot, mirroring GPU's
-          ``initial_state[~has_initial_state, ...] = 0`` in
-          ``gdn_linear_attn._forward_core``.
-        slot_read_offsets: Optional tensor of shape `(num_blocks,)` — per
-          physical slot mamba read offset for speculative decoding. Gathered
-          per sequence (`slot_read_offsets[state_indices]`) so the kernel
-          resumes each verify window from the checkpoint of the last
-          accepted token. Required iff `num_spec_tokens > 0`.
-        num_spec_tokens: Number of speculative draft tokens (0 disables the
-          spec-decode windowed mode).
-        n_kq: Number of key/query heads.
-        n_v: Number of value heads.
-        d_k: Dimension of key.
-        d_v: Dimension of value.
-        kernel_size: Convolution kernel size.
-        config: Configuration for implementation selection.
-
-    Returns:
-        A tuple containing:
-        - A tuple of (new_conv_state, new_recurrent_state).
-        - The output tensor of shape `(num_tokens, n_v * d_v)`.
-    """
-    # has_initial_state[i] = True iff request i already has computed
-    # tokens in its mamba slot (chunked-prefill continuation, prefix-cache
-    # hit, or running decode). False for brand-new prefills, in which
-    # case the conv1d, the chunked / ref delta-rule impls, and the fused
-    # Pallas recurrent kernel all zero the slot's prior state before
-    # the update so a freshly-allocated mamba slot can't leak its
-    # previous tenant's state. context_len = seq_len - query_len.
-    max_reqs = seq_lens.shape[0]
-    query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
-    has_initial_state = (seq_lens - query_lens) > 0
-
-    if num_spec_tokens > 0:
-        assert (config.ragged_gated_delta_rule_impl ==
-                RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD), (
-                    "Mamba state rollback for speculative decoding is only "
-                    "supported by the fused v3 GDN kernel "
-                    "(RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd).")
-        assert slot_read_offsets is not None
-
-    if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
-        read_offsets = None
-        if num_spec_tokens > 0:
-            # Per-sequence read offsets: `state_indices` holds the base slot
-            # of each request's checkpoint group, `slot_read_offsets` is the
-            # per-slot offset buffer updated after each verify step.
-            read_offsets = slot_read_offsets[state_indices]
-        return gdn_v3_wrapper.fused_conv1d_gdn(
-            mixed_qkv,
-            b,
-            a,
-            conv_state,
-            recurrent_state,
-            conv_weight,
-            conv_bias,
-            A_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-            seq_lens,
-            read_offsets,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-            num_spec_tokens=num_spec_tokens,
-        )
-
-    out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
-        mixed_qkv,
-        conv_state,
-        conv_weight,
-        conv_bias,
-        query_start_loc,
-        state_indices,
-        distribution,
-        has_initial_state,
-        kernel_size=kernel_size,
-    )
-
-    if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.REF:
-        ragged_gdn_impl = functools.partial(
-            ragged_gated_delta_rule_ref,
-            has_initial_state=has_initial_state,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-        )
-        new_recurrent_state, output = ragged_gdn_impl(
-            out_mixed_qkv,
-            b,
-            a,
-            recurrent_state,
-            A_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-        )
-    else:
-        wrapper_config = config.ragged_gated_delta_rule_impl.to_config()
-        # DP replicas hold the full-width GDN heads, so the wide (64) scan chunk
-        # overflows VMEM (CompileTimeScopedVmemOom) -- use 32 there.
-        chunk_size = 32 if dp_enabled else 64
-        new_recurrent_state, output = ragged_gated_delta_rule_wrapper.ragged_gated_delta_rule_wrapper(
-            mixed_qkv=out_mixed_qkv,
-            b=b,
-            a=a,
-            recurrent_state=recurrent_state,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            query_start_loc=query_start_loc,
-            state_indices=state_indices,
-            distribution=distribution,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            config=wrapper_config,
-            chunk_size=chunk_size,
-            has_initial_state=has_initial_state,
-        )
-
-    return (new_conv_state, new_recurrent_state), output
 
 
 def run_jax_gdn_attention(
@@ -248,9 +54,7 @@ def run_jax_gdn_attention(
     d_v: int,
     kernel_size: int,
     mesh: jax.sharding.Mesh,
-    dp_enabled: bool,
     num_spec_tokens: int = 0,
-    config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -284,7 +88,6 @@ def run_jax_gdn_attention(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
-        config: Configuration for implementation selection.
 
     Returns:
         A tuple containing:
@@ -324,15 +127,13 @@ def run_jax_gdn_attention(
     tp_size = get_mesh_shape_product(mesh, "model")
 
     p_run_jax_gdn_attention_local = functools.partial(
-        run_jax_gdn_attention_local,
+        gdn_v3_wrapper.fused_conv1d_gdn,
         n_kq=n_kq // tp_size,
         n_v=n_v // tp_size,
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
-        dp_enabled=dp_enabled,
         num_spec_tokens=num_spec_tokens,
-        config=config,
     )
 
     mapped_fn = jax.shard_map(
@@ -655,7 +456,6 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
-    config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """GDN PCP prefill using an op-local PCP mesh.
 
@@ -816,7 +616,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
                              f"got {recurrent_state_.shape[1]}.")
 
         (new_conv_shard,
-         new_rec_shard), seq_output_shard = (run_jax_gdn_attention_local(
+         new_rec_shard), seq_output_shard = gdn_v3_wrapper.fused_conv1d_gdn(
              qkv_shard,
              b_shard,
              a_shard,
@@ -835,9 +635,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
              d_k=d_k,
              d_v=d_v,
              kernel_size=kernel_size,
-             dp_enabled=False,
-             config=config,
-         ))
+         )
 
         seq_output_shard = seq_output_shard.reshape(seq_output_shard.shape[0],
                                                     local_n_v, d_v)
@@ -889,39 +687,6 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 # ---------------------------------------------------------------
 
 
-@functools.lru_cache(maxsize=None)
-def _pool_state_ops(ssm_ntok: int, n_v: int, d_k: int, d_v: int, split: int):
-    """StateOps reading/writing the ssm f32 token-range of the pool.
-    Cached per geometry so the delta-rule jit sees one stable static
-    instance across steps."""
-
-    def _read(pool, idx):
-        # out_lanes=d_v: the kernel splits pool lanes in place, so this
-        # reshape is lane-preserving (free) instead of a lane-crossing
-        # relayout of the whole gathered state.
-        gathered = pool_adapters.gather_region(pool,
-                                               idx,
-                                               tok0=0,
-                                               ntok=ssm_ntok,
-                                               out_dtype=jnp.float32,
-                                               out_lanes=d_v,
-                                               split=split)
-        return gathered.reshape(idx.shape[0], n_v, d_k, d_v)
-
-    def _write(pool, states, idx):
-        rows = (n_v * d_k * d_v) // d_v
-        return pool_adapters.scatter_region(pool,
-                                            states.astype(jnp.float32).reshape(
-                                                idx.shape[0], rows, d_v),
-                                            idx,
-                                            tok0=0,
-                                            ntok=ssm_ntok,
-                                            split=split)
-
-    return ragged_gated_delta_rule_wrapper.jax_impl.StateOps(read=_read,
-                                                             write=_write)
-
-
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -941,7 +706,6 @@ def run_jax_gdn_attention_pooled_local(
     d_v: int,
     kernel_size: int,
     pool_block_tokens: int,
-    config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -954,9 +718,6 @@ def run_jax_gdn_attention_pooled_local(
     in place through a `v3_state_source` copy-plan — the model kernels'
     math is unmodified either way.
     """
-    max_reqs = seq_lens.shape[0]
-    query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
-    has_initial_state = (seq_lens - query_lens) > 0
 
     # Backends with a fixed kernel block (batched RPA) get the pool born
     # at kernel granularity; a manager block is `split` consecutive kernel
@@ -969,7 +730,6 @@ def run_jax_gdn_attention_pooled_local(
     split = pool_block_tokens // recurrent_state.shape[1]
 
     conv_dim = conv_weight.shape[0]
-    lanes = recurrent_state.shape[-1]
     per_tok_elems = math.prod(recurrent_state.shape[2:])
     tok_bytes = per_tok_elems * jnp.dtype(recurrent_state.dtype).itemsize
     ssm_bytes = n_v * d_k * d_v * 4
@@ -979,7 +739,6 @@ def run_jax_gdn_attention_pooled_local(
     assert ssm_ntok <= pool_block_tokens, (
         "ssm state does not fit the attention page", ssm_ntok,
         pool_block_tokens)
-    conv_data_rows = conv_bytes // (2 * lanes)
 
     # The conv slot occupies whole tokens right after the ssm region,
     # padded up so the slot's token range satisfies the tok0 % ntok == 0
@@ -990,117 +749,48 @@ def run_jax_gdn_attention_pooled_local(
     assert ssm_ntok + conv_ntok <= pool_block_tokens, (
         "mamba slot exceeds the attention page", ssm_ntok, conv_ntok,
         pool_block_tokens)
-    conv_pool, conv_tok0 = recurrent_state, ssm_ntok
-    conv_slot_rows = (conv_ntok * tok_bytes) // (2 * lanes)
 
-    if (config.ragged_gated_delta_rule_impl ==
-            RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD):
-        # Fused conv+GDN kernel: both state regions stream directly
-        # between the pool and the kernel's double-buffered pipeline (one
-        # contiguous DMA per slot per region) — no external gather/scatter
-        # round trip. The kernel masks fresh slots via has_initial_state,
-        # so a newly-allocated block's bytes are never read, and padded
-        # slots move no bytes in either direction.
-        plan = pool_adapters.v3_state_source(
-            recurrent_state,
-            split=split,
-            ssm_ntok=ssm_ntok,
-            conv_tok0=conv_tok0,
-            conv_ntok=conv_ntok,
-            conv_dim=conv_dim,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-        )
-        recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
-            mixed_qkv,
-            b,
-            a,
-            None,
-            None,
-            conv_weight,
-            conv_bias,
-            A_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-            seq_lens,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-            state_source=recurrent_state,
-            state_plan=plan,
-        )
-        return recurrent_state, output
-
-    def _write_conv(pool, new_conv):
-        rows = new_conv.reshape(-1, conv_data_rows, lanes)
-        pad = conv_slot_rows - conv_data_rows
-        if pad:
-            rows = jnp.pad(rows, ((0, 0), (0, pad), (0, 0)))
-        return pool_adapters.scatter_region(pool,
-                                            rows.astype(jnp.bfloat16),
-                                            state_indices,
-                                            tok0=conv_tok0,
-                                            ntok=conv_ntok,
-                                            split=split)
-
-    conv_gathered = pool_adapters.gather_region(conv_pool,
-                                                state_indices,
-                                                tok0=conv_tok0,
-                                                ntok=conv_ntok,
-                                                split=split,
-                                                out_dtype=jnp.bfloat16)
-    conv_state = conv_gathered[:, :conv_data_rows, :].reshape(
-        -1, kernel_size - 1, conv_dim)
-    identity_indices = jnp.arange(state_indices.shape[0], dtype=jnp.int32)
-
-    out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
-        mixed_qkv,
-        conv_state,
-        conv_weight,
-        conv_bias,
-        query_start_loc,
-        identity_indices,
-        distribution,
-        has_initial_state,
+    # Fused conv+GDN kernel: both state regions stream directly
+    # between the pool and the kernel's double-buffered pipeline (one
+    # contiguous DMA per slot per region) — no external gather/scatter
+    # round trip. The kernel masks fresh slots via has_initial_state,
+    # so a newly-allocated block's bytes are never read, and padded
+    # slots move no bytes in either direction.
+    plan = pool_adapters.v3_state_source(
+        recurrent_state,
+        split=split,
+        ssm_ntok=ssm_ntok,
+        conv_tok0=ssm_ntok,
+        conv_ntok=conv_ntok,
+        conv_dim=conv_dim,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
         kernel_size=kernel_size,
     )
-
-    recurrent_state = _write_conv(conv_pool, new_conv_state)
-
-    if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.REF:
-        raise NotImplementedError(
-            "the ref impl reads recurrent state natively and is not wired "
-            "to the unified block pool; use chunked_jax_pd or "
-            "chunked_kernel_v3_pd.")
-
-    wrapper_config = config.ragged_gated_delta_rule_impl.to_config()
-    new_recurrent_state, output = ragged_gated_delta_rule_wrapper.ragged_gated_delta_rule_wrapper(
-        mixed_qkv=out_mixed_qkv,
-        b=b,
-        a=a,
-        recurrent_state=recurrent_state,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        query_start_loc=query_start_loc,
-        state_indices=state_indices,
-        distribution=distribution,
+    recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
+        mixed_qkv,
+        b,
+        a,
+        None,
+        None,
+        conv_weight,
+        conv_bias,
+        A_log,
+        dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        seq_lens,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
         d_v=d_v,
-        config=wrapper_config,
-        chunk_size=64,
-        has_initial_state=has_initial_state,
-        state_ops=_pool_state_ops(ssm_ntok, n_v, d_k, d_v, split),
+        kernel_size=kernel_size,
+        state_source=recurrent_state,
+        state_plan=plan,
     )
-
-    return new_recurrent_state, output
+    return recurrent_state, output
 
 
 def run_jax_gdn_attention_pooled(
@@ -1123,7 +813,6 @@ def run_jax_gdn_attention_pooled(
     kernel_size: int,
     pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
-    config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -1156,7 +845,6 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
-        config: Configuration for implementation selection.
 
     Returns:
         A tuple containing:
@@ -1194,7 +882,6 @@ def run_jax_gdn_attention_pooled(
         d_v=d_v,
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
-        config=config,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
