@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
-    TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
     TPU_KV_RESHARD_DST_PAGE_TOKENS: int = 0
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
@@ -167,10 +166,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
-    # HBM reserve kept out of vLLM KV-cache sizing for TPU runtime programs and
-    # post-profiling activation allocations.
-    "TPU_KV_CACHE_HEADROOM_MIB":
-    lambda: int(os.getenv("TPU_KV_CACHE_HEADROOM_MIB") or "5120"),
     # Experimental TPU unified block-pool cache layout. Disabled by default to
     # preserve the compact-mamba allocation/indexing path.
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL":

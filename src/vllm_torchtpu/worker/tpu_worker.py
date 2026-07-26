@@ -359,7 +359,6 @@ class TPUWorker(WorkerBase):
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
-        kv_cache_headroom_gb = round(budget.headroom / utils.GBYTES, 2)
         kv_connector_hbm_reserve_gb = round(
             kv_connector_hbm_reserve / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
@@ -367,7 +366,6 @@ class TPUWorker(WorkerBase):
                     f"{total_hbm_limit_gb=}GiB | "
                     f"{total_hbm_limit_cap_gb=}GiB | "
                     f"{total_hbm_used_gb=}GiB | "
-                    f"{kv_cache_headroom_gb=}GiB | "
                     f"{kv_connector_hbm_reserve_gb=}GiB | "
                     f"{total_hbm_avail_gb=}GiB")
 
@@ -376,10 +374,7 @@ class TPUWorker(WorkerBase):
                              f"{total_hbm_limit_cap_gb=}GiB by "
                              f"{-total_hbm_avail_gb}GiB. Please consider "
                              f"increasing --gpu-memory-utilization from "
-                             f"{gpu_memory_utilization} to a larger value, "
-                             "or decreasing TPU_KV_CACHE_HEADROOM_MIB if "
-                             "this run has a known smaller TPU runtime "
-                             "headroom requirement.")
+                             f"{gpu_memory_utilization} to a larger value.")
         return available
 
     def execute_model(self, scheduler_output):

@@ -145,14 +145,11 @@ class HbmBudget(NamedTuple):
       total_limit: HBM the device(s) expose.
       total_used:  HBM already resident (weights, compiled graphs, ...).
       cap:         total_limit * gpu_memory_utilization.
-      headroom:    TPU_KV_CACHE_HEADROOM_MIB reserved for non-KV memory
-                   (activations, compilation scratch).
       available:   cap - total_used - headroom; the budget for the KV cache.
     """
     total_limit: int
     total_used: int
     cap: int
-    headroom: int
     available: int
 
 
@@ -165,13 +162,11 @@ def compute_hbm_budget(devices: Any,
         total_used += limit_memory - free_memory
         total_limit += limit_memory
     cap = int(total_limit * gpu_memory_utilization)
-    headroom = max(envs.TPU_KV_CACHE_HEADROOM_MIB, 0) * 1024 * 1024
-    available = cap - total_used - headroom
+    available = cap - total_used
 
     return HbmBudget(total_limit=total_limit,
                      total_used=total_used,
                      cap=cap,
-                     headroom=headroom,
                      available=available)
 
 
