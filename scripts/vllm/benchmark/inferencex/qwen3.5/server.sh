@@ -38,14 +38,17 @@ case "$SHARDING" in
   DP8_EP)
     # Data-parallel attention across all 8 chips + expert-parallel MoE.
     DP_SIZE=8
+    # New prefills are admitted every this many steps. Larger value trades
+    # TTFT for throughput. 256 was picked for maximizing 8k1k concurrency 256
+    # throughput. May need more tuning to work well across more concurrencies.
+    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-256}"
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
       --enable-expert-parallel
+      --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
     export DP_SCHED_ENABLED=1
-    export DP_SCHED_BUFFER_PREFILL=1
-    export DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS=10000
     ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 chips + expert-parallel MoE.

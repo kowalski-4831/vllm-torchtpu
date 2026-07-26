@@ -37,8 +37,6 @@ _tpu_backend = TpuBackend()
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
-    "DP_SCHED_BUFFER_PREFILL",
-    "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS",
     "DP_SCHED_ENABLED",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
