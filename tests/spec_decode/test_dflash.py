@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
-os.environ["TORCHDYNAMO_DISABLE"] = "1"
-
 from types import SimpleNamespace
 from unittest import mock
 

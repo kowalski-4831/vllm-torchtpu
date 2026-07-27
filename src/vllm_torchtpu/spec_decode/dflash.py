@@ -210,7 +210,7 @@ class DFlashProposer:
             per_layer_attn_metadata, _ = runner._build_attention_metadata(
                 num_tokens=num_tokens_padded,
                 num_reqs=padded_num_reqs,
-                max_query_len=block_size,
+                max_query_len=num_tokens_padded // padded_num_reqs,
                 num_tokens_padded=num_tokens_padded,
                 num_reqs_padded=padded_num_reqs,
                 slot_mappings=slot_mappings_dict,
@@ -540,14 +540,15 @@ class DFlashProposer:
         if actual_num_reqs == 0:
             actual_num_reqs = 1
 
-        query_lens = [block_size] * actual_num_reqs
+        num_tokens_per_req = num_tokens // actual_num_reqs
+        query_lens = [num_tokens_per_req] * actual_num_reqs
         query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
                                                     dtype=torch.int32),
                                        dim=0,
                                        dtype=torch.int32).to(runner.device)
 
-        seq_lens = torch.ones(
-            (actual_num_reqs, ), dtype=torch.int32).to(runner.device) * 10
+        seq_lens = torch.ones((actual_num_reqs, ), dtype=torch.int32).to(
+            runner.device) * num_tokens_per_req
 
         request_distribution = torch.tensor([0, 0, actual_num_reqs],
                                             dtype=torch.int32).to(
@@ -586,7 +587,7 @@ class DFlashProposer:
                 per_layer_attn_metadata, _ = runner._build_attention_metadata(
                     num_tokens=num_tokens,
                     num_reqs=actual_num_reqs,
-                    max_query_len=block_size,
+                    max_query_len=num_tokens_per_req,
                     num_tokens_padded=num_tokens,
                     num_reqs_padded=actual_num_reqs,
                     slot_mappings=slot_mappings,
@@ -797,7 +798,7 @@ class DFlashProposer:
                                dtype=torch.int32,
                                device=next_tokens_device_padded.device)
         scatter_indices = torch.arange(0,
-                                       padded_len,
+                                       padded_num_reqs * block_size,
                                        block_size,
                                        dtype=torch.int32,
                                        device=next_tokens_device_padded.device)
@@ -810,7 +811,10 @@ class DFlashProposer:
             block_size,
             dtype=torch.int32,
             device=next_tokens_device_padded.device).unsqueeze(0)
-        positions = (base_pos + offsets).flatten()
+        positions_unpadded = (base_pos + offsets).flatten()
+        positions = F.pad(positions_unpadded,
+                          (0, padded_len - positions_unpadded.shape[0]),
+                          value=0)
         seq_lens = base_pos.squeeze(1) + block_size
 
         return input_ids, positions, seq_lens
@@ -868,7 +872,7 @@ class DFlashProposer:
                                dtype=torch.int32,
                                device=device_seed_padded.device)
         scatter_indices = torch.arange(0,
-                                       padded_len,
+                                       padded_num_reqs * block_size,
                                        block_size,
                                        dtype=torch.int32,
                                        device=device_seed_padded.device)
@@ -880,7 +884,10 @@ class DFlashProposer:
                                block_size,
                                dtype=torch.int32,
                                device=device_seed_padded.device).unsqueeze(0)
-        positions = (base_pos + offsets).flatten()
+        positions_unpadded = (base_pos + offsets).flatten()
+        positions = F.pad(positions_unpadded,
+                          (0, padded_len - positions_unpadded.shape[0]),
+                          value=0)
         seq_lens = base_pos.squeeze(1) + block_size
 
         return input_ids, positions, seq_lens
