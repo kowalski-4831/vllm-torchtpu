@@ -38,21 +38,22 @@ from typing import Any, Optional
 import torch
 import zmq
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.base import \
-    KVConnectorMetadata
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs
+# The scheduler->worker metadata contract lives in connector_metadata (shared
+# with the Raiden connector); re-imported here so existing zmq-stack call
+# sites and pickles keep working.
+from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+    LoadMeta, ReqId, SendMeta, TPUConnectorMetadata)
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
                                                                PoolSpec)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import \
     TpuKVConnectorStats
 from vllm_torchtpu.logger import init_logger
-
-ReqId = str
 
 logger = init_logger(__name__)
 
@@ -79,43 +80,6 @@ _IPC_LOAD_NOTIFY = b"LOAD_N"  # coord -> worker: (uuid, slot_idx, num_blocks, lo
 _IPC_LOAD_SKIP = b"LOAD_S"  # coord -> worker: (uuid,) -- drain w/ no scatter (cache hit)
 _IPC_COPY_DONE = b"COPY_D"  # worker -> coord: (uuid, rank)
 _IPC_DROP = b"DROP"  # coord -> worker: (uuid,)  -- failure/timeout
-
-
-@dataclass
-class SendMeta:
-    uuid: int
-    local_block_ids: list[int]
-    expiration_time: float
-    # Exact transfer extent for controller-planned PCP striping. Legacy send
-    # paths leave this unset.
-    num_tokens: int | None = None
-    # Uniform-mamba-layout source state slots, one per mamba kv-cache group
-    # ordinal (the block holding the final recurrent state); None for FA-only
-    # Stage-3 models and all legacy paths.
-    mamba_state_block_ids: list[int] | None = None
-
-
-@dataclass
-class LoadMeta:
-    uuid: int
-    local_block_ids: list[int]
-    remote_block_ids: list[int]
-    remote_host: str | list[str]
-    remote_port: int | list[int]
-    remote_side_channel_port: Optional[int] = None
-    # Whether the worker reports this load's completion to the scheduler as
-    # finished_recving. False when this connector doesn't own the request's
-    # load state (the request is not WAITING_FOR_REMOTE_KVS here, e.g. a full
-    # local cache hit or delegation to another MultiConnector child), where a
-    # report would trip the scheduler's assert or prematurely resume the
-    # request.
-    report_completion: bool = True
-
-
-@dataclass
-class TPUConnectorMetadata(KVConnectorMetadata):
-    reqs_to_send: dict[ReqId, SendMeta] = field(default_factory=dict)
-    reqs_to_load: dict[ReqId, LoadMeta] = field(default_factory=dict)
 
 
 # ---- Rank-0 bookkeeping (TP>1 coordinator-mode only) -------------------

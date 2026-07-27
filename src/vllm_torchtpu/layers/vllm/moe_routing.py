@@ -15,6 +15,44 @@
 
 import torch
 
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Warn once at import time rather than inside maybe_force_random_routing():
+# the notice then reaches every worker's startup log without adding a Python
+# call to the compiled forward pass, where it could trigger a graph break in
+# the exact code path we are trying to profile.
+if envs.FORCE_MOE_RANDOM_ROUTING:
+    logger.warning(
+        "FORCE_MOE_RANDOM_ROUTING is enabled: MoE expert routing is RANDOM. "
+        "This is a test-only feature and model output is meaningless. Never "
+        "enable it for serving or accuracy evaluation.")
+
+
+def maybe_force_random_routing(router_logits: torch.Tensor) -> torch.Tensor:
+    """Optionally replace router logits with uniform noise, for profiling.
+
+    Motivation: the TPU profiler (xprof) can only trace a single device, but
+    under expert parallelism each device owns a different slice of the experts.
+    Real routing is data-dependent and typically skewed, so which experts --
+    and therefore which devices -- do work depends on the input. A one-device
+    trace is then not representative of the full mesh.
+
+    With ``FORCE_MOE_RANDOM_ROUTING`` set, we route on uniform noise instead of
+    the model's gate. Top-k over i.i.d. noise selects a uniformly random set of
+    experts per token, so expert load is balanced across all EP shards in
+    expectation and any single device's profile represents the whole mesh.
+
+    This deliberately discards the trained gate, so model output is garbage.
+    Use it only for profiling and performance benchmarking -- never for serving
+    or accuracy evaluation. Disabled by default; a no-op when the flag is unset.
+    """
+    if not envs.FORCE_MOE_RANDOM_ROUTING:
+        return router_logits
+    return torch.rand_like(router_logits)
+
 
 def _apply_scoring_fn(scoring_fn: str,
                       router_logits: torch.Tensor) -> torch.Tensor:
@@ -37,6 +75,8 @@ def select_experts(
     layer=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute local routed ids/weights for the non-EP path."""
+    # Profiling-only override; a no-op unless FORCE_MOE_RANDOM_ROUTING is set.
+    router_logits = maybe_force_random_routing(router_logits)
     if layer is not None and layer.use_grouped_topk:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk

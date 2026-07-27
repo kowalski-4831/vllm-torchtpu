@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
-    TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
     TPU_KV_RESHARD_DST_PAGE_TOKENS: int = 0
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
@@ -35,6 +34,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
     USE_MOE_SPARSE_CORE: bool = True
+    FORCE_MOE_RANDOM_ROUTING: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -167,10 +167,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
-    # HBM reserve kept out of vLLM KV-cache sizing for TPU runtime programs and
-    # post-profiling activation allocations.
-    "TPU_KV_CACHE_HEADROOM_MIB":
-    lambda: int(os.getenv("TPU_KV_CACHE_HEADROOM_MIB") or "5120"),
     # Experimental TPU unified block-pool cache layout. Disabled by default to
     # preserve the compact-mamba allocation/indexing path.
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL":
@@ -220,6 +216,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
+    # Route MoE tokens to uniformly random experts instead of using the gate.
+    # Balances expert load so a single-device profile represents the whole EP
+    # mesh (see moe_routing.maybe_force_random_routing). Produces meaningless
+    # output -- for profiling only, never serving. Disabled by default.
+    "FORCE_MOE_RANDOM_ROUTING":
+    env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
     # Use Onehot+Matmul for permute and unpermute before and after moe
     # when the batch size <= this threshold. When set to 0, this feature
     # is effectively disabled.
