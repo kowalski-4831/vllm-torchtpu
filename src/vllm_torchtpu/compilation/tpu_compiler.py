@@ -161,13 +161,15 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             "effective_data_parallel_size":
             utils.get_dp_size(vllm_config.parallel_config),
         },
-        # Upstream intentionally omits several runtime/derived cache fields,
-        # but TPU AOT graphs embed the KV tensor extent and request metadata
-        # shapes. Include both the sizing inputs and the resolved block count.
+        # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
+        # resolved block count, which every rank shares via kv_cache_config.
+        # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM
+        # measurement that diverges by a few blocks across ranks (the executor
+        # aligns the value actually used to min()); hashing it would split
+        # ranks into separate cache dirs and force asymmetric recompiles.
         "kv_cache": {
             "gpu_memory_utilization": cache_config.gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
-            "num_gpu_blocks_override": cache_config.num_gpu_blocks_override,
         },
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,
