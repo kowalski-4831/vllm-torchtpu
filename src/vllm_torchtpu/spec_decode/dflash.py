@@ -384,7 +384,7 @@ class DFlashProposer:
         # 3. Extract K tokens from logits
         if return_device:
             if len(draft_logits_per_chunk) == 1:
-                return draft_logits_per_chunk[0]
+                return draft_logits_per_chunk[0][:chunks[0].num_reqs]
             sliced_chunks = [
                 logits if logits.shape[0] == chunk.num_reqs else
                 logits[:chunk.num_reqs]
@@ -393,26 +393,11 @@ class DFlashProposer:
             return torch.cat(sliced_chunks, dim=0)
 
         # Single synchronization and transfer to the host (return_device=False)
-        if len(draft_logits_per_chunk) == 1:
-            chunk = chunks[0]
-            all_logits_dev = draft_logits_per_chunk[0][:chunk.num_reqs]
-        else:
-            sliced_chunks = [
-                logits if logits.shape[0] == chunk.num_reqs else
-                logits[:chunk.num_reqs]
-                for logits, chunk in zip(draft_logits_per_chunk, chunks)
-            ]
-            all_logits_dev = torch.cat(sliced_chunks, dim=0)
-
-        # Single synchronization and transfer to the host
-        all_logits_host = all_logits_dev.cpu().tolist()
-
+        # We transfer the ENTIRE padded tensor to CPU to avoid dynamic-shape recompilations
         draft_tokens_list = []
-        idx = 0
-        for chunk in chunks:
-            for _ in range(chunk.num_reqs):
-                draft_tokens_list.append(all_logits_host[idx])
-                idx += 1
+        for logits, chunk in zip(draft_logits_per_chunk, chunks):
+            logits_host = logits.cpu().tolist()
+            draft_tokens_list.extend(logits_host[:chunk.num_reqs])
 
         return draft_tokens_list
 
