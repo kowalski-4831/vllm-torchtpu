@@ -28,11 +28,6 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import (
 from vllm_torchtpu.kernels.deepseek_v4.compressor import compressor_forward
 # isort: on
 
-requires_tpu = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu",
-    reason="requires a TPU backend",
-)
-
 # KV row-slots per shared-cache page (the MLA storage block size).
 PAGE_SIZE = 64
 
@@ -400,9 +395,15 @@ def test_compressor_forward_eval_shape():
     assert out_cache.dtype == jnp.uint8
 
 
-@requires_tpu
 def test_compressor_forward_runs_on_tpu():
     """Executes on TPU and confirms the backend really is TPU."""
+    try:
+        backend = jax.default_backend()
+    except Exception as exc:
+        pytest.skip(f"JAX TPU backend failed to initialize: {exc}")
+    if backend != "tpu":
+        pytest.skip(f"Expected JAX TPU backend, got {backend}.")
+
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
     ref_deq = _naive_reference(kw)
 
