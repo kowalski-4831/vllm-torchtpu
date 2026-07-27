@@ -340,6 +340,21 @@ class TPUWorker(WorkerBase):
         jax_parallel_state.connect(self.prev_worker_ip, self.rank - 1)
 
     def determine_available_memory(self) -> int:
+        # To determine a reasonable kv_cache_memory_bytes for a specific vllm
+        # setup, users can run vllm without this flag, and collect the
+        # total_hbm_avail_gb value logged later in this function.
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            msg = ("kv_cache_memory_bytes in cache_config is specified."
+                   "This does not respect the gpu_memory_utilization config. "
+                   "Only use kv_cache_memory_bytes config "
+                   "when you want manual control of KV cache memory size. "
+                   "If OOM'ed, check the difference of initial free "
+                   "memory between the current run and the previous run "
+                   "where kv_cache_memory_bytes is suggested and update it "
+                   "correspondingly.")
+            logger.info(msg)
+            return kv_cache_memory_bytes
+
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
