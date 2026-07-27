@@ -25,22 +25,21 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     pcp_local_token_counts as _pcp_local_token_counts
+from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.gdn_attention import (
-    GdnAttentionConfig, _derive_pcp_ragged_exchange_descriptors,
+    _derive_pcp_ragged_exchange_descriptors,
     _derive_pcp_rank_major_reorder_indices,
     _exchange_pcp_token_shards_for_head_shards,
     _select_replicated_shard_for_pcp_rank,
-    _validate_pcp_ragged_exchange_layout_support, run_jax_gdn_attention_local,
+    _validate_pcp_ragged_exchange_layout_support,
     run_jax_gdn_attention_pcp_tp_prefill)
-from vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper import \
-    RaggedGatedDeltaRuleImpl
 from vllm_torchtpu.layers.common.utils import (
     inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
 
 _GDN_PCP_NUMERICAL_CASES = (
-    pytest.param(2, (10, 10), 4, None, id="pcp2-multi-request-padding"),
-    pytest.param(4, (17, 15), 4, None, id="pcp4-uneven-rank-split"),
-    pytest.param(4, (10, 10), 4, (7, 22), id="pcp4-chunk-continuation"),
+    pytest.param(2, (20, 20, 24), 4, None, id="pcp2-multi-request-padding"),
+    pytest.param(4, (34, 30), 4, None, id="pcp4-uneven-rank-split"),
+    pytest.param(4, (20, 20, 24), 4, (7, 22, 3), id="pcp4-chunk-continuation"),
 )
 
 _GDN_PCP_DESCRIPTOR_CASES = _GDN_PCP_NUMERICAL_CASES + (pytest.param(
@@ -303,8 +302,8 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         token_start_offsets, dtype=np.int32))
     n_kq = 4
     n_v = 4
-    d_k = 64
-    d_v = 64
+    d_k = 128
+    d_v = 128
     kernel_size = 4
     num_tokens = int(lengths.sum())
     num_blocks = len(lengths) + 1
@@ -375,9 +374,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     A_log = jnp.array(np.array(A_log0))
     dt_bias = jnp.array(np.array(dt_bias0))
 
-    config = GdnAttentionConfig(
-        ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF)
-    (ref_conv, ref_rec), ref_output = run_jax_gdn_attention_local(
+    (ref_conv, ref_rec), ref_output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
         a,
@@ -396,8 +393,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
-        dp_enabled=False,
-        config=config)
+    )
 
     mesh = Mesh(
         np.array(jax.devices()[:pcp_size]).reshape((pcp_size, )), ('pcp', ))
@@ -440,7 +436,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         pcp_size=pcp_size,
         interleave_size=interleave_size,
         mesh=mesh,
-        config=config)
+    )
 
     pcp_output_np = np.array(pcp_output).reshape(padded_num_tokens, -1)
     pcp_output_seq = np.zeros((padded_num_tokens, pcp_output_np.shape[1]),

@@ -130,29 +130,6 @@ def lower_fa_spans(
     )
 
 
-def whole_slot_registration(*, tag: str, block_id: int,
-                            live_bytes: int) -> PoolSpanRegistration:
-    """Declare one manifest-sized state slot copied to destination slot 0."""
-    if not tag:
-        raise ValueError("state pool tag must not be empty")
-    if block_id < 0:
-        raise ValueError("state block id must be non-negative")
-    if live_bytes <= 0:
-        raise ValueError("state live bytes must be positive")
-    return PoolSpanRegistration(
-        tag=tag,
-        block_ids=(int(block_id), ),
-        spans=(PoolByteSpan(
-            src_block_ordinal=0,
-            src_offset_bytes=0,
-            dst_block_index=0,
-            dst_offset_bytes=0,
-            size_bytes=int(live_bytes),
-        ), ),
-        declared_bytes=int(live_bytes),
-    )
-
-
 def _region_value(region: object, name: str) -> int | str:
     if isinstance(region, dict):
         value = region[name]

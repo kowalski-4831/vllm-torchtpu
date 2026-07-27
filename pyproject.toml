@@ -48,7 +48,7 @@ dependencies = [
     # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
     # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
     # bumping.
-    "libtpu==0.0.42.1",
+    "libtpu==0.0.43",
     "ray[default]",
     "ray[data]",
 ]
@@ -85,6 +85,9 @@ benchmarking = [
 # the dotted class path when this platform should activate, else None. See
 # https://docs.vllm.ai/en/latest/design/plugin_system/
 torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
+
+[project.entry-points."vllm.general_plugins"]
+torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 
 [tool.pytest.ini_options]
 markers = [

@@ -1152,9 +1152,9 @@ class TPUModelRunner(GPUModelRunner):
 
         Matches `TPUWorker.determine_available_memory()`: the
         `utils.compute_hbm_budget` result (which reserves the
-        `gpu_memory_utilization` cap and `TPU_KV_CACHE_HEADROOM_MIB`
-        headroom) minus `utils.estimate_kv_connector_hbm_reserve` (HBM a
-        connector allocates after profile_run, such as the offload H2D
+        `gpu_memory_utilization` cap minus
+        `utils.estimate_kv_connector_hbm_reserve` (HBM a connector allocates
+        after profile_run, such as the offload H2D
         staging pool). Sizing overrides against this budget keeps them from
         filling the connector reserve back up with KV blocks and defeating
         the worker-side subtraction.

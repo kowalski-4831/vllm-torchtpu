@@ -341,9 +341,12 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         activation_str = layer._tpu_activation_str
         custom_routing_fn = layer.custom_routing_function
         if custom_routing_fn is not None:
+            # custom_routing_fn bypasses select_experts, so apply the
+            # random-routing profiling override here too (a no-op by default).
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
-                gating_output=router_logits,
+                gating_output=moe_routing.maybe_force_random_routing(
+                    router_logits),
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
             )

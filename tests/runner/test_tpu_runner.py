@@ -358,7 +358,6 @@ class TestTPURunner:
         self.runner._add_shared_kv_cache_aliases = (
             TPUModelRunner._add_shared_kv_cache_aliases.__get__(self.runner))
 
-    @patch('vllm_torchtpu.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
@@ -398,7 +397,6 @@ class TestTPURunner:
         assert self.runner._mamba_num_blocks == 17
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
 
-    @patch('vllm_torchtpu.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
@@ -421,7 +419,6 @@ class TestTPURunner:
         with pytest.raises(ValueError, match="does not fit"):
             self.runner._update_mamba_page_size_padded(layers)
 
-    @patch('vllm_torchtpu.envs.TPU_KV_CACHE_HEADROOM_MIB', 0)
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)

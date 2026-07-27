@@ -49,13 +49,16 @@ if TYPE_CHECKING:
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
+from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+    LoadMeta, ReqId, SendMeta, TPUConnectorMetadata)
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm_hma import (
     HostKVShmPoolHMA, PoolSpecHMA)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
+# zmq/shm transport pieces: used only by the zmq-stack workers below
+# (TPUConnectorWorker, TPUConnectorHMAWorker), not by the Raiden connector.
 from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
-    LoadMeta, ReqId, SendMeta, TPUConnectorMetadata, ZmqShmKvConnectorBase,
-    _CoordRecvEntry, _CoordSendEntry)
+    ZmqShmKvConnectorBase, _CoordRecvEntry, _CoordSendEntry)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 

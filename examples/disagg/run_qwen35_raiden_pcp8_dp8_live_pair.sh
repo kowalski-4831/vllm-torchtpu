@@ -417,33 +417,21 @@ configure_role_environment() {
   export SKIP_JAX_PRECOMPILE=1
   export VLLM_XLA_CHECK_RECOMPILATION=0
   export USE_MOE_SPARSE_CORE=0
-  export TPUMISC_HMA_CHECKSUM_TRACE=0
 
-  # This is the single current layout gate. The removed alias-fallback flag
-  # must not influence the test, even if it is set in the invoking shell.
+  # This is the single current layout gate.
   export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
-  unset TPU_VLLM_KV_CACHE_ALIAS_FALLBACK
   export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
   export TPU_RAIDEN_QWEN35_ADMISSION=1
   export TPU_KV_RESHARD_TRANSPORT=raiden
   export TPU_KV_RESHARD_DST_PAGE_TOKENS=4096
   export TPU_RAIDEN_TRANSFER_PARALLELISM=8
-  unset TPU_KV_RESHARD_TRANSFER_TAGS
 
-  export TPU_GDN_CONV_STATE_TILE_PAD=1
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
   export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
   export USE_BATCHED_RPA_KERNEL=1
   export RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd
   export LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536 --xla_tpu_enable_latency_hiding_scheduler=false"
 
-  export TPU_ENABLE_D2H_TRANSFER=1
-  export TPU_HMA_D2H_COPY_IMPL=device_put
-  export TPU_HMA_MIN_DONE_RECVING_BATCH=1
-  export TPU_HMA_MAX_DONE_RECVING_BATCH=1
-  export TPU_HMA_MAX_INFLIGHT_D2H_SENDS=1
-  export TPU_HMA_MAX_INFLIGHT_PULLS=8
-  export TPU_MAX_HOST_KV_BUFFER_SIZE=64
   export TPU_P2P_WAIT_PULL_TIMEOUT=600
   export TPU_KV_SHM_POOL_GB=8
   export TPU_KV_TRANSFER_PORT="${transfer_port}"
@@ -695,7 +683,6 @@ PY
     --compilation-config "${compilation_config}"
     --no-enable-prefix-caching
     --no-async-scheduling
-    --block-size 4096
     --tensor-parallel-size 1
   )
 

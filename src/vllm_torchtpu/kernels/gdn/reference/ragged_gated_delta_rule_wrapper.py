@@ -20,11 +20,11 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.gdn import triangle_solver
+from vllm_torchtpu.kernels.gdn.reference import \
+    ragged_gated_delta_rule_chunked as jax_impl
 from vllm_torchtpu.kernels.gdn.v2.gdn_decode_kernel import \
     ragged_gated_delta_rule_decode_only
 from vllm_torchtpu.kernels.gdn.v2.recurrent_scan_v2 import recurrent_scan
-from vllm_torchtpu.layers.common import \
-    ragged_gated_delta_rule_chunked as jax_impl
 
 
 @dataclasses.dataclass(frozen=True)
