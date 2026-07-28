@@ -263,7 +263,16 @@ class TPUModelRunner(GPUModelRunner):
         vllm_config: VllmConfig,
         device: torch.device,
         original_parallel_config: ParallelConfig | None = None,
+        *,
+        profiler_rank: int,
+        profiler_world_size: int,
     ):
+        # Slice-global rank/world used to label phased-profiler traces; the
+        # worker resolves them from the TPU rank binding. Required rather than
+        # defaulted, because the obvious default -- parallel_config -- is the
+        # wrong scope and fails silently. See `_init_phased_profiling`.
+        self._profiler_rank = profiler_rank
+        self._profiler_world_size = profiler_world_size
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
             # GPUModelRunner probes torch.cuda.mem_get_info during init. The
@@ -550,8 +559,13 @@ class TPUModelRunner(GPUModelRunner):
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
             profiler_config = self.vllm_config.profiler_config
-            global_rank = getattr(self.parallel_config, "rank", 0) or 0
-            world_size = getattr(self.parallel_config, "world_size", 1) or 1
+            # Deliberately not read from parallel_config: its rank is
+            # TPxPP-scoped, so every DP replica would call itself rank 0 and
+            # their traces would overwrite each other on merge. The worker
+            # resolves the slice-global rank from the TPU rank binding and
+            # passes it in.
+            global_rank = self._profiler_rank
+            world_size = self._profiler_world_size
             decode_kv_len_threshold = additional_config.get(
                 runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
                 runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
