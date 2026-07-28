@@ -131,6 +131,42 @@ def _patch_default_moe_runner_select_forward() -> None:
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
+def _patch_expert_map_host_lookup() -> None:
+    """Serve expert-map lookups from a host-side copy of the expert map.
+
+    ``ExpertMapManager.map_global_to_local`` reads the device-resident
+    expert map with ``.item()`` once per (expert, shard) tensor during MoE
+    weight loading. On TPU every ``.item()`` is a blocking sync that
+    flushes the deferred graph, so loading dispatches one tiny device
+    program per expert copy (~200k per worker on Qwen3.5-397B). Index a
+    cached host copy in Python instead; the cache follows reassignment
+    and in-place rebalance via the tensor's version counter.
+    """
+    from vllm.model_executor.layers.fused_moe import expert_map_manager as _em
+
+    cls = _em.ExpertMapManager
+    if getattr(cls, "_tpu_host_expert_map_patch", False):
+        return
+
+    def map_global_to_local(self, global_id: int) -> int:
+        expert_map = self._expert_map
+        if expert_map is None:
+            return global_id
+        if (self._tpu_expert_map_source is not expert_map
+                or self._tpu_expert_map_version != expert_map._version):
+            self._tpu_expert_map_source = expert_map
+            self._tpu_expert_map_version = expert_map._version
+            self._tpu_expert_map_host = expert_map.tolist()
+        return self._tpu_expert_map_host[global_id]
+
+    cls.map_global_to_local = map_global_to_local
+    cls._tpu_expert_map_source = None
+    cls._tpu_expert_map_version = None
+    cls._tpu_expert_map_host = None
+    cls._tpu_host_expert_map_patch = True
+    logger.info("Applied TPU patch: host-side expert-map lookup.")
+
+
 def _patch_vllm_disable_compile_ranges() -> None:
     """Force TPU to compile only fixed bucketed sizes, never dynamic ranges.
 

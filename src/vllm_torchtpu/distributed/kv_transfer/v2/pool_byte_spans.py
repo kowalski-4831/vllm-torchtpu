@@ -37,6 +37,10 @@ class PoolSpanRegistration:
     block_ids: tuple[int, ...]
     spans: tuple[PoolByteSpan, ...]
     declared_bytes: int
+    # 0: page-indexed destination spans (state classes). 1: request-global
+    # compact destination byte space (FA) — the controller splits at
+    # destination pages (T3.4).
+    dst_space_version: int = 0
 
 
 def owned_token_ranges(
@@ -73,15 +77,19 @@ def lower_fa_spans(
     parallelism: int,
     interleave_tokens: int,
     page_tokens: int,
-    dst_page_tokens: int,
     token_bytes: int,
     block_ids: Sequence[int],
 ) -> PoolSpanRegistration:
-    """Lower PCP ownership to source- and destination-page byte ranges."""
+    """Lower PCP ownership to source-page / global-destination byte ranges.
+
+    T3.4: spans are destination-page-agnostic — dst offsets address the
+    request-global compact live byte space (dst_space_version=1) and the
+    controller, which holds the destination manifest, splits them at
+    destination page boundaries at plan build. The producer only splits at
+    its OWN page boundaries (source geometry it authoritatively knows).
+    """
     if page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
-    if dst_page_tokens <= 0:
-        raise ValueError("dst_page_tokens must be positive")
     if token_bytes <= 0:
         raise ValueError("token_bytes must be positive")
 
@@ -99,20 +107,14 @@ def lower_fa_spans(
             block_ordinal, block_token_offset = divmod(local_cursor,
                                                        page_tokens)
             source_end = min(end, cursor + page_tokens - block_token_offset)
-            sub = cursor
-            while sub < source_end:
-                dst_page = sub // dst_page_tokens
-                span_end = min((dst_page + 1) * dst_page_tokens, source_end)
-                spans.append(
-                    PoolByteSpan(
-                        src_block_ordinal=block_ordinal,
-                        src_offset_bytes=(block_token_offset + sub - cursor) *
-                        token_bytes,
-                        dst_block_index=dst_page,
-                        dst_offset_bytes=(sub % dst_page_tokens) * token_bytes,
-                        size_bytes=(span_end - sub) * token_bytes,
-                    ))
-                sub = span_end
+            spans.append(
+                PoolByteSpan(
+                    src_block_ordinal=block_ordinal,
+                    src_offset_bytes=block_token_offset * token_bytes,
+                    dst_block_index=0,
+                    dst_offset_bytes=cursor * token_bytes,
+                    size_bytes=(source_end - cursor) * token_bytes,
+                ))
             local_cursor += source_end - cursor
             cursor = source_end
 
@@ -127,6 +129,7 @@ def lower_fa_spans(
         block_ids=tuple(int(block_id) for block_id in block_ids),
         spans=tuple(spans),
         declared_bytes=local_cursor * token_bytes,
+        dst_space_version=1,
     )
 
 

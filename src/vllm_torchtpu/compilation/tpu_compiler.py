@@ -37,13 +37,17 @@ _tpu_backend = TpuBackend()
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
-    "DP_SCHED_BUFFER_PREFILL",
-    "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS",
     "DP_SCHED_ENABLED",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "SKIP_JAX_PRECOMPILE",
     "TPU_NAME",
+    # Raiden KV-transfer orchestration/identity only; consumed at serving time
+    # by the KV connector and never affect the compiled graph.
+    "TPU_RAIDEN_CONTROLLER_ADDRESS",
+    "TPU_RAIDEN_ENGINE_ID",
+    "TPU_RAIDEN_JOB_NAME",
+    "TPU_RAIDEN_TRANSFER_PARALLELISM",
     "TPU_WORKER_ID",
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
@@ -157,13 +161,15 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             "effective_data_parallel_size":
             utils.get_dp_size(vllm_config.parallel_config),
         },
-        # Upstream intentionally omits several runtime/derived cache fields,
-        # but TPU AOT graphs embed the KV tensor extent and request metadata
-        # shapes. Include both the sizing inputs and the resolved block count.
+        # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
+        # resolved block count, which every rank shares via kv_cache_config.
+        # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM
+        # measurement that diverges by a few blocks across ranks (the executor
+        # aligns the value actually used to min()); hashing it would split
+        # ranks into separate cache dirs and force asymmetric recompiles.
         "kv_cache": {
             "gpu_memory_utilization": cache_config.gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
-            "num_gpu_blocks_override": cache_config.num_gpu_blocks_override,
         },
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,

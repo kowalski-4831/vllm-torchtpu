@@ -3114,8 +3114,23 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self.speculative_config and self.speculative_config.use_eagle():
             self.drafter.load_model(self.model)
+
         # Ensure attention custom ops exist before any compile/inference path,
+        self._initialize_pallas_kernels()
+
+    def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
+        self._initialize_quantization_kernels()
+
+    def _initialize_quantization_kernels(self):
+        from vllm_torchtpu.layers.vllm.linear_common import (
+            _get_quantized_matmul_fp4_op, _get_quantized_matmul_op)
+
+        with set_current_vllm_config(self.vllm_config):
+            # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
+            _get_quantized_matmul_op()
+            # Same for the NVFP4 W4A16 matmul op.
+            _get_quantized_matmul_fp4_op()
 
     def _initialize_attention_kernels(self) -> None:
         """Pre-build Pallas RPA attention kernels before torch.compile.

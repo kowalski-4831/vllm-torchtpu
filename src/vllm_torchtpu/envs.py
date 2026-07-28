@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
-    TPU_KV_RESHARD_DST_PAGE_TOKENS: int = 0
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
@@ -39,8 +38,6 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
-    DP_SCHED_BUFFER_PREFILL: bool = False
-    DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS: int = 10000
 
 
 def env_with_choices(
@@ -174,8 +171,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Destination (decode-side) page geometry in tokens, required on the
     # producer: the byte-span lowering splits declarations at destination
     # page boundaries at registration time. 0 means unset.
-    "TPU_KV_RESHARD_DST_PAGE_TOKENS":
-    lambda: int(os.getenv("TPU_KV_RESHARD_DST_PAGE_TOKENS") or "0"),
     # Raiden admission gates: construct a Raiden KVCacheManager and
     # register the pool manifest derived from the live typed KV caches.
     # This does not switch the V2 strided transfer transport.
@@ -251,13 +246,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
-    # TpuDpScheduler: buffer new prefills and flush them in batches.
-    "DP_SCHED_BUFFER_PREFILL":
-    lambda: bool(int(os.getenv("DP_SCHED_BUFFER_PREFILL") or "0")),
-    # TpuDpScheduler: flush buffered prefills once the oldest pending request
-    # has waited this long (bounds TTFT).
-    "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS":
-    lambda: int(os.getenv("DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS") or "10000"),
 }
 
 
