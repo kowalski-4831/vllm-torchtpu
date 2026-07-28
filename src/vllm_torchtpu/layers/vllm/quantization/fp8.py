@@ -831,6 +831,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # These are needed by create_weights but are GPU-specific.
         # Set safe defaults so the parent's create_weights doesn't crash.
         self.use_marlin = False
+        self.use_deep_gemm = False
         self.cutlass_block_fp8_supported = False
         self.is_scale_e8m0 = getattr(quant_config, "is_scale_e8m0", False)
         self.activation_quant_key = None
@@ -937,6 +938,19 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
+        # Derive weight_block_size explicitly from weight_scale layout when requant_block_size is unspecified.
+        # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream linear kernels and dequantization
+        # pipelines properly recognize scale broadcast granularity right across tensor-parallel shards.
+        if requant_block_size is None:
+            if weight_scale.ndim == 1:
+                if weight_scale.shape[0] == weight.shape[0]:
+                    layer.weight_block_size = (1, weight.shape[1])
+                else:
+                    layer.weight_block_size = (weight.shape[0], 1)
+            else:
+                layer.weight_block_size = (weight.shape[0], weight.shape[1])
+        else:
+            layer.weight_block_size = requant_block_size
 
         if layer.weight.device.type == "tpu":
             sync.synchronize(layer.weight, wait=True)

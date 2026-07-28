@@ -67,7 +67,8 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
-                                                 PallasAttentionBackend)
+                                                 PallasAttentionBackend,
+                                                 PallasMLAttentionBackend)
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
@@ -857,7 +858,7 @@ class TPUModelRunner(GPUModelRunner):
                 page_size_padded = (
                     self._hybrid_uniform_page_size_bytes
                     if self._hybrid_uniform_page_size_bytes is not None else
-                    PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
                         block_size,
                         1,
                         attn_module.head_size,
@@ -3150,12 +3151,14 @@ class TPUModelRunner(GPUModelRunner):
         draft_attn_names = getattr(spec_drafter, "_draft_attn_layer_names",
                                    None) or set()
 
-        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        layers = get_layers_from_vllm_config(self.vllm_config,
+                                             AttentionLayerBase)
         initialized_count = 0
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                             vllm_config=self.vllm_config):
             for name, attn_layer in layers.items():
-                if isinstance(attn_layer.impl, PallasAttentionBackendImpl):
+                if isinstance(getattr(attn_layer, "impl", None),
+                              PallasAttentionBackendImpl):
                     # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
                     # (non-shard_map) kernel.
                     if (name in draft_attn_names and
@@ -3255,8 +3258,9 @@ class TPUModelRunner(GPUModelRunner):
             # caller-supplied num_blocks and a single shared metadata.
             if self._attn_layer_names is None:
                 self._attn_layer_names = list(
-                    get_layers_from_vllm_config(self.vllm_config,
-                                                (Attention, MambaBase)).keys())
+                    get_layers_from_vllm_config(
+                        self.vllm_config,
+                        (AttentionLayerBase, MambaBase)).keys())
             block_tables = torch.zeros((num_reqs * num_blocks, ),
                                        dtype=torch.int32).to(self.device)
             attn_metadata = AttentionMetadata(
@@ -4320,6 +4324,25 @@ class TPUModelRunner(GPUModelRunner):
                             torch.zeros(cache_shape,
                                         dtype=dtype).to(self.device))
                     kv_caches[layer_name] = tuple(mamba_states)
+                elif isinstance(kv_cache_spec, MLAAttentionSpec):
+                    # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
+                    # Because MLA maps all attention heads onto a single joint compressed latent key-value
+                    # representation (`num_kv_heads=1`), the physical KV cache dimension never splits
+                    # across tensor parallel ranks (`tp_size`) during SPMD graph execution (`self.use_spmd`).
+                    # Each device partition consistently retains a complete, unsliced replication of the
+                    # compressed latent cache structure across multi-chip execution loops.
+                    kv_cache_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                        num_blocks,
+                        kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        kv_cache_spec.dtype,
+                    )
+                    dtype = kv_cache_spec.dtype
+                    tpu_kv_cache = torch.zeros(kv_cache_shape,
+                                               dtype=dtype).to(self.device)
+
+                    kv_caches[layer_name] = tpu_kv_cache
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     if self.use_spmd:
                         num_kv_heads = kv_cache_spec.num_kv_heads

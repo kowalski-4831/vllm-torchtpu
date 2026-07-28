@@ -509,8 +509,12 @@ class TpuPlatform(Platform):
                              **kwargs) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        if getattr(attn_selector_config, "use_mla", False):
+            selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
+
         supported_backends = [
-            AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM
+            AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM,
+            AttentionBackendEnum.FLASH_ATTN_MLA
         ]
         if selected_backend not in supported_backends:
             logger.info("Cannot use %s backend on TPU. Setting to FLASH_ATTN.",

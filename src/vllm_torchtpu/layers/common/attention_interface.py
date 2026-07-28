@@ -14,9 +14,12 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
+from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
+                                                       get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
@@ -36,6 +39,8 @@ get_kv_cache_shape = rpa_default.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
+
+mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 
 
 def sharded_flash_attention(
@@ -461,3 +466,121 @@ def attention(
     )
 
     return kv_cache, output
+
+
+def mla_attention(
+        q_TNA: jax.Array,
+        q_rope_TNH: jax.Array,
+        k_SA: jax.Array,
+        k_rope_SH: jax.Array,
+        kv_cache: jax.Array,
+        md: AttentionMetadata,
+        mesh: Mesh,
+        num_attention_heads: int,
+        qk_nope_head_dim: int,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        sm_scale: float | None = None) -> Tuple[jax.Array, jax.Array]:
+    """Main shared interface for Multi-Head Latent Attention (MLA).
+
+    Computes sharded MLA paged attention and applies in-place KV cache updates across
+    the device mesh using custom Pallas kernels.
+
+    Args:
+        q_TNA: NOPE query activations in token-major format `(T, N, A)` (`[num_tokens, num_heads, lkv_dim]`).
+        q_rope_TNH: RoPE query activations in token-major format `(T, N, H)` (`[num_tokens, num_heads, rope_dim]`).
+        k_SA: New compressed latent keys to insert into the KV cache `(S, A)` (`[num_tokens, lkv_dim]`).
+        k_rope_SH: New RoPE keys to insert into the KV cache `(S, H)` (`[num_tokens, rope_dim]`).
+        kv_cache: Persistent paged latent KV cache tensor residing across devices.
+        md: Attention metadata containing block tables, sequence lengths, and layout indices.
+        mesh: JAX execution device mesh dictating parallel shard routing.
+        num_attention_heads: Total number of attention heads across the layer.
+        qk_nope_head_dim: Inner compressed projection dimension (`lkv_dim`).
+        q_scale: Optional scalar activation quantization scale for queries.
+        k_scale: Optional scalar parameter quantization scale for latent keys.
+        v_scale: Optional scalar parameter quantization scale for latent values.
+        sm_scale: Softmax temperature scale factor.
+
+    Returns:
+        Tuple of `(updated_kv_cache, output_TNA)` in token-major sequence layout `(T, N, D)`.
+    """
+    in_specs = (
+        P(None, "model", None),  # q_TNA
+        P(None, "model", None),  # q_rope_TNH
+        P(None, None),  # k_SA
+        P(None, None),  # k_rope_SH
+        P(None),  # kv_cache
+        P(None),  # md.seq_lens
+        P(None),  # md.block_tables
+        P(None),  # md.query_start_loc
+        P(None),  # md.distribution
+    )
+    out_specs = (
+        P(None, "model",
+          None),  # attn output in token-major sequence format (T, N, D)
+        P(None),  # kv cache
+    )
+
+    def _mla_ragged_paged_attention(q, q_rope, k, k_rope, cache, seq_lens,
+                                    block_tables, query_start_loc,
+                                    request_distribution):
+        max_num_tokens = q.shape[
+            0]  # q is in token-major sequence format (T, N, A)
+        actual_r_dim = q_rope.shape[2]
+        kv_dtype_str = "float8_e4m3fn" if any(
+            x in str(cache.dtype).lower()
+            for x in ("fp8", "e4m3")) else "bfloat16"
+
+        tuning_key = TuningKey(
+            case="batched_decode",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=num_attention_heads,
+            actual_lkv_dim=qk_nope_head_dim,
+            actual_r_dim=actual_r_dim,
+            kv_dtype=kv_dtype_str,
+        )
+        tuned = get_tuned_params(tuning_key)
+        decode_batch_size = tuned.decode_batch_size
+
+        # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
+        num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block, 1, 1)
+        num_queries_per_blocks = (tuned.num_queries_per_block, 16, 16)
+
+        # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
+        q = q.transpose((1, 0, 2))
+
+        out, new_cache = mla_ragged_paged_attention(
+            q,
+            q_rope,
+            k,
+            k_rope,
+            cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            sm_scale=sm_scale or 1.0,
+            num_kv_pages_per_block=num_kv_pages_per_blocks,
+            num_queries_per_block=num_queries_per_blocks,
+            decode_batch_size=decode_batch_size,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale)
+
+        # tpu-inference kernel returns out in head-major (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
+        out = out.transpose((1, 0, 2))
+
+        return out, new_cache
+
+    output_TNA, kv_cache = jax.jit(
+        shard_map.shard_map(_mla_ragged_paged_attention,
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))(q_TNA, q_rope_TNH, k_SA,
+                                              k_rope_SH, kv_cache, md.seq_lens,
+                                              md.block_tables,
+                                              md.query_start_loc,
+                                              md.request_distribution)
+    return kv_cache, output_TNA
