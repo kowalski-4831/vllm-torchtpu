@@ -157,6 +157,7 @@ def _build_kv_connector_output(
     kv_connector_worker_meta: Any | None,
     invalid_block_ids: set[int],
     invalid_block_group_index: int | None,
+    kv_connector_stats: Any | None = None,
 ) -> KVConnectorOutput:
     """Build a connector output across the vLLM 0.23 API boundary.
 
@@ -171,6 +172,7 @@ def _build_kv_connector_output(
         "finished_recving": finished_recving,
         "kv_connector_worker_meta": kv_connector_worker_meta,
         "invalid_block_ids": invalid_block_ids,
+        "kv_connector_stats": kv_connector_stats,
     }
     if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         kwargs["invalid_block_group_index"] = invalid_block_group_index
@@ -608,7 +610,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
-            return None, None, None, set(), None
+            return None, None, None, set(), None, None
         kv_connector = get_kv_transfer_group()
         finished_sending, finished_recving = kv_connector.get_finished(
             scheduler_output.finished_req_ids)
@@ -624,11 +626,13 @@ class TPUModelRunner(GPUModelRunner):
         # forever -> the engine busy-spins / hangs. Mirrors
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
+        kv_connector_stats = kv_connector.get_kv_connector_stats()
         # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
         return (finished_sending, finished_recving, worker_meta,
-                invalid_block_ids, invalid_block_group_index)
+                invalid_block_ids, invalid_block_group_index,
+                kv_connector_stats)
 
     def kv_connector_no_forward(self, scheduler_output,
                                 vllm_config) -> ModelRunnerOutput:
@@ -639,14 +643,15 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output,
             wait_for_completion=dist_utils.get_raiden_inline_load())
         (finished_sending, finished_recving, worker_meta, invalid_block_ids,
-         invalid_block_group_index
-         ) = self.get_finished_kv_transfers(scheduler_output)
+         invalid_block_group_index,
+         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
         kv_connector_output = _build_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             kv_connector_worker_meta=worker_meta,
             invalid_block_ids=invalid_block_ids,
             invalid_block_group_index=invalid_block_group_index,
+            kv_connector_stats=kv_connector_stats,
         )
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -2843,8 +2848,8 @@ class TPUModelRunner(GPUModelRunner):
         # instead of the forwards of the entire input batch.
         self.maybe_wait_for_kv_save()
         (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
-         invalid_block_group_index
-         ) = self.get_finished_kv_transfers(scheduler_output)
+         invalid_block_group_index,
+         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
 
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
@@ -2890,15 +2895,16 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
-        kv_connector_output = (
-            None if (finished_sending is None and finished_recving is None
-                     and kv_worker_meta is None and not invalid_block_ids) else
-            _build_kv_connector_output(
+        kv_connector_output = (None if (
+            finished_sending is None and finished_recving is None
+            and kv_worker_meta is None and not invalid_block_ids
+            and kv_connector_stats is None) else _build_kv_connector_output(
                 finished_sending=finished_sending,
                 finished_recving=finished_recving,
                 kv_connector_worker_meta=kv_worker_meta,
                 invalid_block_ids=invalid_block_ids,
                 invalid_block_group_index=invalid_block_group_index,
+                kv_connector_stats=kv_connector_stats,
             ))
 
         next_tokens_tpu = None

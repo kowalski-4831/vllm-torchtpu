@@ -89,6 +89,7 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids():
     connector.get_block_ids_with_load_errors.return_value = {41, 43}
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
+    connector.get_kv_connector_stats.return_value = None
     runner = SimpleNamespace()
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
@@ -99,7 +100,7 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids():
         result = TPUModelRunner.get_finished_kv_transfers(
             runner, scheduler_output)
 
-    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2)
+    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, None)
     connector.get_finished.assert_called_once_with({"finished"})
     connector.get_block_ids_with_load_errors.assert_called_once_with()
     connector.get_block_ids_with_load_errors_group_index.assert_called_once_with(
@@ -112,7 +113,8 @@ def test_no_forward_output_preserves_invalid_block_ids():
         maybe_setup_kv_connector=MagicMock(),
         get_finished_kv_transfers=MagicMock(return_value=(set(),
                                                           {"failed-load"},
-                                                          None, {41, 43}, 2)),
+                                                          None, {41, 43}, 2,
+                                                          None)),
     )
     scheduler_output = SimpleNamespace()
     vllm_config = SimpleNamespace()
@@ -154,6 +156,7 @@ def test_build_kv_connector_output_supports_vllm_023():
         finished_recving=None,
         kv_connector_worker_meta=None,
         invalid_block_ids=set(),
+        kv_connector_stats=None,
     )
 
 
