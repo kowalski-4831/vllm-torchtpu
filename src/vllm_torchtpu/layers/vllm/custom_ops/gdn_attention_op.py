@@ -430,19 +430,58 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _build_pooled_gdn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
-        wrapped_fn = functools.partial(
-            gdn_attention_pooled_core_tpu,
-            mesh=vllm_context.mesh,
-            n_kq=self.num_k_heads // self.tp_size,
-            n_v=local_num_v_heads,
-            d_k=self.head_k_dim,
-            d_v=self.head_v_dim,
-            kernel_size=self.conv_kernel_size,
-            # Manager block size: the pool may be born at a smaller kernel
-            # granularity for backends with a fixed kernel block.
-            pool_block_tokens=(
-                vllm_context.vllm_config.cache_config.block_size),
-        )
+        vllm_config = vllm_context.vllm_config
+        mesh = vllm_context.mesh
+        n_kq = self.num_k_heads // self.tp_size
+        d_k = self.head_k_dim
+        d_v = self.head_v_dim
+        kernel_size = self.conv_kernel_size
+
+        # Written out rather than functools.partial so pool_block_tokens is
+        # read per call instead of at build time; pallas.jax_op requires a
+        # fully annotated signature, so the operands are spelled out.
+        def wrapped_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return gdn_attention_pooled_core_tpu(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                mesh=mesh,
+                n_kq=n_kq,
+                n_v=local_num_v_heads,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                # Manager block size: the pool may be born at a smaller
+                # kernel granularity for backends with a fixed kernel
+                # block. Read lazily at first call: the executor finalizes
+                # cache_config.block_size only AFTER load_model, and hybrid
+                # models construct GDN layers before the first
+                # full-attention layer would ever see the adjusted value.
+                pool_block_tokens=vllm_config.cache_config.block_size,
+            )
+
         op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
         # The recurrent state (arg 3) is the attention-shaped pool: the ssm
         # and conv byte-regions are read/written through it by the pool

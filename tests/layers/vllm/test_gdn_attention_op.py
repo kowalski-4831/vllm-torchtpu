@@ -34,6 +34,7 @@ def _mesh():
 def _vllm_config(*,
                  pcp_size: int = 1,
                  interleave_size: int = 16,
+                 block_size: int = 16,
                  mamba_page_size_padded: int | None = None):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -42,6 +43,7 @@ def _vllm_config(*,
             data_parallel_size=1,
         ),
         cache_config=SimpleNamespace(
+            block_size=block_size,
             mamba_block_size=4096,
             mamba_page_size_padded=mamba_page_size_padded,
             mamba_cache_mode=None,
@@ -162,6 +164,48 @@ class TestVllmGatedDeltaNetAttention:
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
         assert attn.gdn_pcp_op is pcp_op
+
+    def test_pooled_op_reads_block_size_at_call_time(self):
+        """The pooled op must not freeze cache_config.block_size at build.
+
+        Hybrid models construct GDN layers during load_model(), but the
+        executor only calls update_block_size_for_backend() afterwards, so
+        the value visible at build time is the pre-adjustment one. Binding
+        it then makes the kernel run at the input block size while the pool
+        was built at the derived one, tripping
+        `pool_block_tokens % recurrent_state.shape[1]` inside the kernel.
+        Only reproduces when --block-size is not passed explicitly, which
+        is why every earlier unified-pool run missed it.
+        """
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        # Pre-adjustment value, i.e. what a GDN layer sees during load.
+        vllm_config = _vllm_config(block_size=16)
+        captured = {}
+
+        def fake_jax_op(_name, wrapped_fn, **_kwargs):
+            captured["wrapped_fn"] = wrapped_fn
+            return MagicMock()
+
+        with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                            vllm_config=vllm_config), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "pallas.jax_op",
+                 side_effect=fake_jax_op,
+             ), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "gdn_attention_pooled_core_tpu",
+             ) as mock_core:
+            attn._build_pooled_gdn_op()
+
+            # The executor finalizes the manager block size only after
+            # load_model() has already built every GDN layer.
+            vllm_config.cache_config.block_size = 256
+            captured["wrapped_fn"](*([MagicMock()] * 12))
+
+        assert mock_core.call_args.kwargs["pool_block_tokens"] == 256
 
     def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):
         attn0 = _qwen35_397b_gdn_attn(
