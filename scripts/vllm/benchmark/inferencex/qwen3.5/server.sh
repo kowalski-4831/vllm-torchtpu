@@ -83,6 +83,10 @@ export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
 
+# Token padding sizes step by 16 up to 64 and double after.
+export TPU_TOKEN_BUCKET_LINEAR_UNTIL="${TPU_TOKEN_BUCKET_LINEAR_UNTIL:-64}"
+export TPU_TOKEN_BUCKET_LINEAR_INTERVAL="${TPU_TOKEN_BUCKET_LINEAR_INTERVAL:-16}"
+
 args=(
   "$MODEL"
   --served-model-name="$SERVED_NAME"

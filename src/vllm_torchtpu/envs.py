@@ -39,6 +39,8 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    TPU_TOKEN_BUCKET_LINEAR_UNTIL: int = 0
+    TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
 
 
 def env_with_choices(
@@ -235,6 +237,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    # Pad token sizes linearly up to this size with step
+    # TPU_TOKEN_BUCKET_LINEAR_INTERVAL, then double after it. For example,
+    # if set to 64, the padding sizes will be 16, 32, 48, 64, 128, 256, etc.
+    # If set to 0, it will just double sizes(16, 32, 64, 128, ...).
+    "TPU_TOKEN_BUCKET_LINEAR_UNTIL":
+    lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_UNTIL") or "0"),
+    # Step for the linear range above.
+    "TPU_TOKEN_BUCKET_LINEAR_INTERVAL":
+    lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_INTERVAL") or "16"),
 }
 
 
