@@ -45,6 +45,7 @@ logger = init_logger(__name__)
 # TODO(ranlihao): add more flexible topology map
 TPU_MULTIHOST_TOPOLOGY_MAP = {
     16: "2,2,2,2",
+    32: "2,2,4,2",
 }
 
 # ---------------------------------------------------------------------------
