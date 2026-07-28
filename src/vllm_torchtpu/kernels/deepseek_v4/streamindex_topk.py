@@ -27,8 +27,12 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 def cdiv(a, b):
-    assert b != 0
-    return (a + b - 1) // b
+    if isinstance(b, (int, float)):
+        if b == 0:
+            return 0
+        return (a + b - 1) // b
+    return jnp.where(b != 0, (a + jnp.maximum(1, b) - 1) // jnp.maximum(1, b),
+                     0)
 
 
 def align_to(x, a):
@@ -230,13 +234,21 @@ def _streamindex_topk_kernel(
         if not wait:
             for i in range(bkv_p):
                 sz_per_kv_packing = page_size_per_kv_packing
-                page_idx = page_indices_offset + i
+                # Clamp: an out-of-range bkv_idx would otherwise read
+                # page_indices_ref out of bounds and DMA from an unrelated
+                # physical page. Matches the reference (tpu-inference).
+                page_idx = jnp.minimum(page_indices_offset + i,
+                                       num_page_indices - 1)
+
+                max_hbm_pages = reshaped_cache_hbm_ref.shape[0]
+                safe_page_offset = jnp.minimum(
+                    page_indices_ref[page_idx] * page_size_per_kv_packing,
+                    jnp.maximum(0, max_hbm_pages - page_size_per_kv_packing),
+                )
 
                 _async_copy(
-                    reshaped_cache_hbm_ref.at[pl.ds(
-                        page_indices_ref[page_idx] * page_size_per_kv_packing,
-                        sz_per_kv_packing,
-                    )],
+                    reshaped_cache_hbm_ref.at[pl.ds(safe_page_offset,
+                                                    sz_per_kv_packing)],
                     bkv_vmem_ref.at[pl.ds(i * page_size_per_kv_packing,
                                           sz_per_kv_packing)],
                     sem,
@@ -491,7 +503,8 @@ def prepare_q_inputs(
 
 
 def prepare_index_weights(
-        index_weights: jax.Array,  # [max_num_tokens, actual_num_q_heads],
+    index_weights: jax.Array,  # [max_num_tokens, actual_num_q_heads],
+    q_dtype,
 ):
     _, actual_num_q_heads = index_weights.shape
     index_weights = index_weights.astype(jnp.float32)
@@ -586,7 +599,7 @@ def streamindex_topk(
     original_dtype = q.dtype
 
     prepared_indexer_weights = prepare_index_weights(
-        indexer_weights.astype(original_dtype))
+        indexer_weights.astype(original_dtype), original_dtype)
 
     actual_num_q_heads = q.shape[1]
     q = prepare_q_inputs(q)
