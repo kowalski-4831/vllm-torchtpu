@@ -16,6 +16,8 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+    sparse_packed_width
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
@@ -47,6 +49,7 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8": torch.float8_e4m3fn,
     "fp8_e4m3": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
+    "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
 }
@@ -351,9 +354,6 @@ class PallasAttentionBackend(AttentionBackend):
             return (num_blocks, block_size, num_kv_heads_x2, 1,
                     padded_head_size)
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        if not is_floating_dtype(kv_dtype):
-            raise NotImplementedError(
-                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
         kv_packing = get_dtype_packing(kv_dtype)
 
         num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
@@ -882,7 +882,12 @@ class PallasMLAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "fp8_ds_mla",
     ]
+
+    # DeepSeek-V4 MLA packed-cache constants (64-dim RoPE tail, 64-wide UE8M0 blocks).
+    _DS_MLA_ROPE_HEAD_DIM = 64
+    _DS_MLA_QUANT_BLOCK = 64
 
     @staticmethod
     def get_name() -> str:
@@ -897,6 +902,15 @@ class PallasMLAttentionBackend(AttentionBackend):
         return PallasMLAttentionBackendImpl
 
     @staticmethod
+    def _is_ds_mla_packed_cache(cache_dtype_str: str | torch.dtype) -> bool:
+        # Recognizes both raw "fp8_ds_mla" string and resolved torch.uint8 dtype.
+        if isinstance(cache_dtype_str,
+                      str) and cache_dtype_str.lower().strip() == "fp8_ds_mla":
+            return True
+        return isinstance(cache_dtype_str,
+                          torch.dtype) and cache_dtype_str == torch.uint8
+
+    @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
         block_size: int,
@@ -907,6 +921,21 @@ class PallasMLAttentionBackend(AttentionBackend):
         if (isinstance(cache_dtype_str, str)
                 and cache_dtype_str.lower().strip() == "auto"):
             return (num_blocks, block_size, 1, cdiv(head_size, 128) * 128)
+        if PallasMLAttentionBackend._is_ds_mla_packed_cache(cache_dtype_str):
+            # Packed layout is [nope fp8 | rope bf16 | UE8M0 scales] padded to 128-aligned minor dim.
+            rope_head_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
+            quant_block = PallasMLAttentionBackend._DS_MLA_QUANT_BLOCK
+            nope_dim = head_size - rope_head_dim
+            packed_width = sparse_packed_width(nope_dim, rope_head_dim,
+                                               quant_block)
+            kv_packing = get_dtype_packing(torch.uint8)
+            return mla_v2_kernel.get_kv_cache_shape(
+                total_num_pages=num_blocks,
+                page_size=block_size,
+                kv_dim=packed_width,
+                kv_dtype=None,
+                kv_packing=kv_packing,
+            )
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         if not is_floating_dtype(kv_dtype):
             raise NotImplementedError(

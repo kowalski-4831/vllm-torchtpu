@@ -29,6 +29,7 @@ _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "fp8": torch.float8_e4m3fn,
     "fp8_e4m3": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
+    "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
 }
