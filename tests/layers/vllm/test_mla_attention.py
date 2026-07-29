@@ -56,6 +56,41 @@ def test_pallas_mla_attention_backend():
     assert page_size == 10240
 
 
+def test_pallas_mla_attention_backend_fp8_ds_mla():
+    """Verify DeepSeek-V4 packed MLA KV-cache format shape computation."""
+    assert "fp8_ds_mla" in PallasMLAttentionBackend.supported_kv_cache_dtypes
+
+    # Called directly with raw cache-dtype string "fp8_ds_mla".
+    shape_str = PallasMLAttentionBackend.get_kv_cache_shape(
+        num_blocks=10,
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        cache_dtype_str="fp8_ds_mla",
+    )
+    assert shape_str == (10, 64, 4, 640)
+
+    # Called with the already-resolved torch.uint8 dtype, matching how
+    # get_kv_cache_page_size_bytes below delegates internally.
+    shape_dtype = PallasMLAttentionBackend.get_kv_cache_shape(
+        num_blocks=10,
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        cache_dtype_str=torch.uint8,
+    )
+    assert shape_dtype == shape_str
+
+    page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        cache_dtype_str="fp8_ds_mla",
+    )
+    # 640 packed bytes/token * 256 tokens/block.
+    assert page_size == 640 * 256
+
+
 def test_tpu_platform_mla_backend():
     TpuPlatform.pre_register_and_update()
     attn_selector_config = MagicMock()
