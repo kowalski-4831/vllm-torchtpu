@@ -114,7 +114,7 @@ def main():
         print("Output sample (first 10 channels of first token/head 0):")
         print(out[0, 0, :10])
 
-    except Exception:  # noqa: BLE001
+    except Exception:
         print("Failed with error:")
         traceback.print_exc()
 
@@ -156,7 +156,7 @@ def main():
         print("Output sample (first 10 channels of first token/head 0):")
         print(out[0, 0, :10])
 
-    except Exception:  # noqa: BLE001
+    except Exception:
         print("Failed with error:")
         traceback.print_exc()
 
