@@ -80,7 +80,8 @@ steps:
     commands:
       - |
         # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N (and a bigger queue) for TP/EP runs.
+        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
+        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
         .buildkite/scripts/run_in_docker.sh bash -c '
           python3 examples/offline_inference.py \
             --model Qwen/Qwen3-0.6B \
@@ -97,7 +98,7 @@ steps:
     key: demo_pytest
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_8_queue
+      queue: tpu_v7x_2_queue
     commands:
       - |
         # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
@@ -117,7 +118,7 @@ steps:
     key: demo_stress
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_8_queue
+      queue: tpu_v7x_2_queue
     matrix: ["1", "2", "3", "4", "5"]
     commands:
       - |
