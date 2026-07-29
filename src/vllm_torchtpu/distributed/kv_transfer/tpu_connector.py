@@ -478,6 +478,24 @@ class TPUConnectorScheduler:
             "TPUConnectorScheduler --> kv_ip=%s | kv_port=%s | side_channel_port=%s",
             self.kv_ip, self.kv_port, self.side_channel_port)
 
+    def _maybe_truncate_for_mamba(self, request: "Request") -> None:
+        """P-side: drop the last prompt token so prefill ships the mamba
+        state h(N-1); D's recompute of token N then reproduces h(N) instead
+        of advancing the recurrence a second time."""
+        if request.num_prompt_tokens <= 1:
+            return
+        params = request.kv_transfer_params
+        if params is not None and params.get("_p_side_truncated"):
+            return
+        if request.prompt_token_ids is None:
+            return
+        request.prompt_token_ids.pop()
+        request._all_token_ids.pop()
+        request.num_prompt_tokens -= 1
+        if request.kv_transfer_params is None:
+            request.kv_transfer_params = {}
+        request.kv_transfer_params["_p_side_truncated"] = True
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -763,7 +781,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
-        if self.is_producer or not request.kv_transfer_params:
+        if self.is_producer:
+            if (_use_raiden_stage3_transport()
+                    and self._stage3_mamba_group_indices):
+                self._maybe_truncate_for_mamba(request)
+            return 0, False
+        if not request.kv_transfer_params:
             return 0, False
 
         assert num_computed_tokens % self.block_size == 0
@@ -937,10 +960,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"num_tokens={num_tokens}, page_tokens={self.block_size}")
         mamba_state_block_ids: Optional[list[int]] = None
         if self._stage3_mamba_group_indices:
-            # Uniform mamba layout: the GDN op reads/writes the live
-            # recurrent state at the mamba table's FIRST block
-            # (block_tables[:, 0] fallback); later blocks hold APC boundary
-            # checkpoints, not the live state.
+            # Live state = last live entry; 'align' mode pads the head of
+            # the table with the null block.
             mamba_state_block_ids = []
             for mamba_gid in self._stage3_mamba_group_indices:
                 if mamba_gid >= len(grouped_block_ids):
@@ -953,7 +974,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     raise ValueError(
                         "GDN state reshard: destination mamba table is empty "
                         f"(group {mamba_gid})")
-                mamba_state_block_ids.append(int(mamba_ids[0]))
+                mamba_state_block_ids.append(int(mamba_ids[-1]))
         self.reqs_to_load[request.request_id] = _Stage3LoadMeta(
             uuid=uuid,
             source_req_id=source_req_id,
@@ -998,7 +1019,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # source page instead of inheriting the legacy full-block-only trim.
         computed_tokens = int(request.num_computed_tokens)
         prompt_tokens = int(request.num_prompt_tokens)
-        num_tokens = min(computed_tokens, prompt_tokens - 1)
+        finish_params = request.kv_transfer_params
+        if isinstance(finish_params, dict) and bool(
+                finish_params.get("_p_side_truncated")):
+            # The producer already dropped one token; N-1 is already applied.
+            num_tokens = min(computed_tokens, prompt_tokens)
+        else:
+            num_tokens = min(computed_tokens, prompt_tokens - 1)
         if num_tokens <= 0 or not block_ids:
             return False, {}
         parallel_config = self.vllm_config.parallel_config
@@ -1072,15 +1099,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if not mamba_block_ids:
                 raise ValueError("GDN state is present but the producer's "
                                  "mamba block tables were not provided")
-            # Live state is at the mamba table's first block (see the
-            # consumer-side note); the producer ships that slot.
             mamba_state_block_ids = []
             for ordinal, group_ids in enumerate(mamba_block_ids):
                 if not group_ids:
                     raise ValueError(
                         "GDN state reshard: producer mamba table is empty "
                         f"(ordinal {ordinal})")
-                mamba_state_block_ids.append(int(group_ids[0]))
+                mamba_state_block_ids.append(int(group_ids[-1]))
         uuid = get_uuid()
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())
@@ -2688,32 +2713,6 @@ class TPUConnectorHMA(TPUConnector):
 
 
 class TPUConnectorHMAScheduler(TPUConnectorScheduler):
-
-    def _maybe_truncate_for_mamba(self, request: "Request") -> None:
-        """P-side: drop the last prompt token so the prefiller computes the
-        Mamba recurrent state h(N-1) (state before the last token) instead
-        of h(N).
-
-        For attention that recompute is idempotent, but a Mamba layer would
-        fold the last token through the conv1d/SSM recurrence a second time
-        (P's transferred state already includes it), corrupting the first
-        decode logit. By having P prefill shipping h(N-1),
-        the decoder's recompute of the last token reproduces h(N) exactly.
-        """
-        if request.num_prompt_tokens <= 1:
-            return
-        params = request.kv_transfer_params
-        if params is not None and params.get("_p_side_truncated"):
-            return
-        if request.prompt_token_ids is not None:
-            request.prompt_token_ids.pop()
-        else:
-            return
-        request._all_token_ids.pop()
-        request.num_prompt_tokens -= 1
-        if request.kv_transfer_params is None:
-            request.kv_transfer_params = {}
-        request.kv_transfer_params["_p_side_truncated"] = True
 
     def get_num_new_matched_tokens(
         self,
