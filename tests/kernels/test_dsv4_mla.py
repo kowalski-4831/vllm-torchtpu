@@ -116,6 +116,9 @@ def ref_implementation(
                        total_num_pages, page_size, 448)
     kv_c_cache = jnp.concatenate([fp8_dequant, bf16_part], axis=-1)
 
+    print("DEBUG_REF inside: kv_c_cache has NaNs =",
+          jnp.any(jnp.isnan(kv_c_cache)))
+
     outputs = []
     for i in range(distribution[-1]):
         q_start, q_end = cu_q_lens[i], cu_q_lens[i + 1]
@@ -183,7 +186,13 @@ def ref_implementation(
         exp_m1_diff = jnp.transpose(jnp.exp(m_1 - m), (1, 0, 2))
         acc_1_scaled = swa_accumulation_i * exp_m1_diff
         acc = acc_1_scaled + acc_2
+        print(f"DEBUG_REF inside seq {i}: attn has NaNs =",
+              jnp.any(jnp.isnan(attn)))
+        print(f"DEBUG_REF inside seq {i}: L has NaNs =", jnp.any(jnp.isnan(L)))
+        print(f"DEBUG_REF inside seq {i}: L minimum value =", jnp.min(L))
         out_i = (acc / jnp.transpose(L, (1, 0, 2))).astype(q_i.dtype)
+        print(f"DEBUG_REF inside seq {i}: out_i has NaNs =",
+              jnp.any(jnp.isnan(out_i)))
         outputs.append(out_i)
 
     return jnp.concatenate(outputs, axis=0)
