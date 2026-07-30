@@ -41,6 +41,8 @@ if TYPE_CHECKING:
     MLA_XPOSE_N_TILE_SIZE: int = 160
     TPU_TOKEN_BUCKET_LINEAR_UNTIL: int = 0
     TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
+    VLLM_TPU_BUCKET_PADDING_GAP: int = 0
+    VLLM_TPU_MOST_MODEL_LEN: int | None = None
 
 
 def env_with_choices(
@@ -246,6 +248,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Step for the linear range above.
     "TPU_TOKEN_BUCKET_LINEAR_INTERVAL":
     lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_INTERVAL") or "16"),
+    # Bucket padding gap for TPU compile sizes
+    "VLLM_TPU_BUCKET_PADDING_GAP":
+    lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
+
+    # Most model length cap for TPU compile bucketing
+    "VLLM_TPU_MOST_MODEL_LEN":
+    lambda: int(val)
+    if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
 }
 
 

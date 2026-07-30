@@ -316,7 +316,6 @@ class TestVllmGatedDeltaNetAttention:
 
         num_tokens = 2
         hidden_states = torch.randn(num_tokens, 64)
-        output = torch.zeros(5, 64)
 
         attn.in_proj_qkv.return_value = (torch.randn(num_tokens, 96), None)
         attn.in_proj_z.return_value = (torch.randn(num_tokens, 64), None)
@@ -344,7 +343,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
-        attn.forward(hidden_states, output)
+        output = attn.forward(hidden_states)
 
         attn.in_proj_qkv.assert_called_once_with(hidden_states)
         attn.in_proj_z.assert_called_once_with(hidden_states)
@@ -375,9 +374,7 @@ class TestVllmGatedDeltaNetAttention:
         # Verify reshaped output from norm went to out_proj
         assert attn.out_proj.call_args[0][0].shape == (num_tokens, 64)
 
-        # Check that output buffer was updated only up to num_tokens
-        assert torch.all(output[:num_tokens] == 5)
-        assert torch.all(output[num_tokens:] == 0)
+        assert torch.all(output == 5)
 
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
@@ -409,7 +406,6 @@ class TestVllmGatedDeltaNetAttention:
 
         num_tokens = 2
         hidden_states = torch.randn(num_tokens, 64)
-        output = torch.zeros(5, 64)
 
         attn.in_proj_qkvz.return_value = (torch.randn(num_tokens, 192), None)
         attn.in_proj_ba.return_value = (torch.randn(num_tokens, 32), None)
@@ -446,7 +442,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
-        attn.forward(hidden_states, output)
+        output = attn.forward(hidden_states)
 
         attn.in_proj_qkvz.assert_called_once_with(hidden_states)
         attn.in_proj_ba.assert_called_once_with(hidden_states)
@@ -478,8 +474,7 @@ class TestVllmGatedDeltaNetAttention:
         attn.out_proj.assert_called_once()
         assert attn.out_proj.call_args[0][0].shape == (num_tokens, 64)
 
-        assert torch.all(output[:num_tokens] == 5)
-        assert torch.all(output[num_tokens:] == 0)
+        assert torch.all(output == 5)
 
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
@@ -512,7 +507,6 @@ class TestVllmGatedDeltaNetAttention:
 
         num_tokens = 2
         hidden_states = torch.randn(num_tokens, 64)
-        output = torch.zeros(5, 64)
 
         attn.in_proj_qkv.return_value = (torch.randn(num_tokens, 96), None)
         attn.in_proj_z.return_value = (torch.randn(num_tokens, 64), None)
@@ -538,7 +532,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
-        attn.forward(hidden_states, output)
+        attn.forward(hidden_states)
 
         assert attn.gdn_op.call_count == 1
         core_args = attn.gdn_op.call_args[0]
@@ -619,7 +613,7 @@ class TestVllmGatedDeltaNetAttention:
         with set_vllm_model_wrapper_context(
                 mesh=_mesh(),
                 vllm_config=_vllm_config(pcp_size=2, interleave_size=1)):
-            attn.forward(hidden_states, output)
+            output = attn.forward(hidden_states)
 
         attn.gdn_op.assert_not_called()
         attn.gdn_pcp_op.assert_called_once()
@@ -638,8 +632,7 @@ class TestVllmGatedDeltaNetAttention:
             [torch.full((4, 16), 12.0),
              torch.full((4, 16), 13.0)])
         assert torch.equal(attn.norm.call_args[0][0], expected_local)
-        assert torch.all(output[:num_tokens] == 5)
-        assert torch.all(output[num_tokens:] == 0)
+        assert torch.all(output == 5)
 
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
@@ -671,7 +664,6 @@ class TestVllmGatedDeltaNetAttention:
 
         num_tokens = 2
         hidden_states = torch.randn(num_tokens, 64)
-        output = torch.zeros(5, 64)
 
         attn.in_proj_qkv.return_value = (torch.randn(num_tokens, 96), None)
         attn.in_proj_z.return_value = (torch.randn(num_tokens, 64), None)
@@ -702,7 +694,7 @@ class TestVllmGatedDeltaNetAttention:
                                             vllm_config=_vllm_config()):
             with pytest.raises(RuntimeError,
                                match="GDN PCP prefill op was not initialized"):
-                attn.forward(hidden_states, output)
+                attn.forward(hidden_states)
 
         attn.gdn_op.assert_not_called()
 
@@ -766,7 +758,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
-        attn.forward(hidden_states, output)
+        output = attn.forward(hidden_states)
 
         attn.in_proj_qkvz.assert_called_once_with(hidden_states)
         attn.in_proj_ba.assert_called_once_with(hidden_states)
@@ -796,5 +788,4 @@ class TestVllmGatedDeltaNetAttention:
         attn.out_proj.assert_called_once()
         assert attn.out_proj.call_args[0][0].shape == (num_tokens, 64)
 
-        assert torch.all(output[:num_tokens] == 5)
-        assert torch.all(output[num_tokens:] == 0)
+        assert torch.all(output == 5)

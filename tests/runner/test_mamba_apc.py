@@ -217,8 +217,12 @@ class TestMambaApcStateCopier:
                                              [[5, 6, 7, 8]])
         copier = MambaApcStateCopier(runner)
 
-        with patch("vllm_torchtpu.runner.mamba_apc.get_total_cp_world_size",
-                   return_value=2):
+        with patch(
+                "vllm_torchtpu.runner.mamba_apc.get_dcp_group"
+        ) as mock_dcp, patch(
+                "vllm_torchtpu.runner.mamba_apc.get_pcp_group") as mock_pcp:
+            mock_dcp.return_value.world_size = 2
+            mock_pcp.return_value.world_size = 1
             copier.preprocess(_sched_output({"a": 1}))
 
         assert copier._state_block_idx["a"] == 1

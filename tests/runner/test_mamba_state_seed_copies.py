@@ -117,7 +117,10 @@ def test_chunk_advance_copies_state():
 
 
 def test_pcp_uses_rank_local_state_block_size(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_total_cp_world_size", lambda: 8)
+    monkeypatch.setattr(runner_mod, "get_dcp_group",
+                        lambda: SimpleNamespace(world_size=8))
+    monkeypatch.setattr(runner_mod, "get_pcp_group",
+                        lambda: SimpleNamespace(world_size=1))
     # A PCP rank's two table columns cover 16 logical manager blocks. The
     # third global chunk is still in local column 0 and must not index column 2.
     fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6]]])
@@ -127,7 +130,10 @@ def test_pcp_uses_rank_local_state_block_size(monkeypatch):
 
 
 def test_pcp_local_state_block_crossing_copies(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_total_cp_world_size", lambda: 8)
+    monkeypatch.setattr(runner_mod, "get_dcp_group",
+                        lambda: SimpleNamespace(world_size=8))
+    monkeypatch.setattr(runner_mod, "get_pcp_group",
+                        lambda: SimpleNamespace(world_size=1))
     fake, _ = _make_self(["a"], [8 * BLOCK_SIZE], [[[5, 6]]],
                          state_pos={"a": 0})
     _collect(fake, _sched({"a": BLOCK_SIZE}))

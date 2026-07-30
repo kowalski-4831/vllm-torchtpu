@@ -99,7 +99,7 @@ def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
     coordinator = get_kv_cache_coordinator(
         kv_cache_config=kv_cache_config,
         max_model_len=65536,
-        max_num_batched_tokens=4096,
+        max_in_flight_tokens=4096,
         use_eagle=False,
         enable_caching=True,
         enable_kv_cache_events=False,
@@ -191,7 +191,7 @@ def test_hybrid_pcp_coordinator_patch_keeps_non_mamba_scope():
         get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=4096,
-            max_num_batched_tokens=4096,
+            max_in_flight_tokens=4096,
             use_eagle=False,
             enable_caching=True,
             enable_kv_cache_events=False,

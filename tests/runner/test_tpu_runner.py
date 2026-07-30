@@ -1410,9 +1410,12 @@ class TestAttentionMetadataBuilder:
             page_size_padded=256,
         )
         with patch(
-                "vllm_torchtpu.layers.common.attention_metadata."
-                "get_total_cp_world_size",
-                return_value=4):
+                "vllm_torchtpu.layers.common.attention_metadata.get_dcp_group"
+        ) as mock_dcp, patch(
+                "vllm_torchtpu.layers.common.attention_metadata.get_pcp_group"
+        ) as mock_pcp:
+            mock_dcp.return_value.world_size = 4
+            mock_pcp.return_value.world_size = 1
             builder = self._make_builder(runner, spec=mamba_spec)
 
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(

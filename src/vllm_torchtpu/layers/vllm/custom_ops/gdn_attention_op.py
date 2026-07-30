@@ -704,8 +704,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
-    ):
+    ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
 
         # ============================================================
@@ -876,4 +875,5 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                            self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens], _ = self.out_proj(core_attn_out)
+        out, _ = self.out_proj(core_attn_out)
+        return out

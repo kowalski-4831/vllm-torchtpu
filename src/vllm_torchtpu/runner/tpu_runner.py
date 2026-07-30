@@ -20,13 +20,14 @@ import jax
 import numpy as np
 import torch
 import torch_tpu  # noqa: F401
-import vllm.envs as envs
+import vllm.envs as vllm_envs
 # TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from packaging import version
 from torch_tpu._internal import sync
-from vllm.config import (CUDAGraphMode, ParallelConfig, VllmConfig,
+from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -48,14 +49,13 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              LogprobsLists, LogprobsTensors, ModelRunnerOutput)
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
-from vllm_torchtpu import utils
+from vllm_torchtpu import envs, utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
@@ -272,7 +272,6 @@ class TPUModelRunner(GPUModelRunner):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        original_parallel_config: ParallelConfig | None = None,
         *,
         profiler_rank: int,
         profiler_world_size: int,
@@ -338,8 +337,7 @@ class TPUModelRunner(GPUModelRunner):
         # num_prompt_logprobs, input_batch, etc. The block below is only the
         # TPU-specific delta + overrides.
 
-        # TPU-only custom kwarg + alias kept for backwards-compat with worker.
-        self.original_parallel_config = original_parallel_config
+        self.original_parallel_config = vllm_config.parallel_config
         self.device_config = vllm_config.device_config
 
         # Set by `_update_mamba_page_size_padded` for hybrid attention+mamba
@@ -389,17 +387,16 @@ class TPUModelRunner(GPUModelRunner):
         # bucket and chunk count.
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
-
-        # TPU env-var flags.
-        self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
-        self.use_spmd = envs.VLLM_XLA_USE_SPMD
+        self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
+        self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
         # XLA graph tracker (TPU-specific debug aid).
         self.enforce_eager = self.model_config.enforce_eager
         self.num_xla_graphs = 0
         self._update_num_xla_graphs("init")
-        # torchTPU doesn't support SymInt yet, so widen Dynamo cache limit.
+        # torchTPU doesn't support SymInt yet, so widen Dynamo cache limits.
         torch._dynamo.config.cache_size_limit = 1024
+        torch._dynamo.config.accumulated_recompile_limit = 1024
 
         # Override parent's kv_cache_dtype with the TPU mapping (handles
         # auto -> bfloat16 for our supported dtype set).
@@ -1432,7 +1429,12 @@ class TPUModelRunner(GPUModelRunner):
         # Using the unsharded block size here can index beyond the per-rank
         # table and also move the recurrent state before its local block
         # actually advances.
-        block_size = self.block_size * get_total_cp_world_size()
+        try:
+            cp_world_size = (get_dcp_group().world_size *
+                             get_pcp_group().world_size)
+        except Exception:
+            cp_world_size = 1
+        block_size = self.block_size * cp_world_size
         num_computed = self.input_batch.num_computed_tokens_cpu
         req_ids = self.input_batch.req_ids
         crossings: list[tuple[int, int, int]] = []
@@ -3941,7 +3943,7 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.compilation.tpu_compiler import \
             compute_tpu_compilation_hash
         cc = self.vllm_config.compilation_config
-        base_cache_dir = cc.cache_dir or envs.VLLM_CACHE_ROOT
+        base_cache_dir = cc.cache_dir or vllm_envs.VLLM_CACHE_ROOT
         factors = aot_compile_hash_factors(self.vllm_config)
         factors.append(compute_tpu_compilation_hash(self.vllm_config))
         hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
@@ -4079,8 +4081,8 @@ class TPUModelRunner(GPUModelRunner):
             if isinstance(group.kv_cache_spec,
                           AttentionSpec) and self.use_spmd:
                 num_kv_heads = group.kv_cache_spec.num_kv_heads
-                assert self.original_parallel_config is not None
-                tp_size = self.original_parallel_config.tensor_parallel_size
+                parallel_config = self.parallel_config
+                tp_size = parallel_config.tensor_parallel_size
                 assert num_kv_heads % tp_size == 0, (
                     f"num_kv_heads {num_kv_heads} must be divisible by "
                     f"tp_size {tp_size} under SPMD mode")
@@ -4369,8 +4371,8 @@ class TPUModelRunner(GPUModelRunner):
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     if self.use_spmd:
                         num_kv_heads = kv_cache_spec.num_kv_heads
-                        assert self.original_parallel_config is not None
-                        tp_size = self.original_parallel_config.tensor_parallel_size
+                        parallel_config = self.parallel_config
+                        tp_size = parallel_config.tensor_parallel_size
                         # TODO: Handle kv cache duplication under SPMD mode.
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "

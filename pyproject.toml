@@ -24,7 +24,7 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    "vllm==0.25.1",
+    "vllm==0.26.0",
     "torch==2.11.0",
     "torch-tpu==0.1.1.dev20260728090214",
     # Required for N-gram speculative decoding
