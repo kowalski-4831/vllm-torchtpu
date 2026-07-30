@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for TPUMultiConnector.
 
-TPUMultiConnector adds only the register_runner fan-out on top of upstream
-MultiConnector; children come entirely from the explicit
+TPUMultiConnector adds TPU-specific method fan-out on top of upstream
+MultiConnector. Children come entirely from the explicit
 ``kv_connector_extra_config["connectors"]`` list. The tests here run the
 real upstream __init__, with fake child connector classes resolved from this
 module via kv_connector_module_path (the same mechanism the recipe uses for
@@ -11,6 +11,7 @@ the real children). No TPU or network access is required.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import \
@@ -31,6 +32,9 @@ class _FakeRaidenChild:
 
     def register_runner(self, runner):
         self.runner = runner
+
+    def get_block_ids_with_load_errors_group_index(self):
+        return 2
 
 
 class _FakeOffloadChild:
@@ -122,3 +126,20 @@ class TestTPUMultiConnectorRegisterRunner:
         # forward register_runner; if this starts failing, upstream grew
         # native support and the override should be dropped.
         assert not hasattr(MultiConnector, "register_runner")
+
+
+def test_failed_load_group_index_reaches_child_connector():
+    assert _build().get_block_ids_with_load_errors_group_index() == 2
+
+
+def test_conflicting_group_indices_across_children_raise():
+    # A single scalar can't scope errors from two groups; mis-scoping would
+    # make the scheduler recompute the wrong group's blocks, so it must fail
+    # loudly instead.
+    connector = _build()
+    conflicting = MagicMock()
+    conflicting.get_block_ids_with_load_errors_group_index.return_value = 3
+    connector._connectors.append(conflicting)
+
+    with pytest.raises(RuntimeError, match="Conflicting"):
+        connector.get_block_ids_with_load_errors_group_index()

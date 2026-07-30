@@ -1035,13 +1035,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             (num_tokens + scheduler_block_tokens - 1) //
             scheduler_block_tokens)
         normalized_block_ids = tuple(int(block_id) for block_id in block_ids)
-        # If the excluded last prompt token opened a new scheduler block, the
-        # full producer block table has one trailing ID that is outside the
-        # transfer prefix. This is the only safe count mismatch to trim.
-        if (len(normalized_block_ids) == expected_scheduler_blocks + 1
-                and prompt_tokens == num_tokens + 1
-                and num_tokens % scheduler_block_tokens == 0):
-            normalized_block_ids = normalized_block_ids[:-1]
+        # The producer may allocate trailing blocks for its excluded final
+        # prompt token or locally generated tokens. They are outside the
+        # transfer prefix; too few blocks remains an error.
+        if len(normalized_block_ids) > expected_scheduler_blocks:
+            normalized_block_ids = (
+                normalized_block_ids[:expected_scheduler_blocks])
         if len(normalized_block_ids) != expected_scheduler_blocks:
             raise ValueError(
                 "Stage-3 producer block IDs must cover every PCP scheduler "
