@@ -2292,6 +2292,24 @@ class ZmqShmKvConnectorBase:
             local_blocks: list[int]) -> Optional[list[torch.Tensor]]:
         raise NotImplementedError
 
+    def get_kv_connector_stats(self) -> TpuKVConnectorStats | None:
+        """
+            Get the KV transfer stats for the worker.
+            """
+        if self._is_host_coordinator:
+            with self._coord_lock:
+                if self.is_producer:
+                    self.transfer_stats.record_prefill_queue_length(
+                        len(self._coord_send))
+                else:
+                    self.transfer_stats.record_decode_queue_length(
+                        len(self._coord_recv))
+
+        # Clear stats for next iteration
+        if not self.transfer_stats.is_empty():
+            return self.transfer_stats.clone_and_reset()
+        return None
+
 
 def _try_remove_ipc_endpoint(ipc_path: str) -> None:
     """ZMQ's ipc:// backs onto a filesystem path; a stale file from a

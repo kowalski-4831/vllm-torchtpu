@@ -53,6 +53,14 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record a failed KV transfer operation."""
         self.data["num_failed_transfers"].append(1)
 
+    def record_prefill_queue_length(self, prefill_queue_length: int):
+        """Record the prefill (send) queue length."""
+        self.data["prefill_queue_length"].append(prefill_queue_length)
+
+    def record_decode_queue_length(self, decode_queue_length: int):
+        """Record the decode (load) queue length."""
+        self.data["decode_queue_length"].append(decode_queue_length)
+
     def reset(self):
         # Must be serializable
         self.data: dict[str, list[float | int]] = {
@@ -61,6 +69,8 @@ class TpuKVConnectorStats(KVConnectorStats):
             "kv_pull_time": [],
             "mb_transferred": [],
             "num_failed_transfers": [],
+            "prefill_queue_length": [],
+            "decode_queue_length": [],
         }
 
     def clone_and_reset(self) -> "TpuKVConnectorStats":
@@ -71,6 +81,8 @@ class TpuKVConnectorStats(KVConnectorStats):
     def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
         if not other.is_empty():
             for k, v in other.data.items():
+                if k not in self.data:
+                    self.data[k] = []
                 accumulator = self.data[k]
                 assert isinstance(accumulator, list)
                 accumulator.extend(v)
@@ -81,6 +93,10 @@ class TpuKVConnectorStats(KVConnectorStats):
         h2d_transfer_time = np.asarray(self.data["h2d_transfer_time"])
         kv_pull_time = np.asarray(self.data["kv_pull_time"])
         mb_transferred = np.asarray(self.data["mb_transferred"])
+        prefill_queue_length = np.asarray(
+            self.data.get("prefill_queue_length", []))
+        decode_queue_length = np.asarray(
+            self.data.get("decode_queue_length", []))
 
         total_mb = mb_transferred.sum()
         avg_mb = total_mb / self.num_successful_transfers if self.num_successful_transfers > 0 else 0
@@ -114,6 +130,12 @@ class TpuKVConnectorStats(KVConnectorStats):
             round(avg_mb, 3),
             "Throughput (MB/s)":
             round(throughput_mb_s, 3),
+            "Prefill queue length":
+            int(prefill_queue_length.max())
+            if prefill_queue_length.size > 0 else 0,
+            "Decode queue length":
+            int(decode_queue_length.max())
+            if decode_queue_length.size > 0 else 0,
         }
 
     def is_empty(self) -> bool:
@@ -121,7 +143,9 @@ class TpuKVConnectorStats(KVConnectorStats):
                 and len(self.data["h2d_transfer_time"]) == 0
                 and len(self.data["kv_pull_time"]) == 0
                 and len(self.data["mb_transferred"]) == 0
-                and len(self.data["num_failed_transfers"]) == 0)
+                and len(self.data["num_failed_transfers"]) == 0
+                and len(self.data["prefill_queue_length"]) == 0
+                and len(self.data["decode_queue_length"]) == 0)
 
     @property
     def num_successful_transfers(self) -> int:
@@ -212,6 +236,23 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.counter_tpu_num_failed_transfers = create_metric_per_engine(
             counter_tpu_num_failed_transfers, self.per_engine_labelvalues)
 
+        gauge_tpu_prefill_queue_length = self._gauge_cls(
+            name="vllm:tpu_prefill_kv_queue_length",
+            documentation=
+            "Current length of the TPU KV transfer prefill queue.",
+            labelnames=labelnames,
+        )
+        self.gauge_tpu_prefill_queue_length = create_metric_per_engine(
+            gauge_tpu_prefill_queue_length, self.per_engine_labelvalues)
+
+        gauge_tpu_decode_queue_length = self._gauge_cls(
+            name="vllm:tpu_decode_kv_queue_length",
+            documentation="Current length of the TPU KV transfer decode queue.",
+            labelnames=labelnames,
+        )
+        self.gauge_tpu_decode_queue_length = create_metric_per_engine(
+            gauge_tpu_decode_queue_length, self.per_engine_labelvalues)
+
     def observe(self,
                 transfer_stats_data: dict[str, Any],
                 engine_idx: int = 0):
@@ -240,3 +281,18 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data[counter_item_key]:
                 counter_obj[engine_idx].inc(list_item)
+
+        for gauge_obj, gauge_item_key in zip(
+            [
+                self.gauge_tpu_prefill_queue_length,
+                self.gauge_tpu_decode_queue_length,
+            ],
+            [
+                "prefill_queue_length",
+                "decode_queue_length",
+            ],
+        ):
+            if gauge_item_key in transfer_stats_data and transfer_stats_data[
+                    gauge_item_key]:
+                for list_item in transfer_stats_data[gauge_item_key]:
+                    gauge_obj[engine_idx].set(list_item)

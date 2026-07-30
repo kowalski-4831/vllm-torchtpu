@@ -629,15 +629,6 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
     """TPU-specific transport hooks for the generic ZmqShmKvConnectorBase.
     """
 
-    def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        """
-        Get the KV transfer stats for the worker.
-        """
-        # Clear stats for next iteration
-        if not self.transfer_stats.is_empty():
-            return self.transfer_stats.clone_and_reset()
-        return None
-
     def process_send_load(self,
                           metadata: TPUConnectorMetadata,
                           wait_for_completion: bool = False,
@@ -2827,13 +2818,6 @@ class TPUConnectorHMAWorker(ZmqShmKvConnectorBase):
     # layer_name -> kv cache dict used to resolve each positional kv cache's
     # group by object id in _map_layers_to_groups.
     named_kv_caches: Optional[dict[str, Any]] = None
-
-    def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        """Get the KV transfer stats for the worker."""
-        # Clear stats for next iteration
-        if not self.transfer_stats.is_empty():
-            return self.transfer_stats.clone_and_reset()
-        return None
 
     def process_send_load(self,
                           metadata: TPUConnectorMetadata,
