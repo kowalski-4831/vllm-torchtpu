@@ -1376,6 +1376,7 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.cache_config.mamba_cache_mode != "align":
             self._mamba_copy_plan = []
+            self._mamba_state_block_size = None
             return
         layer_to_raw: dict[str, torch.Tensor] = {}
         for raw, kv_cache_tensor in zip(raw_tensors,
@@ -1383,6 +1384,7 @@ class TPUModelRunner(GPUModelRunner):
             for layer_name in kv_cache_tensor.shared_by:
                 layer_to_raw[layer_name] = raw
         plan: list[tuple[int, list[torch.Tensor]]] = []
+        state_block_size: int | None = None
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
             if not isinstance(group.kv_cache_spec, MambaSpec):
                 continue
@@ -1395,6 +1397,8 @@ class TPUModelRunner(GPUModelRunner):
                     raws.append(raw)
             if raws:
                 plan.append((gid, raws))
+                state_block_size = group.kv_cache_spec.block_size
+        self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
         for raw in raw_tensors:
             if raw.dim() > 1:
@@ -1423,18 +1427,37 @@ class TPUModelRunner(GPUModelRunner):
             if req_id not in live_req_ids:
                 del self._mamba_state_pos[req_id]
 
-        # Each CP rank owns only its interleaved share of a logical sequence.
-        # Accordingly, vLLM sizes Mamba block-table rows in units of
-        # block_size * total_cp_world_size (see AttentionMetadataBuilder).
-        # Using the unsharded block size here can index beyond the per-rank
-        # table and also move the recurrent state before its local block
-        # actually advances.
+        # Column stride of the mamba block tables, in logical (whole-sequence)
+        # tokens. Three block sizes meet here and only one is correct:
+        #   * self.block_size is the attention/scheduler size -- unrelated to
+        #     mamba tables, whose width is cdiv(max_model_len, mamba size) --
+        #     and a stale __init__-time snapshot besides (the executor
+        #     finalizes cache_config.block_size only after the runner is
+        #     constructed);
+        #   * the mamba groups' kv_cache_spec.block_size (the copy of
+        #     cache_config.mamba_block_size that get_kv_cache_spec bakes into
+        #     every MambaSpec, which then sizes these tables) is physical and
+        #     per-rank, and cannot be stale: specs are created only after the
+        #     platform finalizes block sizes;
+        #   * the scheduler appends a block id to a mamba row only once per
+        #     mamba_block_size * total_cp_world logical tokens, because the
+        #     PCP coordinator patch presents specs to the hybrid coordinator
+        #     at that granularity (_patch_vllm_hybrid_pcp_block_sizes). Mamba
+        #     state is never token-sharded across CP ranks; the cp factor
+        #     exists purely to mirror that allocation cadence.
+        # Every reader of these tables must divide logical token counts by
+        # the allocator's stride. This is the same derivation
+        # AttentionMetadataBuilder.target_block_size uses for its state-slot
+        # lookup -- spec block size times cp world -- so the two readers
+        # cannot diverge. A smaller divisor visits columns the scheduler
+        # never filled: beyond the row width it raises IndexError, within it
+        # the null block silently swallows the recurrent state.
         try:
             cp_world_size = (get_dcp_group().world_size *
                              get_pcp_group().world_size)
         except Exception:
             cp_world_size = 1
-        block_size = self.block_size * cp_world_size
+        col_stride = self._mamba_state_block_size * cp_world_size
         num_computed = self.input_batch.num_computed_tokens_cpu
         req_ids = self.input_batch.req_ids
         crossings: list[tuple[int, int, int]] = []
@@ -1444,9 +1467,9 @@ class TPUModelRunner(GPUModelRunner):
             assert req_id is not None
             computed = int(num_computed[row])
             scheduled = scheduler_output.num_scheduled_tokens[req_id]
-            curr = (computed + scheduled - 1) // block_size
+            curr = (computed + scheduled - 1) // col_stride
             prev = self._mamba_state_pos.get(req_id,
-                                             (computed - 1) // block_size)
+                                             (computed - 1) // col_stride)
             self._mamba_state_pos[req_id] = curr
             if 0 <= prev != curr:
                 crossings.append((row, prev, curr))
