@@ -108,6 +108,14 @@ QUANTIZATION=""
 ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
 RANDOM_RANGE_RATIO=""
+NUM_PROMPTS=""
+# How RANDOM_RANGE_RATIO is interpreted:
+#   symmetric - vllm bench serve native: sample lengths in [(1-r)*len, (1+r)*len]
+#   min       - benchmark_serving.py / inferenceX client style: sample in
+#               [r*len, len]. Translated to vllm bench serve's symmetric form
+#               below. Sampled lengths never exceed the nominal length, so
+#               nominal ISL+OSL <= max-model-len guarantees full completion.
+RANGE_RATIO_STYLE="symmetric"
 BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
 # Empty => do not pass --temperature, so the server default applies
 # (for Qwen3-Coder the model's generation_config enables sampling =>
@@ -116,6 +124,9 @@ BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
 BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
 EVAL_TOLERANCE=""
+# Ratio tolerance for the perf regression gate (per-metric floors in
+# check_regression.py still apply). Raise per config for noisier layouts.
+PERF_TOLERANCE="0.05"
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
@@ -130,6 +141,10 @@ if [ -z "$RANDOM_RANGE_RATIO" ]; then
 fi
 if [ -z "$EVAL_TOLERANCE" ]; then
     echo "ERROR: Config must set EVAL_TOLERANCE"
+    exit 1
+fi
+if [ "$RANGE_RATIO_STYLE" != "symmetric" ] && [ "$RANGE_RATIO_STYLE" != "min" ]; then
+    echo "ERROR: RANGE_RATIO_STYLE must be 'symmetric' or 'min'"
     exit 1
 fi
 if ! [[ "$BENCHMARK_WARMUP_RUNS" =~ ^[0-9]+$ ]]; then
@@ -305,6 +320,18 @@ run_benchmark_once() {
     local bench_log=$5
     local is_warmup=${6:-0}
 
+    # min-style ratios sample in [r*len, len]; vllm bench serve only supports
+    # the symmetric [(1-h)*mid, (1+h)*mid], so pass mid = len*(1+r)/2 and
+    # h = (1-r)/(1+r), which spans exactly the same range.
+    local bench_input_len=$input_len
+    local bench_output_len=$output_len
+    local bench_range_ratio=$RANDOM_RANGE_RATIO
+    if [ "$RANGE_RATIO_STYLE" = "min" ]; then
+        bench_input_len=$(awk -v l="$input_len" -v r="$RANDOM_RANGE_RATIO" 'BEGIN{printf "%.0f", l*(1+r)/2}')
+        bench_output_len=$(awk -v l="$output_len" -v r="$RANDOM_RANGE_RATIO" 'BEGIN{printf "%.0f", l*(1+r)/2}')
+        bench_range_ratio=$(awk -v r="$RANDOM_RANGE_RATIO" 'BEGIN{printf "%.6f", (1-r)/(1+r)}')
+    fi
+
     local profile_arg=""
     if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ "$is_warmup" != "1" ]; then
         profile_arg="--profile"
@@ -325,12 +352,13 @@ run_benchmark_once() {
         --host "$HOST" \
         --port "$PORT" \
         --dataset-name random \
-        --random-input-len "$input_len" \
-        --random-output-len "$output_len" \
-        --random-range-ratio "$RANDOM_RANGE_RATIO" \
-        --num-prompts 320 \
+        --random-input-len "$bench_input_len" \
+        --random-output-len "$bench_output_len" \
+        --random-range-ratio "$bench_range_ratio" \
+        --num-prompts "${NUM_PROMPTS:-320}" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
+        --percentile-metrics ttft,tpot,itl,e2el \
         --save-result \
         --ignore-eos \
         --result-filename "$result_file" \
@@ -375,6 +403,9 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "quantization": "${QUANTIZATION:-none}",
     "isl_osl_configs": "$ISL_OSL_CONFIGS",
     "concurrency_options": "$CONCURRENCY_OPTIONS",
+    "num_prompts": ${NUM_PROMPTS:-320},
+    "random_range_ratio": $RANDOM_RANGE_RATIO,
+    "range_ratio_style": "$RANGE_RATIO_STYLE",
     "benchmark_warmup_runs": $BENCHMARK_WARMUP_RUNS,
     "benchmark_temperature": $benchmark_temperature_json,
     "max_model_len": $max_model_len,
@@ -384,6 +415,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
+    "perf_tolerance": $PERF_TOLERANCE,
     "eval_tolerance": $EVAL_TOLERANCE
 }
 EOF
@@ -399,6 +431,7 @@ echo "  Model: $MODEL"
 echo "  TP=$TENSOR_PARALLELISM DP=$DATA_PARALLELISM EP=$ENABLE_EP"
 echo "  ISL/OSL: $ISL_OSL_CONFIGS"
 echo "  Concurrency: $CONCURRENCY_OPTIONS"
+echo "  Num prompts: ${NUM_PROMPTS:-320}"
 echo "  Benchmark warmup runs: $BENCHMARK_WARMUP_RUNS"
 echo "  Benchmark temperature: ${BENCHMARK_TEMPERATURE:-<server default (non-greedy)>}"
 echo "  Results: $RESULTS_DIR"
@@ -413,8 +446,9 @@ echo "================================================"
     echo "========================================"
 } > "$log_file"
 
-# Use uniform random MoE routing for consistent benchmarking
-export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
+# Large models need a long engine-core handshake window for AOT precompile
+# (vLLM's default is 600s). Matches the golden cmds' setting.
+export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
 if [ "$START_SERVER" = "1" ]; then
     trap stop_vllm_server EXIT INT TERM

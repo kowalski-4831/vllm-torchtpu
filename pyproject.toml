@@ -77,7 +77,6 @@ benchmarking = [
     "scikit-learn",
     "pandas",
     "lm-eval[api]==0.5.0.dev1",
-    "evalplus",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
