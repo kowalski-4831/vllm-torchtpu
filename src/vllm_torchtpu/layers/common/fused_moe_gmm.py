@@ -18,8 +18,8 @@ import jax
 from jax import numpy as jnp
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
-    ragged_gather_reduce
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
+    ragged_gather_reduce_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
 
@@ -270,7 +270,7 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] *
                        valid_mask[..., None]).sum(axis=1)
             return (combine @ gmm2_res).astype(x.dtype)
-        return ragged_gather_reduce(
+        return ragged_gather_reduce_v2(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,
