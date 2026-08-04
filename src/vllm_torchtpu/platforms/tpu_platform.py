@@ -210,6 +210,8 @@ def apply_tpu_patches() -> None:
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
     from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
+    from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
+    from vllm_torchtpu import _patch_vllm_offloading_connector_spec  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
@@ -223,6 +225,8 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_offloading_config_build()
+    _patch_vllm_offloading_connector_spec()
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
