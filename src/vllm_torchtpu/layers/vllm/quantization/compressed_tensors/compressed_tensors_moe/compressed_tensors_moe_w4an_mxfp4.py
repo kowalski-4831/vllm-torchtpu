@@ -164,7 +164,6 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 gating_output=moe_routing.maybe_force_random_routing(
                     router_logits),
                 topk=layer.moe_config.experts_per_token,
-                # renormalize=getattr(layer.moe_config, "norm_topk_prob", getattr(layer, "renormalize", True)))
                 renormalize=layer.renormalize)
         else:
             # Fallback to standard vLLM routing if no custom routing function is defined
