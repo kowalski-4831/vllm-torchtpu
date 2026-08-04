@@ -61,7 +61,8 @@ from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
+from vllm_torchtpu.layers.common.quant_methods import (DEEPSEEK_V4_FP8, FP8,
+                                                       get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
 from vllm_torchtpu.layers.vllm import moe_routing, token_padding
@@ -658,6 +659,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype,
                        **extra_weight_attrs):
+        self.moe = layer
+        if not hasattr(layer, "has_bias") and hasattr(layer, "moe_config"):
+            layer.has_bias = layer.moe_config.has_bias
         if self.quant_config.is_checkpoint_fp8_serialized:
             Fp8MoEMethod.create_weights(self, layer, num_experts, hidden_size,
                                         intermediate_size_per_partition,
@@ -683,8 +687,10 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                                                       requires_grad=False)
                 w2_weight_scale = torch.nn.Parameter(w2_scale_data,
                                                      requires_grad=False)
-                layer.register_parameter("w13_weight_scale", w13_weight_scale)
-                layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                layer.register_parameter(f"w13_{self.weight_scale_name}",
+                                         w13_weight_scale)
+                layer.register_parameter(f"w2_{self.weight_scale_name}",
+                                         w2_weight_scale)
                 from vllm.model_executor.layers.fused_moe import \
                     FusedMoeWeightScaleSupported
                 attrs = dict(extra_weight_attrs)
@@ -754,10 +760,15 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                  activation=activation_str,
              )
 
-        if hasattr(layer, "w13_weight_scale"):
-            del layer.w13_weight_scale
-        if hasattr(layer, "w2_weight_scale"):
-            del layer.w2_weight_scale
+        # Remove placeholder checkpoint scales before assigning runtime inverse scales
+        # to prevent nn.Module parameter re-assignment errors and free state dict memory.
+        # Note: RoutedExperts universally names its parameters w13 (gate+up) and w2 (down);
+        # hasattr is True for serialized FP8 checkpoints and False for unquantized BF16.
+        if hasattr(layer, f"w13_{self.weight_scale_name}"):
+            delattr(layer, f"w13_{self.weight_scale_name}")
+        if hasattr(layer, f"w2_{self.weight_scale_name}"):
+            delattr(layer, f"w2_{self.weight_scale_name}")
+
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale,
@@ -886,7 +897,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def __init__(self,
                  quant_config: Fp8Config,
-                 linear_config: VllmQuantLinearConfig | None = None):
+                 linear_config: VllmQuantLinearConfig | None = None,
+                 prefix: str = ""):
         # Skip Fp8LinearMethod.__init__ which has GPU-specific code
         # (CUDA capability, Marlin, cutlass, W8A8BlockFp8LinearOp).
         # Set only the attributes that create_weights() reads.
@@ -906,8 +918,23 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.out_dtype = torch.get_default_dtype()
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
-        self._linear_quant_config = _get_linear_quant_config(
-            self.linear_config)
+
+        # For DSV4, non-expert dense linears use per-channel FP8 rather than block-quantized FP8.
+        # Gated on config name so generic FP8 models/tests without 'experts' prefixes are unaffected.
+        is_dsv4 = getattr(quant_config, "get_name", lambda: None)() == \
+            DEEPSEEK_V4_FP8
+        is_routed_expert = bool(prefix and ("experts" in prefix)
+                                and ("shared_experts" not in prefix))
+        if is_dsv4 and not is_routed_expert:
+            # Non-expert dense linear layers (attention and shared experts) use per-channel FP8
+            self.weight_block_size = None
+            self.block_quant = False
+            self._linear_quant_config = ("fp8", torch.float8_e4m3fn, None,
+                                         False)
+            self.is_channel_quant = True
+        else:
+            self._linear_quant_config = _get_linear_quant_config(
+                self.linear_config)
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
@@ -918,7 +945,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                                            output_partition_sizes, input_size,
                                            output_size, params_dtype,
                                            **extra_weight_attrs)
-            if getattr(self.quant_config, "is_channel_quant", False):
+            if getattr(self.quant_config, "is_channel_quant",
+                       False) or getattr(self, "is_channel_quant", False):
                 weight_loader = extra_weight_attrs.get(
                     "weight_loader", getattr(layer, "weight_loader", None))
                 scale = ChannelQuantScaleParameterTPU(
@@ -972,8 +1000,10 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     linear_quant_config=self._linear_quant_config,
                 ))
         else:
-            desired_quant_dtype, requant_dtype, requant_block_size, blockwise_kernel = (
-                self._linear_quant_config)
+            requant_dtype = torch.float8_e4m3fn
+            requant_block_size = None
+            blockwise_kernel = False
+            desired_quant_dtype = "fp8"
             weight, weight_scale = quantize_tensor(
                 layer.weight.data.to(torch.float32),
                 quant_dtype=requant_dtype,

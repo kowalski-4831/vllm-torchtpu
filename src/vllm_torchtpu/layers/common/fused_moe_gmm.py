@@ -63,6 +63,37 @@ def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
                          -2), jnp.expand_dims(jnp.swapaxes(scale, -1, -2), -2))
 
 
+def quantize_to_native_fp4_kmajor(w: jax.Array,
+                                  block: int) -> tuple[jax.Array, jax.Array]:
+    """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and per-block FP32 scale.
+    Returns uint8 to safely cross the PyTorch/JAX bridge before unpacking in gmm_v2.
+
+    TODO: Make a more generic version of this function; possibly combine with quantize_tensor_to_fp4
+    """
+
+    size_k = w.shape[-2]
+    num_blocks = size_k // block
+    blocked = w.astype(jnp.float32).reshape(*w.shape[:-2], num_blocks, block,
+                                            w.shape[-1])
+    fp4_max = float(jnp.finfo(jnp.float4_e2m1fn).max)
+    abs_max = jnp.max(jnp.abs(blocked), axis=-2, keepdims=True)
+    scale = abs_max / fp4_max
+    scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
+    quantized = jnp.clip(blocked * scale_inv, -fp4_max,
+                         fp4_max).astype(jnp.float4_e2m1fn)
+    quantized = quantized.reshape(*w.shape[:-2], size_k,
+                                  w.shape[-1])  # [..., K, N]
+
+    # Real e2m1 bit-packing (2 values/byte along K), matching gmm_v2's own
+    # should_unpack/bitcast(quant_dtype) unpacking convention.
+    pairs = quantized.reshape(*w.shape[:-2], size_k // 2, 2, w.shape[-1])
+    pairs = jnp.swapaxes(pairs, -1, -2)  # [..., K/2, N, 2] -- pair axis last
+    packed = jax.lax.bitcast_convert_type(pairs, jnp.uint8)  # [..., K/2, N]
+
+    scale = scale.astype(jnp.float32)  # [..., num_blocks, 1, N]
+    return packed, scale
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
