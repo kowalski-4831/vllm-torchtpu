@@ -512,7 +512,6 @@ configure_role_environment() {
   export JAX_PLATFORMS=tpu,cpu
   export PJRT_DEVICE=TPU
   export TPU_BACKEND_TYPE=jax
-  export VLLM_TARGET_DEVICE=tpu
   export VLLM_XLA_CHECK_RECOMPILATION=0
 
   # Golden r14/r20 runtime profile: keep the latency-hiding scheduler, sparse
