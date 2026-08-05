@@ -1495,7 +1495,6 @@ class TestAttentionMetadataBuilder:
     def test_unified_mamba_state_indices_derive_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_kv_layout = True
-        runner._mamba_align_mode = True
         mamba_spec = MambaSpec(
             block_size=16,
             shapes=[(2, 8)],

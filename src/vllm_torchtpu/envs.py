@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
-    TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
+    TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
@@ -113,6 +113,21 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
     return _get_bool_env
 
 
+def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
+    """
+    Same parsing as ``env_bool``, but an unset variable reads as ``None`` so
+    callers can tell "explicitly disabled" from "not configured".
+    """
+    parse_bool = env_bool(env_name)
+
+    def _get_optional_bool_env() -> bool | None:
+        if not os.getenv(env_name):
+            return None
+        return parse_bool()
+
+    return _get_optional_bool_env
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
@@ -175,10 +190,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
-    # Experimental TPU unified block-pool cache layout. Disabled by default to
-    # preserve the compact-mamba allocation/indexing path.
+    # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
+    # wins; unset defers to
+    # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
+    # the pool for the hybrid models that ship a pooled state path and keeps
+    # everything else on the per-layer KV caches.
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL":
-    env_bool("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"),
+    env_optional_bool("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"),
     # Destination (decode-side) page geometry in tokens, required on the
     # producer: the byte-span lowering splits declarations at destination
     # page boundaries at registration time. 0 means unset.
