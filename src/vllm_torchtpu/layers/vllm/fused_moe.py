@@ -13,6 +13,7 @@
 # limitations under the License.
 """Torch bridge for fused MoE based on fused_moe_func in fused_moe_gmm."""
 
+import enum
 import functools
 from typing import Any, Callable, Optional
 
@@ -32,10 +33,16 @@ _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[int, Callable] = {}
 
 
+def _resolve_activation_name(activation: Any) -> str:
+    if isinstance(activation, enum.Enum):
+        return activation.value
+    return activation.value if hasattr(activation,
+                                       "value") else str(activation)
+
+
 def get_fused_moe_activation(activation, moe_config) -> str:
     """Encode vLLM's activation config for the Pallas GMM kernel."""
-    activation = (activation.value
-                  if hasattr(activation, "value") else str(activation))
+    activation = _resolve_activation_name(activation)
     if activation != "situ":
         return activation
 
