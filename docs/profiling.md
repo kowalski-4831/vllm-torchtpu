@@ -360,6 +360,7 @@ first. Preserve the directory hierarchy — XProf reads the
 rsync -avzm \
   --include='*/' \
   --include='*.xplane.pb' \
+  --include='*.pt.trace.json.gz' \
   --exclude='*' \
   <tpu-vm-host>:/tmp/vllm_phased_profile ~/traces/
 ```
@@ -383,8 +384,10 @@ anything by hand. This is the reason the capture goes through the rank-prefix
 merge described above; a per-rank directory layout would force you to open each
 rank as a separate session.
 
-Note that TorchTPU serializes individual raw XPlane chunks rather than a single
-merged trace, so a viewer that asks you to choose a file type wants **XPlane**.
+Note that by migrating to the native `torch.profiler`, vllm-torchtpu concurrently generates multiple trace formats:
+* **`plugins/profile/<timestamp>/*xplane.pb`**: Raw TPU hardware traces  (viewable via TensorBoard's XProf plugin, so a viewer that asks you to choose a file type wants **XPlane**).
+* **`rank_<N>/*.pt.trace.json.gz`**: Detailed PyTorch/ATen host traces + Kineto TPU traces in standard Chrome Trace Event Format. These can be dragged directly into native viewers like [Perfetto](https://ui.perfetto.dev) or Chrome Tracing UI.
+* **`*.async_llm.*.pt.trace.json.gz`**: The vLLM AsyncLLM CPU frontend traces.
 
 ## Troubleshooting
 
