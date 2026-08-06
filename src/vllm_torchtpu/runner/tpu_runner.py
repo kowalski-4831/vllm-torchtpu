@@ -37,6 +37,10 @@ from vllm.model_executor.layers.attention import (Attention,
                                                   MLAAttention)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.rotary_embedding import (MRotaryEmbedding,
+                                                         RotaryEmbedding)
+from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import \
+    MRotaryEmbeddingInterleaved
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -777,6 +781,45 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Unsupported speculative decoding method: "
                     f"{self.speculative_config.method}")
+
+    def _truncate_rope_caches(self) -> None:
+        """Slice rotary cos_sin caches to max_model_len which can reduce
+        the overhead of xla layout data copy. Applicable to text-only.
+        """
+        multimodal_config = self.model_config.multimodal_config
+        if self.model_config.is_multimodal_model and not (
+                multimodal_config is not None
+                and multimodal_config.language_model_only):
+            logger.warning(
+                "TPU_ROPE_CACHE_TRUNCATE skipped, multimodal positions are "
+                "not bounded by max_model_len")
+            return
+        max_len = self.model_config.max_model_len
+        num_eligible = 0
+        num_truncated = 0
+        for name, module in self.model.named_modules():
+            if type(module) not in (RotaryEmbedding, MRotaryEmbedding,
+                                    MRotaryEmbeddingInterleaved):
+                continue
+            for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
+                buf = getattr(module, buf_name, None)
+                if buf is None or not isinstance(buf, torch.Tensor):
+                    continue
+                num_eligible += 1
+                if buf.ndim >= 1 and buf.shape[0] > max_len:
+                    truncated = buf[:max_len].clone(
+                        memory_format=torch.contiguous_format)
+                    setattr(module, buf_name, truncated)
+                    num_truncated += 1
+                    logger.info("Truncated rope cache %s.%s rows %d -> %d",
+                                name, buf_name, buf.shape[0], max_len)
+        if num_eligible:
+            logger.info("Truncated %d of %d rope caches", num_truncated,
+                        num_eligible)
+        else:
+            logger.warning(
+                "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
+                "position-indexed rope cache, nothing was truncated")
 
     def _create_mesh_for_parallelism(self) -> Mesh:
         local_devices = list(jax.local_devices())
@@ -3724,6 +3767,8 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        if envs.TPU_ROPE_CACHE_TRUNCATE:
+            self._truncate_rope_caches()
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
