@@ -53,7 +53,7 @@ def get_fused_moe_activation(activation, moe_config) -> str:
 
 
 def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
-    """One-time NVFP4 load transform: packed uint8 ``[..., N, K//2]`` -> native
+    """One-time load transform: packed uint8 ``[..., N, K//2]`` -> native
     fp4 ``torch.float4_e2m1fn_x2`` ``[..., K, N]`` (K-major).
 
     Unpacks (bitcast uint8 -> float4_e2m1fn) and transposes the contracting axis
