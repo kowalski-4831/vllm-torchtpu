@@ -331,7 +331,7 @@ fi
 FAILED_CELLS=$(grep -l -E '"failed": *[1-9]' "${RESULT_FILES[@]}" || true)
 if [ -n "$FAILED_CELLS" ]; then
     for f in $FAILED_CELLS; do
-        echo "ERROR: $f recorded failed requests:"              "$(grep -oE '"(completed|failed)": *[0-9]+' "$f" | tr '\n' ' ')"
+        echo "ERROR: $f recorded failed requests: $(grep -oE '"(completed|failed)": *[0-9]+' "$f" | tr '\n' ' ')"
     done
     echo "ERROR: failing the build and skipping GCS/BigQuery upload."
     dump_diagnostics
