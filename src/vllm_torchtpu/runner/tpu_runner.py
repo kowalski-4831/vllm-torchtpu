@@ -29,7 +29,8 @@ from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
-                                          has_kv_transfer_group)
+                                          has_kv_transfer_group,
+                                          kv_transfer_state)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import (Attention,
@@ -158,6 +159,33 @@ def _substitute_placeholder_token(
 
 
 logger = init_logger(__name__)
+
+
+def _spec_warmup_all_token_ids(
+        req_ids: list[str],
+        num_computed_tokens: list[int]) -> dict[str, list[int]]:
+    """Build complete synthetic token histories for async cached requests."""
+    assert len(req_ids) == len(num_computed_tokens), (
+        "spec-decode warmup request IDs and computed-token counts must align: "
+        f"requests={len(req_ids)}, counts={len(num_computed_tokens)}")
+    # The current sampled token is not computed yet, so the complete sequence
+    # contains num_computed + 1 tokens at scheduler handoff.
+    return {
+        req_id: [0] * (num_computed + 1)
+        for req_id, num_computed in zip(req_ids, num_computed_tokens)
+    }
+
+
+@contextmanager
+def _suspend_kv_transfer_group() -> Iterator[None]:
+    """Hide the process-global connector during worker-local warmup."""
+    connector = kv_transfer_state._KV_CONNECTOR_AGENT
+    kv_transfer_state._KV_CONNECTOR_AGENT = None
+    try:
+        yield
+    finally:
+        kv_transfer_state._KV_CONNECTOR_AGENT = connector
+
 
 _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
     "invalid_block_group_index" in getattr(KVConnectorOutput,
@@ -4309,7 +4337,11 @@ class TPUModelRunner(GPUModelRunner):
             return
 
         n0 = self.num_xla_graphs
-        with self._precompile_timed("spec-decode real warmup"):
+        # These SchedulerOutputs are built locally and therefore have no
+        # scheduler-generated kv_connector_metadata. They must not start real
+        # PD transfers or bind synthetic requests into the connector.
+        with _suspend_kv_transfer_group(), self._precompile_timed(
+                "spec-decode real warmup"):
             # (1) First-pass / first-decode shapes depend on the prompt length:
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
             # runs the REAL two-phase propose+verify+sampling dispatch, so
@@ -4413,10 +4445,11 @@ class TPUModelRunner(GPUModelRunner):
             # ---- decode all R together: real nr=R propose + verify + sample ---
             nct = [P] * R
             for t in range(n_decode):
+                all_token_ids = _spec_warmup_all_token_ids(rids, nct)
                 creq = CachedRequestData(req_ids=list(rids),
                                          resumed_req_ids=set(),
                                          new_token_ids=[],
-                                         all_token_ids={},
+                                         all_token_ids=all_token_ids,
                                          new_block_ids=[None] * R,
                                          num_computed_tokens=list(nct),
                                          num_output_tokens=[t + 1] * R)
@@ -4504,10 +4537,11 @@ class TPUModelRunner(GPUModelRunner):
             cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
             # ---- decode steps (real propose + verify + sampling) ----
             for t, nct in enumerate(decode_ncts):
+                all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
                 creq = CachedRequestData(req_ids=[rid],
                                          resumed_req_ids=set(),
                                          new_token_ids=[],
-                                         all_token_ids={},
+                                         all_token_ids=all_token_ids,
                                          new_block_ids=[None],
                                          num_computed_tokens=[nct],
                                          num_output_tokens=[t + 1])
