@@ -13,7 +13,7 @@ from vllm_torchtpu.runner.utils import (
 def profiler_fixture(tmp_path):
     """Fixture to set up a PhaseBasedProfiler with mocked dependencies."""
     target_module = "vllm_torchtpu.runner.utils"
-    with patch(f"{target_module}.profiler_api.profile") as mock_profile, patch(
+    with patch("torch.profiler.profile") as mock_profile, patch(
             "builtins.open", mock_open()
     ) as mock_file, patch(f"{target_module}.datetime") as mock_datetime, patch(
             f"{target_module}.determine_phase_from_batch_composition_stats"
