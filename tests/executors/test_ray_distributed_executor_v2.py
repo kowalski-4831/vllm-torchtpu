@@ -17,8 +17,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.config import CacheConfig
 
-from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
-    RayDistributedExecutorV2
+from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+    RayDistributedExecutorV2, get_tpu_bundles_for_indices)
 
 
 class MockParallelConfig:
@@ -210,7 +210,7 @@ class TestTpuRayDistributedExecutorV2:
 
         # Mock get_bundles_sorted_by_node or similar utils
         with patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_bundles_sorted_by_node", return_value=bundle_to_node), \
-             patch("vllm_torchtpu.executors.ray_distributed_executor_v2.TPU_MULTIHOST_TOPOLOGY_MAP", {2: "2x2"}):
+             patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_tpu_multihost_topology", return_value="2x2"):
             mock_ray.get_runtime_context().get_node_id.return_value = "node_1"
 
             # Setup parallel config
@@ -291,3 +291,98 @@ class TestTpuRayDistributedExecutorV2:
             assert kwargs_w1["assigned_physical_gpu_ids"] == [6]
 
             executor.ray_worker_handles = []
+
+    def test_ray_distributed_executor_v2_bundle_expansion(
+            self, mock_wait_until_pg_ready, mock_get_ip, mock_platform,
+            mock_ray):
+        self.parallel_config.world_size = 16
+        self.parallel_config.tensor_parallel_size = 16
+        self.parallel_config.pipeline_parallel_size = 1
+
+        executor = RayDistributedExecutorV2(self.vllm_config)
+        executor.vllm_config = self.vllm_config
+        executor.parallel_config = self.parallel_config
+        executor.world_size = 16
+
+        # 4 host-level bundles for world_size = 16
+        bundle_to_node = [
+            (0, "node_0", "10.0.0.1"),
+            (1, "node_1", "10.0.0.2"),
+            (2, "node_2", "10.0.0.3"),
+            (3, "node_3", "10.0.0.4"),
+        ]
+
+        # Test get_tpu_bundles_for_indices helper function
+        selected = get_tpu_bundles_for_indices(
+            None, [0, 2], bundle_to_node_id=bundle_to_node)
+        assert selected == [(0, "node_0", "10.0.0.1"),
+                            (2, "node_2", "10.0.0.3")]
+        with pytest.raises(ValueError, match="Bundle index 99 not found"):
+            get_tpu_bundles_for_indices(None, [99],
+                                        bundle_to_node_id=bundle_to_node)
+
+        # Test host-level bundle expansion (4 bundles for world_size = 16)
+        assignments = executor._get_bundle_assignments(None, bundle_to_node)
+        assert len(assignments) == 16
+        assert len(executor.bundle_assignments) == 16
+        for rank in range(16):
+            expected_node_id = f"node_{rank // 4}"
+            assert assignments[rank]["rank"] == rank
+            assert assignments[rank]["node_id"] == expected_node_id
+
+        # Test 1:1 chip-level bundle mapping (16 bundles for world_size = 16)
+        chip_bundles = [(i, f"node_{i // 4}", f"10.0.0.{1 + (i // 4)}")
+                        for i in range(16)]
+        chip_assignments = executor._get_bundle_assignments(None, chip_bundles)
+        assert len(chip_assignments) == 16
+        for rank in range(16):
+            assert chip_assignments[rank]["rank"] == rank
+            assert chip_assignments[rank]["bundle_id_idx"] == rank
+
+        # Indivisible bundle count raises ValueError
+        bad_bundle_to_node = [
+            (0, "node_0", "10.0.0.1"),
+            (1, "node_1", "10.0.0.2"),
+            (2, "node_2", "10.0.0.3"),
+        ]
+        with pytest.raises(ValueError, match="divisible"):
+            executor._get_bundle_assignments(None, bad_bundle_to_node)
+
+
+def test_ray_distributed_executor_bundle_expansion():
+    """Verify V1 executor bundle index expansion for host-level and chip-level bundles."""
+
+    def expand_bundles(bundle_indices, world_size):
+        if len(bundle_indices) < world_size:
+            if len(bundle_indices
+                   ) == 0 or world_size % len(bundle_indices) != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) must be divisible by "
+                    f"the number of placement group bundles ({len(bundle_indices)})."
+                )
+            workers_per_bundle = world_size // len(bundle_indices)
+            expanded_indices = []
+            for b_id in bundle_indices:
+                expanded_indices.extend([b_id] * workers_per_bundle)
+            return expanded_indices
+        elif len(bundle_indices) != world_size:
+            raise ValueError(
+                f"Number of bundle indices ({len(bundle_indices)}) must be less than or equal to "
+                f"world_size ({world_size}).")
+        return bundle_indices
+
+    # 4 host-level bundle indices expanded 4x for world_size=16
+    assert expand_bundles(
+        [0, 1, 2, 3], 16) == [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+
+    # 16 chip-level bundle indices unchanged for world_size=16
+    chip_indices = list(range(16))
+    assert expand_bundles(chip_indices, 16) == chip_indices
+
+    # Indivisible bundle count raises ValueError
+    with pytest.raises(ValueError, match="must be divisible"):
+        expand_bundles([0, 1, 2], 16)
+
+    # Too many bundle indices raises ValueError
+    with pytest.raises(ValueError, match="less than or equal to world_size"):
+        expand_bundles(list(range(17)), 16)

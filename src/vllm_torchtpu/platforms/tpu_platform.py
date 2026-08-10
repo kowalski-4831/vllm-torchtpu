@@ -42,11 +42,65 @@ else:
 
 logger = init_logger(__name__)
 
-# TODO(ranlihao): add more flexible topology map
-TPU_MULTIHOST_TOPOLOGY_MAP = {
-    16: "2,2,2,2",
-    32: "2,2,4,2",
+# Multi-host TPU slice mesh topologies for 2D Torus architectures.
+TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
+    4: "2,2,1",
+    8: "2,4,1",
+    16: "4,4,1",
+    32: "4,8,1",
+    64: "8,8,1",
+    128: "8,16,1",
+    256: "16,16,1",
 }
+
+# Multi-host TPU slice mesh topologies for 3D Torus architectures.
+TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
+    8: "2,2,2,2",
+    16: "2,2,4,2",
+    32: "2,4,4,2",
+    64: "4,4,4,2",
+    128: "4,4,8,2",
+    256: "4,8,8,2",
+}
+
+# TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
+# TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects (4-tuple mesh geometry: X,Y,Z,T).
+_TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
+
+
+def get_tpu_multihost_topology(
+    world_size: int,
+    device_name: Optional[str] = None,
+) -> str:
+    """Return the multi-host mesh topology string for a TPU cluster.
+
+    Resolution order:
+    1. `TORCH_TPU_TOPOLOGY` environment variable (set by GKE).
+    2. Fallback map for environments without TORCH_TPU_TOPOLOGY set.
+    """
+    env_val = os.environ.get("TORCH_TPU_TOPOLOGY")
+    if env_val:
+        # Automatically normalize standard 'AxBxC' syntax to PyTorch/XLA 'A,B,C'
+        return env_val.replace("x", ",")
+
+    if device_name is None:
+        try:
+            device_name = TpuPlatform.get_device_name()
+        except Exception:
+            device_name = ""
+
+    is_2d_torus = any(gen in device_name.lower()
+                      for gen in _TPU_2D_TORUS_GENERATIONS)
+    topo_map = (TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
+                if is_2d_torus else TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP)
+
+    topo = topo_map.get(world_size)
+    if topo is None:
+        raise ValueError(
+            f"Cannot find topology for {world_size} chips in {topo_map}. "
+            "Please export TORCH_TPU_TOPOLOGY in your environment.")
+    return topo
+
 
 # ---------------------------------------------------------------------------
 # Modules/attrs whose @torch.compile(dynamic=True) wrappers must be removed.

@@ -17,7 +17,7 @@ import threading
 import time
 import weakref
 from collections import defaultdict, deque
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import ray
 import vllm.envs as envs
@@ -31,13 +31,30 @@ from vllm.v1.executor.ray_env_utils import get_driver_env_vars
 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2, RayWorkerHandle
 from vllm.v1.executor.ray_utils import (WORKER_SPECIFIC_ENV_VARS,
                                         _wait_until_pg_ready, build_actor_name,
-                                        get_bundles_for_indices,
                                         get_bundles_sorted_by_node)
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
+from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
+
+
+def get_tpu_bundles_for_indices(
+    placement_group,
+    bundle_indices: list[int],
+    bundle_to_node_id: Optional[list[tuple[int, str, str]]] = None,
+) -> list[tuple[int, str, str]]:
+    """Return bundle metadata for the specified bundle indices."""
+    if bundle_to_node_id is None:
+        bundle_to_node_id = get_bundles_sorted_by_node(placement_group)
+    bundle_map = {b[0]: b for b in bundle_to_node_id}
+    try:
+        return [bundle_map[idx] for idx in bundle_indices]
+    except KeyError as e:
+        raise ValueError(
+            f"Bundle index {e.args[0]} not found in placement group bundles: {list(bundle_map.keys())}"
+        ) from None
+
 
 logger = init_logger(__name__)
 
@@ -95,28 +112,22 @@ class RayDistributedExecutorV2(RayExecutorV2):
             f"_parallel_size ({pp_size}) x prefill_context"
             f"_parallel_size ({pcp_size}). ")
 
-        # Step 2: Build bundle assignments for worker rank placement
-        # while respecting VLLM_RAY_BUNDLE_INDICES.
+        # Step 2: Build bundle assignments for worker rank placement.
+        # If VLLM_RAY_BUNDLE_INDICES specifies a complete 1:1 rank-to-bundle
+        # mapping (len == world_size), respect it; otherwise fall back to all
+        # placement group bundles sorted by node.
+        bundle_to_node_id = None
         if envs.VLLM_RAY_BUNDLE_INDICES:
-            bundle_to_node_id = get_bundles_for_indices(
-                placement_group,
-                list(map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(","))),
-                self.world_size,
-            )
-        else:
+            indices = [int(x) for x in envs.VLLM_RAY_BUNDLE_INDICES.split(",")]
+            if len(indices) == self.world_size:
+                bundle_to_node_id = get_tpu_bundles_for_indices(
+                    placement_group, indices)
+        if bundle_to_node_id is None:
             bundle_to_node_id = get_bundles_sorted_by_node(placement_group)
 
+        bundle_assignments = self._get_bundle_assignments(
+            placement_group, bundle_to_node_id)
         driver_node = ray.get_runtime_context().get_node_id()
-
-        bundle_assignments: list[dict[str, Any]] = []
-        for rank, (bundle_id_idx, node_id,
-                   node_ip) in enumerate(bundle_to_node_id):
-            bundle_assignments.append({
-                "rank": rank,
-                "bundle_id_idx": bundle_id_idx,
-                "node_id": node_id,
-                "node_ip": node_ip,
-            })
 
         # Step 3: Resolve the IP for torch.distributed TCPStore.
         # The TCPStore server runs on rank 0's node, so all workers
@@ -234,12 +245,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
         master_addr = bundle_assignments[0]["node_ip"]
         master_port = str(get_open_port())
 
-        topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(self.world_size, None)
-        if topology is None:
-            raise ValueError(
-                f"Cannot find topology for {self.world_size} chips. "
-                f"The supported number of chips are {list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}"
-            )
+        topology = get_tpu_multihost_topology(self.world_size)
         xprof_session_id = os.environ.get("TORCH_TPU_XPROF_SESSION_ID",
                                           str(time.time_ns()))
         os.environ["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
@@ -423,3 +429,27 @@ class RayDistributedExecutorV2(RayExecutorV2):
             return
         for p in shapes[0]:
             self.collective_rpc("prewarm_kv_offload_shape", args=(p, ))
+
+    def _get_bundle_assignments(
+        self,
+        placement_group,
+        bundle_to_node_id: list[tuple[int, str, str]],
+    ) -> list[dict[str, Any]]:
+        num_bundles = len(bundle_to_node_id)
+        if num_bundles == 0 or self.world_size % num_bundles != 0:
+            raise ValueError(
+                f"world_size ({self.world_size}) must be divisible by "
+                f"the number of placement group bundles ({num_bundles}).")
+        workers_per_bundle = self.world_size // num_bundles
+        bundle_assignments: list[dict[str, Any]] = []
+        for rank in range(self.world_size):
+            bundle_idx = rank // workers_per_bundle
+            bundle_id_idx, node_id, node_ip = bundle_to_node_id[bundle_idx]
+            bundle_assignments.append({
+                "rank": rank,
+                "bundle_id_idx": bundle_id_idx,
+                "node_id": node_id,
+                "node_ip": node_ip,
+            })
+        self.bundle_assignments = bundle_assignments
+        return bundle_assignments
