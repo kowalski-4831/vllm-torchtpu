@@ -109,7 +109,8 @@ def select_experts(
 
     Dispatch order:
     1. DeepSeek-V4 hash routing (if `layer.hash_indices_table` is present).
-    2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled, e.g. DeepSeek-V2/V3).
+    2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled AND the group
+       config actually requires grouped selection).
     3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for DeepSeek-V4)
        and optional `e_score_correction_bias`.
     """
@@ -129,7 +130,10 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    if layer is not None and layer.use_grouped_topk:
+    use_grouped = (layer is not None and layer.use_grouped_topk
+                   and layer.num_expert_group > 1
+                   and layer.topk_group < layer.num_expert_group)
+    if use_grouped:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk
         topk_weights, topk_ids = grouped_topk(
