@@ -811,6 +811,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
         value = value.view(k_len, self.num_kv_heads, self.head_size)
         assert key.shape == value.shape
 
+        # A layer whose head_size is narrower than the page it writes into —
+        # a DFlash draft layer sharing the target's unified pool, whose page
+        # geometry comes from whichever attention spec defined the pool (see
+        # `kv_cache_materializer._pool_attention_geometry`). Pad q/k/v out to
+        # the page width so the kernel's slot writes line up, and slice the
+        # result back below. Zeros contribute nothing to the QK dot product,
+        # `self.scale` comes from the real head_size and is passed separately,
+        # and the padded V columns are dropped — so the output is unchanged.
+        #
+        # Only the head dim is reconciled. A layer whose `num_kv_heads`
+        # disagrees with the pool's would write the wrong slots and padding
+        # cannot fix that, so the two must already agree.
+        pool_head_dim = kv_cache.shape[-1]
+        if pool_head_dim > self.head_size:
+            pad_size = pool_head_dim - self.head_size
+            query = torch.nn.functional.pad(query, (0, pad_size))
+            key = torch.nn.functional.pad(key, (0, pad_size))
+            value = torch.nn.functional.pad(value, (0, pad_size))
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float
@@ -865,6 +883,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             sink,
         )
 
+        # Drop the padding added above so callers see the layer's own width.
+        if outputs.shape[-1] > self.head_size:
+            outputs = outputs[..., :self.head_size]
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():
             sync.synchronize(kv_cache)
