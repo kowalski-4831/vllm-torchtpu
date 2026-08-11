@@ -224,24 +224,10 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     ) -> torch.Tensor:
         activation_str = layer._tpu_activation_str
 
-        # Handle custom routing function if present
-        custom_routing_fn = getattr(layer, "custom_routing_function", None)
-        if custom_routing_fn is not None:
-            topk_weights, topk_ids = custom_routing_fn(
-                hidden_states=x,
-                gating_output=moe_routing.maybe_force_random_routing(
-                    router_logits),
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize)
-        else:
-            # Fallback to standard vLLM routing if no custom routing function is defined
-            topk_weights, topk_ids = moe_routing.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                scoring_fn=getattr(layer, "scoring_func", "softmax"),
-                layer=layer)
+        # Quantization-independent routing decision (simulation override ->
+        # custom_routing_function -> select_experts); shared across all TPU MoE
+        # methods so the routing-simulation hook lives in exactly one place.
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
         # Ensure correct type for routing inputs
         topk_ids = topk_ids.to(torch.int32)

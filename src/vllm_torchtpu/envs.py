@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
     USE_MOE_SPARSE_CORE: bool = True
-    FORCE_MOE_RANDOM_ROUTING: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -246,12 +245,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
-    # Route MoE tokens to uniformly random experts instead of using the gate.
-    # Balances expert load so a single-device profile represents the whole EP
-    # mesh (see moe_routing.maybe_force_random_routing). Produces meaningless
-    # output -- for profiling only, never serving. Disabled by default.
-    "FORCE_MOE_RANDOM_ROUTING":
-    env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
