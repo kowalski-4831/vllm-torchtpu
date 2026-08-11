@@ -37,6 +37,12 @@ from vllm.v1.attention.backends.mla.prefill import selector
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 
 
+def _fresh(t: torch.Tensor) -> torch.Tensor:
+    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
+    the torch_tpu pallas boundary ships a plain row-major buffer)."""
+    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
+
+
 class TPUDummyMLAPrefillBackend:
 
     def __init__(self, *args, **kwargs):
@@ -119,6 +125,10 @@ class VllmTPUMLAAttention(MLAAttention):
         super().process_weights_after_loading(act_dtype)
 
         device = torch.device("tpu")
+
+        # move W_UK_T and W_UV into fresh contiguous buffers
+        self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)
+        self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
 
         if self.kv_cache_quantized_dtype is not None:
             from vllm_torchtpu.layers.common.quantization import \
