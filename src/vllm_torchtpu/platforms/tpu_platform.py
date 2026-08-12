@@ -948,6 +948,9 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
         backend_cls = cls._find_non_ssm_backend(vllm_config)
 
+        if backend_cls is None:
+            return
+
         is_hybrid = vllm_config.model_config.is_hybrid
         if not is_hybrid and not cache_config.user_specified_block_size:
             default = backend_cls.get_page_size(vllm_config)
