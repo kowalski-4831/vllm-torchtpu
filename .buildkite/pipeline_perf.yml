@@ -118,6 +118,27 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      # GLM-5.2-FP8 on a full v7x-16 slice: perf-only (latency + throughput
+      # at 8k in / 1k out, concurrency 64/256/512). Serve flags mirror
+      # scripts/vllm/benchmarking/glm_cmds.yaml (glm branch). The slice is
+      # 2 hosts x 8 chips with no attached data disk, so the step runs
+      # through run_multihost.sh (Ray head+worker containers) and weights
+      # stream from gs://tpu-commons-ci/glm/GLM-5.2-FP8 via runai
+      # (MODEL_URI set in the config).
+      - label: "Perf: Nightly glm-5.2-fp8-tp16-ep (TPU v7x-16)"
+        key: "perf_nightly_glm_5_2_fp8_tp16_ep"
+        if: 'build.env("NIGHTLY") == "1"'
+        agents:
+          queue: "tpu_v7x_16_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        commands:
+          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-tp16-ep --results-dir /perf_eval_results/glm-5.2-fp8-tp16-ep"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
         key: "perf_nightly_qwen3_5_397b_fp8_tp8_dp1_ep"
         if: 'build.env("NIGHTLY") == "1"'
