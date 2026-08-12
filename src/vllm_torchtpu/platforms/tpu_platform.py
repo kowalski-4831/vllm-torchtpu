@@ -42,6 +42,17 @@ else:
 
 logger = init_logger(__name__)
 
+# Every map below is keyed on the number of devices in the slice, which is
+# what world_size counts and what the slice builder sizes its worker address
+# list against. How that key relates to the topology string differs by
+# generation, so the maps cannot be merged:
+#
+#   - 2D Torus (v5e, v6e): one core per chip, T=1, so key == X*Y.
+#   - 3D Torus (v4, v5p): two cores per chip, but megacore presents the pair
+#     as a single device, so key == X*Y*Z and the trailing T=2 is not counted.
+#   - 3D Torus (v7x / Ironwood): two cores per chip exposed as two separate
+#     devices, so key == X*Y*Z*T, twice the chip count.
+#
 # Multi-host TPU slice mesh topologies for 2D Torus architectures.
 TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     4: "2,2,1",
@@ -53,7 +64,7 @@ TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     256: "16,16,1",
 }
 
-# Multi-host TPU slice mesh topologies for 3D Torus architectures.
+# Multi-host TPU slice mesh topologies for TPU v4 / v5p (4 devices per host).
 TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     8: "2,2,2,2",
     16: "2,2,4,2",
@@ -63,9 +74,26 @@ TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     256: "4,8,8,2",
 }
 
+# Multi-host TPU slice mesh topologies for TPU v7x / Ironwood, which exposes
+# both cores of a chip as separate devices (8 devices per host). Same meshes
+# as above, addressed by twice as many devices.
+TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
+    16: "2,2,2,2",
+    32: "2,2,4,2",
+    64: "2,4,4,2",
+    128: "4,4,4,2",
+    256: "4,4,8,2",
+    512: "4,8,8,2",
+}
+
 # TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
 # TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects (4-tuple mesh geometry: X,Y,Z,T).
 _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
+
+# 3D Torus generations that expose two devices per chip. The device name
+# surfaces as "TPU v7" from get_tpu_device_name() and as "TPU7x" from the
+# device-kind path, so both spellings have to match.
+_TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 
 
 def get_tpu_multihost_topology(
@@ -73,6 +101,10 @@ def get_tpu_multihost_topology(
     device_name: Optional[str] = None,
 ) -> str:
     """Return the multi-host mesh topology string for a TPU cluster.
+
+    `world_size` is the number of devices in the slice (one per worker), which
+    is what the fallback maps are keyed on. The map is selected by generation
+    because devices-per-chip varies; see the maps above.
 
     Resolution order:
     1. `TORCH_TPU_TOPOLOGY` environment variable (set by GKE).
@@ -89,15 +121,18 @@ def get_tpu_multihost_topology(
         except Exception:
             device_name = ""
 
-    is_2d_torus = any(gen in device_name.lower()
-                      for gen in _TPU_2D_TORUS_GENERATIONS)
-    topo_map = (TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
-                if is_2d_torus else TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP)
+    device_name = device_name.lower()
+    if any(gen in device_name for gen in _TPU_2D_TORUS_GENERATIONS):
+        topo_map = TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
+    elif any(gen in device_name for gen in _TPU_DUAL_DEVICE_GENERATIONS):
+        topo_map = TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP
+    else:
+        topo_map = TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP
 
     topo = topo_map.get(world_size)
     if topo is None:
         raise ValueError(
-            f"Cannot find topology for {world_size} chips in {topo_map}. "
+            f"Cannot find topology for {world_size} devices in {topo_map}. "
             "Please export TORCH_TPU_TOPOLOGY in your environment.")
     return topo
 
