@@ -142,7 +142,13 @@ bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
 # Start Ray head container locally (run_cluster.sh blocks; background it)
 # ---------------------------------------------------------------------------
 # Env for the benchmark flow inside the container mirrors run_in_docker.sh.
+# VLLM_DISABLE_COMPILE_CACHE: every DP engine's workers persist their own
+# AOT compile artifacts to the container disk (torch _dynamo
+# atomic_write_binary), duplicating what the torch_tpu tier cache already
+# holds in /dev/shm; at DP>=4 this fills the ~80G boot disk (dev builds
+# 173/174). CI containers are ephemeral, so the on-disk cache buys nothing.
 CONTAINER_ENV=(
+  -e VLLM_DISABLE_COMPILE_CACHE=1
   -e HF_TOKEN="${HF_TOKEN:-}"
   -e TPU_MULTIHOST_BACKEND=ray
   -e JAX_PLATFORMS=""
@@ -220,7 +226,7 @@ for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
   (
     for _attempt in 1 2 3; do
       ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
-        "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1" \
+        "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e VLLM_DISABLE_COMPILE_CACHE=1 -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1" \
         && break
       echo "worker run_cluster ssh dropped (attempt ${_attempt}/3); restarting in 15s"
       sleep 15
