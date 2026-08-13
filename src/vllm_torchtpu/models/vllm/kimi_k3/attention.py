@@ -18,8 +18,7 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateDtypeCalculator, MambaStateShapeCalculator,
-    is_conv_state_dim_first)
+    MambaStateDtypeCalculator, is_conv_state_dim_first)
 from vllm.model_executor.layers.mla import (MLAModules,
                                             MultiHeadLatentAttentionWrapper)
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -511,12 +510,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.kda_state_shape(
-            self.tp_size,
-            self.total_heads,
-            self.head_dim,
-            conv_kernel_size=self.conv_size,
-            num_spec=0,
+        # Keep the KDA short-convolution cache in the Pallas DMA layout.
+        return (
+            (self.conv_size - 1, 3, self.num_heads, self.head_dim),
+            (self.num_heads, self.head_dim, self.head_dim),
         )
 
     def _metadata(self) -> AttentionMetadata | None:

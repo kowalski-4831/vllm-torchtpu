@@ -239,8 +239,9 @@ def decode_kda(
             f"{conv_weight.shape}.")
     kernel_size = conv_weight.shape[0]
     state_len = kernel_size - 1
-    expected_conv_tail = ((mixed_dim, state_len) if conv_state_dim_first else
-                          (state_len, mixed_dim))
+    expected_conv_tail = ((state_len, 3, n_v, d_k) if conv_state.ndim == 5 else
+                          ((mixed_dim, state_len) if conv_state_dim_first else
+                           (state_len, mixed_dim)))
     if conv_state.shape[1:] != expected_conv_tail:
         raise ValueError(f"conv_state must end in {expected_conv_tail}, got "
                          f"{conv_state.shape}.")
@@ -271,10 +272,12 @@ def decode_kda(
     )
 
     conv_state_shape = conv_state.shape
-    if conv_state_dim_first:
-        conv_state = jnp.swapaxes(conv_state, 1, 2)
-    conv_state = conv_state.reshape(conv_state.shape[0], state_len, 3, n_v,
-                                    d_k)
+    if conv_state.ndim != 5:
+        # Compatibility for direct callers using the former flat cache ABI.
+        if conv_state_dim_first:
+            conv_state = jnp.swapaxes(conv_state, 1, 2)
+        conv_state = conv_state.reshape(conv_state.shape[0], state_len, 3, n_v,
+                                        d_k)
     mixed_qkv = mixed_qkv.reshape(num_seqs, 3, n_v, d_k)
 
     # Per-sequence activations are indexed by grid step; the state pool is
@@ -345,7 +348,9 @@ def decode_kda(
         dt_bias,
         state,
     )
-    conv_state = conv_state.reshape(conv_state.shape[0], state_len, mixed_dim)
-    if conv_state_dim_first:
-        conv_state = jnp.swapaxes(conv_state, 1, 2)
+    if len(conv_state_shape) != 5:
+        conv_state = conv_state.reshape(conv_state.shape[0], state_len,
+                                        mixed_dim)
+        if conv_state_dim_first:
+            conv_state = jnp.swapaxes(conv_state, 1, 2)
     return out, conv_state.reshape(conv_state_shape), state

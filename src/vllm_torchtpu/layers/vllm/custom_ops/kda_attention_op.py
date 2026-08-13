@@ -133,9 +133,11 @@ def _short_conv_tokens(
     has_initial_state = seq_lens > query_lens
 
     # Each sequence's carried window, zeroed where there is no history to carry.
-    windows = jnp.where(has_initial_state[:, None, None],
-                        conv_state[state_indices], 0)
-    windows_flat = windows.reshape(num_seqs * history, -1)
+    state_broadcast = has_initial_state.reshape((num_seqs, ) + (1, ) *
+                                                (conv_state.ndim - 1))
+    windows = jnp.where(state_broadcast, conv_state[state_indices], 0)
+    windows_2d = windows.reshape(num_seqs, history, -1)
+    windows_flat = windows_2d.reshape(num_seqs * history, -1)
 
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
     position = token_ids - query_start_loc[sequence_ids]
@@ -170,11 +172,14 @@ def _short_conv_tokens(
     local = query_lens[:, None] - history + rows
     from_x = x[jnp.clip(query_start_loc[:-1][:, None] + local, 0,
                         num_tokens - 1)]
-    from_window = jnp.take_along_axis(windows,
+    from_window = jnp.take_along_axis(windows_2d,
                                       jnp.clip(query_lens[:, None] + rows, 0,
                                                history - 1)[..., None],
                                       axis=1)
     new_window = jnp.where((local >= 0)[..., None], from_x, from_window)
+    if conv_state.ndim > 3:
+        new_window = new_window.reshape(num_seqs, history,
+                                        *conv_state.shape[2:])
 
     # Only sequences that were walked and hold tokens may advance their slot.
     # Everything else would wipe a live slot, so point it at the null block --
@@ -185,8 +190,9 @@ def _short_conv_tokens(
     keep = ((query_lens > 0) & (sequence_all >= first_seq)
             & (query_start_loc[:-1] < total_tokens))
     write_indices = jnp.where(keep, state_indices, 0)
-    written = jnp.where(keep[:, None, None],
-                        new_window.astype(conv_state.dtype), conv_state[0])
+    keep_broadcast = keep.reshape((num_seqs, ) + (1, ) * (conv_state.ndim - 1))
+    written = jnp.where(keep_broadcast, new_window.astype(conv_state.dtype),
+                        conv_state[0])
     new_state = conv_state.at[write_indices].set(written)
     return output, new_state
 
@@ -224,9 +230,7 @@ def build_kimi_sconv_op(
             raise ValueError("query_start_loc and state_indices disagree")
         if seq_lens.shape != (num_sequences, ):
             raise ValueError("seq_lens and state_indices disagree")
-        expected_state_tail = ((mixed_dim,
-                                kernel_size - 1) if state_dim_first else
-                               (kernel_size - 1, mixed_dim))
+        expected_state_tail = (kernel_size - 1, *conv_weight.shape[1:])
         if conv_state.shape[1:] != expected_state_tail:
             raise ValueError(
                 f"conv_state must end in {expected_state_tail}, got "
@@ -236,11 +240,9 @@ def build_kimi_sconv_op(
                 or seq_lens.dtype != jnp.int32):
             raise TypeError("Short-convolution metadata tensors must be int32")
 
-        state = (jnp.swapaxes(conv_state, 1, 2)
-                 if state_dim_first else conv_state)
         output, new_state = kimi_short_conv_scan(
             mixed_qkv,
-            state,
+            conv_state,
             # Free: the fused buffer is contiguous, and the scan wants the same
             # kernel-major channels flattened.
             conv_weight.reshape(kernel_size, mixed_dim),
@@ -248,8 +250,6 @@ def build_kimi_sconv_op(
             state_indices,
             seq_lens,
         )
-        if state_dim_first:
-            new_state = jnp.swapaxes(new_state, 1, 2)
         if output.shape != (num_tokens, mixed_dim):
             raise ValueError("Short-convolution output shape changed")
         return new_state, jax.nn.silu(output)
@@ -631,8 +631,7 @@ def build_kimi_dispatched_kda_op(
 
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         has_initial_state = seq_lens > query_lens
-        conv_in = (jnp.swapaxes(conv_state, 1, 2)
-                   if state_dim_first else conv_state)
+        conv_in = conv_state
         # Both convolution paths take the same fused weight, built once at load
         # time by `KimiDeltaAttention.process_weights_after_loading`. It used
         # to be concatenated from the checkpoint's three tensors here, on every
@@ -767,9 +766,7 @@ def build_kimi_dispatched_kda_op(
         output = _gated_output_norm(output, output_gate, norm_weight, eps,
                                     activation_dtype)
 
-        conv_out_state = (jnp.swapaxes(conv_after_prefill, 1, 2)
-                          if state_dim_first else conv_after_prefill)
-        return output, conv_out_state, new_pool
+        return output, conv_after_prefill, new_pool
 
     op_name = f"pallas::kimi_dispatched_kda_{prefix.replace('.', '_')}"
     dispatched_op = pallas.jax_op(op_name,

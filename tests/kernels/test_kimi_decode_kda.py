@@ -448,6 +448,28 @@ def test_decode_kda_reads_a_dim_first_conv_state() -> None:
     )
 
 
+def test_decode_kda_accepts_native_rank5_conv_state() -> None:
+    """The production Kimi cache keeps Q/K/V and heads explicit."""
+    inputs = _build(4, 8, seed=31)
+    plain_out, plain_conv, plain_pool = _call(inputs)
+
+    native = dict(inputs)
+    native["conv_state"] = inputs["conv_state"].reshape(
+        inputs["conv_state"].shape[0], KERNEL_SIZE - 1, 3, HEADS, HEAD_DIM)
+    out, conv_state, pool = _call(native)
+
+    assert conv_state.shape == native["conv_state"].shape
+    _assert_close(out,
+                  np.asarray(plain_out, np.float64),
+                  rtol=0,
+                  name="output")
+    np.testing.assert_array_equal(
+        np.asarray(conv_state, np.float32),
+        np.asarray(plain_conv, np.float32).reshape(conv_state.shape))
+    np.testing.assert_array_equal(np.asarray(pool, np.float32),
+                                  np.asarray(plain_pool, np.float32))
+
+
 # ---------------------------------------------------------------------------
 # Agreement with the path it replaces
 # ---------------------------------------------------------------------------
