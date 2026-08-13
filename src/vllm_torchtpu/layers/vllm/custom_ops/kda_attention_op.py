@@ -125,9 +125,8 @@ def _short_conv_tokens(
     """The loop-free convolution body. See ``kimi_short_conv_scan``."""
     num_tokens = x.shape[0]
     num_seqs = state_indices.shape[0]
-    kernel_size = conv_weight.shape[-1]
+    kernel_size = conv_weight.shape[0]
     history = kernel_size - 1
-    weights = jnp.swapaxes(conv_weight[:, 0, :], 0, 1)  # [kernel_size, dim]
 
     sequence_ids = _token_sequence_ids(query_start_loc, num_tokens, num_seqs)
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -159,7 +158,7 @@ def _short_conv_tokens(
     # Reduced over the tap axis the way the per-token loop reduced over its
     # stacked window, so the two agree bit for bit.
     output = jnp.sum(jnp.stack(taps, axis=0).astype(jnp.float32) *
-                     weights[:, None, :].astype(jnp.float32),
+                     conv_weight[:, None, :].astype(jnp.float32),
                      axis=0).astype(x.dtype)
     walked = (token_ids >= first_token) & (token_ids < total_tokens)
     output = jnp.where(walked[:, None], output, 0)
@@ -203,9 +202,7 @@ def build_kimi_sconv_op(
     def sconv_core(
         mixed_qkv: jax.Array,
         conv_state: jax.Array,
-        q_weight: jax.Array,
-        k_weight: jax.Array,
-        v_weight: jax.Array,
+        conv_weight: jax.Array,
         query_start_loc: jax.Array,
         state_indices: jax.Array,
         seq_lens: jax.Array,
@@ -214,14 +211,14 @@ def build_kimi_sconv_op(
         if mixed_dim % 3:
             raise ValueError(
                 "Kimi short-convolution input must contain Q, K, V")
-        projection_size = mixed_dim // 3
-        expected_weight_shape = (projection_size, 1, kernel_size)
-        for name, weight in (("q", q_weight), ("k", k_weight), ("v",
-                                                                v_weight)):
-            if weight.shape != expected_weight_shape:
-                raise ValueError(
-                    f"{name}_weight must have shape {expected_weight_shape}, "
-                    f"got {weight.shape}")
+        # The fused [kernel_size, 3, heads, head_dim] weight, built at load time
+        # by `KimiDeltaAttention.process_weights_after_loading`.
+        if (conv_weight.shape[0] != kernel_size
+                or conv_weight.size != kernel_size * mixed_dim):
+            raise ValueError(
+                "conv_weight must be the fused [kernel_size, 3, heads, "
+                f"head_dim] weight covering {kernel_size * mixed_dim} "
+                f"channels, got {conv_weight.shape}")
         num_sequences = state_indices.shape[0]
         if query_start_loc.shape != (num_sequences + 1, ):
             raise ValueError("query_start_loc and state_indices disagree")
@@ -241,11 +238,12 @@ def build_kimi_sconv_op(
 
         state = (jnp.swapaxes(conv_state, 1, 2)
                  if state_dim_first else conv_state)
-        weight = jnp.concatenate((q_weight, k_weight, v_weight), axis=0)
         output, new_state = kimi_short_conv_scan(
             mixed_qkv,
             state,
-            weight,
+            # Free: the fused buffer is contiguous, and the scan wants the same
+            # kernel-major channels flattened.
+            conv_weight.reshape(kernel_size, mixed_dim),
             query_start_loc,
             state_indices,
             seq_lens,
@@ -267,9 +265,7 @@ def build_kimi_sconv_op(
     def sconv_impl(
         mixed_qkv: torch.Tensor,
         conv_state: torch.Tensor,
-        q_weight: torch.Tensor,
-        k_weight: torch.Tensor,
-        v_weight: torch.Tensor,
+        conv_weight: torch.Tensor,
         query_start_loc: torch.Tensor,
         state_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -277,9 +273,7 @@ def build_kimi_sconv_op(
         new_state, output = sconv_op(
             mixed_qkv,
             conv_state,
-            q_weight,
-            k_weight,
-            v_weight,
+            conv_weight,
             query_start_loc,
             state_indices,
             seq_lens,
@@ -620,9 +614,7 @@ def build_kimi_dispatched_kda_op(
         output_gate: jax.Array,  # [T, H * D]
         conv_state: jax.Array,  # paged short-convolution cache
         recurrent_state: jax.Array,  # [num_slots, H, K, V]
-        q_weight: jax.Array,  # [H * D, 1, kernel_size]
-        k_weight: jax.Array,
-        v_weight: jax.Array,
+        conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
         a_log: jax.Array,  # [H]
         dt_bias: jax.Array,  # [H * D]
         norm_weight: jax.Array,  # [D]
@@ -641,9 +633,11 @@ def build_kimi_dispatched_kda_op(
         has_initial_state = seq_lens > query_lens
         conv_in = (jnp.swapaxes(conv_state, 1, 2)
                    if state_dim_first else conv_state)
-        # Both convolution paths want one weight over the concatenated q/k/v
-        # projection, the same way `sconv_core` builds it.
-        conv_weight = jnp.concatenate((q_weight, k_weight, v_weight), axis=0)
+        # Both convolution paths take the same fused weight, built once at load
+        # time by `KimiDeltaAttention.process_weights_after_loading`. It used
+        # to be concatenated from the checkpoint's three tensors here, on every
+        # step,
+        # and each consumer then transposed it into its own layout.
 
         token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
         total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
@@ -693,7 +687,8 @@ def build_kimi_dispatched_kda_op(
             conv_out, conv_after_prefill = kimi_short_conv_scan(
                 mixed_qkv,
                 conv_after_decode,
-                conv_weight,
+                # Free: contiguous buffer, same channels in the same order.
+                conv_weight.reshape(conv_weight.shape[0], -1),
                 query_start_loc,
                 state_indices,
                 seq_lens,
@@ -799,9 +794,7 @@ def build_kimi_dispatched_kda_op(
         output_gate: torch.Tensor,
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
-        q_weight: torch.Tensor,
-        k_weight: torch.Tensor,
-        v_weight: torch.Tensor,
+        conv_weight: torch.Tensor,
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
         norm_weight: torch.Tensor,
@@ -817,9 +810,7 @@ def build_kimi_dispatched_kda_op(
             output_gate,
             conv_state,
             recurrent_state,
-            q_weight,
-            k_weight,
-            v_weight,
+            conv_weight,
             a_log,
             dt_bias,
             norm_weight,

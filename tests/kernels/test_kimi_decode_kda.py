@@ -70,8 +70,10 @@ def _build(num_live,
                  (KERNEL_SIZE - 1, MIXED_DIM))
     conv_state = jnp.asarray(
         rng.standard_normal((num_slots, ) + conv_tail) * 0.1, jnp.bfloat16)
-    conv_weight = jnp.asarray(
+    conv_weight_raw = jnp.asarray(
         rng.standard_normal((MIXED_DIM, 1, KERNEL_SIZE)) * 0.3, jnp.bfloat16)
+    conv_weight = jnp.swapaxes(conv_weight_raw[:, 0, :], 0,
+                               1).reshape(KERNEL_SIZE, 3, HEADS, HEAD_DIM)
     pool = jnp.asarray(
         rng.standard_normal((num_slots, HEADS, HEAD_DIM, HEAD_DIM)) * 0.05,
         jnp.float32)
@@ -93,6 +95,7 @@ def _build(num_live,
         "output_gate": activation(PROJECTION),
         "conv_state": conv_state,
         "conv_weight": conv_weight,
+        "conv_weight_raw": conv_weight_raw,
         "pool": pool,
         "a_log": a_log,
         "dt_bias": dt_bias,
@@ -158,7 +161,8 @@ def _reference_step(inputs, seq, *, lower_bound):
     # A first step starts from zero: the slot may hold another request's tail.
     prior = prior if carries else np.zeros_like(prior)
 
-    weights = np.asarray(inputs["conv_weight"][:, 0, :]).astype(np.float64).T
+    weights = np.asarray(inputs["conv_weight"]).astype(np.float64).reshape(
+        KERNEL_SIZE, MIXED_DIM)
     window = np.concatenate([prior, token[None]], axis=0)  # [K, mixed_dim]
     # The kernel rounds back to bfloat16 after the activation, so the reference
     # has to as well or the comparison measures the cast.
@@ -465,7 +469,9 @@ def test_decode_kda_matches_mains_two_op_path() -> None:
     conv_out, naive_conv = kimi_short_conv_scan(
         inputs["mixed_qkv"],
         inputs["conv_state"],
-        inputs["conv_weight"],
+        # Free reshape of the same fused buffer: the scan takes the channels
+        # flat, `decode_kda` takes them split per component and head.
+        inputs["conv_weight"].reshape(KERNEL_SIZE, MIXED_DIM),
         inputs["query_start_loc"],
         inputs["state_indices"],
         inputs["seq_lens"],
@@ -526,8 +532,14 @@ def test_decode_kda_rejects_a_mixed_qkv_width_that_is_not_three_projections(
 
 
 def test_decode_kda_rejects_a_misshaped_conv_weight() -> None:
+    """The checkpoint's own layout must be rejected, not silently misread.
+
+    ``[mixed_dim, 1, kernel_size]`` and the fused ``[kernel_size, 3, heads,
+    head_dim]`` hold the same numbers, so a caller that forgets to fuse would
+    otherwise get a plausible-looking but transposed weight.
+    """
     inputs = _build(2, 4, seed=33)
-    inputs["conv_weight"] = inputs["conv_weight"][:, 0, :]
+    inputs["conv_weight"] = inputs["conv_weight_raw"]
     with pytest.raises(ValueError, match="conv_weight must have shape"):
         _call(inputs)
 

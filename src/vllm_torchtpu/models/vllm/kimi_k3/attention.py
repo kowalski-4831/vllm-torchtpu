@@ -424,6 +424,17 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                                               self.conv_size)
         self.v_conv1d = CausalDepthwiseConv1d(self.projection_size,
                                               self.conv_size)
+        # Both convolution consumers take one fused weight in the kernels'
+        # [kernel_size, 3, heads, head_dim] layout;
+        # `process_weights_after_loading` folds the checkpoint's three tensors
+        # into it at load time. Non-persistent:
+        # it is derived from q/k/v_conv1d.weight, not a checkpoint entry of its
+        # own, and must not appear in a state dict.
+        self.register_buffer(
+            "conv_weight_fused",
+            torch.empty(self.conv_size, 3, self.num_heads, self.head_dim),
+            persistent=False,
+        )
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
             self.projection_size,
@@ -519,6 +530,30 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             raise TypeError("KDA received incompatible attention metadata")
         return layer_metadata
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Fold the three depthwise conv weights into the kernels' layout.
+
+        The checkpoint keeps q/k/v as separate ``[dim, 1, kernel_size]``
+        tensors, and the ops used to concatenate and transpose them on every
+        step. Both convolution consumers want ``[kernel_size, 3, heads,
+        head_dim]``, so build that once, here, at load time.
+        """
+        fused = torch.stack(
+            tuple(w[:, 0, :].t().reshape(self.conv_size, self.num_heads,
+                                         self.head_dim)
+                  for w in (self.q_conv1d.weight, self.k_conv1d.weight,
+                            self.v_conv1d.weight)),
+            dim=1,
+        )
+        # `fused` is the lazy result of a stack of views, and torch_tpu
+        # re-materializes that lineage as a per-step `tt_jit_as_strided`
+        # program at the dispatched op's boundary (same failure mode and fix as
+        # the w_scale case in quantization/fp8.py). A fresh buffer filled by
+        # copy_ breaks the lazy chain so PJRT ships a plain row-major buffer.
+        out = torch.empty_like(fused)
+        out.copy_(fused)
+        self.conv_weight_fused = out
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -598,9 +633,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             mixed_qkv = self.sconv_op(
                 mixed_qkv,
                 sconv_cache,
-                self.q_conv1d.weight,
-                self.k_conv1d.weight,
-                self.v_conv1d.weight,
+                self.conv_weight_fused,
                 metadata.query_start_loc,
                 metadata.mamba_state_indices,
                 metadata.seq_lens,
@@ -626,9 +659,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output_gate,
             sconv_cache,
             recurrent_cache,
-            self.q_conv1d.weight,
-            self.k_conv1d.weight,
-            self.v_conv1d.weight,
+            self.conv_weight_fused,
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,
