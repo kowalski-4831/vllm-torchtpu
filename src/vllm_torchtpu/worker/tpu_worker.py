@@ -516,9 +516,10 @@ class TPUWorker(WorkerBase):
                 logger.warning(
                     "Profiler is already running. Ignoring start request.")
                 return
-            profile_dir = self.profile_dir
-            if profile_prefix:
-                profile_dir = os.path.join(profile_dir, profile_prefix)
+            from vllm_torchtpu.tracing.options import \
+                resolve_profile_dir_and_opts
+            profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
+                self.profile_dir, profile_prefix)
             os.makedirs(profile_dir, exist_ok=True)
             # All ranks capture concurrently, so each writes into its own
             # sandbox under a run directory they agree on; stop merges them.
@@ -538,9 +539,10 @@ class TPUWorker(WorkerBase):
                 dir_name=self.profile_capture_dir, use_gzip=True)
             config = TpuProfilerConfig(
                 run_dir=self.profile_capture_dir,
-                host_tracer_level=2,
-                device_tracer_level=1,
-                python_tracer_level=1,
+                host_tracer_level=standard_opts["host_tracer_level"],
+                device_tracer_level=standard_opts["device_tracer_level"],
+                python_tracer_level=standard_opts["python_tracer_level"],
+                experimental_options=advanced_opts,
             )
             self.profile_context = torch.profiler.profile(
                 activities=[
