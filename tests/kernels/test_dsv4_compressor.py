@@ -333,6 +333,14 @@ _CASES = [
     (4, True, 12, 3, 2),
     (128, False, 256, 0, 3),
     (128, False, 200, 4, 4),
+    # CSA (compress_ratio=4) had only been tested at seq_len 8 and 12 -- 2-3
+    # compressed rows inside the first state block, so a wrong token->row
+    # mapping deeper into the sequence went undetected. At this harness's
+    # state_block_size=4, 256 tokens walks 64 state blocks and 512 walks 128,
+    # so the state block table is actually exercised.
+    (4, True, 256, 0, 5),
+    (4, True, 512, 0, 6),
+    (4, True, 260, 3, 7),
 ]
 
 
