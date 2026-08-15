@@ -37,6 +37,9 @@ def _parallel_config(**kwargs):
     values = vars(ParallelConfig(tensor_parallel_size=8)).copy()
     values["prefill_context_parallel_size"] = 8
     values.update(kwargs)
+    # Single-host tests: local chip count equals the full TP world size
+    # unless a test explicitly overrides it (e.g. to simulate --nnodes > 1).
+    values.setdefault("local_world_size", values["world_size"])
     return SimpleNamespace(**values)
 
 
@@ -232,12 +235,16 @@ def test_dp_binding_uses_registered_probe_result_and_applies_offset():
         "TORCH_TPU_DP_SIZE": "2",
         "TPU_LOCAL_RANK_OFFSET": "1",
     }
-    pc = _parallel_config(world_size=4,
-                          data_parallel_size=1,
-                          data_parallel_rank=0,
-                          data_parallel_index=1,
-                          prefill_context_parallel_size=4,
-                          enable_expert_parallel=True)
+    pc = _parallel_config(
+        world_size=4,
+        data_parallel_size=1,
+        data_parallel_rank=0,
+        data_parallel_index=1,
+        # Single-host DP: run_engine_core sets this equal to
+        # the global DP rank, since every replica is local.
+        data_parallel_rank_local=1,
+        prefill_context_parallel_size=4,
+        enable_expert_parallel=True)
 
     b = binding.get_tpu_worker_binding(pc, rank=2, local_rank=2, env=env)
 

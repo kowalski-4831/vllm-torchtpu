@@ -620,6 +620,27 @@ class TpuPlatform(Platform):
         return
 
     @classmethod
+    def device_count(cls) -> int:
+        """Local physical chip count on this host, stable across contexts.
+
+        Without this override, `device_count()` resolves dynamically to
+        `torch.tpu.device_count()` (see torch_tpu's device module), which
+        returns the *local* chip count outside any torch.distributed group
+        but drops to 1 (chips bound to this rank) once a real multi-host
+        `tpu_dist` process group is active — vLLM workers are one-process-
+        per-chip, so every rank observes exactly 1 there. Callers like
+        MessageQueue.create_from_process_group_single_reader use this value
+        as "how many ranks share this host" (the CUDA convention, where
+        device_count() stays host-wide regardless of the process's own
+        device binding), so the dynamic proxy silently breaks cross-host
+        same-node detection for every rank but the reader itself. Scanning
+        /dev/vfio (or /dev/accel*) directly sidesteps the distributed
+        context entirely and always returns the true local chip count.
+        """
+        from vllm_torchtpu.tpu_info import get_num_chips
+        return get_num_chips()
+
+    @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
         """Pick torch.distributed backend used by worker bootstrap.
 
@@ -656,7 +677,16 @@ class TpuPlatform(Platform):
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
                 f"localhost:{p}" for p in sb_ports)
 
-        os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(world_size)
+        # A per-engine DP config copy (data_parallel_size collapsed to 1,
+        # see the caller) re-enters this function in a child process that
+        # inherits TORCH_TPU_TOPOLOGY already computed for the *real* multi-
+        # host slice by prepare_mp_multihost_dp_env. Only the single-host
+        # PCI-scan lookup below needs a fresh call, and re-running it here
+        # would fail: this process only has world_size's local share of
+        # chips, not the whole cross-host slice.
+        if "TORCH_TPU_TOPOLOGY" not in os.environ:
+            os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(
+                world_size)
 
     @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
@@ -874,7 +904,28 @@ class TpuPlatform(Platform):
                         "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
-        if not multihost_backend:  # Single host
+        if multihost_backend != "ray" and parallel_config.nnodes > 1:
+            # Genuine multi-host run without Ray: each host runs its own
+            # `vllm serve --nnodes N --node-rank R [--headless]` process and
+            # spawns its local TP-slice workers via TpuMultiprocExecutor.
+            # Unlike the Ray path there's no actor system to discover peer
+            # hosts, so a short TCPStore rendezvous fills in the TORCH_TPU_*
+            # env vars (slicebuilder addresses spanning every host, full
+            # ICI topology, TPU_NUM_HOSTS/NODE_RANK) before workers are
+            # forked. This must be checked before the "not multihost_backend"
+            # single-host branch below: an unset TPU_MULTIHOST_BACKEND still
+            # means "mp" whenever --nnodes > 1 was actually passed.
+            from vllm_torchtpu.distributed.tpu_mp_multihost import \
+                prepare_mp_multihost_env
+            prepare_mp_multihost_env(parallel_config)
+            logger.info(
+                "Force using TpuMultiprocExecutor for TPU multi-host "
+                "(nnodes=%d, node_rank=%d).", parallel_config.nnodes,
+                parallel_config.node_rank)
+            from vllm_torchtpu.executors.tpu_multiproc_executor import \
+                TpuMultiprocExecutor
+            parallel_config.distributed_executor_backend = TpuMultiprocExecutor
+        elif not multihost_backend:  # Single host
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
                 if pcp_size > 1:
@@ -901,8 +952,15 @@ class TpuPlatform(Platform):
                     # binding.
                     cls.device_control_env_var = \
                         "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
-                cls._prepare_singlehost_tpu_env(
-                    parallel_config.world_size_across_dp)
+                # Genuine multi-host DP (this host only owns a slice of the
+                # DP ranks) needs a TCPStore rendezvous across hosts instead
+                # of the single-host localhost/PCI-scan bootstrap below.
+                from vllm_torchtpu.distributed.tpu_mp_multihost import \
+                    prepare_mp_multihost_dp_env
+                if not prepare_mp_multihost_dp_env(
+                        parallel_config, parallel_config.world_size_across_dp):
+                    cls._prepare_singlehost_tpu_env(
+                        parallel_config.world_size_across_dp)
             else:
                 # vLLM hands each DP engine a ParallelConfig with
                 # data_parallel_size collapsed to 1, so the inherited

@@ -483,7 +483,27 @@ def get_tpu_worker_binding(
         if executor_binding is not None:
             return executor_binding
 
-        native_local_rank = dp_rank * world_size + local_rank
+        # dp_rank is the *global* DP replica index (0..dp_size-1), spanning
+        # every host under multi-host DP (vLLM's --data-parallel-start-rank
+        # hybrid-LB launch). native_local_rank pins this worker to a
+        # physical chip (see tpu_worker.py's TPU_VISIBLE_CHIPS), which is
+        # numbered locally on *this* host (0..data_parallel_size_local-1), so
+        # it must use this host's local DP index, not the raw global one --
+        # otherwise a second host's ranks (e.g. 8-15) get pinned to chip
+        # indices that don't exist there. data_parallel_rank_local is set by
+        # CoreEngineProcManager/run_engine_core (vllm/v1/engine/{utils,core}
+        # .py) directly from the process-spawn-time-known local slot -- the
+        # same field GPU's worker.py reads for the identical purpose -- so no
+        # TPU-specific plumbing is needed to get it here. The modulo is only
+        # a defensive fallback for contexts where that never ran; it assumes
+        # a contiguous host-major rank layout (true for --data-parallel-
+        # start-rank, e.g. host 0 = ranks 0-7 and host 1 = ranks 8-15), unlike
+        # the authoritative field.
+        dp_rank_local = parallel_config.data_parallel_rank_local
+        if dp_rank_local is None:
+            dp_size_local = parallel_config.data_parallel_size_local or dp_size
+            dp_rank_local = dp_rank % dp_size_local
+        native_local_rank = dp_rank_local * world_size + local_rank
         global_rank = dp_rank * world_size + rank
         global_world = world_size * dp_size
         if pcp_size > 1 and use_spawned_pcp_local_rank:
@@ -521,12 +541,18 @@ def get_tpu_worker_binding(
         )
     else:
         tpu_local_rank, remap, source = get_pcp_worker_local_rank_env(
-            local_rank, world_size, pcp_size)
+            native_local_rank, world_size, pcp_size)
+    # LOCAL_WORLD_SIZE must be the per-host chip count, not the global TP*PP
+    # world size: on a single host they're equal, but across --nnodes hosts
+    # each host only has world_size // nnodes chips, and PjRt bootstrap fails
+    # ("PjRtClient is not initialized") if told to expect more local devices
+    # than physically exist on this host.
+    local_chip_count = parallel_config.local_world_size
     return TpuWorkerBinding(
         rank=rank,
         local_rank=local_rank_offset + tpu_local_rank,
         world_size=world_size,
-        local_world_size=local_rank_offset + world_size,
+        local_world_size=local_rank_offset + local_chip_count,
         init_rank=rank,
         init_world_size=world_size,
         init_local_rank=tpu_local_rank,
