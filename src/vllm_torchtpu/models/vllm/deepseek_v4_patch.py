@@ -16,6 +16,7 @@
 # TODO(patemotter): replace this patching with a dedicated DSv4 model.py
 # registered in `register_models()`, the way `kimi_k3` is.
 
+import sys
 from contextlib import contextmanager
 
 import torch
@@ -379,6 +380,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
+        # Distinct per layer, so each gets its own compile cache directory.
+        self.prefix = prefix
 
     DeepseekV4DecoderLayer.__init__ = patched_decoder_layer_init
 
@@ -471,6 +474,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             hc_eps: float,
         ):
             super().__init__()
+            # One head per model, so a literal is a stable compile cache key.
+            self.prefix = "model.head"
             self.hc_head_op = hc_head_op
             self.hc_head_fn = hc_head_fn
             self.hc_head_scale = hc_head_scale
@@ -554,6 +559,34 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
     DeepseekV4Model.__init__ = patched_model_init
     DeepseekV4Model.forward = patched_model_forward
+
+    # Tracing this model exceeds the default 1000 frames.
+    sys.setrecursionlimit(50000)
+
+    # Layer-level and head graph mode.
+    from vllm.compilation.decorators import support_torch_compile
+    if not hasattr(DeepseekV4DecoderLayer, "__vllm_torch_compile__"):
+        support_torch_compile(
+            DeepseekV4DecoderLayer,
+            dynamic_arg_dims={
+                "x": 0,
+                "positions": 0,
+                "residual": 0,
+                "post_mix": 0,
+                "res_mix": 0,
+                "input_ids": 0,
+            },
+        )
+    if not hasattr(DeepseekV4Head, "__vllm_torch_compile__"):
+        support_torch_compile(
+            DeepseekV4Head,
+            dynamic_arg_dims={
+                "hidden_states": 0,
+                "residual": 0,
+                "post_mix": 0,
+                "res_mix": 0,
+            },
+        )
 
     # 2. Clear cached resolved architectures so the AMD model is picked up.
     from vllm.model_executor.model_loader import utils as _ml_utils
