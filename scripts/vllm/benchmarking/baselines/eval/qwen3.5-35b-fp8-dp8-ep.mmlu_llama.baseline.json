@@ -1,0 +1,22 @@
+{
+  "mmlu_llama": {
+    "exact_match,strict_match": 0.8491228070175438,
+    "exact_match_stderr,strict_match": 0.004568384358163419
+  },
+  "mmlu_llama_humanities": {
+    "exact_match,strict_match": 0.8515384615384616,
+    "exact_match_stderr,strict_match": 0.009592435706537393
+  },
+  "mmlu_llama_other": {
+    "exact_match,strict_match": 0.8438461538461538,
+    "exact_match_stderr,strict_match": 0.009497883459476128
+  },
+  "mmlu_llama_social_sciences": {
+    "exact_match,strict_match": 0.9058333333333334,
+    "exact_match_stderr,strict_match": 0.008306775863867114
+  },
+  "mmlu_llama_stem": {
+    "exact_match,strict_match": 0.8157894736842105,
+    "exact_match_stderr,strict_match": 0.008658921178423205
+  }
+}
