@@ -697,7 +697,7 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     @bucket, K lm-head gathers @constant loop bucket, K-1 loop forwards @that
     bucket — not just K bare forwards."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
-    monkeypatch.setattr(e3.sync, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
 
     proposer = _make_proposer(draft_tp=2, target_tp=2)
     proposer.speculative_config.num_speculative_tokens = 3
@@ -759,7 +759,7 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
     not have.
     """
     import vllm_torchtpu.spec_decode.eagle3 as e3
-    monkeypatch.setattr(e3.sync, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
 
     proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
     proposer.speculative_config.num_speculative_tokens = 3
@@ -815,7 +815,7 @@ def test_run_dp_dummy_draft_positions_match_draft_graph_rank(
     1-D token positions, like runner.position_ids.
     """
     import vllm_torchtpu.spec_decode.eagle3 as e3
-    monkeypatch.setattr(e3.sync, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
 
     proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
     proposer.speculative_config.num_speculative_tokens = 3

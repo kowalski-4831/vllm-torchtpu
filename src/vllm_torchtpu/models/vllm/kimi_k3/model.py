@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
-from torch_tpu._internal import sync
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_gather
@@ -46,6 +45,8 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+
+from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
@@ -396,9 +397,9 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
 def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Gather a materialized encoder output without leaving the TPU."""
     materialized = torch.empty_like(input_).copy_(input_)
-    sync.synchronize(materialized, wait=True)
+    synchronize_tensors(materialized)
     gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
-    sync.synchronize(gathered, wait=True)
+    synchronize_tensors(gathered)
     return gathered
 
 
@@ -585,7 +586,7 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
             return merged
 
         materialized = torch.empty_like(merged).copy_(merged)
-        sync.synchronize(materialized, wait=True)
+        synchronize_tensors(materialized)
         return materialized
 
     def forward(

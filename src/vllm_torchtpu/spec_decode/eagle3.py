@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from torch_tpu._internal import sync
 from vllm.compilation.backends import set_model_tag
 from vllm.config import (VllmConfig, get_layers_from_vllm_config,
                          set_current_vllm_config)
@@ -24,6 +23,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
                                              maybe_share_embeddings)
+from vllm_torchtpu.utils import synchronize_tensors
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
@@ -1034,7 +1034,7 @@ class Eagle3Proposer:
                                 device=runner.device) for _ in range(3)
                 ]
                 out = self._draft_combine_hidden_states(*aux)
-                sync.synchronize(out, wait=True)
+                synchronize_tensors(out)
                 logger.info("  -- drafter combine num_tokens: %d", num_tokens)
 
     def _precompile_draft_seed(self) -> None:
@@ -1065,7 +1065,7 @@ class Eagle3Proposer:
                                       dtype=torch.int32,
                                       device=runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
-                    sync.synchronize(out, wait=True)
+                    synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -1094,7 +1094,7 @@ class Eagle3Proposer:
                     device=runner.device,
                 )
                 out = self._draft_propose_token(dummy_hidden)
-                sync.synchronize(out, wait=True)
+                synchronize_tensors(out)
                 logger.info("  -- drafter compute_logits n: %d", n)
 
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
@@ -1251,4 +1251,4 @@ class Eagle3Proposer:
                     tok = self._draft_propose_token(last_hidden)
             # Force the chunk to execute so its collectives fire in lockstep
             # with the peer ranks' real propose (nothing consumes the result).
-            sync.synchronize(tok, wait=True)
+            synchronize_tensors(tok)

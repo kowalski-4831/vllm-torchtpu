@@ -49,7 +49,6 @@ from typing import Any, Optional
 
 import jax.numpy as jnp
 import torch
-from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
@@ -78,6 +77,7 @@ from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  quantize_native_fp4_kmajor)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -230,12 +230,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             )
 
         if layer.w13_weight.device.type == "tpu":
-            sync.synchronize(layer.w13_weight, wait=True)
-            sync.synchronize(layer.w2_weight, wait=True)
+            to_sync = [layer.w13_weight, layer.w2_weight]
             if layer.w13_bias is not None:
-                sync.synchronize(layer.w13_bias, wait=True)
+                to_sync.append(layer.w13_bias)
             if layer.w2_bias is not None:
-                sync.synchronize(layer.w2_bias, wait=True)
+                to_sync.append(layer.w2_bias)
+            synchronize_tensors(to_sync)
 
         logger.info_once(
             "MXFP4 weights dequantized to bfloat16 and transposed for GMM kernel."
@@ -466,12 +466,12 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             layer.w2_bias = torch.nn.Parameter(w2_bias_padded.to(device),
                                                requires_grad=False)
 
-        sync.synchronize(layer.w13_weight, wait=True)
-        sync.synchronize(layer.w2_weight, wait=True)
+        to_sync = [layer.w13_weight, layer.w2_weight]
         if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
-            sync.synchronize(layer.w13_bias, wait=True)
+            to_sync.append(layer.w13_bias)
         if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
-            sync.synchronize(layer.w2_bias, wait=True)
+            to_sync.append(layer.w2_bias)
+        synchronize_tensors(to_sync)
 
         logger.info(
             "DeepSeek-V4 MXFP4 weights processed and stored as native FP4 "

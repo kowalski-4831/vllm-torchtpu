@@ -95,7 +95,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch_tpu._internal.sync import synchronize as _tpu_sync
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
@@ -106,6 +105,7 @@ from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -475,7 +475,7 @@ class Transfer:
     num_bytes: int
     n: int
     # threading.Event set by _DmaWorker when the DMA task returns. Because
-    # the task ends with `_tpu_sync(wait=True)` (D2H) or a blocking
+    # the task ends with `synchronize_tensors(...)` (D2H) or a blocking
     # `d.copy_(h)` (H2D), dma_done.is_set() implies the DMA is physically
     # complete on-device. For H2D, dma_done starts as None until
     # `_start_h2d_dma` kicks the worker — deferred submission keeps only one
@@ -600,7 +600,7 @@ class SingleDirectionOffloadingHandler:
         # Lightweight diagnostics — printed sparingly to spot stalls.
 
         # Single background DMA worker for this direction. The FIFO queue
-        # plus the worker task's terminating `_tpu_sync(..., wait=True)`
+        # plus the worker task's terminating `synchronize_tensors(...)`
         # together guarantee that only one DMA per direction is in flight
         # at any instant. Thread isolation replaces what a dedicated TPU
         # stream + event.synchronize() would do on CUDA — no explicit
@@ -631,7 +631,7 @@ class SingleDirectionOffloadingHandler:
             ]
             # Force materialization so subsequent copy_ calls don't go
             # through a lazy-allocation path that could stall PJRT.
-            _tpu_sync(self._h2d_device_buffer, wait=True)
+            synchronize_tensors(self._h2d_device_buffer)
             # Buffer-reuse gate. SET = device buffer is logically free for
             # the worker to write the next H2D into. CLEARED = a transfer
             # is mid-flight (worker is writing) OR pending scatter (main
@@ -674,7 +674,7 @@ class SingleDirectionOffloadingHandler:
             scatter(prev) → H2D(this)
         in that command-stream order. XLA's HBM-range dependency on
         `device_buffer` then serializes them on-device — no host-side
-        `_tpu_sync` is needed and the main thread never blocks.
+        `synchronize_tensors` is needed and the main thread never blocks.
 
         For oversized transfers (chunks_total > 1), dispatches just the
         chunk indexed by `t.chunks_done`. get_finished() re-submits so
@@ -764,7 +764,7 @@ class SingleDirectionOffloadingHandler:
             # to coordinate kv_l (live KV cache) reads across threads.
             src_ids_i64 = src_ids_i32.to(torch.int64)
             device_buffer = [kv_l[src_ids_i64] for kv_l in self.src_tensors]
-            _tpu_sync(device_buffer, wait=False)
+            synchronize_tensors(device_buffer, wait=False)
 
             # (2) Unpinned host staging matching the gathered device shape.
             # The lazy D2H copy_ below stages through libtpu's premap pool
@@ -1162,7 +1162,7 @@ class _RaidenOffloadingHandler:
             # cannot read a block mid-write. Scoped to the KV tensors (not a
             # global device sync); waits on their PJRT readiness event, the
             # same event raiden's raw copy would otherwise race.
-            _tpu_sync(self._device_tensors or None, wait=True)
+            synchronize_tensors(self._device_tensors or None)
             fut = self._mgr.d2h(src_ids.tolist(), dst_ids.tolist(), sizes)
         else:
             fut = self._mgr.h2d(src_ids.tolist(), dst_ids.tolist(), sizes)

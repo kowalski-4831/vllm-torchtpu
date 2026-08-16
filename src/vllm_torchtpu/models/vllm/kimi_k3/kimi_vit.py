@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from torch_tpu._internal import sync
 from vllm.model_executor.models.kimi_k25_vit import MoonViT3dPretrainedModel
+
+from vllm_torchtpu.utils import synchronize_tensors
 
 
 def _materialize_vision_qkv(
@@ -22,7 +23,7 @@ def _materialize_vision_qkv(
         return None
 
     materialized_qkv = torch.empty_like(qkv).copy_(qkv)
-    sync.synchronize(materialized_qkv, wait=True)
+    synchronize_tensors(materialized_qkv)
     return materialized_qkv, output[1]
 
 

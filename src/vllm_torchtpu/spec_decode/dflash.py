@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch_tpu._internal import sync
 from vllm.compilation.backends import set_model_tag
 from vllm.config import (VllmConfig, get_layers_from_vllm_config,
                          set_current_vllm_config)
@@ -26,6 +25,7 @@ from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
                                              maybe_share_embeddings,
                                              maybe_share_lm_head)
+from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -502,8 +502,7 @@ class DFlashProposer:
             ]
             _, dummy_outputs = self._tpu_precompute_and_update_kv_cache(
                 dummy_hidden, dummy_positions, dummy_attn_metadata, kv_caches)
-            for out in dummy_outputs:
-                sync.synchronize(out, wait=True)
+            synchronize_tensors(dummy_outputs)
 
     def _dummy_draft_forward(
         self,
@@ -584,7 +583,7 @@ class DFlashProposer:
             ):
                 draft_tokens_chunk, hidden = self._dflash_forward_and_sample(
                     input_ids, positions, block_size)
-                sync.synchronize(draft_tokens_chunk, wait=True)
+                synchronize_tensors(draft_tokens_chunk)
 
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx

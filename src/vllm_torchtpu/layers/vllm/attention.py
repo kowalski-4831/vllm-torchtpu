@@ -6,7 +6,7 @@ from typing import Any, ClassVar
 
 import jax
 import torch
-from torch_tpu._internal import pallas, sync
+from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.common.sequence_layout import \
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -887,7 +888,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             outputs = outputs[..., :self.head_size]
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():
-            sync.synchronize(kv_cache)
+            synchronize_tensors(kv_cache, wait=False)
 
         if query_dim == 2:
             outputs = outputs.reshape(q_len, self.num_heads * self.head_size)

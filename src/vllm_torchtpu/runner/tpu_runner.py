@@ -25,7 +25,6 @@ import vllm.envs as vllm_envs
 # TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from packaging import version
-from torch_tpu._internal import sync
 from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
 from vllm.distributed import get_dcp_group, get_pcp_group
@@ -107,6 +106,7 @@ from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
+from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -758,7 +758,7 @@ class TPUModelRunner(GPUModelRunner):
         pass
 
     def _sync_device(self) -> None:
-        torch.tpu.synchronize()
+        synchronize_device()
 
     def maybe_setup_kv_connector(self,
                                  scheduler_output,
@@ -3101,10 +3101,10 @@ class TPUModelRunner(GPUModelRunner):
             has_encoder_inputs = bool(
                 scheduler_output.scheduled_encoder_inputs)
             if has_encoder_inputs:
-                sync.synchronize(wait=True)
+                synchronize_tensors()
             self._execute_mm_encoder(scheduler_output)
             if has_encoder_inputs:
-                sync.synchronize(wait=True)
+                synchronize_tensors()
 
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
@@ -4301,7 +4301,7 @@ class TPUModelRunner(GPUModelRunner):
                                    dtype=torch.int32,
                                    device=out.device)
                 _ = self.compute_selected_logits(out, _idx)
-            sync.synchronize(out, wait=True)
+            synchronize_tensors(out)
         self._hidden_states_dtype = out.dtype
 
     @contextlib.contextmanager
@@ -4331,7 +4331,7 @@ class TPUModelRunner(GPUModelRunner):
                                           dtype=torch.int32,
                                           device=self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
-                    sync.synchronize(out, wait=True)
+                    synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
@@ -4345,7 +4345,7 @@ class TPUModelRunner(GPUModelRunner):
                                            device=self.device,
                                            dtype=self._hidden_states_dtype)
                 out = self.compute_logits_from_hidden_states(dummy_hidden)
-                sync.synchronize(out, wait=True)
+                synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_structured_decoding(self) -> None:
@@ -4361,7 +4361,7 @@ class TPUModelRunner(GPUModelRunner):
                     self._dummy_logits(num_reqs),
                     arange,
                 )
-                sync.synchronize(out, wait=True)
+                synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_sample_from_logits(self) -> None:
@@ -4386,7 +4386,7 @@ class TPUModelRunner(GPUModelRunner):
                                                        dummy_top_k,
                                                        dummy_top_p,
                                                        all_greedy=all_greedy)
-                    sync.synchronize(out, wait=True)
+                    synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_gather_logprobs(self) -> None:
@@ -4397,7 +4397,7 @@ class TPUModelRunner(GPUModelRunner):
                     torch.zeros((num_reqs, 1),
                                 dtype=torch.int64).to(self.device),
                 )
-                sync.synchronize(out.logprobs, wait=True)
+                synchronize_tensors(out.logprobs)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_substitute_placeholder_token(self) -> None:
@@ -4433,7 +4433,7 @@ class TPUModelRunner(GPUModelRunner):
                     out = _substitute_placeholder_token(
                         input_ids, cur_input_indices, pre_next_tokens_indices,
                         next_tokens)
-                    sync.synchronize(out, wait=True)
+                    synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, next_len: %d",
                                 num_tokens, nlen)
 
@@ -4510,7 +4510,7 @@ class TPUModelRunner(GPUModelRunner):
                         group_indices=group_indices,
                         max_draft_tokens=k,
                     )
-                    sync.synchronize(out, wait=True)
+                    synchronize_tensors(out)
                     # --- non-greedy verify path (do_sampling=True) ---
                     _, target_logits_ng = (
                         self.spec_gather_bonus_and_target_logits(
@@ -4546,7 +4546,7 @@ class TPUModelRunner(GPUModelRunner):
                         recover_u=warm_recover_u,
                         do_sampling=True,
                     )
-                    sync.synchronize(out, wait=True)
+                    synchronize_tensors(out)
                     logger.info("  -- padded_logits_length: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
@@ -5000,7 +5000,7 @@ class TPUModelRunner(GPUModelRunner):
             cc.cache_dir, cc.local_cache_dir = saved_cache
             cc.compile_sizes = saved_sizes
             torch._dynamo.reset()
-            torch.tpu.synchronize()
+            synchronize_device()
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
             if not self.enforce_eager:
@@ -5158,8 +5158,8 @@ class TPUModelRunner(GPUModelRunner):
             # makes every donated pool parameter fall back to a fresh
             # pool-sized output copy (a 2x-pool transient that OOMs at high
             # gpu_memory_utilization).
-            for raw in self.kv_cache_raw_tensors:
-                sync.synchronize(raw, wait=True)
+            if self.kv_cache_raw_tensors:
+                synchronize_tensors(self.kv_cache_raw_tensors)
 
         logger.info(
             "%s",

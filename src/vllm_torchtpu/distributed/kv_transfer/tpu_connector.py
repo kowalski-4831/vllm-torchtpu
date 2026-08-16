@@ -59,6 +59,7 @@ from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
     ZmqShmKvConnectorBase, _CoordRecvEntry, _CoordSendEntry)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -706,8 +707,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         return future, device_shards
 
     def _synchronize_device(self, tensor: torch.Tensor) -> None:
-        from torch_tpu._internal.sync import sync as tpu_sync
-        tpu_sync.synchronize(tensor)
+        synchronize_tensors(tensor, wait=False)
 
     def _try_fast_scatter(
             self, device_shards: list[torch.Tensor],

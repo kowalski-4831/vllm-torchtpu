@@ -236,8 +236,10 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
         "vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
-    monkeypatch.setattr("vllm_torchtpu.runner.tpu_runner.sync.synchronize",
-                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.synchronize_tensors",
+        lambda *_args, **_kwargs: None,
+    )
 
     runner.maybe_select_dummy_loras = (
         lambda *_args, **_kwargs: contextlib.nullcontext())

@@ -112,7 +112,7 @@ def test_vllm_fp8_linear_method_tpu():
     with patch(
             "vllm_torchtpu.layers.vllm.quantization.fp8.replace_parameter"
     ), patch(
-            "vllm_torchtpu.layers.vllm.quantization.fp8.sync.synchronize"
+            "vllm_torchtpu.layers.vllm.quantization.fp8.synchronize_tensors"
     ), patch(
             "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
             return_value=0

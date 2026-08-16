@@ -1,5 +1,4 @@
 import torch
-from torch_tpu._internal import sync
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import \
@@ -15,6 +14,7 @@ from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  requant_load_kmajor_fp4)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import (
     get_cpu_weight_loader_hook, release_memory_to_os)
+from vllm_torchtpu.utils import synchronize_tensors
 
 
 def _fresh(t: torch.Tensor) -> torch.Tensor:
@@ -193,10 +193,12 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         layer.w2_bias = None
 
         if layer.w13_weight.device.type == "tpu":
-            sync.synchronize(layer.w13_weight, wait=True)
-            sync.synchronize(layer.w2_weight, wait=True)
-            sync.synchronize(layer.w13_weight_scale, wait=True)
-            sync.synchronize(layer.w2_weight_scale, wait=True)
+            synchronize_tensors([
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+            ])
 
         release_memory_to_os()
 

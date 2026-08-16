@@ -6,11 +6,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn import Parameter
-from torch_tpu._internal import sync
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -125,7 +125,7 @@ def populate_draft_embed_from_target(draft_model: torch.nn.Module,
     draft_model.model.embed_tokens = new_embed
 
     if draft_device.type == "tpu":
-        sync.synchronize(new_embed.weight, wait=True)
+        synchronize_tensors(new_embed.weight)
     logger.info(
         "Draft embed_tokens replaced with full replicated nn.Embedding: "
         "%d x %d per worker.", org_vocab, dim)
@@ -184,7 +184,7 @@ def populate_draft_lm_head_from_target(
     draft_lm_head.weight = Parameter(full_dev, requires_grad=False)
 
     if draft_device.type == "tpu":
-        sync.synchronize(draft_lm_head.weight, wait=True)
+        synchronize_tensors(draft_lm_head.weight)
     logger.info(
         "Draft lm_head replaced with full replicated nn.Linear: "
         "%d x %d per worker.", org_vocab, dim)

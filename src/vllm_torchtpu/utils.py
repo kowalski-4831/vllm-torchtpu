@@ -3,7 +3,7 @@ import importlib
 import os
 import time
 from functools import wraps
-from typing import Any, Callable, List, NamedTuple, Tuple, Union
+from typing import Any, Callable, List, NamedTuple, Sequence, Tuple, Union
 
 import jax
 import torch
@@ -271,3 +271,37 @@ def tpu_bind_kv_cache(
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
+
+
+def synchronize_device() -> None:
+    """Synchronize the TPU hardware execution stream (Device Stream Barrier).
+
+    Differences vs. `synchronize_tensors(tensors=...)`:
+    - `synchronize_device()` is equivalent to `torch.cuda.synchronize()`. It waits for
+      enqueued hardware stream operations to finish on PJRT, but does NOT trigger deferred
+      graph compilation or materialization for uninstantiated PyTorch Eager tensors.
+    - Use this for stream barriers, Dynamo resets, or device-level synchronization after
+      a computation.
+    """
+    torch.tpu.synchronize()
+
+
+def synchronize_tensors(
+    tensors: Union[torch.Tensor, Sequence[torch.Tensor], None] = None,
+    wait: bool = True,
+) -> None:
+    """Synchronize TPU execution and force materialization of deferred tensors (Graph Sync).
+
+    Differences vs. `synchronize_device()`:
+    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the deferred tensor
+      graph producing `tensors`, compile and enqueue the graph to PJRT, and materialize the
+      resulting buffers in device memory.
+    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands without
+      building/compiling pending deferred graphs.
+    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should be synchronized
+      (e.g., weight materialization across multiple tensors). Prefer `synchronize_device()` when
+      synchronizing immediately after a computation or across the entire device.
+    """
+    from torch_tpu._internal import sync
+
+    sync.synchronize(tensors=tensors, wait=wait)

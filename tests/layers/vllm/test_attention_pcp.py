@@ -100,8 +100,10 @@ def _capture_kernel(monkeypatch):
 
     monkeypatch.setattr(PallasAttentionBackendImpl, "_build_rpa_kernel",
                         fake_build)
-    monkeypatch.setattr("vllm_torchtpu.layers.vllm.attention.sync.synchronize",
-                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.vllm.attention.synchronize_tensors",
+        lambda *_args, **_kwargs: None,
+    )
     return captured
 
 

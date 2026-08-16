@@ -38,7 +38,6 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 from typing import Optional
 
 import torch
-from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
@@ -69,7 +68,7 @@ from vllm_torchtpu.layers.vllm.linear_common import quantized_matmul_fp4
 from vllm_torchtpu.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import align_to
+from vllm_torchtpu.utils import align_to, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -308,10 +307,12 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                                                    requires_grad=False)
 
         if layer.w13_weight.device.type == "tpu":
-            sync.synchronize(layer.w13_weight, wait=True)
-            sync.synchronize(layer.w2_weight, wait=True)
-            sync.synchronize(layer.w13_weight_scale, wait=True)
-            sync.synchronize(layer.w2_weight_scale, wait=True)
+            synchronize_tensors([
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+            ])
 
         logger.info_once(
             f"NVFP4 MoE weights prepared ({mode}): "
@@ -444,8 +445,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
                           torch.nn.Parameter(scale_4d, requires_grad=False))
 
         if layer.weight.device.type == "tpu":
-            sync.synchronize(layer.weight, wait=True)
-            sync.synchronize(layer.weight_scale, wait=True)
+            synchronize_tensors([layer.weight, layer.weight_scale])
 
         logger.info_once(
             "NVFP4 linear weights prepared (W4A16): "

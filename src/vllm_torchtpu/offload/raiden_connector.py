@@ -28,7 +28,7 @@ Core mechanisms:
 
 - Save fence: Store jobs only read HBM after the forward pass writing those
   blocks has fully completed. Store jobs ship as `fence_job_ids`. Each rank
-  executes a post-forward `_tpu_sync` scoped to the registered KV pool buffers
+  executes a post-forward `synchronize_tensors` scoped to the registered KV pool buffers
   and acknowledges via `fenced_jobs`. The scheduler launches `save()` only
   after all ranks have acked.
 
@@ -73,6 +73,7 @@ from vllm_torchtpu.offload.raiden_store import (AdmissionOp,
                                                 RaidenLoadStoreSpec,
                                                 RaidenOffloadingManager,
                                                 TPURaidenStoreOffloadingSpec)
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -349,10 +350,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         if meta.fence_job_ids:
             # Run device fence: ensure previous forward writes to HBM are complete
             # before the controller's background save reads them.
-            from torch_tpu._internal.sync import synchronize as _tpu_sync
             assert self._pool_sync_tensors, (
                 "KV pool tensors must be registered before the save fence")
-            _tpu_sync(self._pool_sync_tensors, wait=True)
+            synchronize_tensors(self._pool_sync_tensors)
             for job_id in meta.fence_job_ids:
                 self._fenced_jobs[job_id] = 1
 

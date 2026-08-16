@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
-from torch_tpu._internal import pallas, sync
+from torch_tpu._internal import pallas
 from vllm.config import CacheConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
@@ -46,6 +46,7 @@ from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
+from vllm_torchtpu.utils import synchronize_tensors
 
 # streamindex_topk block-tuning knobs. NOT tuned: these are the first values
 # found to fit, not the result of a sweep -- benchmark before reading anything
@@ -386,8 +387,7 @@ class VllmTPUMLAAttention(MLAAttention):
                 delattr(self.kv_b_proj, key)
 
         if self.W_UK_T.device.type == "tpu":
-            sync.synchronize(self.W_UK_T, wait=True)
-            sync.synchronize(self.W_UV, wait=True)
+            synchronize_tensors([self.W_UK_T, self.W_UV])
 
         q_scale, k_scale, v_scale = self.impl._get_kv_scales(self)
         self.mla_op = self.impl._build_mla_op(self,
