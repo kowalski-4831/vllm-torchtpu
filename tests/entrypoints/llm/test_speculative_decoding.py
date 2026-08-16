@@ -52,10 +52,17 @@ def _get_tensor_parallel_size():
 
 
 def get_ngram_test_prompts():
+    # Seeded: unseeded prompts made every nightly compare a different letter
+    # set, so test_sd_correctness_greedy_multi_chunk flapped between 0 and 2
+    # divergences on the identical commit (a rolled letter can land on a
+    # near-tie between the reference and chunked-spec batch shapes). A fixed
+    # seed makes the comparison deterministic run-to-run, like the fixed
+    # prompt strings the other methods use.
+    rng = random.Random(0)
     num_prompts = 10
     prompts = []
     for _ in range(num_prompts):
-        w = random.choice(list(string.ascii_lowercase))
+        w = rng.choice(list(string.ascii_lowercase))
         prompts.append(
             f"Keep repeating: {w} {w} {w} {w} {w} {w} {w} {w} {w} {w}")
     return prompts

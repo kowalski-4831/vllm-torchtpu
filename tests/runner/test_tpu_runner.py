@@ -2493,3 +2493,36 @@ def test_tpu_platform_block_size_override_is_dsv4_only():
     # DSv4's own backend hardcodes get_preferred_block_size to 256, which does
     # not fit the packed latent record; DSv4 must not be clamped by it.
     assert _block_size_for("DeepseekV4ForCausalLM", preferred=256) == 1024
+
+
+def test_spec_token_room_guard_caps_writes_at_context_limit():
+    """The wrapped update_req_spec_token_ids caps scheduled drafts to the
+    exact remaining token-buffer room at call time; unchecked, the write
+    overflows and kills the engine for requests near max_model_len."""
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            token_ids_cpu=np.zeros((4, 2048), dtype=np.int32),
+            num_tokens_no_spec=np.array([10, 2038, 2048, 0], dtype=np.int32),
+            req_id_to_index={
+                "roomy": 0,
+                "edge": 1,
+                "full": 2
+            },
+        ),
+        requests={},
+    )
+    calls = []
+    runner.input_batch.update_req_spec_token_ids = (
+        lambda request, scheduled: calls.append(
+            (request.req_id, list(scheduled[request.req_id]))))
+    TPUModelRunner._install_spec_token_room_guard(runner)
+
+    scheduled = {"roomy": [1] * 15, "edge": [2] * 15, "full": [3] * 15}
+    for rid in ("roomy", "edge", "full"):
+        runner.input_batch.update_req_spec_token_ids(
+            SimpleNamespace(req_id=rid), scheduled)
+    assert [(r, len(ids)) for r, ids in calls] \
+        == [("roomy", 15), ("edge", 10), ("full", 0)]
+    # in-place dict trim keeps downstream consumers consistent
+    assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] \
+        == [15, 10, 0]

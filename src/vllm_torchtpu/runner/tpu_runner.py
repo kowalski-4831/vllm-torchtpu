@@ -2312,12 +2312,46 @@ class TPUModelRunner(GPUModelRunner):
         self._modify_prev_results()
         self._pre_async_results = None
 
+    def _install_spec_token_room_guard(self) -> None:
+        """Wrap InputBatch.update_req_spec_token_ids with an exact room cap.
+
+        The write position is num_tokens_no_spec[req_index] at call time;
+        capping against it there cannot go stale, unlike any earlier-stage
+        bound. The scheduler-output dict is trimmed in place so downstream
+        consumers (spec metadata, verify sizing) see the same count.
+        """
+        input_batch = self.input_batch
+        if getattr(input_batch, "_tpu_spec_room_guard", False):
+            return
+        orig = input_batch.update_req_spec_token_ids
+
+        def guarded(request, scheduled_spec_tokens):
+            req_id = request.req_id
+            ids = scheduled_spec_tokens.get(req_id)
+            idx = input_batch.req_id_to_index.get(req_id)
+            if ids and idx is not None:
+                room = (input_batch.token_ids_cpu.shape[1] -
+                        int(input_batch.num_tokens_no_spec[idx]))
+                if len(ids) > room:
+                    # Fires routinely for a request's final steps near
+                    # max_model_len: async placeholder accounting overshoots
+                    # the scheduler-side bound there.
+                    logger.debug(
+                        "Trimming %d scheduled draft tokens to %d for %s at "
+                        "the context limit.", len(ids), max(0, room), req_id)
+                    scheduled_spec_tokens[req_id] = ids[:max(0, room)]
+            return orig(request, scheduled_spec_tokens)
+
+        input_batch.update_req_spec_token_ids = guarded
+        input_batch._tpu_spec_room_guard = True
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
         # so letting the base also correct would double-count.
         for req_state in self.requests.values():
             req_state.prev_num_draft_len = 0
+        self._install_spec_token_room_guard()
         return super()._update_states(scheduler_output)
 
     def _modify_prev_results(self):
