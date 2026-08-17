@@ -158,7 +158,7 @@ steps:
           - "perf_eval_results/**/*"
 
       # Same config and benchmark as glm-5.2-fp8-dp16-ep above, but through
-      # the `mp` distributed-executor backend (run_multihost_mp.sh:
+      # the `mp` distributed-executor backend (run_multihost.sh --backend mp:
       # independent `vllm serve` head + `--headless` processes with
       # vllm-torchtpu's own multihost DP bootstrap, src/vllm_torchtpu/
       # distributed/tpu_mp_multihost.py) instead of Ray. Regression-tests
@@ -176,7 +176,7 @@ steps:
           BENCHMARK_WARMUP_RUNS: "1"
           DATA_PARALLELISM_LOCAL: "8"
         commands:
-          - "bash .buildkite/scripts/run_multihost_mp.sh glm-5.2-fp8-dp16-ep"
+          - "bash .buildkite/scripts/run_multihost.sh --backend mp glm-5.2-fp8-dp16-ep"
         artifact_paths:
           - "perf_eval_results/**/*"
 

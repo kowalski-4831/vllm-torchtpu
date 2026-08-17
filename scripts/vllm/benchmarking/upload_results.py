@@ -326,6 +326,8 @@ def main():
                 "max_model_len": max_model_len,
                 "enable_ep": bool(config.get("enable_ep")),
                 "quantization": config.get("quantization"),
+                "multihost_backend": os.getenv("TPU_MULTIHOST_BACKEND")
+                or None,
             },
             "workload": {
                 "input_len": input_len,

@@ -11,7 +11,7 @@
 # the shared "run this command in a TPU-privileged container" primitive
 # used by both the head (foreground `vllm serve`) and each worker
 # (foreground `vllm serve --headless ...`) in
-# .buildkite/scripts/run_multihost_mp.sh.
+# .buildkite/scripts/run_multihost.sh (--backend mp).
 #
 # Usage:
 #   run_cluster_mp.sh <docker_image> <path_to_huggingface_cache> \

@@ -78,8 +78,8 @@ if [ -n "${BUILDKITE_OIDC_TOKEN_PATH:-}" ]; then
   TEST_SUITE_VARS+=(-v "$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}"):$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}")")
 fi
 
-# Spanner/BigQuery eval upload tracking & metadata variables (from PR #14)
-SPANNER_EVAL_VARS=(
+# BigQuery eval upload tracking & metadata variables
+BQ_EVAL_VARS=(
   -e BQ_PROJECT_ID="${BQ_PROJECT_ID:-}"
   -e BQ_TABLE="${BQ_TABLE:-}"
   -e CREATED_BY="${CREATED_BY:-}"
@@ -109,10 +109,11 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64
   ${RUN_ROOT:+-e RUN_ROOT="${RUN_ROOT}"} \
   ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"} \
   ${TPU_ACCELERATOR_TYPE:+-e TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE}"} \
+  ${TPU_MULTIHOST_BACKEND:+-e TPU_MULTIHOST_BACKEND="${TPU_MULTIHOST_BACKEND}"} \
   ${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:+-e TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}"} \
   ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"} \
   "${TEST_SUITE_VARS[@]}" \
-  "${SPANNER_EVAL_VARS[@]}" \
+  "${BQ_EVAL_VARS[@]}" \
   "${IMAGE_TAG}" \
   bash -c '
     umask 000
