@@ -29,10 +29,15 @@ constructed.
 from __future__ import annotations
 
 import dataclasses
-import math
 from typing import Any, Mapping, Sequence
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_CONV_STATE_DTYPE,
+                                           POOLED_GDN_CONV_STATE_ITEMSIZE,
+                                           POOLED_GDN_SSM_STATE_DTYPE,
+                                           POOLED_GDN_SSM_STATE_ITEMSIZE,
+                                           pooled_gdn_conv_state_bytes,
+                                           pooled_gdn_ssm_state_bytes)
 
 from .tags import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
 
@@ -181,30 +186,6 @@ def _dtype_tag(tensor: Any) -> str:
     return text.removeprefix("torch.")
 
 
-def _dtype_itemsize(dtype: Any) -> int:
-    itemsize = getattr(dtype, "itemsize", None)
-    if itemsize is not None:
-        return int(itemsize)
-    # Test fakes and serialized specs may carry a dtype name rather than a
-    # torch.dtype.  Keep this module importable without importing torch/TPU.
-    name = str(dtype).removeprefix("torch.")
-    known = {
-        "bfloat16": 2,
-        "float16": 2,
-        "float32": 4,
-        "float64": 8,
-        "float8_e4m3fn": 1,
-        "float8_e5m2": 1,
-        "int8": 1,
-        "uint8": 1,
-    }
-    try:
-        return known[name]
-    except KeyError as exc:
-        raise ManifestError(f"cannot determine item size of dtype {dtype!r}") \
-            from exc
-
-
 @dataclasses.dataclass(frozen=True)
 class _PooledStateView:
     """Tensor-like metadata for one logical state inside a unified pool.
@@ -268,6 +249,14 @@ class GdnHeadGeometry:
     local_value_heads: int
     key_head_dim: int
     value_head_dim: int
+    # Model's linear_conv_kernel_dim; the pooled conv region holds
+    # kernel_size - 1 taps (no spec-decode widening, see gdn_pool_layout).
+    conv_kernel_size: int = 4
+
+    @property
+    def conv_dim(self) -> int:
+        return (2 * self.local_key_heads * self.key_head_dim +
+                self.local_value_heads * self.value_head_dim)
 
 
 def _fa_regions(*, block_size_tokens: int, token_stride_bytes: int,
@@ -301,8 +290,7 @@ def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
                             f"(blocks, taps, 1, dim): got {conv_shape}")
     taps = int(conv_shape[1])
     local_dim = int(conv_shape[2])
-    expected_dim = (2 * geometry.local_key_heads * geometry.key_head_dim +
-                    geometry.local_value_heads * geometry.value_head_dim)
+    expected_dim = geometry.conv_dim
     if local_dim != expected_dim:
         raise ManifestError(
             "GDN conv state dim does not match the local head geometry: "
@@ -388,9 +376,19 @@ def _group_spec_for_layer(kv_cache_groups: Sequence[Any],
 
 
 def _pooled_gdn_state_views(*, pool: Any, spec: Any,
-                            raw_tensors: Sequence[Any],
-                            layer_name: str) -> tuple[Any, Any]:
-    """Derive logical ``(conv, ssm)`` descriptors from a unified raw pool."""
+                            raw_tensors: Sequence[Any], layer_name: str,
+                            gdn_geometry: GdnHeadGeometry) -> tuple[Any, Any]:
+    """Derive logical ``(conv, ssm)`` descriptors from a unified raw pool.
+
+    The state geometry is tied to the pooled GDN kernel's byte model
+    (``gdn_pool_layout`` — the same helpers ``_build_v3_pool_state_plan``
+    uses), NOT to the layer's declared MambaSpec shapes/dtypes.  The pooled
+    kernel never reads that declaration, so only the kernel model describes
+    the bytes that actually move; a declaration that drifts from it (e.g. a
+    dtype/shape override made for the typed materialization path) must not
+    leak into transfer spans.  The spec contributes only the manager page
+    pitch, plus the identity check that this is a two-state GDN layer.
+    """
     raw_index = _raw_index_for(pool, raw_tensors)
     if raw_index is None:
         raise ManifestError(
@@ -409,18 +407,26 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
     if len(shapes) != 2 or len(dtypes) != 2:
         raise ManifestError(
             f"pooled GDN cache {layer_name} requires conv and SSM specs")
-    conv_shape, ssm_shape = (tuple(int(dim) for dim in shape)
-                             for shape in shapes)
-    if (not conv_shape or not ssm_shape or any(dim <= 0 for dim in conv_shape)
-            or any(dim <= 0 for dim in ssm_shape)):
+
+    taps = gdn_geometry.conv_kernel_size - 1
+    if taps <= 0:
         raise ManifestError(
-            f"pooled GDN cache {layer_name} has invalid state shapes: "
-            f"conv={conv_shape} ssm={ssm_shape}")
-    conv_dtype, ssm_dtype = dtypes
-    conv_itemsize = _dtype_itemsize(conv_dtype)
-    ssm_itemsize = _dtype_itemsize(ssm_dtype)
-    conv_bytes = math.prod(conv_shape) * conv_itemsize
-    ssm_bytes = math.prod(ssm_shape) * ssm_itemsize
+            f"pooled GDN cache {layer_name} has no conv taps: "
+            f"conv_kernel_size={gdn_geometry.conv_kernel_size}")
+    conv_shape = (taps, gdn_geometry.conv_dim)
+    conv_dtype = POOLED_GDN_CONV_STATE_DTYPE
+    conv_itemsize = POOLED_GDN_CONV_STATE_ITEMSIZE
+    conv_bytes = pooled_gdn_conv_state_bytes(
+        kernel_size=gdn_geometry.conv_kernel_size,
+        conv_dim=gdn_geometry.conv_dim)
+    ssm_shape = (gdn_geometry.local_value_heads, gdn_geometry.value_head_dim,
+                 gdn_geometry.key_head_dim)
+    ssm_dtype = POOLED_GDN_SSM_STATE_DTYPE
+    ssm_itemsize = POOLED_GDN_SSM_STATE_ITEMSIZE
+    ssm_bytes = pooled_gdn_ssm_state_bytes(
+        num_v_heads=gdn_geometry.local_value_heads,
+        head_k_dim=gdn_geometry.key_head_dim,
+        head_v_dim=gdn_geometry.value_head_dim)
 
     try:
         manager_page_bytes = int(spec.page_size_bytes)
@@ -549,7 +555,8 @@ def build_qwen35_pool_manifest(
                 states = _pooled_gdn_state_views(pool=cache[0],
                                                  spec=spec,
                                                  raw_tensors=raw_tensors,
-                                                 layer_name=layer_name)
+                                                 layer_name=layer_name,
+                                                 gdn_geometry=gdn_geometry)
             elif len(cache) == 2:
                 states = cache
             else:

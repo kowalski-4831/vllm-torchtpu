@@ -353,7 +353,8 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
     geometry = rpm.GdnHeadGeometry(local_key_heads=4,
                                    local_value_heads=8,
                                    key_head_dim=64,
-                                   value_head_dim=32)
+                                   value_head_dim=32,
+                                   conv_kernel_size=3)
     conv_shape = (2, 768)
     ssm_shape = (8, 64, 32)
     manager_page_bytes = 131_072
@@ -409,6 +410,97 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
     rpm.verify_storage_binding(manifest, named, raw_tensors=(pool, ))
 
 
+def test_unified_pool_views_are_kernel_tied_not_spec_tied():
+    """A drifted MambaSpec declaration must not leak into the manifest.
+
+    The layer-level ``get_state_shape``/``get_state_dtype`` overrides can
+    diverge from the pooled kernel's fixed byte model (PR #437 declared the
+    conv state fp32 with an extra singleton dim).  The manifest describes
+    the bytes the kernel actually moves, so two manifests built from the
+    drifted and the kernel-matching declarations must be identical.
+    """
+    geometry = rpm.GdnHeadGeometry(local_key_heads=4,
+                                   local_value_heads=8,
+                                   key_head_dim=64,
+                                   value_head_dim=32,
+                                   conv_kernel_size=3)
+    layer = "model.layers.0.linear_attn"
+    page = 131_072
+    pool = FakeTensor((4, 128, 1, 4, 256), 1, dtype="torch.float8_e4m3fn")
+
+    def build(shapes, dtypes):
+        groups = (_pooled_gdn_group([layer],
+                                    shapes=shapes,
+                                    dtypes=dtypes,
+                                    page_size_bytes=page), )
+        return rpm.build_qwen35_pool_manifest(named_kv_caches={layer: [pool]},
+                                              kv_cache_groups=groups,
+                                              raw_tensors=(pool, ),
+                                              gdn_geometry=geometry)
+
+    drifted = build(shapes=((2, 1, 768), (8, 64, 32)),
+                    dtypes=("torch.float32", "torch.float32"))
+    matching = build(shapes=((2, 768), (8, 64, 32)),
+                     dtypes=("torch.bfloat16", "torch.float32"))
+    assert drifted.pool_dicts() == matching.pool_dicts()
+
+    conv, ssm = drifted.pools
+    ssm_bytes = 8 * 64 * 32 * 4
+    assert (conv.dtype_tag, conv.base_offset_bytes,
+            conv.live_bytes_per_block) == ("bfloat16", ssm_bytes, 2 * 768 * 2)
+    assert (ssm.dtype_tag, ssm.base_offset_bytes,
+            ssm.live_bytes_per_block) == ("float32", 0, ssm_bytes)
+
+
+def test_unified_pool_conv_region_matches_kernel_state_plan():
+    """Pin the manifest's state model to the pooled kernel's state plan.
+
+    Uses the live Qwen3.5 full-width geometry and the same
+    ``gdn_pool_layout`` helpers ``_build_v3_pool_state_plan`` consumes, so a
+    kernel-side layout change breaks this test instead of the nightly
+    reshard pair.
+    """
+    from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
+                                               pooled_gdn_conv_state_bytes,
+                                               pooled_gdn_ssm_state_bytes)
+
+    geometry = PCP8_GEOMETRY  # 16 K heads / 64 V heads / 128-dim, kernel 4
+    fa_page = 8_388_608
+    token_bytes = 1024
+    conv_bytes = pooled_gdn_conv_state_bytes(
+        kernel_size=geometry.conv_kernel_size, conv_dim=geometry.conv_dim)
+    ssm_bytes = pooled_gdn_ssm_state_bytes(
+        num_v_heads=geometry.local_value_heads,
+        head_k_dim=geometry.key_head_dim,
+        head_v_dim=geometry.value_head_dim)
+
+    layer = "model.layers.0.linear_attn"
+    pool = FakeTensor((2 * fa_page, ), 1, dtype="torch.float8_e4m3fn")
+    groups = (
+        _pooled_gdn_group(
+            [layer],
+            # Post-#437 declaration: ignored by the kernel-tied manifest.
+            shapes=((3, 1, 12288), (64, 128, 128)),
+            dtypes=("torch.float32", "torch.float32"),
+            page_size_bytes=fa_page,
+        ), )
+    manifest = rpm.build_qwen35_pool_manifest(named_kv_caches={layer: [pool]},
+                                              kv_cache_groups=groups,
+                                              raw_tensors=(pool, ),
+                                              gdn_geometry=geometry)
+
+    conv, ssm = manifest.pools
+    assert conv.live_bytes_per_block == conv_bytes == 73_728
+    assert ssm.live_bytes_per_block == ssm_bytes == 4_194_304
+    # The conv view starts exactly where the kernel's token plan places the
+    # conv region (right after the SSM tokens).
+    kernel_plan = derive_pooled_gdn_state_layout(ssm_bytes=ssm_bytes,
+                                                 conv_bytes=conv_bytes,
+                                                 token_bytes=token_bytes)
+    assert conv.base_offset_bytes == kernel_plan.ssm_tokens * token_bytes
+    assert kernel_plan.required_tokens * token_bytes <= fa_page
+
+
 @pytest.mark.parametrize(
     ("shapes", "dtypes", "page_size", "raw_size", "match"),
     [
@@ -432,7 +524,8 @@ def test_unified_pool_rejects_invalid_gdn_spec(shapes, dtypes, page_size,
     geometry = rpm.GdnHeadGeometry(local_key_heads=4,
                                    local_value_heads=8,
                                    key_head_dim=64,
-                                   value_head_dim=32)
+                                   value_head_dim=32,
+                                   conv_kernel_size=3)
     with pytest.raises(rpm.ManifestError, match=match):
         rpm.build_qwen35_pool_manifest(named_kv_caches=named,
                                        kv_cache_groups=groups,

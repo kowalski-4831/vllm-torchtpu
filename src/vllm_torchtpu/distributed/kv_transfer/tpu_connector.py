@@ -1354,6 +1354,8 @@ class TPURaidenConnectorWorker:
                 value_head_dim=self._model_config_int(
                     "linear_value_head_dim",
                     self._model_config_int("linear_key_head_dim", 1)),
+                conv_kernel_size=self._model_config_int(
+                    "linear_conv_kernel_dim", 4),
             ),
         )
         # Hard-fail before manager construction if the pools point at storage
