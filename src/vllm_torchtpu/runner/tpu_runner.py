@@ -3323,13 +3323,29 @@ class TPUModelRunner(GPUModelRunner):
                                  inputs_embeds).shape[0]
             self._token_padding_update(num_tokens_padded)
 
-            req_id_kwargs = extract_request_ids_for_tracing(
+            trace_kwargs = extract_request_ids_for_tracing(
                 self.input_batch.req_ids, start_index, num_reqs)
+
+            if self.phase_based_profiler and 'batch_composition_stats' in locals(
+            ):
+                stats_map = {
+                    "num_prefill_tokens": "num_prefill_tokens",
+                    "num_decode_tokens": "num_decode_tokens",
+                    "phase": "phase",
+                    "batch_id": "batch_id",
+                    "total_num_scheduled_tokens": "total_num_scheduled_tokens",
+                    "padded_total_num_scheduled_tokens":
+                    "padded_total_num_scheduled_tokens",
+                    "min_kv_len": "min_kv_length",
+                }
+                for src_key, target_key in stats_map.items():
+                    trace_kwargs[target_key] = batch_composition_stats.get(
+                        src_key, "UNKNOWN" if src_key == "phase" else 0)
 
             with TraceAnnotation(
                     name="ModelForward",
                     num_reqs=num_reqs,
-                    **req_id_kwargs,
+                    **trace_kwargs,
             ), set_forward_context(
                     attn_metadata,
                     self.vllm_config,
