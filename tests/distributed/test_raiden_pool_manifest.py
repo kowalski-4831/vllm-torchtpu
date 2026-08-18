@@ -13,7 +13,7 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import FakeTensor
+from .raiden_test_utils import FakeTensor, glm_named_kv_caches
 
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
@@ -654,3 +654,92 @@ def test_pool_dicts_coerce_into_raiden_pool_specs():
         assert spec.tag == entry.tag
         assert spec.block_stride_bytes == entry.block_stride_bytes
         assert spec.live_bytes_per_block == entry.live_bytes_per_block
+
+
+# --------------------------------------------------------------------------
+# GLM-5.2 MLA manifest (row-granular regions over replicated caches).
+# --------------------------------------------------------------------------
+
+_GLM_BLOCK_SIZE = 1024
+
+
+def test_glm_manifest_row_regions_and_dtype_classification():
+    named = glm_named_kv_caches()
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=named,
+        raw_tensors=(),
+        block_size_tokens=_GLM_BLOCK_SIZE)
+
+    assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
+    assert manifest.tag_counts() == {rpm.TAG_FA: 2, rpm.TAG_DSA_IDX: 1}
+    assert len(manifest.storages) == 3
+    geometry = manifest.geometry_by_tag()
+    assert geometry[rpm.TAG_FA] == {
+        "num_blocks": 16,
+        "block_stride_bytes": 256 * 2560,
+        "live_bytes_per_block": 256 * 2560,
+    }
+    assert geometry[rpm.TAG_DSA_IDX]["live_bytes_per_block"] == 256 * 1024
+    for pool in manifest.pools:
+        (region, ) = pool.regions
+        row_bytes = 2560 if pool.tag == rpm.TAG_FA else 1024
+        assert region.name == ("mla_rows"
+                               if pool.tag == rpm.TAG_FA else "dsa_rows")
+        assert region.offset_bytes == 0
+        assert region.stride_bytes == region.unit_bytes == row_bytes
+        assert region.num_units == 256
+        assert region.units_per_stride == 1
+        assert pool.base_offset_bytes == 0
+    rpm.verify_storage_binding(manifest, named, raw_tensors=())
+
+
+def test_glm_manifest_accepts_bf16_pair_packing():
+    named = glm_named_kv_caches(fa_shape=(16, 512, 2, 640),
+                                fa_esz=2,
+                                fa_dtype="torch.bfloat16")
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=named,
+        raw_tensors=(),
+        block_size_tokens=_GLM_BLOCK_SIZE)
+    fa_pools = [p for p in manifest.pools if p.tag == rpm.TAG_FA]
+    (region, ) = fa_pools[0].regions
+    assert region.unit_bytes == 2 * 640 * 2
+    assert region.num_units == 512
+
+
+def test_glm_manifest_requires_private_typed_binding():
+    raw = FakeTensor((16, 3 * 256 * 2560), 1, dtype="torch.uint8")
+    named = {
+        "model.layers.0.self_attn.mla_attn":
+        FakeTensor((16, 256, 4, 640),
+                   1,
+                   dtype="torch.float8_e5m2",
+                   storage=raw.untyped_storage()),
+        "model.layers.0.self_attn.indexer":
+        FakeTensor((16, 256, 4, 256),
+                   1,
+                   dtype="torch.uint8",
+                   storage=raw.untyped_storage()),
+    }
+    with pytest.raises(rpm.ManifestError, match="private typed"):
+        rpm.build_glm_mla_pool_manifest(named_kv_caches=named,
+                                        raw_tensors=(raw, ),
+                                        block_size_tokens=_GLM_BLOCK_SIZE)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (dict(fa_shape=(16, 1024, 640)), r"\[blocks, rows, packing, width\]"),
+        (dict(fa_shape=(16, 128, 4, 640)), "KV block size"),
+        (dict(fa_shape=(16, 512, 2, 640)), "32-bit word"),
+        (dict(fa_shape=(16, 256, 4, 600)), "lane-aligned"),
+        (dict(idx_shape=(8, 256, 4, 256)), "disagree on num_blocks"),
+    ],
+)
+def test_glm_manifest_rejects_bad_geometry(overrides, message):
+    named = glm_named_kv_caches(**overrides)
+    with pytest.raises(rpm.ManifestError, match=message):
+        rpm.build_glm_mla_pool_manifest(named_kv_caches=named,
+                                        raw_tensors=(),
+                                        block_size_tokens=_GLM_BLOCK_SIZE)

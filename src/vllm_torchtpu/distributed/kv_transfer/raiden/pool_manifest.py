@@ -39,7 +39,7 @@ from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_CONV_STATE_DTYPE,
                                            pooled_gdn_conv_state_bytes,
                                            pooled_gdn_ssm_state_bytes)
 
-from .tags import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
+from .tags import TAG_DSA_IDX, TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"
@@ -761,3 +761,111 @@ def verify_storage_binding(
                 "aliased_raw binding requires every typed KV cache to share "
                 "raw unified storage")
     return len(manifest.storages)
+
+
+def _glm_row_region(tag: str, *, row_bytes: int,
+                    num_rows: int) -> tuple[RegionSpec, ...]:
+    """One dense region of whole packed rows covering the full page."""
+    return (RegionSpec(
+        name="mla_rows" if tag == TAG_FA else "dsa_rows",
+        offset_bytes=0,
+        stride_bytes=row_bytes,
+        unit_bytes=row_bytes,
+        num_units=num_rows,
+        units_per_stride=1,
+    ), )
+
+
+def build_glm_mla_pool_manifest(
+    *,
+    named_kv_caches: Mapping[str, Any],
+    raw_tensors: Sequence[Any],
+    block_size_tokens: int,
+) -> PoolManifest:
+    """Builds the Pool Manifest for GLM MLA models.
+
+    Two per-layer TP-replicated cache classes: the MLA latent cache
+    (-> TAG_FA, first tag = H2D order rank 0) and the DSA indexer K cache
+    (-> TAG_DSA_IDX, the only uint8 class). The packed [blocks, rows,
+    packing, width] layout is declared as row-granular regions.
+    """
+    if block_size_tokens <= 0:
+        raise ManifestError("block_size_tokens must be positive")
+    flat: list[tuple[str, str, str, Any]] = []
+    for layer_name in sorted(named_kv_caches):
+        cache = named_kv_caches[layer_name]
+        if isinstance(cache, (list, tuple)):
+            raise ManifestError(
+                f"GLM MLA admission expects plain per-layer cache tensors; "
+                f"layer {layer_name} has a {len(cache)}-tuple")
+        dtype_tag = _dtype_tag(cache)
+        tag = TAG_DSA_IDX if dtype_tag == "uint8" else TAG_FA
+        flat.append((tag, layer_name, dtype_tag, cache))
+    if not any(tag == TAG_FA for tag, _, _, _ in flat):
+        raise ManifestError("GLM MLA admission found no latent (fa) caches")
+
+    binding, _ = _binding_for([(layer_name, tensor)
+                               for _, layer_name, _, tensor in flat],
+                              raw_tensors)
+    if binding != BINDING_PRIVATE_TYPED:
+        raise ManifestError(
+            "GLM MLA admission requires private typed cache tensors; got "
+            f"binding {binding!r}")
+
+    storages = _StorageTable()
+    pools: list[PoolEntry] = []
+    for tag, layer_name, dtype_tag, tensor in flat:
+        nbytes = _nbytes(tensor)
+        shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
+        if len(shape) != 4:
+            raise ManifestError(
+                f"cache {layer_name} must be [blocks, rows, packing, width]: "
+                f"got shape {shape}")
+        num_blocks, rows, packing, width = shape
+        itemsize = _element_size(tensor)
+        if num_blocks <= 0 or nbytes % num_blocks != 0:
+            raise ManifestError(
+                f"cache {layer_name} nbytes {nbytes} is not divisible by "
+                f"num_blocks {num_blocks}")
+        live_stride = nbytes // num_blocks
+        if rows * packing != block_size_tokens:
+            raise ManifestError(
+                f"cache {layer_name} rows*packing {rows}*{packing} does not "
+                f"match the KV block size {block_size_tokens}")
+        # The packing axis must fill one 32-bit word (see the layout
+        # fingerprint's tile assertion).
+        if packing * itemsize != 4:
+            raise ManifestError(
+                f"cache {layer_name} packing {packing} does not fill one "
+                f"32-bit word at itemsize {itemsize}")
+        if width % 128:
+            raise ManifestError(
+                f"cache {layer_name} width {width} is not lane-aligned")
+        row_bytes = packing * width * itemsize
+        if live_stride != rows * row_bytes:
+            raise ManifestError(
+                f"cache {layer_name} block stride {live_stride} does not "
+                f"match {rows} rows of {row_bytes} bytes")
+        pools.append(
+            PoolEntry(
+                tag=tag,
+                layer_name=layer_name,
+                storage_index=storages.index_for(tensor),
+                base_offset_bytes=0,
+                block_stride_bytes=live_stride,
+                num_blocks=num_blocks,
+                regions=_glm_row_region(tag,
+                                        row_bytes=row_bytes,
+                                        num_rows=rows),
+                dtype_tag=dtype_tag,
+            ))
+
+    manifest = PoolManifest(binding=binding,
+                            storages=storages.storages,
+                            pools=pools)
+    block_counts = {pool.num_blocks for pool in manifest.pools}
+    if len(block_counts) != 1:
+        raise ManifestError(
+            f"pools disagree on num_blocks: {sorted(block_counts)}")
+    manifest.geometry_by_tag()  # raises on per-tag geometry divergence
+    return manifest
