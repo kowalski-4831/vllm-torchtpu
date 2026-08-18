@@ -41,9 +41,13 @@ trap cleanup EXIT
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${CACHE_DIR}/torch_tpu_tier3"
 export VLLM_CACHE_ROOT="${CACHE_DIR}/vllm_cache"
 export VLLM_TARGET_DEVICE="tpu"
+export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
 
 MODEL="${1:-${MODEL:-Qwen/Qwen3-0.6B}}"
 TIER3_DIR="${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}"
+
+# Pre-sized KV cache memory (~85.96 GiB = 50,312 blocks) to bypass profile_run
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-92305620992}"
 
 # Helper function: kill orphaned processes holding TPU locks
 clean_tpu_processes() {
@@ -76,7 +80,8 @@ rm -rf "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 mkdir -p "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/cold_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 \
+  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/cold_run.log"
 
 sync && sleep 10
 
@@ -113,9 +118,12 @@ fi
 echo "================================================================="
 echo "=== 📊 [Test 2] Storage Duplication Audit (Cold Run Artifacts)"
 echo "================================================================="
-CAT1_SIZE=$(du -sb "${TIER3_DIR}" 2>/dev/null | cut -f1 || echo 0)
-CAT2_SIZE=$(find "${VLLM_CACHE_ROOT}" -type f -name "artifact_compile_range_*" -exec du -cb {} + 2>/dev/null | tail -n 1 | cut -f1 || echo 0)
-CAT3_SIZE=$(du -sb "${VLLM_CACHE_ROOT}/torch_compile_cache/torch_aot_compile" 2>/dev/null | cut -f1 || echo 0)
+CAT1_SIZE=$(du -sb "${TIER3_DIR}" 2>/dev/null | cut -f1 || true)
+CAT1_SIZE="${CAT1_SIZE:-0}"
+CAT2_SIZE=$(find "${VLLM_CACHE_ROOT}" -type f -name "artifact_compile_range_*" -exec du -cb {} + 2>/dev/null | tail -n 1 | cut -f1 || true)
+CAT2_SIZE="${CAT2_SIZE:-0}"
+CAT3_SIZE=$(du -sb "${VLLM_CACHE_ROOT}/torch_compile_cache/torch_aot_compile" 2>/dev/null | cut -f1 || true)
+CAT3_SIZE="${CAT3_SIZE:-0}"
 
 CAT1_MB=$(awk "BEGIN {printf \"%.2f\", ${CAT1_SIZE}/1048576}")
 CAT2_KB=$(awk "BEGIN {printf \"%.2f\", ${CAT2_SIZE}/1024}")
@@ -144,7 +152,8 @@ echo "================================================================="
 clean_tpu_processes
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/warm_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 \
+  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/warm_run.log"
 
 sync && sleep 10
 
@@ -172,12 +181,11 @@ fi
 echo "================================================================="
 echo "=== 🔍 [Test 4] Cache File & MD5 Consistency Check (Cold vs Warm)"
 echo "================================================================="
-# TODO(@maxwillzq): Tier-3 cache file non-deterministic diff is still under investigation.
-# Log warning rather than exiting with failure until zero-diff is fully resolved.
 if diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt"; then
   echo "✅ [Test 4 PASSED] Tier-3 cache files and MD5sums are 100% identical between Cold and Warm runs!"
 else
-  echo "⚠️ [Test 4 WARNING] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+  echo "❌ [Test 4 FAILED] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+  exit 1
 fi
 
 echo "================================================================="
