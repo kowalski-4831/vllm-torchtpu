@@ -4131,14 +4131,11 @@ class TPUModelRunner(GPUModelRunner):
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config)
 
-        from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
-            _maybe_patch_for_deepseek_v4
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                            vllm_config=self.vllm_config), \
-             set_current_vllm_config(self.vllm_config), \
-             _maybe_patch_for_deepseek_v4(self.vllm_config):
+             set_current_vllm_config(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
