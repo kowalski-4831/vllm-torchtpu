@@ -23,7 +23,8 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
-                                             maybe_share_embeddings)
+                                             maybe_share_embeddings,
+                                             maybe_share_lm_head)
 from vllm_torchtpu.utils import synchronize_tensors
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
@@ -106,6 +107,8 @@ class Eagle3Proposer:
                 f"on TPU: it must be 1 (replicated draft) or {target_tp} "
                 f"(== target tensor_parallel_size, sharded draft).")
         self._draft_replicated = (draft_tp == 1)
+        # Independent from replication: target TP1 / draft TP1 can alias.
+        self._draft_tp_matches_target = (draft_tp == target_tp)
         # Lazily resolved by _draft_has_moe once the draft model exists.
         self._draft_has_moe_cache: bool | None = None
         logger.info(
@@ -152,8 +155,12 @@ class Eagle3Proposer:
             self._validate_pcp_draft_model(draft_attn_layer_names)
 
         maybe_share_embeddings(self.draft_model, target_model,
-                               self._draft_replicated)
-        self._maybe_share_lm_head(target_model)
+                               self._draft_tp_matches_target)
+        maybe_share_lm_head(self.draft_model,
+                            target_model,
+                            self._draft_replicated,
+                            self._draft_tp_matches_target,
+                            materialize_if_mismatched=False)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -206,34 +213,6 @@ class Eagle3Proposer:
                 raise NotImplementedError(
                     "PCP MTP draft requires FullAttentionSpec for layer "
                     f"{layer_name}, got {type(spec).__name__}")
-
-    def _maybe_share_lm_head(self, target_model) -> None:
-        """Override of LLMBaseProposer._maybe_share_lm_head.
-
-        Upstream conditionally shares the target's lm_head weights; we don't
-        share weights, we align the logits all_gather with the draft's
-        parallelism:
-
-        - REPLICATED (tp=1) draft: the head holds the full vocab on every
-          worker, so each already has the complete logits.
-          otherwise force (it reads the runtime TP group, size = target tp).
-        - SHARDED (draft_tp == target tp) draft: the head is column-parallel
-          over the vocab like the target, so each rank holds only vocab/tp
-          logits and the native _gather_logits all_gather IS required — leave it
-          untouched (early return below).
-        """
-        del target_model  # unused; kept to match upstream override signature
-        if not self._draft_replicated:
-            return
-        lp = getattr(self.draft_model, "logits_processor", None)
-        if lp is not None:
-            # Fail loudly if upstream renames the attr: a silent no-op here
-            # would leave the cross-rank all_gather enabled, producing wrong
-            # draft logits under a TP target.
-            assert hasattr(lp, "_gather_logits"), (
-                "draft logits_processor has no _gather_logits to override; "
-                "vLLM may have renamed it.")
-            lp._gather_logits = lambda logits: logits
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:

@@ -146,7 +146,7 @@ def populate_draft_embed_from_target(draft_model: torch.nn.Module,
 
 def maybe_share_embeddings(draft_model: torch.nn.Module,
                            target_model: torch.nn.Module,
-                           draft_replicated: bool,
+                           tp_layout_matches: bool,
                            force_share: bool = False) -> None:
     target_lm = target_model.get_language_model() if hasattr(
         target_model, "get_language_model") else target_model
@@ -168,16 +168,16 @@ def maybe_share_embeddings(draft_model: torch.nn.Module,
             raise RuntimeError(
                 "Draft embedding sharing requires target_lm.model.embed_tokens"
             )
-        if draft_replicated:
+        if tp_layout_matches:
+            logger.info(
+                "Sharing the target's embed_tokens with the draft using the same TP layout."
+            )
+            draft_model.model.embed_tokens = target_embed
+        else:
             logger.info(
                 "Populating draft's own embed_tokens with a host-gathered copy of target embedding."
             )
             populate_draft_embed_from_target(draft_model, target_embed)
-        else:
-            logger.info(
-                "Sharing the target's sharded embed_tokens with the sharded draft."
-            )
-            draft_model.model.embed_tokens = target_embed
 
 
 def populate_draft_lm_head_from_target(
@@ -206,7 +206,9 @@ def populate_draft_lm_head_from_target(
 def maybe_share_lm_head(draft_model: torch.nn.Module,
                         target_model: torch.nn.Module,
                         draft_replicated: bool,
-                        force_share: bool = False) -> None:
+                        tp_layout_matches: bool,
+                        force_share: bool = False,
+                        materialize_if_mismatched: bool = True) -> None:
     target_lm = target_model.get_language_model() if hasattr(
         target_model, "get_language_model") else target_model
     target_lm_head = getattr(target_lm, "lm_head", None)
@@ -225,13 +227,10 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
         share_lm_head = True
 
     if share_lm_head:
-        if draft_replicated:
-            logger.info("Populating draft's own lm_head with a host-gathered, "
-                        "per-worker replicated copy of the target lm_head.")
-            populate_draft_lm_head_from_target(draft_model, target_lm_head)
-        else:
+        if tp_layout_matches:
             logger.info(
-                "Sharing the target's sharded lm_head with the sharded draft.")
+                "Sharing the target's lm_head with the draft using the same TP layout."
+            )
             if hasattr(draft_model, "lm_head"):
                 draft_model.lm_head = target_lm_head
             elif hasattr(draft_model, "model") and hasattr(
@@ -239,6 +238,10 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
                 draft_model.model.lm_head = target_lm_head
             else:
                 draft_model.lm_head = target_lm_head
+        elif materialize_if_mismatched:
+            logger.info("Populating draft's own lm_head with a host-gathered, "
+                        "per-worker replicated copy of the target lm_head.")
+            populate_draft_lm_head_from_target(draft_model, target_lm_head)
 
     # We must override _gather_logits for replicated draft models even if we don't share the lm_head,
     # because the draft model's logits_processor will still try to gather logits across TP=1.

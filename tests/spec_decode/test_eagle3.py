@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm_torchtpu.layers.common.sequence_layout import (
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL, SequenceLayoutDescriptor,
     SequenceLayoutKind, SequenceLayoutPlan)
+from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.eagle3 import (DraftChunkInputs, Eagle3Proposer,
                                               _force_draft_tp1,
                                               _maybe_pad_dim0)
@@ -38,6 +39,31 @@ def _make_proposer(draft_tp: int | None = 1,
     vllm_config = SimpleNamespace(speculative_config=speculative_config,
                                   parallel_config=parallel_config)
     return Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
+
+
+def _make_vocab_models():
+    target_embed = torch.nn.Embedding(3, 2)
+    target_embed.org_vocab_size = 3
+    draft_embed = torch.nn.Embedding(3, 2)
+    draft_embed.org_vocab_size = 3
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=target_embed),
+        lm_head=torch.nn.Linear(2, 3, bias=False),
+    )
+    draft = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=draft_embed),
+        lm_head=torch.nn.Linear(2, 3, bias=False),
+        logits_processor=SimpleNamespace(
+            _gather_logits=lambda logits: logits.clone()),
+        has_own_embed_tokens=False,
+        has_own_lm_head=False,
+    )
+    return draft, target
+
+
+def _fake_gather_sharded_weight(module):
+    weight = module.weight.detach().clone()
+    return weight, weight.shape[0], weight.shape[1], weight.device
 
 
 @pytest.mark.parametrize(
@@ -93,6 +119,44 @@ def test_draft_tp_defaults_to_target_tp():
     proposer = _make_proposer(draft_tp=None, target_tp=8)
     assert proposer.speculative_config.draft_tensor_parallel_size == 8
     assert proposer._draft_replicated is False
+
+
+@pytest.mark.parametrize("draft_tp,target_tp", [(1, 1), (1, 8), (8, 8)])
+def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp,
+                                                   monkeypatch):
+    proposer = _make_proposer(draft_tp=draft_tp,
+                              target_tp=target_tp,
+                              method="mtp")
+    draft, target = _make_vocab_models()
+    draft_head = draft.lm_head
+    original_gather_logits = draft.logits_processor._gather_logits
+
+    def load_draft_model():
+        proposer.draft_model = draft
+
+    proposer._load_draft_model = load_draft_model
+    monkeypatch.setattr(spec_decode_utils, "gather_sharded_weight",
+                        _fake_gather_sharded_weight)
+
+    with mock.patch(
+            "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config",
+            return_value={}):
+        proposer.load_model(target)
+
+    if draft_tp == target_tp:
+        assert draft.model.embed_tokens is target.model.embed_tokens
+        assert draft.lm_head is target.lm_head
+    else:
+        assert draft.model.embed_tokens is not target.model.embed_tokens
+        assert torch.equal(draft.model.embed_tokens.weight,
+                           target.model.embed_tokens.weight)
+        assert draft.lm_head is draft_head
+
+    if draft_tp == 1:
+        logits = torch.randn(2, 3)
+        assert draft.logits_processor._gather_logits(logits) is logits
+    else:
+        assert draft.logits_processor._gather_logits is original_gather_logits
 
 
 @pytest.mark.parametrize("draft_tp", [2, 4])
