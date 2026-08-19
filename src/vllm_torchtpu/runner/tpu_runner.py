@@ -95,6 +95,8 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.mm_encoder_manager import \
+    maybe_create_mm_encoder_manager
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from vllm_torchtpu.runner.structured_decoding_manager import \
@@ -4724,6 +4726,13 @@ class TPUModelRunner(GPUModelRunner):
                 self._precompile_backbone()
 
             self._precompile_sampling_subgraphs()
+
+            # Precompile multimodal vision encoder graphs
+            self.encoder_cudagraph_manager = (maybe_create_mm_encoder_manager(
+                self.vllm_config, self.device, self.model))
+            if self.encoder_cudagraph_manager is not None:
+                with self._precompile_timed("multimodal vision encoder"):
+                    self.encoder_cudagraph_manager.precompile_vision_encoder()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
