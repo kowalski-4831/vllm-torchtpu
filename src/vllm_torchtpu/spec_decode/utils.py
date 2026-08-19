@@ -9,6 +9,8 @@ from torch.nn import Parameter
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from vllm_torchtpu.layers.common.sequence_layout import (
+    AllSequenceLayoutPlanner, SequenceLayoutPlan)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -18,11 +20,18 @@ if TYPE_CHECKING:
     from vllm_torchtpu.layers.common.attention_metadata import \
         AttentionMetadataBuilderContext
 
+_DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = (
+    AllSequenceLayoutPlanner().prepare_dummy(
+        num_tokens=0,
+        num_reqs=0,
+        kv_cache_initialized=False,
+    ))
+
 
 @dataclass
 class DraftChunkInputs:
-    # Token ids the target consumed (post async-token-substitution).
-    # Device tensor, [padded_chunk_tokens].
+    # Full padded request-major token ids for this draft chunk, captured before a
+    # partial sequence layout packs or slices the target input.
     input_ids: torch.Tensor
     # Device tensor, [padded_chunk_tokens].
     position_ids: torch.Tensor
@@ -40,6 +49,10 @@ class DraftChunkInputs:
     # [padded_chunk_tokens, aux_hidden]. Only consumed when the draft
     # checkpoint wants them.
     aux_hidden_states: list[torch.Tensor]
+    # Production supplies the exact chunk-local plan. Dummy/default consumers
+    # share this immutable ALL-layout no-op plan and PCP callers override it.
+    sequence_layout_plan: SequenceLayoutPlan = \
+        _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN
     # Chunk-local per-request draft count (device tensor, padded), a snapshot
     # of the chunk's spec_decode_metadata.draft_lengths. Lets the async draft
     # path read num_draft on-device instead of re-scanning the scheduler dict

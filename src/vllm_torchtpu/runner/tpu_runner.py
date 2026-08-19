@@ -91,6 +91,7 @@ from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
@@ -377,6 +378,8 @@ class TPUModelRunner(GPUModelRunner):
         # wrong scope and fails silently. See `_init_phased_profiling`.
         self._profiler_rank = profiler_rank
         self._profiler_world_size = profiler_world_size
+        self._pcp_mtp_k1_enabled = (PcpStaticSupportValidator.from_vllm_config(
+            vllm_config).pcp_mtp_k1_enabled)
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
             # GPUModelRunner probes torch.cuda.mem_get_info during init. The
@@ -2752,6 +2755,13 @@ class TPUModelRunner(GPUModelRunner):
                                                      num_reqs] +
             num_scheduled_tokens_per_req)
 
+        request_major_input_ids_cpu: torch.Tensor
+        if self._pcp_mtp_k1_enabled:
+            # prepare_real() may repack input_ids_cpu in place. Preserve only
+            # the real request-major prefix before crossing that boundary.
+            request_major_input_ids_cpu = self.input_ids_cpu.narrow(
+                0, 0, int(total_num_scheduled_tokens)).clone()
+
         if use_max_model_len:
             target_num_reqs = self.num_reqs_max_model_len
         else:
@@ -2774,6 +2784,17 @@ class TPUModelRunner(GPUModelRunner):
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = (
             layout_plan.global_padded_num_tokens)
+        request_major_input_ids = None
+        if self._pcp_mtp_k1_enabled:
+            request_major_input_ids_cpu_padded = torch.zeros(
+                layout_plan.global_padded_num_tokens,
+                dtype=request_major_input_ids_cpu.dtype,
+            )
+            request_major_input_ids_cpu_padded.narrow(
+                0, 0, layout_plan.global_num_tokens).copy_(
+                    request_major_input_ids_cpu)
+            request_major_input_ids = request_major_input_ids_cpu_padded.to(
+                self.device, non_blocking=True)
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
         local_padded_total_num_scheduled_tokens = (
             layout_plan.local_padded_num_tokens)
@@ -3012,6 +3033,8 @@ class TPUModelRunner(GPUModelRunner):
             cur_input_indices,
             pre_next_tokens_indices,
             spec_decode_metadata,
+            request_major_input_ids,
+            layout_plan,
         )
 
     def _get_model_inputs(
@@ -3267,7 +3290,8 @@ class TPUModelRunner(GPUModelRunner):
 
             (attn_metadata, logits_indices, padded_num_reqs, num_reqs,
              end_index, cur_input_indices, pre_next_tokens_indices,
-             spec_decode_metadata) = (self._prepare_inputs(
+             spec_decode_metadata, request_major_input_ids,
+             draft_sequence_layout_plan) = (self._prepare_inputs(
                  scheduler_output, start_index, num_decode_reqs,
                  num_windowed_reqs))
 
@@ -3417,23 +3441,25 @@ class TPUModelRunner(GPUModelRunner):
                     ctx.unified_mamba_state_indices)
             if is_draft_model:
                 # Capture this chunk's draft inputs while they are valid.
-                draft_chunks.append(
-                    DraftChunkInputs(
-                        input_ids=draft_input_ids_src,
-                        position_ids=self.position_ids,
-                        query_start_loc_np=self.query_start_loc_np[:num_reqs +
-                                                                   1].copy(),
-                        attn_ctx=self._attn_metadata_builder_ctx,
-                        start_index=start_index,
-                        num_reqs=num_reqs,
-                        aux_hidden_states=aux_hidden_states
-                        if aux_hidden_states is not None else [],
-                        hidden_states=hidden_states,
-                        draft_lengths=(spec_decode_metadata.draft_lengths
-                                       if spec_decode_metadata is not None else
-                                       None),
-                        attn_metadata=attn_metadata,
-                    ))
+                draft_chunk = DraftChunkInputs(
+                    input_ids=(request_major_input_ids
+                               if request_major_input_ids is not None else
+                               draft_input_ids_src),
+                    position_ids=self.position_ids,
+                    query_start_loc_np=self.query_start_loc_np[:num_reqs +
+                                                               1].copy(),
+                    attn_ctx=self._attn_metadata_builder_ctx,
+                    start_index=start_index,
+                    num_reqs=num_reqs,
+                    aux_hidden_states=(aux_hidden_states if aux_hidden_states
+                                       is not None else []),
+                    hidden_states=hidden_states,
+                    draft_lengths=(spec_decode_metadata.draft_lengths if
+                                   spec_decode_metadata is not None else None),
+                    attn_metadata=attn_metadata,
+                    sequence_layout_plan=draft_sequence_layout_plan,
+                )
+                draft_chunks.append(draft_chunk)
 
             start_index = end_index
             chunk_index += 1
@@ -4671,13 +4697,107 @@ class TPUModelRunner(GPUModelRunner):
             # bucket shape it may see at runtime.
             if (self._is_async_drafter):
                 self.drafter.precompile()
-                self._precompile_rejection_sampler()
-                # The isolated precompile above emits standalone fused programs;
-                # the real per-step propose+verify+sampling dispatch fuses them
-                # differently, so the first real request would otherwise compile
-                # a handful of new graphs. Warm those by running the REAL
-                # two-phase spec-decode path once on a synthetic request.
-                self._warmup_spec_decode()
+                if self._pcp_mtp_k1_enabled:
+                    logger.info(
+                        "Skipping rejection replay and decode/verify warmup "
+                        "for prefill-only PCP MTP K1")
+                    self._warmup_pcp_mtp_prefill()
+                else:
+                    self._precompile_rejection_sampler()
+                    # The isolated precompiles above emit standalone fused
+                    # programs; the real per-step propose+verify+sampling
+                    # dispatch fuses them differently, so the first real
+                    # request would otherwise compile new graphs. Warm those
+                    # through the real two-phase spec-decode path.
+                    self._warmup_spec_decode()
+
+    def _warmup_pcp_mtp_prefill(self) -> None:
+        """Warm the real PCP MTP K1 prefill proposal and nothing else.
+
+        The real path may fail once while its draft forward is being cold
+        compiled. Run one bounded retry during startup so no live request
+        becomes the compiler probe.
+
+        This lifecycle is intentionally separate from ``_warmup_spec_decode``:
+        a prefill-only producer must never synthesize decode/verify work.
+        """
+        if os.environ.get("SPEC_WARMUP", "1") == "0":
+            return
+        if self.enforce_eager or not self._is_async_drafter:
+            return
+        P = min(int(self.num_tokens_paddings[0]), self.max_model_len)
+        n0 = self.num_xla_graphs
+        with _suspend_kv_transfer_group(), self._precompile_timed(
+                "PCP MTP real prefill warmup"):
+            if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):
+                if not self._warmup_one_pcp_mtp_prefill(P):
+                    raise RuntimeError(
+                        "PCP MTP prefill warmup failed after retry; refusing "
+                        "to start a producer whose first live proposal would "
+                        "hit the same failure")
+        logger.info("PCP MTP prefill warmup compiled %d graphs",
+                    self.num_xla_graphs - n0)
+
+    def _warmup_one_pcp_mtp_prefill(self, P: int, quiet: bool = False) -> bool:
+        """Run one synthetic PCP prefill through target sampling + K1 propose."""
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+
+        rid = "__pcp_mtp_warmup__"
+        max_pos = min(self.max_model_len, P + 1)
+        top = int(self.kv_cache_config.num_blocks)
+        block_ids_per_group = []
+        max_nblk = 0
+        for group in self.kv_cache_config.kv_cache_groups:
+            group_block_size = int(group.kv_cache_spec.block_size)
+            group_num_blocks = min(cdiv(max_pos, group_block_size),
+                                   cdiv(self.max_model_len, group_block_size))
+            block_ids_per_group.append(list(range(top - group_num_blocks,
+                                                  top)))
+            max_nblk = max(max_nblk, group_num_blocks)
+        if top <= max_nblk + 1:
+            raise RuntimeError(
+                "PCP MTP prefill warmup has not enough KV blocks for its "
+                f"synthetic request: num_blocks={top}, required>{max_nblk + 1}"
+            )
+
+        attempt_succeeded = True
+        try:
+            request = NewRequestData(
+                req_id=rid,
+                prompt_token_ids=[0] * P,
+                mm_features=[],
+                sampling_params=SamplingParams(temperature=0.0),
+                pooling_params=None,
+                block_ids=tuple(block_ids_per_group),
+                num_computed_tokens=0,
+                lora_request=None,
+            )
+            scheduler_output = SchedulerOutput.make_empty()
+            scheduler_output.scheduled_new_reqs = [request]
+            scheduler_output.num_scheduled_tokens = {rid: P}
+            scheduler_output.total_num_scheduled_tokens = P
+            self.execute_model(scheduler_output)
+            self.sample_tokens(None)
+            self.take_draft_token_ids()
+        except Exception:
+            attempt_succeeded = False
+            if quiet:
+                logger.warning(
+                    "PCP MTP prefill warmup P=%d first attempt failed; "
+                    "retrying once.",
+                    P,
+                    exc_info=True)
+            else:
+                logger.exception("PCP MTP prefill warmup P=%d retry failed", P)
+        finally:
+            cleanup_succeeded = self._warmup_spec_decode_cleanup(rid)
+
+        if not cleanup_succeeded:
+            raise RuntimeError(
+                "PCP MTP prefill warmup cleanup failed; refusing to retry or "
+                "start with residual synthetic request state")
+        return attempt_succeeded
 
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.
@@ -4993,9 +5113,10 @@ class TPUModelRunner(GPUModelRunner):
             self._warmup_spec_decode_cleanup(rid)
         return True
 
-    def _warmup_spec_decode_cleanup(self, rids) -> None:
+    def _warmup_spec_decode_cleanup(self, rids) -> bool:
         """Tear down the synthetic warmup request(s) so serving starts clean."""
         from vllm.v1.core.sched.output import SchedulerOutput
+        cleanup_succeeded = True
         if isinstance(rids, str):
             rids = [rids]
         # Reset the two-phase guard: a half-finished step would otherwise make
@@ -5012,7 +5133,8 @@ class TPUModelRunner(GPUModelRunner):
             try:
                 self._pre_async_results.wait_for_copy()
             except Exception:
-                pass
+                cleanup_succeeded = False
+                logger.exception("spec-decode warmup async copy wait failed")
             self._pre_async_results = None
         try:
             idx_map = self.input_batch.req_id_to_index
@@ -5025,29 +5147,44 @@ class TPUModelRunner(GPUModelRunner):
                 self.execute_model(so)
                 self.execute_model_state = None
         except Exception:
+            cleanup_succeeded = False
             logger.exception("spec-decode warmup drain failed")
         # Belt-and-suspenders: drop any synthetic state defensively.
         for r in rids:
             try:
                 self.requests.pop(r, None)
             except Exception:
-                pass
+                cleanup_succeeded = False
+                logger.exception("spec-decode warmup request cleanup failed")
         for attr in ("_draft_token_ids", ):
             try:
                 if hasattr(self.spec_decode_manager, attr):
                     setattr(self.spec_decode_manager, attr, None)
             except Exception:
-                pass
+                cleanup_succeeded = False
+                logger.exception("spec-decode warmup draft cleanup failed")
         try:
             if self.drafter is not None:
                 self.drafter.draft_chunks = None
         except Exception:
-            pass
+            cleanup_succeeded = False
+            logger.exception("spec-decode warmup chunk cleanup failed")
         self._pre_async_results = None
         self.mm_embed_inputs = None
         if self.input_batch.num_reqs != 0:
+            cleanup_succeeded = False
             logger.warning("spec-decode warmup left batch non-empty (%d)",
                            self.input_batch.num_reqs)
+        remaining = {
+            r
+            for r in rids
+            if r in self.requests or r in self.input_batch.req_id_to_index
+        }
+        if remaining:
+            cleanup_succeeded = False
+            logger.warning("spec-decode warmup state still contains %s",
+                           sorted(remaining))
+        return cleanup_succeeded
 
     @contextmanager
     def _profile_isolated_cache(self) -> Iterator[None]:

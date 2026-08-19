@@ -887,18 +887,13 @@ class TpuPlatform(Platform):
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
         # the pool's align-mode mamba state seed copies; other cache modes
-        # and speculative decoding must be rejected up front instead of
-        # failing partway through warmup.
+        # must be rejected up front instead of failing partway through warmup.
         if is_hybrid and cache_config.enable_prefix_caching:
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
                     "mamba_cache_mode='align' (got "
                     f"{cache_config.mamba_cache_mode!r}).")
-            if vllm_config.speculative_config is not None:
-                raise NotImplementedError(
-                    "Speculative decoding is not yet supported with hybrid "
-                    "Mamba prefix caching (mamba_cache_mode='align').")
             if not unified_kv_layout_enabled(vllm_config):
                 # Seed copies live on the pooled path only, so the per-layer
                 # layout restores no Mamba state on a prefix-cache hit and
