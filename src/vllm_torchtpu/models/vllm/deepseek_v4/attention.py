@@ -49,34 +49,6 @@ logger = init_logger(__name__)
 _attn_op_cache: dict[str, Any] = {}
 
 
-# Stub for torch.cuda.Event on TPU environments;
-# upstream vLLM DeepseekV4Attention instantiates CUDA events unconditionally.
-class _DummyCudaEvent:
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def record(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def wait(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def query(self) -> bool:
-        return True
-
-    def synchronize(self) -> None:
-        pass
-
-
-def _patch_cuda_stubs() -> None:
-    if not torch.cuda.is_available():
-        torch.cuda.Event = _DummyCudaEvent  # pyrefly: ignore
-
-
-_patch_cuda_stubs()
-
-
 class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                                  AttentionLayerBase):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
@@ -88,13 +60,17 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list | None = None,
     ) -> None:
-        # Route submodule instantiation to TorchTPU-native implementations.
+        # Route submodule instantiation to TorchTPU-native implementations. The
+        # base constructors allocate torch.cuda.Event for an aux-stream fan-out
+        # this backend replaces, so the events are stubbed out for the call.
         orig_indexer = dsv4_attention.DeepseekV4Indexer
         orig_compressor = dsv4_attention.DeepseekCompressor
         orig_swa_cache = dsv4_attention.DeepseekV4SWACache
+        orig_cuda_event = torch.cuda.Event
         dsv4_attention.DeepseekV4Indexer = VllmDeepseekV4Indexer
         dsv4_attention.DeepseekCompressor = VllmDeepseekCompressor
         dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
+        torch.cuda.Event = lambda *args, **kwargs: None
 
         try:
             super().__init__(
@@ -113,6 +89,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             dsv4_attention.DeepseekV4Indexer = orig_indexer
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4SWACache = orig_swa_cache
+            torch.cuda.Event = orig_cuda_event
 
         # Bind compressor key-cache reference to SWA or main layer depending on compression ratio.
         if hasattr(self, "compressor") and self.compressor is not None:

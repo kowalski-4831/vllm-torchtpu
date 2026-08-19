@@ -15,23 +15,28 @@
 
 import re
 import sys
-from collections.abc import Iterable
+import typing
+from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
 import torch.nn as nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import (get_dp_group, get_pp_group,
+                              get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.fused_moe import \
     fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               PPMissingLayer, WeightsMapper,
+                                              is_pp_missing_parameter,
                                               make_layers, maybe_prefix)
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
@@ -225,6 +230,19 @@ class DeepseekV4Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _dp_gather_hash_moe_input_ids(self,
+                                      input_ids: torch.Tensor) -> torch.Tensor:
+        """All-gather input_ids over the DP group for hash-MoE routing.
+
+        Hash layers route on hash_indices_table[input_ids], and the MoE runner
+        routes over the DP-gathered global batch, so every rank needs every id.
+        Uses the same all_gather(dim=0) as hidden_states to keep rows aligned.
+        """
+        dp_group = get_dp_group()
+        if dp_group.world_size == 1:
+            return input_ids
+        return dp_group.all_gather(input_ids, dim=0)
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -257,11 +275,18 @@ class DeepseekV4Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
+        # Hash routing is confined to the first `num_hash_layers`; only those
+        # layers need ids gathered across DP.
+        moe_input_ids = input_ids
+        if (input_ids is not None
+                and self.start_layer < self.config.num_hash_layers):
+            moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
+
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(
                 hidden_states,
                 positions,
-                input_ids,
+                moe_input_ids,
             )
 
         if not get_pp_group().is_last_rank:
@@ -276,6 +301,108 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         return self.norm(hidden_states)
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        """Load checkpoint tensors into stacked, expert, sink and plain params."""
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
+            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+            ("attn.fused_wqa_wkv", "attn.wkv", 1),
+            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        # attn_sink is stored per global head; each rank keeps its own slice.
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        n_head = self.config.num_attention_heads
+        n_local_head = n_head // tp_size
+        head_rank_start = n_local_head * tp_rank
+        head_rank_end = n_local_head * (tp_rank + 1)
+
+        # Pre-compute expert mapping ONCE.
+        expert_mapping = self.get_expert_mapping()
+
+        for name, loaded_weight in weights:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if ".experts." in name:
+                    continue
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                if is_pp_missing_parameter(name, self):
+                    break
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                break
+            else:
+                if ".experts." in name:
+                    # E8M0 scales are stored as float8_e8m0fnu in
+                    # checkpoints but the MoE param is uint8. copy_()
+                    # would do a numeric conversion (e.g. 2^-7 → 0),
+                    # destroying the raw exponent bytes.
+                    if ("weight_scale" in name
+                            and loaded_weight.dtype == torch.float8_e8m0fnu):
+                        loaded_weight = loaded_weight.view(torch.uint8)
+                    for mapping in expert_mapping:
+                        param_name, weight_name, expert_id, expert_shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name_mapped = name.replace(weight_name, param_name)
+                        if is_pp_missing_parameter(name_mapped, self):
+                            continue
+                        if name_mapped not in params_dict:
+                            continue
+                        param = params_dict[name_mapped]
+                        weight_loader = typing.cast(Callable[..., bool],
+                                                    param.weight_loader)
+                        success = weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=expert_shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            loaded_params.add(name_mapped)
+                            break
+                    continue
+                elif "attn_sink" in name:
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    if name not in params_dict:
+                        continue
+                    narrow_weight = loaded_weight[
+                        head_rank_start:head_rank_end]
+                    n = narrow_weight.shape[0]
+                    params_dict[name][:n].copy_(narrow_weight)
+                    loaded_params.add(name)
+                    continue
+                else:
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+                    continue
+
+        return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Generate MoE expert parameter mappings for weight loading."""
@@ -378,30 +505,8 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         import safetensors.torch  # pyrefly: ignore
         safetensors.torch._TYPES["F8_E8M0"] = torch.uint8
 
-        stacked_params_mapping = [
-            # (weight_name, param_name, shard_id)
-            ("mlp.w1", "mlp.gate_up_proj", 0),
-            ("mlp.w3", "mlp.gate_up_proj", 1),
-            ("attn.wq_a", "attn.fused_wqa_wkv", 0),
-            ("attn.wkv", "attn.fused_wqa_wkv", 1),
-            ("compressor.wkv", "compressor.fused_wkv_wgate", 0),
-            ("compressor.wgate", "compressor.fused_wkv_wgate", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-
-        def _mapped_weights():
-            for name, loaded_weight in self.hf_to_vllm_mapper.apply(weights):
-                for weight_name, param_name, shard_id in stacked_params_mapping:
-                    if weight_name in name:
-                        candidate = name.replace(weight_name, param_name)
-                        if candidate in params_dict:
-                            name = candidate
-                            loaded_weight.shard_id = shard_id
-                            break
-                yield name, loaded_weight
-
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        return loader.load_weights(_mapped_weights())
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
