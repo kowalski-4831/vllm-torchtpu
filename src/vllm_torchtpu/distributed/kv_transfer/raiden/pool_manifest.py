@@ -2,7 +2,7 @@
 """Raiden pool-manifest builder for the Qwen3.5 hybrid KV cache.
 
 Raiden's admission surface is model-agnostic (storages / pools / regions, see
-``tpu_raiden.api.torch.pool_layout``). Everything model- and kernel-specific
+``tpu_sync.api.torch.pool_layout``). Everything model- and kernel-specific
 about the Qwen3.5 hybrid layout is derived HERE, on the vLLM side, from the
 **live materialization** (the typed KV cache tensors bound into the forward
 context plus their kv-cache-group specs) — never from pinned constants.

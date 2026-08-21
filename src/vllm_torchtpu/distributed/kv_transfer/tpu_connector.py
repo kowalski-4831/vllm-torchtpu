@@ -42,7 +42,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
-    from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+    from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
@@ -1614,20 +1614,22 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _new_raiden_controller_facade(controller_address: str) -> Any:
-        from tpu_raiden.rpc.raiden_controller import \
-            RaidenControllerClientFacade
+        # The reshard surface moved off the Python controller and behind this
+        # client, which fronts the native implementation. The work-unit and
+        # request-block calls below keep the names and arguments they had.
+        from tpu_sync.api.torch.reshard_client import ReshardClient
 
-        return RaidenControllerClientFacade(controller_address)
+        return ReshardClient(controller_address)
 
     @staticmethod
     def _new_raiden_id(fields: dict[str, Any]) -> Any:
-        from tpu_raiden.rpc.raiden_controller import RaidenId
+        from tpu_sync.rpc.raiden_controller import RaidenId
 
         return RaidenId(**fields)
 
     @staticmethod
     def _new_raiden_manager(**kwargs: Any) -> "KVCacheManager":
-        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+        from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         return KVCacheManager(**kwargs)
 
@@ -2274,7 +2276,7 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _raiden_hbm_memory_type() -> Any:
-        from tpu_raiden.rpc.raiden_controller import RaidenMemoryType
+        from tpu_sync.rpc.raiden_controller import RaidenMemoryType
 
         return RaidenMemoryType.HBM
 
