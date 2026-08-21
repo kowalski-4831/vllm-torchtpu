@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -292,6 +293,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # MoE router top-k implementation: "rowmax" (default) is the sort-free
+    # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
+    "TPU_MOE_ROUTER_TOPK":
+    env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
