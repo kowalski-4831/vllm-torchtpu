@@ -93,6 +93,40 @@ class FakeNonShardingMambaModel(FakeQwenMambaModel):
         return ((3, 4096), (16, 128, 128))
 
 
+class FakeKimiLinearModel:
+    """Kimi-Linear KDA state per TP shard: conv (taps, qkv, heads, head_dim)
+    bf16 and recurrent (heads, head_dim, head_dim) fp32."""
+
+    @staticmethod
+    def get_mamba_state_shape_from_config(vllm_config):
+        local_heads = (32 // vllm_config.parallel_config.tensor_parallel_size)
+        return ((3, 3, local_heads, 128), (local_heads, 128, 128))
+
+    @staticmethod
+    def get_mamba_state_dtype_from_config(_):
+        return (torch.bfloat16, torch.float32)
+
+
+class FakeKimiMLABackend(FakePlainAttentionBackend):
+    """MLA page geometry: packing=2 x 640 padded bf16 lanes = 2560 B/token.
+
+    The real PallasMLAttentionBackend inherits MultipleOf(1) kernel block
+    sizes, so the derivation's alignment step is a no-op ([] matches)."""
+
+    @staticmethod
+    def get_name():
+        return "PALLAS_MLA"
+
+    @staticmethod
+    def get_min_page_size(_vllm_config):
+        # Representative for max_model_len=32768, max_num_seqs=256.
+        return 64
+
+    @staticmethod
+    def get_kv_cache_page_size_bytes(block_size, *_args, **_kwargs):
+        return block_size * 2560
+
+
 @pytest.fixture
 def vllm_config():
     vllm_config = MagicMock(spec=VllmConfig)
@@ -167,6 +201,30 @@ def test_hybrid_fit_uses_physical_gdn_extent(vllm_config):
     assert vllm_config.cache_config.block_size == 1280
     assert vllm_config.cache_config.mamba_block_size == 1280
     assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
+
+
+def test_kimi_linear_padded_ssm_fit(vllm_config):
+    """Kimi-Linear TP8: the f32 KDA state (2^18 B) does not divide the MLA
+    token row (2^9 * 5 B), so the derivation pads the SSM region up to whole
+    token rows instead of rejecting the geometry."""
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = "KimiLinearForCausalLM"
+    vllm_config.model_config.get_head_size.return_value = 576
+    vllm_config.cache_config.block_size = 16
+    vllm_config.cache_config.mamba_block_size = 16
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.parallel_config.tensor_parallel_size = 8
+
+    _update(vllm_config,
+            backend_cls=FakeKimiMLABackend,
+            model_cls=FakeKimiLinearModel)
+
+    # SSM: ceil(262144 / 2560) = 103 rows (1536 B of padding in the last
+    # row); conv: pow2(ceil(9216 / 2560)) = 4 rows; the fit floor 107 beats
+    # the backend minimum of 64 and the input block size of 16.
+    assert vllm_config.cache_config.block_size == 107
+    assert vllm_config.cache_config.mamba_block_size == 107
+    assert vllm_config.cache_config.mamba_page_size_padded == 107 * 2560
 
 
 def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):

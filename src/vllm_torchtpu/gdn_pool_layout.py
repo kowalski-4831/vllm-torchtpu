@@ -73,21 +73,18 @@ def derive_pooled_gdn_state_layout(
     conv_bytes: int,
     token_bytes: int,
 ) -> PooledGDNStateLayout:
-    """Derive the physical token extent of pooled GDN state regions."""
+    """Derive the physical token extent of pooled GDN state regions.
+
+    If ssm_bytes cannot be evenly divided into FA token rows, its last row
+    is padded.
+    """
     if min(ssm_bytes, conv_bytes, token_bytes) <= 0:
         raise ValueError("pooled GDN byte sizes must be positive")
-    if ssm_bytes % token_bytes:
-        raise ValueError(
-            "pooled GDN SSM state must occupy complete FA token rows")
 
-    ssm_tokens = ssm_bytes // token_bytes
+    ssm_tokens = (ssm_bytes + token_bytes - 1) // token_bytes
     conv_tokens = 1
-    while (conv_tokens * token_bytes < conv_bytes
-           or ssm_tokens % conv_tokens != 0):
+    while conv_tokens * token_bytes < conv_bytes:
         conv_tokens *= 2
-        if conv_tokens > ssm_tokens:
-            raise ValueError(
-                "pooled GDN conv tile cannot be placed after the SSM region")
 
     return PooledGDNStateLayout(
         ssm_bytes=ssm_bytes,
