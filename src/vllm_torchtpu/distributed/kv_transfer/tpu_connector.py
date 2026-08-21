@@ -1665,9 +1665,9 @@ class TPURaidenConnectorWorker:
             return 0
         if _use_raiden_glm_admission():
             return int(self.tp_rank)
-        from vllm_torchtpu.distributed.pcp import get_pcp_rank
+        from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
 
-        return int(get_pcp_rank())
+        return int(get_pcp_cache_rank())
 
     def _raiden_interleave_tokens(self, page_tokens: int,
                                   transfer_parallelism: int) -> int:
