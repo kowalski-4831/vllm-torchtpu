@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
+    USE_BATCHED_RPA_LONGCTX: bool = False
 
 
 def env_with_choices(
@@ -315,6 +317,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    "USE_BATCHED_RPA_SEQ_ON_LANE":
+    env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
+    # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
+    "USE_BATCHED_RPA_LONGCTX":
+    env_bool("USE_BATCHED_RPA_LONGCTX"),
 }
 
 

@@ -94,6 +94,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
@@ -1113,6 +1114,7 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
         )
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
@@ -1192,9 +1194,9 @@ class TPUModelRunner(GPUModelRunner):
                         self.kv_cache_dtype,
                     )
                     page_size_padded = (
-                        self._hybrid_uniform_page_size_bytes if
-                        self._hybrid_uniform_page_size_bytes is not None else
-                        PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        self._hybrid_uniform_page_size_bytes
+                        if self._hybrid_uniform_page_size_bytes is not None
+                        else backend_cls.get_kv_cache_page_size_bytes(
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
@@ -1559,10 +1561,11 @@ class TPUModelRunner(GPUModelRunner):
         to make sure every layer is pinned to the *same* one.
         """
         attn_page_sizes = set()
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         for m in layers.values():
             if isinstance(m, Attention):
                 attn_page_sizes.add(
-                    PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                    backend_cls.get_kv_cache_page_size_bytes(
                         block_size,
                         m.num_kv_heads,
                         m.head_size,
@@ -1642,8 +1645,7 @@ class TPUModelRunner(GPUModelRunner):
         first_attn_module = attn_modules[0]
         num_kv_heads = first_attn_module.num_kv_heads if isinstance(
             first_attn_module, Attention) else 1
-        attention_backend = (PallasMLAttentionBackend if isinstance(
-            first_attn_module, MLAAttention) else PallasAttentionBackend)
+        attention_backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.block_size, num_kv_heads, first_attn_module.head_size,
             self.kv_cache_dtype)
@@ -5713,6 +5715,7 @@ class TPUModelRunner(GPUModelRunner):
         if self._unified_kv_layout:
             self._initialize_unified_kv_cache(kv_cache_config)
             return
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
 
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
@@ -5888,7 +5891,7 @@ class TPUModelRunner(GPUModelRunner):
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "
                             f"tp_size {tp_size} under SPMD mode")
-                    kv_cache_shape = PallasAttentionBackend.get_kv_cache_shape(
+                    kv_cache_shape = backend_cls.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,

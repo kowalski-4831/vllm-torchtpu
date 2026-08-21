@@ -11,7 +11,7 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
-                                       MLAAttentionImpl)
+                                       MLAAttentionImpl, MultipleOf)
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
@@ -37,6 +37,12 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+# Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
+if envs.USE_BATCHED_RPA_LONGCTX:
+    import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched_wrapper
+else:
+    import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -448,8 +454,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     `--attention-backend CUSTOM`. The Impl subclass sets `use_batched_rpa=True`,
     which plumbs through `_pallas_rpa_kernel` → `attention()` →
     `sharded_ragged_paged_attention()` to pick the batched kernel function.
-    Declares `get_supported_kernel_block_sizes() -> [256]` so vLLM's standard
-    `get_preferred_block_size` flow picks the right block size automatically.
+    Any multiple of 128 is a valid page size for this kernel (with or without
+    `USE_BATCHED_RPA_SEQ_ON_LANE`); `get_preferred_block_size` is overridden
+    so the auto-selected default (no `--block-size` given) stays at 256.
     """
 
     @staticmethod
@@ -461,8 +468,56 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         return PallasBatchedRPAAttentionBackendImpl
 
     @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> tuple[int, ...]:
+        is_auto = (isinstance(cache_dtype_str, str)
+                   and cache_dtype_str.lower().strip() == "auto")
+        if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
+            return PallasAttentionBackend.get_kv_cache_shape(
+                num_blocks, block_size, num_kv_heads, head_size,
+                cache_dtype_str)
+        torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        kv_packing = get_dtype_packing(torch_dtype)
+        return rpa_batched_wrapper.get_kv_cache_shape(
+            total_num_pages=num_blocks,
+            page_size=block_size,
+            actual_num_kv_heads=num_kv_heads,
+            actual_head_dim=head_size,
+            # pyrefly: ignore [unexpected-keyword]
+            kv_packing=kv_packing,
+        )
+
+    @staticmethod
     def get_supported_kernel_block_sizes():
+        if envs.USE_BATCHED_RPA_LONGCTX:
+            return [MultipleOf(128)]
         return [256]
+
+    @staticmethod
+    def get_kv_cache_page_size_bytes(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        if not envs.USE_BATCHED_RPA_LONGCTX:
+            return PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                block_size, num_kv_heads, head_size, cache_dtype_str)
+        dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        shape = PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
+            1,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype,
+        )
+        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
+        return num_elements * torch.empty((), dtype=dtype).element_size()
 
 
 class PallasAttentionBackendImpl(AttentionImpl):

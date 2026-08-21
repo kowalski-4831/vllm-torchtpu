@@ -13,11 +13,11 @@ from jax.experimental.pallas.ops.tpu.splash_attention import \
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
 import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
 import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
@@ -36,6 +36,13 @@ MAX_ALLOWED_PAGE_INDICES_N = (
 # Default and experimental batched RPA kernels are loaded unconditionally.
 # Selection happens per attention layer via the `use_batched_rpa` flag plumbed
 # from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
+#
+# Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
+if envs.USE_BATCHED_RPA_LONGCTX:
+    import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched
+else:
+    import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+
 ragged_paged_attention = rpa_default.ragged_paged_attention
 ragged_paged_attention_batched = rpa_batched.ragged_paged_attention
 get_kv_cache_shape = rpa_default.get_kv_cache_shape
@@ -313,7 +320,11 @@ def sharded_ragged_paged_attention(
     """Shards along KV heads."""
 
     qkv_spec = P(None, "model", None)
-    kv_cache_spec = P(None, None, "model", None, None)
+    use_hd64 = q.shape[-1] == 64
+    if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not use_hd64:
+        kv_cache_spec = P(None, "model", None, None, None)
+    else:
+        kv_cache_spec = P(None, None, "model", None, None)
     in_specs = (
         qkv_spec,  # q
         qkv_spec,  # k
@@ -327,8 +338,6 @@ def sharded_ragged_paged_attention(
     out_specs = (qkv_spec, kv_cache_spec)
 
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
-
-    use_hd64 = q.shape[-1] == 64
 
     if use_hd64:
         # Batched RPA has no hd64 variant; head_dim==64 always uses default.
