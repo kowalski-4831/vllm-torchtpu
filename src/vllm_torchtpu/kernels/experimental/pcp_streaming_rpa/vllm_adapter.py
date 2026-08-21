@@ -67,11 +67,9 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
         output_shapes, out_tree = self.output_shapes.get(
             kernel_key, (None, None))
         mlir_fingerprint = self.kernel_key_to_mlir_fingerprint.get(kernel_key)
-        kernel_exists = (
-            mlir_fingerprint is not None
-            and pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
-                self.name, mlir_fingerprint)
-        )
+        kernel_exists = (mlir_fingerprint is not None
+                         and pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
+                             self.name, mlir_fingerprint))
         if not output_shapes or not kernel_exists:
             jax_args = pallas_impl.jax_placeholders(
                 args,
