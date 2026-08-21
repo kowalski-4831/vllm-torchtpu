@@ -17,8 +17,6 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
-    sparse_packed_width
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
@@ -977,6 +975,13 @@ class PallasMLAttentionBackend(AttentionBackend):
     _DS_MLA_QUANT_BLOCK = 64
 
     @staticmethod
+    def _ds_mla_packed_width(nope_dim: int, rope_head_dim: int,
+                             quant_block: int) -> int:
+        """Bytes per token in the packed sparse (head_dim=512) KV cache."""
+        # nope fp8 (1B) + rope bf16 (2B) + UE8M0 block scale (1B)
+        return nope_dim + rope_head_dim * 2 + (nope_dim // quant_block)
+
+    @staticmethod
     def get_name() -> str:
         return "FLASH_ATTN_MLA"
 
@@ -1023,8 +1028,8 @@ class PallasMLAttentionBackend(AttentionBackend):
                 rope_head_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
                 quant_block = PallasMLAttentionBackend._DS_MLA_QUANT_BLOCK
                 nope_dim = head_size - rope_head_dim
-                packed_width = sparse_packed_width(nope_dim, rope_head_dim,
-                                                   quant_block)
+                packed_width = (PallasMLAttentionBackend._ds_mla_packed_width(
+                    nope_dim, rope_head_dim, quant_block))
             kv_packing = get_dtype_packing(torch.uint8)
             return mla_v2_kernel.get_kv_cache_shape(
                 total_num_pages=num_blocks,

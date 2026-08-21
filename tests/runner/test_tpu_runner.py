@@ -2198,18 +2198,17 @@ class TestUnifiedReadOffsetMigration:
         assert int(runner.mamba_slot_read_offsets[5]) == 1
 
 
-def test_dsv4_swa_overlay_plan():
-    """SWA caches overlay compatible compressed-KV arrays, positionally.
+def test_dsv4_layer_classification():
+    """Every DSv4 layer is sorted by the kernel that reads its array.
 
-    Mirrors the reference (`tpu_inference/runner/kv_cache_manager.py:1155-1178`):
-    a CSA page (256 rows) can host a 128-row SWA logical page; an HCA page
-    (8 rows) cannot. Layers of one group must land on *distinct* hosts because
-    they share a block table, and any overflow beyond the available hosts stays
-    unmapped so it gets its own array.
+    Mirrors the reference (`tpu_inference/runner/kv_cache_manager.py`):
+    MLAAttentionSpec layers anchor the overlays, `*.compressor.state_cache`
+    layers are placed afterwards, and SWA layers stay grouped because layers
+    of one cache group share a block table. A layer matching none of the
+    three is a layout change the overlay plan cannot absorb, so it raises
+    rather than being silently left without an array.
     """
     from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
-
-    from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
 
     def mla(compress_ratio, head_size=640):
         return MLAAttentionSpec(block_size=1024,
@@ -2228,107 +2227,97 @@ def test_dsv4_swa_overlay_plan():
                                     alignment=None)
 
     specs = {
-        "m.layers.0.attn": mla(4),  # CSA host, 256 rows
-        "m.layers.1.attn": mla(4),  # CSA host, 256 rows
-        "m.layers.2.attn": mla(128),  # HCA, 8 rows -> too small
-        "m.layers.0.attn.indexer.k_cache": mla(4, head_size=256),  # too narrow
+        "m.layers.0.attn": mla(4),
+        "m.layers.1.attn": mla(128),
+        "m.layers.0.attn.indexer.k_cache": mla(4, head_size=256),
+        "m.layers.0.attn.compressor.state_cache": swa(),
         "m.layers.0.attn.swa_cache": swa(),
         "m.layers.1.attn.swa_cache": swa(),
-        "m.layers.2.attn.swa_cache": swa(),  # overflow: only 2 hosts fit
     }
-
-    mla_group = SimpleNamespace(layer_names=[
-        "m.layers.0.attn", "m.layers.1.attn", "m.layers.2.attn",
-        "m.layers.0.attn.indexer.k_cache"
-    ])
-    swa_group = SimpleNamespace(layer_names=[
-        "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache",
-        "m.layers.2.attn.swa_cache"
-    ])
-    kv_cache_config = SimpleNamespace(kv_cache_groups=[mla_group, swa_group])
+    groups = [
+        SimpleNamespace(layer_names=[
+            "m.layers.0.attn", "m.layers.1.attn",
+            "m.layers.0.attn.indexer.k_cache",
+            "m.layers.0.attn.compressor.state_cache"
+        ]),
+        SimpleNamespace(layer_names=[
+            "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"
+        ]),
+    ]
 
     runner = MagicMock()
     runner.shared_kv_cache_layers = {}
     runner._is_ds_v4_swa_layer = TPUModelRunner._is_ds_v4_swa_layer
+    runner._DS_V4_STATE_CACHE_SUFFIX = TPUModelRunner._DS_V4_STATE_CACHE_SUFFIX
 
-    overlay = TPUModelRunner._plan_ds_v4_swa_overlay(
-        runner,
-        kv_cache_config,
-        specs.__getitem__,
-        lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
-            10,
-            spec.storage_block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            spec.dtype,
-            head_size_is_packed_width=True),
-    )
+    mla_names, swa_groups, state_names = TPUModelRunner._classify_ds_v4_layers(
+        runner, SimpleNamespace(kv_cache_groups=groups), specs.__getitem__)
 
-    # Two CSA hosts available -> two SWA layers map, third overflows.
-    assert len(overlay) == 2
-    # Distinct hosts: same-group layers share a block table, so two SWA caches
-    # on one array would be handed the same block id.
-    assert len(set(overlay.values())) == 2
-    # Never the HCA array (too few rows) or the indexer (too narrow).
-    assert "m.layers.2.attn" not in overlay.values()
-    assert "m.layers.0.attn.indexer.k_cache" not in overlay.values()
-    assert set(overlay.values()) <= {"m.layers.0.attn", "m.layers.1.attn"}
+    assert mla_names == [
+        "m.layers.0.attn", "m.layers.1.attn", "m.layers.0.attn.indexer.k_cache"
+    ]
+    assert state_names == ["m.layers.0.attn.compressor.state_cache"]
+    # Grouped, not flattened: position within the group picks the host array.
+    assert swa_groups == [[
+        "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"
+    ]]
+
+    stray = SimpleNamespace(layer_names=["m.layers.0.mystery"])
+    with pytest.raises(ValueError, match="no known role"):
+        TPUModelRunner._classify_ds_v4_layers(
+            runner, SimpleNamespace(kv_cache_groups=groups + [stray]), {
+                **specs, "m.layers.0.mystery": swa()
+            }.__getitem__)
 
 
-def test_dsv4_swa_overlay_hosts_are_distinct_across_groups():
-    """A host must back at most one SWA cache, even across cache groups.
+def test_dsv4_swa_overlay_shares_hosts_across_groups():
+    """SWA caches take a host by position *within* their own cache group.
 
-    Regression test: assigning positionally *within* each group restarts at
-    hosts[0] for every group, so when the SWA layers are spread across many
-    groups (which is what vLLM actually produces here, not one group holding
-    all of them) every group piles onto the same array.
+    Mirrors the reference: `swa_host_indices[position]` with `position`
+    restarting at 0 for every group, so the one-SWA-layer-per-group layout
+    vLLM actually produces puts every SWA cache on the *same* CSA NoPE array.
+    That is safe -- distinct cache groups never own the same block ID at the
+    same time -- and it is why `_validate_ds_v4_overlay` checks for collisions
+    within a group only. An earlier design forced globally distinct hosts,
+    which allocated arrays the reference does not.
     """
-    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+    csa_a = torch.zeros(4, 8, 4, 128, dtype=torch.uint8)
+    csa_b = torch.zeros(4, 8, 4, 128, dtype=torch.uint8)
 
-    from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
+    # The MLA layers form one cache group; each SWA cache is its own group,
+    # which is the shape vLLM actually produces here. A CSA layer and the SWA
+    # cache overlaying its NoPE array therefore never share a block table.
+    groups = [
+        SimpleNamespace(layer_names=[f"m.layers.{i}.attn" for i in range(3)]),
+    ] + [
+        SimpleNamespace(layer_names=[f"m.layers.{i}.attn.swa_cache"])
+        for i in range(3)
+    ]
+    # Positional-within-group assignment: every group's sole SWA layer is at
+    # position 0, so all three share the first CSA NoPE array.
+    kv_caches = {
+        "m.layers.0.attn": (csa_a, torch.zeros(4, 2, 4, 128,
+                                               dtype=torch.uint8)),
+        "m.layers.1.attn": (csa_b, torch.zeros(4, 2, 4, 128,
+                                               dtype=torch.uint8)),
+        "m.layers.2.attn": torch.zeros(4, 16, 4, 128, dtype=torch.uint8),
+        "m.layers.0.attn.swa_cache": csa_a,
+        "m.layers.1.attn.swa_cache": csa_a,
+        "m.layers.2.attn.swa_cache": csa_a,
+    }
+    TPUModelRunner._validate_ds_v4_overlay(
+        SimpleNamespace(kv_cache_groups=groups), kv_caches)
 
-    specs = {}
-    groups = []
-    for i in range(3):
-        specs[f"m.layers.{i}.attn"] = MLAAttentionSpec(block_size=1024,
-                                                       num_kv_heads=1,
-                                                       head_size=640,
-                                                       dtype=torch.uint8,
-                                                       compress_ratio=4,
-                                                       alignment=None)
-        specs[f"m.layers.{i}.attn.swa_cache"] = SlidingWindowMLASpec(
-            block_size=128,
-            num_kv_heads=1,
-            head_size=640,
-            dtype=torch.uint8,
-            sliding_window=128,
-            alignment=None)
-        # One SWA layer per group -- the layout that exposed the bug.
-        groups.append(
-            SimpleNamespace(layer_names=[
-                f"m.layers.{i}.attn", f"m.layers.{i}.attn.swa_cache"
-            ]))
-
-    runner = MagicMock()
-    runner.shared_kv_cache_layers = {}
-    runner._is_ds_v4_swa_layer = TPUModelRunner._is_ds_v4_swa_layer
-
-    overlay = TPUModelRunner._plan_ds_v4_swa_overlay(
-        runner,
-        SimpleNamespace(kv_cache_groups=groups),
-        specs.__getitem__,
-        lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
-            10,
-            spec.storage_block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            spec.dtype,
-            head_size_is_packed_width=True),
-    )
-
-    assert len(overlay) == 3, overlay
-    assert len(set(
-        overlay.values())) == 3, (f"hosts reused across groups: {overlay}")
+    # Two layers of ONE group on one array is the case that does corrupt:
+    # they share a block table, so they would write each other's pages.
+    one_group = [
+        SimpleNamespace(layer_names=[
+            "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"
+        ])
+    ]
+    with pytest.raises(ValueError, match="same array"):
+        TPUModelRunner._validate_ds_v4_overlay(
+            SimpleNamespace(kv_cache_groups=one_group), kv_caches)
 
 
 def test_dsv4_specs_are_exempt_from_tpu_normalization():
@@ -2460,76 +2449,79 @@ def test_dsv4_is_cache_for_ds_v4_predicate():
     assert not is_cache_for_ds_v4(MagicMock(spec=MLAAttention))
 
 
-def test_dsv4_compressor_state_cache_aliasing():
-    """Verify compressor state caches are planned as overlays and aliased.
+def test_dsv4_compressor_state_cache_overlay_target():
+    """A compressor state cache is named after the layer whose records it joins.
 
-    The overlay must be planned from layer NAMES alone, before any allocation:
-    an overlaid cache that gets its own array still costs its HBM at peak, even
-    though the alias frees it immediately afterwards.
+    Mirrors how vLLM wires `DeepseekCompressor.k_cache_prefix`: the main
+    compressor's state rides on its own attention layer's array, the indexer
+    compressor's on the indexer's `k_cache`. The mapping is derived from the
+    layer NAME before anything is allocated -- an overlaid cache that gets its
+    own array still costs its HBM at peak, even if aliased away afterwards.
     """
-    from vllm.models.deepseek_v4.compressor import CompressorStateCache
+    assert TPUModelRunner._ds_v4_compressed_kv_layer_name(
+        "model.layers.0.self_attn.compressor.state_cache"
+    ) == "model.layers.0.self_attn"
 
-    mock_runner = MagicMock()
-    mock_runner.vllm_config.compilation_config.static_forward_context = {}
+    assert TPUModelRunner._ds_v4_compressed_kv_layer_name(
+        "model.layers.0.attn.indexer.compressor.state_cache"
+    ) == "model.layers.0.attn.indexer.k_cache"
 
-    layer_name = "model.layers.0.self_attn.compressor.state_cache"
-    host_name = "model.layers.0.self_attn"
-    compressor_mock = MagicMock(spec=CompressorStateCache)
-
-    mock_runner.vllm_config.compilation_config.static_forward_context[
-        layer_name] = compressor_mock
-
-    overlay = TPUModelRunner._plan_ds_v4_auxiliary_overlay(
-        mock_runner, [layer_name, host_name])
-    assert overlay == {layer_name: host_name}
-
-    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
-
-    def _spec(block_size):
-        return SlidingWindowMLASpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=640,
-            dtype=torch.uint8,
-            sliding_window=128,
-            alignment=None,
-        )
-
-    # A CSA host page: (pages, rows/packing, packing, packed width) -> 256
-    # entries of 640 B.
-    host_tensor = torch.zeros(10, 64, 4, 640, dtype=torch.uint8)
-    kv_caches = {host_name: host_tensor}
-
-    TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner, kv_caches,
-                                                 overlay, lambda _: _spec(16))
-    assert kv_caches[layer_name] is host_tensor
-
-    # The state cache is packed into the host's page, so a block size that
-    # does not fit must fail here rather than corrupt the neighbouring page.
-    with pytest.raises(ValueError, match="B per page"):
-        TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner,
-                                                     {host_name: host_tensor},
-                                                     overlay,
-                                                     lambda _: _spec(1024))
-    # ...and one that fits but does not divide the host's entries.
-    with pytest.raises(ValueError, match="does not divide"):
-        TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner,
-                                                     {host_name: host_tensor},
-                                                     overlay,
-                                                     lambda _: _spec(24))
+    # A renamed state cache would otherwise derive a host that does not exist
+    # and overlay onto whatever happened to be there.
+    with pytest.raises(ValueError, match="unexpected layer"):
+        TPUModelRunner._ds_v4_compressed_kv_layer_name(
+            "model.layers.0.self_attn.compressor.state")
 
 
-def test_dsv4_indexer_state_cache_overlay_targets_k_cache():
-    """An indexer's compressor state cache overlays the indexer's k_cache."""
-    mock_runner = MagicMock()
-    mock_runner.vllm_config.compilation_config.static_forward_context = {}
+def test_dsv4_state_cache_overlays_its_own_compressed_kv_array():
+    """CSA / indexer states share their own layer's array; HCA states do not.
 
-    layer_name = "model.layers.0.attn.indexer.compressor.state_cache"
-    host_name = "model.layers.0.attn.indexer.k_cache"
+    An HCA page holds two token states, far too small to host the f32 state
+    rows, so those overlay a CSA NoPE array instead. Both cases must survive
+    the group collision check: the state cache and its compressed-KV layer are
+    in *different* cache groups, which is what makes sharing one array safe.
+    """
+    csa_nope = torch.zeros(4, 8, 4, 128, dtype=torch.uint8)
+    csa_rope = torch.zeros(4, 2, 4, 128, dtype=torch.uint8)
+    indexer = torch.zeros(4, 2, 4, 256, dtype=torch.uint8)
+    hca = torch.zeros(4, 16, 4, 128, dtype=torch.uint8)
 
-    overlay = TPUModelRunner._plan_ds_v4_auxiliary_overlay(
-        mock_runner, [layer_name, host_name])
-    assert overlay == {layer_name: host_name}
+    kv_caches = {
+        "m.layers.0.attn": (csa_nope, csa_rope),
+        "m.layers.0.attn.indexer.k_cache": indexer,
+        "m.layers.1.attn": hca,
+        # CSA and indexer states: their own layer's array.
+        "m.layers.0.attn.compressor.state_cache": csa_nope,
+        "m.layers.0.attn.indexer.compressor.state_cache": indexer,
+        # HCA state: a CSA NoPE array, its own page being too small.
+        "m.layers.1.attn.compressor.state_cache": csa_nope,
+    }
+    groups = [
+        SimpleNamespace(layer_names=[
+            "m.layers.0.attn", "m.layers.0.attn.indexer.k_cache",
+            "m.layers.1.attn"
+        ]),
+        SimpleNamespace(layer_names=[
+            "m.layers.0.attn.compressor.state_cache",
+            "m.layers.0.attn.indexer.compressor.state_cache",
+        ]),
+        SimpleNamespace(
+            layer_names=["m.layers.1.attn.compressor.state_cache"]),
+    ]
+    TPUModelRunner._validate_ds_v4_overlay(
+        SimpleNamespace(kv_cache_groups=groups), kv_caches)
+
+    # The CSA layer is matched on its NoPE array, not its RoPE companion, so a
+    # same-group layer landing on that NoPE array is still caught.
+    clash = [
+        SimpleNamespace(
+            layer_names=["m.layers.0.attn", "m.layers.0.attn.swa_cache"])
+    ]
+    with pytest.raises(ValueError, match="same array"):
+        TPUModelRunner._validate_ds_v4_overlay(
+            SimpleNamespace(kv_cache_groups=clash), {
+                **kv_caches, "m.layers.0.attn.swa_cache": csa_nope
+            })
 
 
 def _block_size_for(architecture, backend_page_size=256, preferred=None):

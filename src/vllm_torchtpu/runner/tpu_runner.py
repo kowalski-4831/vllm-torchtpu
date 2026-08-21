@@ -14,7 +14,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -1386,69 +1386,32 @@ class TPUModelRunner(GPUModelRunner):
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-    def _plan_ds_v4_auxiliary_overlay(
-            self, layer_names: Iterable[str]) -> dict[str, str]:
-        """Map each DSv4 compressor state cache to the layer it overlays.
+    _DS_V4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
+    _DS_V4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
+    _DS_V4_ROPE_CACHE_SUFFIX = "_rope"
+    _DS_V4_KV_PACKING = 4
+    _DS_V4_CSA_COMPRESS_RATIO = 4
 
-        Planned before allocation: allocating then aliasing still counts
-        against peak HBM, since every array in the loop is live at once.
+    @staticmethod
+    def _ds_v4_compressed_kv_layer_name(state_cache_name: str) -> str:
+        """The layer whose compressed-KV records a DSv4 state cache accompanies.
+
+        Mirrors how vLLM wires `DeepseekCompressor.k_cache_prefix` (the
+        attention layer itself for the main compressor, the indexer's
+        `k_cache` for the indexer compressor):
+
+          `<...>.attn.compressor.state_cache`          -> `<...>.attn`
+          `<...>.attn.indexer.compressor.state_cache`  ->
+              `<...>.attn.indexer.k_cache`
         """
-        static_forward_context = (
-            self.vllm_config.compilation_config.static_forward_context)
-        state_suffix = ".compressor.state_cache"
-        overlay: dict[str, str] = {}
-        for layer_name in layer_names:
-            attn_module = static_forward_context.get(layer_name)
-            if isinstance(
-                    attn_module,
-                    CompressorStateCache) or layer_name.endswith(state_suffix):
-                if not layer_name.endswith(state_suffix):
-                    raise ValueError(
-                        "DeepSeek-V4 compressor state cache has an unexpected "
-                        f"layer name {layer_name!r}; expected it to end with "
-                        f"{state_suffix!r} so the host layer can be derived.")
-                base = layer_name[:-len(state_suffix)]
-                # Map compressor state cache layer name to host attention layer's k_cache.
-                overlay[layer_name] = (base + ".k_cache"
-                                       if base.endswith(".indexer") else base)
-        return overlay
-
-    def _alias_ds_v4_auxiliary_caches(
-        self,
-        kv_caches: dict[str, torch.Tensor],
-        overlay: dict[str, str],
-        per_layer_spec: Callable[[str], KVCacheSpec],
-    ) -> None:
-        """Point DeepSeek-V4 compressor state caches at their host's tensor.
-
-        The state cache is packed into the host's page, so a layout change
-        that makes it no longer fit must fail here rather than let
-        `pack_state_cache` write past the page.
-        """
-        for layer_name, host_layer_name in overlay.items():
-            if host_layer_name not in kv_caches:
-                raise ValueError(
-                    "DeepSeek-V4 auxiliary cache has no host KV layer to overlay: "
-                    f"cache={layer_name!r}, expected KV layer {host_layer_name!r}, "
-                    f"known layers={sorted(kv_caches.keys())}")
-            host = kv_caches[host_layer_name]
-            spec = per_layer_spec(layer_name)
-            # 4-D packed layout: (pages, rows/packing, packing, width).
-            host_page_entries = host.shape[1] * host.shape[2]
-            host_page_bytes = host_page_entries * host.shape[-1]
-            state_page_bytes = (spec.block_size * spec.num_kv_heads *
-                                spec.head_size * spec.dtype.itemsize)
-            if state_page_bytes > host_page_bytes:
-                raise ValueError(
-                    f"DeepSeek-V4 state cache {layer_name!r} needs "
-                    f"{state_page_bytes} B per page but its host "
-                    f"{host_layer_name!r} page holds {host_page_bytes} B.")
-            if host_page_entries % spec.block_size != 0:
-                raise ValueError(
-                    f"DeepSeek-V4 state cache {layer_name!r} has block_size "
-                    f"{spec.block_size}, which does not divide its host's "
-                    f"{host_page_entries} entries per page.")
-            kv_caches[layer_name] = host
+        suffix = TPUModelRunner._DS_V4_STATE_CACHE_SUFFIX
+        if not state_cache_name.endswith(suffix):
+            raise ValueError(
+                "DeepSeek-V4 compressor state cache has an unexpected layer "
+                f"name {state_cache_name!r}; expected it to end with "
+                f"{suffix!r} so the compressed-KV layer can be derived.")
+        base = state_cache_name[:-len(suffix)]
+        return base + ".k_cache" if base.endswith(".indexer") else base
 
     @staticmethod
     def _is_ds_v4_swa_layer(layer_name: str, spec: KVCacheSpec) -> bool:
@@ -1459,23 +1422,23 @@ class TPUModelRunner(GPUModelRunner):
         return isinstance(spec,
                           SlidingWindowMLASpec) and "swa_cache" in layer_name
 
-    def _plan_ds_v4_swa_overlay(
+    def _classify_ds_v4_layers(
         self,
         kv_cache_config: KVCacheConfig,
         per_layer_spec: Callable[[str], KVCacheSpec],
-        cache_shape_of: Callable[[KVCacheSpec], tuple[int, ...]],
-    ) -> dict[str, str]:
-        """Map each DSv4 SWA cache onto a compatible compressed-KV layer.
+    ) -> tuple[list[str], list[list[str]], list[str]]:
+        """Split DSv4's layers by the kernel that reads their array.
 
-        vLLM assigns page indices assuming these caches share one allocation.
-        TPU arrays cannot be byte views into a slab, so the overlay is rebuilt
-        here: an `MLAAttentionSpec` host must be at least as wide and hold at
-        least as many entries, and any unmapped remainder gets its own array.
+        Iteration is in cache-group order so allocation and overlay
+        assignment are deterministic across workers.
 
-        Returns `{swa_layer_name: host_layer_name}` for the layers that overlay.
+        Returns `(mla_layer_names, swa_layer_groups, state_layer_names)`.
+        SWA layers stay grouped: layers of one cache group share a block
+        table, so each must land on a different array.
         """
-        mla_layers: list[str] = []
-        swa_groups: list[list[str]] = []
+        mla_layer_names: list[str] = []
+        swa_layer_groups: list[list[str]] = []
+        state_layer_names: list[str] = []
         for group in kv_cache_config.kv_cache_groups:
             swa_in_group: list[str] = []
             for layer_name in group.layer_names:
@@ -1483,45 +1446,26 @@ class TPUModelRunner(GPUModelRunner):
                     continue
                 spec = per_layer_spec(layer_name)
                 if isinstance(spec, MLAAttentionSpec):
-                    mla_layers.append(layer_name)
+                    mla_layer_names.append(layer_name)
+                elif layer_name.endswith(self._DS_V4_STATE_CACHE_SUFFIX):
+                    state_layer_names.append(layer_name)
                 elif self._is_ds_v4_swa_layer(layer_name, spec):
                     swa_in_group.append(layer_name)
+                else:
+                    raise ValueError(
+                        "DeepSeek-V4 layer has no known role (expected an "
+                        "MLAAttentionSpec cache, a `*.compressor.state_cache` "
+                        f"or a `*swa_cache*` layer): layer={layer_name}, "
+                        f"spec={spec}")
             if swa_in_group:
-                swa_groups.append(swa_in_group)
+                swa_layer_groups.append(swa_in_group)
 
-        if not swa_groups:
-            return {}
-        if not mla_layers:
+        if not mla_layer_names:
             raise ValueError(
-                "DeepSeek-V4 model has SWA caches but no MLAAttentionSpec "
-                "layers to overlay them onto: swa_layers="
-                f"{[n for g in swa_groups for n in g]}")
-
-        overlay: dict[str, str] = {}
-        # One host per SWA cache, tracked globally: layers in a group share a
-        # block table, and resetting per group would reuse hosts[0] everywhere.
-        taken: set[str] = set()
-        for swa_layers in swa_groups:
-            swa_spec = per_layer_spec(swa_layers[0])
-            swa_entry_bytes = (swa_spec.num_kv_heads * swa_spec.head_size *
-                               swa_spec.dtype.itemsize)
-            for layer_name in swa_layers:
-                for host_name in mla_layers:
-                    if host_name in taken:
-                        continue
-                    host_spec = per_layer_spec(host_name)
-                    shape = cache_shape_of(host_spec)
-                    # 4-D packed MLA layout:
-                    # (pages, rows/packing, packing, width).
-                    page_entries = shape[1] * shape[2]
-                    entry_width_bytes = shape[-1] * host_spec.dtype.itemsize
-                    if (host_spec.dtype == swa_spec.dtype
-                            and entry_width_bytes >= swa_entry_bytes
-                            and page_entries >= swa_spec.storage_block_size):
-                        overlay[layer_name] = host_name
-                        taken.add(host_name)
-                        break
-        return overlay
+                "DeepSeek-V4 model has no MLAAttentionSpec layers to anchor "
+                "the KV cache overlays. groups="
+                f"{[g.layer_names for g in kv_cache_config.kv_cache_groups]}")
+        return mla_layer_names, swa_layer_groups, state_layer_names
 
     def _update_attention_page_size_padded(self,
                                            layers: dict[str,
@@ -5609,87 +5553,182 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         """Allocate and alias DeepSeek-V4's KV caches.
 
-        vLLM lays DSv4's cache groups out as one packed slab and assigns page
-        indices assuming the compressed-KV, SWA and compressor-state caches
-        share it. TPU arrays cannot be byte views into a slab, so the overlay
-        is rebuilt from the specs instead:
+        vLLM lays DSv4's cache groups out as one packed byte slab and assigns
+        page indices assuming the compressed-KV, SWA and compressor-state
+        caches share it. TPU tensors cannot be byte views into a slab, so the
+        overlay is rebuilt here from the specs.
 
-        - every `MLAAttentionSpec` layer gets an array shaped by its own spec,
-          so the kernels see the page geometry the spec promised;
-        - every compressor state cache maps onto its compressed-KV layer's
-          array, which the compressor writes both records through;
-        - every SWA cache maps onto a distinct compressed-KV array, distinct
-          because layers of one group share a block table; any overflow gets
-          its own array.
+        Every array is uint8 and shaped for the kernel that reads it, rather
+        than by the generic `head_size` formula. With `T =
+        spec.storage_block_size` compressed tokens per page:
+
+            CSA `*.attn`      NoPE `(N, T, 4, 128)`     512B/token
+                              RoPE `(N, T/4, 4, 128)`   128B/token, in a
+                                                        companion array
+            indexer k_cache   `(N, T/4, 4, 256)`        256B/token
+            HCA `*.attn`      `(N, T*2, 4, 128)`       1024B/token (raw bf16)
+
+        The overlays, all of which the specs' byte budgets already account
+        for:
+
+        - Every SWA cache maps onto a CSA NoPE array by its position in its
+          cache group.
+        - Every CSA / indexer compressor state cache maps onto the array of
+          its own compressed-KV layer: the compressor kernel writes the f32
+          state rows and the compressed KV through that one buffer. State and
+          full-attention groups never own the same block ID, so the rows
+          never collide.
+        - The i-th HCA compressor state cache maps onto the i-th CSA NoPE
+          array.
 
         Overlays are planned before allocating: allocating an array and
         aliasing it afterwards still counts against peak HBM.
         """
-        aux_overlay = self._plan_ds_v4_auxiliary_overlay([
-            n for g in kv_cache_config.kv_cache_groups for n in g.layer_names
-        ])
-        swa_overlay = self._plan_ds_v4_swa_overlay(
-            kv_cache_config,
-            per_layer_spec,
-            lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
-                num_blocks,
-                spec.storage_block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                spec.dtype,
-                head_size_is_packed_width=True,
-            ),
-        )
+        mla_layer_names, swa_layer_groups, state_layer_names = (
+            self._classify_ds_v4_layers(kv_cache_config, per_layer_spec))
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # One array per KVCacheTensor, shared by the layers that name it:
-            # vLLM sizes `num_blocks` from `kv_cache_tensor.size`, which
-            # budgets a single array for the whole `shared_by` set.
-            shared: dict[tuple, torch.Tensor] = {}
-            for layer_name in kv_cache_tensor.shared_by:
-                if layer_name in swa_overlay or layer_name in aux_overlay:
-                    continue
-                spec = per_layer_spec(layer_name)
-                if not isinstance(spec,
-                                  (MLAAttentionSpec, SlidingWindowMLASpec)):
-                    raise NotImplementedError(
-                        f"DeepSeek-V4 layer {layer_name!r} has unexpected "
-                        f"spec {type(spec).__name__}")
-                # `head_size` is already the packed byte width, and pages hold
-                # `storage_block_size` compressed rows rather than one per
-                # token. SlidingWindowMLASpec is shaped here too so it gets
-                # the 4-D layout its host uses, not a 5-D one.
-                shape = PallasMLAttentionBackend.get_kv_cache_shape(
-                    num_blocks,
-                    spec.storage_block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    spec.dtype,
-                    head_size_is_packed_width=True,
-                )
-                key = (tuple(shape), spec.dtype)
-                if key not in shared:
-                    shared[key] = torch.zeros(shape,
-                                              dtype=spec.dtype).to(self.device)
-                kv_caches[layer_name] = shared[key]
+        packing = self._DS_V4_KV_PACKING
 
-        for swa_layer_name, host_layer_name in swa_overlay.items():
-            if host_layer_name not in kv_caches:
+        def _create_cache(shape: tuple[int, ...], tag: str) -> torch.Tensor:
+            cache = torch.zeros(shape, dtype=torch.uint8).to(self.device)
+            logger.debug("DeepSeek-V4 KV array for %s: shape=%s", tag, shape)
+            return cache
+
+        # CSA NoPE tensors, in layer order; the SWA caches and the HCA
+        # compressor states overlay these.
+        csa_nope_hosts: list[torch.Tensor] = []
+        # HCA compressed-KV layers, whose own page is far too small to host
+        # their state cache.
+        hca_layer_names: set[str] = set()
+
+        for layer_name in mla_layer_names:
+            spec = per_layer_spec(layer_name)
+            page_size = spec.storage_block_size
+            if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
+                # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,
+                # padded to a 256B record; 4 tokens per row.
+                shape = (num_blocks, page_size // packing, packing, 256)
+                kv_caches[layer_name] = _create_cache(shape, layer_name)
+            elif spec.compress_ratio == self._DS_V4_CSA_COMPRESS_RATIO:
+                # CSA is split across two arrays, for NoPE and RoPE.
+                nope = _create_cache((num_blocks, page_size, packing, 128),
+                                     layer_name)
+                rope = _create_cache(
+                    (num_blocks, page_size // packing, packing, 128),
+                    f"{layer_name}{self._DS_V4_ROPE_CACHE_SUFFIX}")
+                kv_caches[layer_name] = (nope, rope)
+                csa_nope_hosts.append(nope)
+            else:
+                # HCA keeps raw bf16 latents: 512 values = 1024B per token,
+                # i.e. two rows per token.
+                shape = (num_blocks, page_size * 2, packing, 128)
+                kv_caches[layer_name] = _create_cache(shape, layer_name)
+                hca_layer_names.add(layer_name)
+
+        if not csa_nope_hosts:
+            raise ValueError(
+                "DeepSeek-V4 model has no CSA layer (compress_ratio "
+                f"{self._DS_V4_CSA_COMPRESS_RATIO}) to host the SWA and HCA "
+                f"state caches. MLA layers={mla_layer_names}")
+
+        def _host_at(hosts: list[torch.Tensor], position: int) -> torch.Tensor:
+            """`hosts[position]`, growing the list with standalone arrays.
+
+            More SWA (or HCA) layers than CSA arrays is normal -- DSv4-Flash
+            has 43 SWA layers to 21 CSA ones -- and the overflow cannot reuse
+            an array already taken by a same-group layer.
+            """
+            while position >= len(hosts):
+                hosts.append(
+                    _create_cache(tuple(csa_nope_hosts[0].shape),
+                                  f"ds_v4_overflow.{len(hosts)}"))
+            return hosts[position]
+
+        # SWA caches overlay the CSA NoPE arrays; so do the HCA states, and
+        # both index the same host list so they never collide on one array.
+        overlay_hosts = list(csa_nope_hosts)
+        for group_swa_layers in swa_layer_groups:
+            for position, layer_name in enumerate(group_swa_layers):
+                kv_caches[layer_name] = _host_at(overlay_hosts, position)
+
+        hca_state_layers: list[str] = []
+        for layer_name in state_layer_names:
+            kv_layer_name = self._ds_v4_compressed_kv_layer_name(layer_name)
+            if kv_layer_name not in kv_caches:
                 raise ValueError(
-                    "DeepSeek-V4 SWA cache has no host KV layer to overlay: "
-                    f"swa_cache={swa_layer_name!r}, expected KV layer "
-                    f"{host_layer_name!r}, known layers="
-                    f"{sorted(kv_caches.keys())}")
-            kv_caches[swa_layer_name] = kv_caches[host_layer_name]
-        if swa_overlay:
-            logger.info(
-                "DeepSeek-V4 SWA cache overlay: %d of %d sliding-window "
-                "caches share a compressed-KV array; the rest have their own.",
-                len(swa_overlay),
-                sum(1 for name in kv_caches
-                    if self._is_ds_v4_swa_layer(name, per_layer_spec(name))))
-        self._alias_ds_v4_auxiliary_caches(kv_caches, aux_overlay,
-                                           per_layer_spec)
+                    "DeepSeek-V4 compressor state cache has no compressed-KV "
+                    "layer (its compressed records are written there): "
+                    f"state_cache={layer_name}, expected KV layer "
+                    f"{kv_layer_name}, known MLA layers={mla_layer_names}")
+            if kv_layer_name in hca_layer_names:
+                hca_state_layers.append(layer_name)
+            else:
+                kv_caches[layer_name] = kv_caches[kv_layer_name]
+
+        for position, layer_name in enumerate(hca_state_layers):
+            kv_caches[layer_name] = _host_at(overlay_hosts, position)
+
+        self._validate_ds_v4_overlay(kv_cache_config, kv_caches)
+
+        # SWA and HCA-state overlays are assigned by position *within a cache
+        # group*, so the group shape decides how many arrays are needed: two
+        # layers of one group must never share one (they share a block table),
+        # while layers of different groups may. Log it -- a grouping change
+        # silently changes the overlay plan.
+        logger.info(
+            "DeepSeek-V4 KV cache: %d arrays for %d layers (mla=%d of which "
+            "csa=%d, swa=%d in %d group(s) "
+            "sized %s, state=%d), num_blocks=%d, largest array=%s",
+            len({
+                id(t)
+                for e in kv_caches.values()
+                for t in self._ds_v4_cache_arrays(e)
+            }), len(kv_caches), len(mla_layer_names), len(csa_nope_hosts),
+            sum(len(g) for g in swa_layer_groups),
+            len(swa_layer_groups), [len(g) for g in swa_layer_groups],
+            len(state_layer_names), num_blocks,
+            max((tuple(t.shape) for e in kv_caches.values()
+                 for t in self._ds_v4_cache_arrays(e)),
+                key=lambda shp: math.prod(shp),
+                default=()))
+
+    @staticmethod
+    def _ds_v4_cache_arrays(entry) -> tuple[torch.Tensor, ...]:
+        """Every array a bound DSv4 KV entry holds.
+
+        A CSA layer binds a `(nope, rope)` pair -- one layer, two arrays under
+        one block table -- while every other role binds a bare tensor. This is
+        the producer side of that convention; the two consumers that can see a
+        pair (the compressor's `k_cache` and the attention layer's own entry)
+        unpack it inline.
+        """
+        return tuple(entry) if isinstance(entry, tuple) else (entry, )
+
+    @classmethod
+    def _validate_ds_v4_overlay(cls, kv_cache_config: KVCacheConfig,
+                                kv_caches: dict[str, torch.Tensor]) -> None:
+        """No two layers of one cache group may share an array.
+
+        Layers of a group share a block table, so a shared array means they
+        would write each other's pages.
+        """
+        for group in kv_cache_config.kv_cache_groups:
+            hosts: dict[int, str] = {}
+            for layer_name in group.layer_names:
+                cache = kv_caches.get(layer_name)
+                if cache is None:
+                    continue
+                cache = cls._ds_v4_cache_arrays(cache)[0]
+                ptr = id(cache)
+                if ptr in hosts:
+                    raise ValueError(
+                        "DeepSeek-V4 KV cache overlay put two layers of one "
+                        "cache group on the same array; they share a block "
+                        f"table, so they would corrupt each other: "
+                        f"{layer_name} and {hosts[ptr]} both map to the array "
+                        f"of shape {tuple(cache.shape)}. Group "
+                        f"layers={group.layer_names}")
+                hosts[ptr] = layer_name
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
