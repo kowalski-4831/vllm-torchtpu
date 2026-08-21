@@ -46,31 +46,30 @@ def _make_mock_moe_config():
 
 
 def test_env_var_default_and_override():
-    """Verify VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE default is 0 and parses positive ints."""
+    """Verify TPU_MOE_COLLECTION_CHUNK_SIZE default is 0 and parses positive ints."""
     with patch.dict(os.environ, {}, clear=True):
-        assert envs.VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE == 0
+        assert envs.TPU_MOE_COLLECTION_CHUNK_SIZE == 0
 
-    with patch.dict(os.environ,
-                    {"VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE": "16384"}):
-        assert envs.VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE == 16384
+    with patch.dict(os.environ, {"TPU_MOE_COLLECTION_CHUNK_SIZE": "16384"}):
+        assert envs.TPU_MOE_COLLECTION_CHUNK_SIZE == 16384
 
-    with patch.dict(os.environ, {"VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE": "0"}):
-        assert envs.VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE == 0
+    with patch.dict(os.environ, {"TPU_MOE_COLLECTION_CHUNK_SIZE": "0"}):
+        assert envs.TPU_MOE_COLLECTION_CHUNK_SIZE == 0
 
 
 def test_enable_pipelined_collective_and_compute():
-    """Verify enable_pipelined_collective_and_compute reflects VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE > 0."""
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
+    """Verify enable_pipelined_collective_and_compute reflects TPU_MOE_COLLECTION_CHUNK_SIZE > 0."""
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
         assert enable_pipelined_collective_and_compute() is False
 
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_pcp_world_size", return_value=1):
         assert enable_pipelined_collective_and_compute() is True
 
 
 def test_enable_pipelined_collective_raises_on_pcp():
     """Verify enable_pipelined_collective_and_compute raises NotImplementedError when pcp_size > 1."""
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_pcp_world_size", return_value=2):
         with pytest.raises(
                 NotImplementedError,
@@ -78,7 +77,7 @@ def test_enable_pipelined_collective_raises_on_pcp():
             enable_pipelined_collective_and_compute()
 
     # When chunk_size == 0, pipelining is disabled so pcp_size > 1 does not raise
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 0), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_pcp_world_size", return_value=2):
         assert enable_pipelined_collective_and_compute() is False
 
@@ -99,10 +98,10 @@ def test_supports_internal_mk_property(method_cls):
     prop = getattr(method_cls, "supports_internal_mk")
     assert isinstance(prop, property)
 
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
         assert prop.fget(None) is False
 
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384):
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384):
         assert prop.fget(None) is True
 
 
@@ -217,7 +216,7 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
         # Linear compute for parity check: hs * 2.0
         return hidden_states * 2.0
 
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
         out = pipelined_fused_moe_gmm(
@@ -589,7 +588,7 @@ def test_pipelined_moe_single_chunk_dp_greater_than_one():
     def mock_kernel_fn(hidden_states, *args, **kwargs):
         return hidden_states * 3.0
 
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
         out = pipelined_fused_moe_gmm(
@@ -640,7 +639,7 @@ def test_pipelined_moe_dp_size_one_no_collectives():
         return hidden_states * 1.5
 
     # Case 1: dp_group is None
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=None), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
         out = pipelined_fused_moe_gmm(
@@ -662,7 +661,7 @@ def test_pipelined_moe_dp_size_one_no_collectives():
 
     # Case 2: dp_group world_size == 1
     dp_group_1 = _MockDPGroup(world_size=1, rank=0)
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group_1), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
         out = pipelined_fused_moe_gmm(
@@ -710,7 +709,7 @@ def test_pipelined_moe_with_none_routing_tensors():
         assert topk_ids is None
         return hidden_states * 2.0
 
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
         out = pipelined_fused_moe_gmm(
@@ -761,7 +760,7 @@ def test_pipelined_moe_four_stage_pipeline():
     def mock_kernel_fn(hidden_states, *args, **kwargs):
         return hidden_states * 4.0
 
-    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
          patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
         out = pipelined_fused_moe_gmm(

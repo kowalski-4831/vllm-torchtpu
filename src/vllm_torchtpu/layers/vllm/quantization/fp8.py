@@ -829,7 +829,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-                topk_ids, topk_weights)
+                topk_ids,
+                topk_weights,
+                is_local_tensor=enable_pipelined_collective_and_compute())
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).

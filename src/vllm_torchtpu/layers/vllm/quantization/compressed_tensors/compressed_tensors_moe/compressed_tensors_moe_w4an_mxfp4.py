@@ -244,7 +244,9 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         topk_weights = topk_weights.to(x.dtype)
 
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-            topk_ids, topk_weights)
+            topk_ids,
+            topk_weights,
+            is_local_tensor=enable_pipelined_collective_and_compute())
 
         kwargs = {
             "hidden_states": x,

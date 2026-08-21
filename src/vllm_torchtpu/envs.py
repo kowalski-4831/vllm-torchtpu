@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
-    VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
 
 
 def env_with_choices(
@@ -308,8 +308,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
-    "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE":
-    lambda: int(os.getenv("VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    "TPU_MOE_COLLECTION_CHUNK_SIZE":
+    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
 }
 
 

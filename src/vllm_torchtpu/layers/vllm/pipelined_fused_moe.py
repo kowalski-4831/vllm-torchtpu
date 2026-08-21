@@ -32,12 +32,12 @@ def enable_pipelined_collective_and_compute() -> bool:
     """Check whether collective communication and compute pipelining is enabled.
 
     Returns:
-        bool: True if `envs.VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE > 0`, False otherwise.
+        bool: True if `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`, False otherwise.
 
     Raises:
-        NotImplementedError: If `pcp_size > 1` when `envs.VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE > 0`.
+        NotImplementedError: If `pcp_size > 1` when `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`.
     """
-    if envs.VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
+    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
         pcp_size = get_pcp_world_size()
         if pcp_size > 1:
             raise NotImplementedError(
@@ -135,7 +135,7 @@ def pipelined_fused_moe_gmm(
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
-    chunk_size = envs.VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE
+    chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
     dp_group = get_dp_group()
 
     seq_len = hidden_states.shape[0]
