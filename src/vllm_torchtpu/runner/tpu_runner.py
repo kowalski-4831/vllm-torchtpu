@@ -11,9 +11,11 @@ import dataclasses
 import math
 import os
 import time
+from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
@@ -135,6 +137,68 @@ class ExecuteModelState:
     # and so contributes a single-element list.
     mamba_state_indices_list: list[list[torch.Tensor]
                                    | None] = field(default_factory=list)
+
+
+# Per-step mamba read-offset operations, consolidated into single cached
+# TPU programs (avoiding per-group eager launches). Each body is defined
+# once; the compiled variant is derived from it, and the dispatchers pick
+# eager on CPU (unit tests, pre-init paths) since the tpu backend cannot
+# trace CPU tensors.
+def _reset_read_offsets_impl(read_offsets: torch.Tensor,
+                             keep_dev: torch.Tensor,
+                             stacked_groups: torch.Tensor,
+                             null: torch.Tensor) -> None:
+    """Scatter reset across all mamba groups in a single program.
+    `stacked_groups` is [G, width]; `keep_dev` [width] broadcasts across G.
+    Non-new rows collapse onto the null slot, where writing 0 is a no-op."""
+    targets = torch.where(keep_dev, stacked_groups, null)
+    zero = torch.zeros((),
+                       dtype=read_offsets.dtype,
+                       device=read_offsets.device)
+    read_offsets.index_put_((targets.reshape(-1).long(), ), zero)
+
+
+def _rollback_offsets_seed_impl(read_offsets: torch.Tensor,
+                                dst_t: torch.Tensor) -> None:
+    read_offsets.index_put_((dst_t, ),
+                            torch.zeros(dst_t.shape[0],
+                                        dtype=read_offsets.dtype,
+                                        device=read_offsets.device))
+
+
+def _rollback_offsets_migrate_impl(read_offsets: torch.Tensor,
+                                   src_t: torch.Tensor,
+                                   dst_t: torch.Tensor) -> None:
+    read_offsets.index_put_((dst_t, ), read_offsets[src_t])
+
+
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
+_rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
+_rollback_offsets_migrate_compiled = _tpu_compile(
+    _rollback_offsets_migrate_impl)
+
+
+def _reset_read_offsets(read_offsets: torch.Tensor, keep_dev: torch.Tensor,
+                        stacked_groups: torch.Tensor,
+                        null: torch.Tensor) -> None:
+    fn = (_reset_read_offsets_compiled
+          if read_offsets.device.type == "tpu" else _reset_read_offsets_impl)
+    fn(read_offsets, keep_dev, stacked_groups, null)
+
+
+def _rollback_offsets_seed(read_offsets: torch.Tensor,
+                           dst_t: torch.Tensor) -> None:
+    fn = (_rollback_offsets_seed_compiled if read_offsets.device.type == "tpu"
+          else _rollback_offsets_seed_impl)
+    fn(read_offsets, dst_t)
+
+
+def _rollback_offsets_migrate(read_offsets: torch.Tensor, src_t: torch.Tensor,
+                              dst_t: torch.Tensor) -> None:
+    fn = (_rollback_offsets_migrate_compiled if read_offsets.device.type
+          == "tpu" else _rollback_offsets_migrate_impl)
+    fn(read_offsets, src_t, dst_t)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1273,6 +1337,41 @@ class TPUModelRunner(GPUModelRunner):
             exempt_layers=ds_v4_layers,
         )
 
+    def build_attention_metadata_for_layers(
+        self,
+        layer_names: Collection[str],
+        num_reqs_padded: int,
+    ) -> dict[str, AttentionMetadata]:
+        """Build attention metadata for only the groups owning `layer_names`.
+
+        `_build_attention_metadata` walks every KV cache group. A drafter
+        needs only its own layers, and the group count tracks the layer count
+        whenever vLLM's spec bucketing collapses — which a drafter mixing
+        window and full attention causes on its own. Building every group and
+        discarding all but the draft's costs a block-table H2D plus a handful
+        of gathers per discarded group, per chunk, per step.
+
+        Reads the same `_attn_metadata_builder_ctx` the full build does, so
+        callers stage it identically.
+        """
+        # `AttentionMetadataBuilder.build` takes only `num_reqs` off the
+        # common metadata; everything else it needs comes from
+        # `_attn_metadata_builder_ctx`.
+        common = SimpleNamespace(num_reqs=num_reqs_padded)
+        metadata: dict[str, AttentionMetadata] = {}
+        for group_list in self.attn_groups:
+            for group in group_list:
+                selected = [n for n in group.layer_names if n in layer_names]
+                if not selected:
+                    continue
+                built = group.metadata_builders[0].build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                )
+                for name in selected:
+                    metadata[name] = built
+        return metadata
+
     @staticmethod
     def _validate_shared_kv_cache_layout(
         layer_name: str,
@@ -2101,11 +2200,7 @@ class TPUModelRunner(GPUModelRunner):
                                  dtype=torch.long).to(self.device,
                                                       non_blocking=True)
             assert self.mamba_slot_read_offsets is not None
-            self.mamba_slot_read_offsets.index_put_(
-                (dst_t, ),
-                torch.zeros(dst_t.shape[0],
-                            dtype=self.mamba_slot_read_offsets.dtype,
-                            device=self.mamba_slot_read_offsets.device))
+            _rollback_offsets_seed(self.mamba_slot_read_offsets, dst_t)
         elif self.mamba_slot_read_offsets is not None and offset_pairs:
             # Migrate the read offsets with the state: gather at the old
             # blocks, scatter at the new ones (both device-side, before the
@@ -2118,8 +2213,8 @@ class TPUModelRunner(GPUModelRunner):
             dst_t = torch.tensor([d for _, d in offset_pairs],
                                  dtype=torch.long).to(self.device,
                                                       non_blocking=True)
-            self.mamba_slot_read_offsets.index_put_(
-                (dst_t, ), self.mamba_slot_read_offsets[src_t])
+            _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t,
+                                      dst_t)
 
         for raw, srcs_dev, dsts_dev in per_raw_dev.values():
             src_t = self._pad_dev_to_bucket(torch.cat(srcs_dev))
@@ -3581,9 +3676,14 @@ class TPUModelRunner(GPUModelRunner):
             num_valid = (next_tokens[:num_reqs]
                          != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
             offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
-        for group_indices in indices_per_group:
-            self.mamba_slot_read_offsets.index_put_((group_indices.long(), ),
-                                                    offsets)
+        if len(indices_per_group) == 1:
+            self.mamba_slot_read_offsets.index_put_(
+                (indices_per_group[0].long(), ), offsets)
+        else:
+            all_indices = torch.cat(indices_per_group, dim=0).long()
+            all_offsets = offsets.repeat(len(indices_per_group))
+            self.mamba_slot_read_offsets.index_put_((all_indices, ),
+                                                    all_offsets)
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -3644,7 +3744,7 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.req_id_to_index.keys())
 
         width = groups[0].shape[0]
-        keep, keep_dev, zeros, null = self._read_offset_reset_scratch(
+        keep, keep_dev, null = self._read_offset_reset_scratch(
             width, groups[0].device)
         keep.zero_()
         for i in range(min(num_reqs, max(0, len(req_ids) - start_index))):
@@ -3657,16 +3757,16 @@ class TPUModelRunner(GPUModelRunner):
         # No `if nothing_new: return` here — see the docstring. The device
         # work below must be issued on every rank on every step.
         keep_dev.copy_(keep, non_blocking=True)
-        for group_indices in groups:
-            # Non-new rows collapse onto the null slot; writing 0 there is a
-            # no-op, which keeps this scatter one fixed shape.
-            targets = torch.where(keep_dev, group_indices, null)
-            self.mamba_slot_read_offsets.index_put_((targets.long(), ), zeros)
+        # Stack groups and reset offsets across all groups in one compiled program.
+        stacked = torch.stack(groups) if len(
+            groups) > 1 else groups[0].unsqueeze(0)
+        _reset_read_offsets(self.mamba_slot_read_offsets, keep_dev, stacked,
+                            null)
 
     def _read_offset_reset_scratch(
         self, width: int, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reusable `(keep_cpu, keep_dev, zeros, null)` of length `width`.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reusable `(keep_cpu, keep_dev, null)` of length `width`.
 
         `_reset_read_offsets_for_new_requests` runs on every step, so its
         working set is allocated once per width rather than per step. Width
@@ -3679,11 +3779,9 @@ class TPUModelRunner(GPUModelRunner):
         key = (width, str(device))
         entry = self._read_offset_scratch.get(key)
         if entry is None:
-            offsets = self.mamba_slot_read_offsets
             entry = (
                 torch.zeros(width, dtype=torch.bool),
                 torch.zeros(width, dtype=torch.bool, device=device),
-                torch.zeros(width, dtype=offsets.dtype, device=offsets.device),
                 torch.zeros((), dtype=torch.int32, device=device),
             )
             self._read_offset_scratch[key] = entry
@@ -4774,6 +4872,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._precompile_backbone()
 
             self._precompile_sampling_subgraphs()
+            self._precompile_mamba_rollback_helpers()
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = (maybe_create_mm_encoder_manager(
@@ -4918,6 +5017,33 @@ class TPUModelRunner(GPUModelRunner):
                 raise shape_variants.ShapeSpecializationError(
                     "warmup left token buckets uncompiled: "
                     f"{sorted(buckets.refused)}")
+
+    def _precompile_mamba_rollback_helpers(self) -> None:
+        """Warm the compiled rollback scatters at every bucket length.
+
+        Mamba block-boundary crossings do not occur during the synthetic
+        warmup request (unlike the reset scatter, which the real warmup
+        path exercises), so without this the first real crossing would
+        compile XLA mid-serving while lockstep peers wait at their next
+        collective. All-zero indices write the null slot, moving no state.
+        Crossings accumulate across every mamba group in a step, so the
+        ladder tops out at num_groups * max_num_reqs; src and dst must be
+        DISTINCT tensors or dynamo specializes the migrate graph on
+        src-is-dst and the real two-tensor call retraces mid-serving.
+        """
+        offsets = self.mamba_slot_read_offsets
+        if offsets is None:
+            return
+        with self._precompile_timed("mamba rollback helpers"):
+            num_groups = max(1, len(self._mamba_copy_plan))
+            limit = self._bucket_len(num_groups * self.max_num_reqs)
+            n = 8
+            while n <= limit:
+                src = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                dst = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                _rollback_offsets_seed_compiled(offsets, dst)
+                _rollback_offsets_migrate_compiled(offsets, src, dst)
+                n *= 4
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.

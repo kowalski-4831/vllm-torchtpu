@@ -226,24 +226,14 @@ class DFlashProposer:
         # with recurrent layers needs more than a slot tensor here anyway —
         # `unified_mamba_state_indices`, the read-offset scatter, and the
         # state seed copies are all target-path only.
-        slot_mappings_dict = runner.empty_slot_mappings
         try:
-            per_layer_attn_metadata, _ = runner._build_attention_metadata(
-                num_tokens=num_tokens_padded,
-                num_reqs=padded_num_reqs,
-                max_query_len=num_tokens_padded // padded_num_reqs,
-                num_tokens_padded=num_tokens_padded,
-                num_reqs_padded=padded_num_reqs,
-                slot_mappings=slot_mappings_dict,
-            )
+            # Only the draft layers' KV cache groups. The full build walks
+            # every group in the deployment and we would discard all but
+            # these — see `build_attention_metadata_for_layers`.
+            return runner.build_attention_metadata_for_layers(
+                self._draft_attn_layer_names, padded_num_reqs)
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
-
-        return {
-            name: md
-            for name, md in per_layer_attn_metadata.items()
-            if name in self._draft_attn_layer_names
-        }
 
     def _prepare_dflash_inputs(
         self,
@@ -599,15 +589,13 @@ class DFlashProposer:
                     for layer_name in runner._attn_layer_names
                 }
             else:
-                slot_mappings = runner.empty_slot_mappings
-                per_layer_attn_metadata, _ = runner._build_attention_metadata(
-                    num_tokens=num_tokens,
-                    num_reqs=actual_num_reqs,
-                    max_query_len=num_tokens_per_req,
-                    num_tokens_padded=num_tokens,
-                    num_reqs_padded=actual_num_reqs,
-                    slot_mappings=slot_mappings,
-                )
+                # Must match _build_draft_attn_metadata so warmup compiles the
+                # same dispatch sequence used during live inference.
+                assert self._draft_attn_layer_names is not None, (
+                    "load_model() must run before precompile()")
+                per_layer_attn_metadata = (
+                    runner.build_attention_metadata_for_layers(
+                        self._draft_attn_layer_names, actual_num_reqs))
             with (
                     set_forward_context(per_layer_attn_metadata,
                                         self.vllm_config, 0),
