@@ -759,6 +759,14 @@ class TpuPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def get_current_memory_usage(cls,
+                                 device: torch.device | None = None) -> float:
+        if not torch.tpu.is_initialized():
+            return 0.0
+        free, total = torch.accelerator.get_memory_info(device)
+        return float(total - free)
+
+    @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
         return False
 
@@ -880,6 +888,7 @@ class TpuPlatform(Platform):
         compilation_config.compile_ranges_split_points = []
 
         model_config = vllm_config.model_config
+
         if model_config is not None and model_config.dtype in (
                 torch.float16,
                 torch.float32,
@@ -894,7 +903,7 @@ class TpuPlatform(Platform):
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
 
-        is_hybrid = model_config.is_hybrid
+        is_hybrid = model_config.is_hybrid if model_config is not None else False
         if vllm_config.speculative_config is not None and scheduler_config.async_scheduling:
             method = vllm_config.speculative_config.method
             if not vllm_config.speculative_config.use_eagle():
