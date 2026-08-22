@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -365,6 +366,32 @@ class TestTpuPlatform:
         vllm_config.cache_config.block_size = 16
 
         TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("compile_sizes", "shapes_type", "expected_type"),
+        [
+            # Size 1 under backed shapes would crash in PiecewiseBackend.
+            ([1, 16], DynamicShapesType.BACKED,
+             DynamicShapesType.BACKED_SIZE_OBLIVIOUS),
+            ([16, 32], DynamicShapesType.BACKED, DynamicShapesType.BACKED),
+            # A user-chosen non-backed type is never overridden.
+            ([1, 16], DynamicShapesType.UNBACKED, DynamicShapesType.UNBACKED),
+        ],
+    )
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_dynamic_shapes_for_compile_size_1(
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
+            compile_sizes, shapes_type, expected_type):
+        vllm_config.compilation_config.compile_sizes = compile_sizes
+        vllm_config.compilation_config.dynamic_shapes_config.type = shapes_type
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert (vllm_config.compilation_config.dynamic_shapes_config.type ==
+                expected_type)
 
     @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),

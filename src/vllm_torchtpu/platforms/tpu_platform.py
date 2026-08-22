@@ -887,6 +887,20 @@ class TpuPlatform(Platform):
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []
 
+        # Backed dynamic shapes 0/1-specialize a size-1 compile into a static
+        # retrace that trips PiecewiseBackend's single-entry assert;
+        # size-oblivious backed shapes keep the graph dynamic at size 1.
+        from vllm.config.compilation import DynamicShapesType
+        dynamic_shapes_config = compilation_config.dynamic_shapes_config
+        if (1 in compilation_config.compile_sizes
+                and dynamic_shapes_config.type == DynamicShapesType.BACKED):
+            dynamic_shapes_config.type = (
+                DynamicShapesType.BACKED_SIZE_OBLIVIOUS)
+            logger.info(
+                "compile_sizes contains 1, which backed dynamic shapes "
+                "cannot compile (0/1 specialization); switching to "
+                "backed_size_oblivious dynamic shapes.")
+
         model_config = vllm_config.model_config
 
         if model_config is not None and model_config.dtype in (
