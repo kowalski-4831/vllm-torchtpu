@@ -196,6 +196,7 @@ class RaidenOffloadingManager(OffloadingManager):
         raiden_job_name: str,
         global_registry_address: str = "",
         store_server_ip: str = "",
+        kv_pool_group: str = "",
         key_namespace: bytes = b"",
         # Test overrides: allow injecting mock store instance and type bindings.
         store: object | None = None,
@@ -247,6 +248,9 @@ class RaidenOffloadingManager(OffloadingManager):
                 global_registry_address=global_registry_address,
                 # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
                 store_server_ip=store_server_ip or "127.0.0.1",
+                # Pool group this store's KV cache flows within (spec
+                # publication and eviction placement).
+                kv_pool_group=kv_pool_group,
                 # Construction blocks in RaidenController::Init() until every
                 # rank registers, and raises on timeout
                 # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
@@ -1347,6 +1351,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             self.extra_config.get("global_registry_address", ""))
         self.store_server_ip = str(self.extra_config.get(
             "store_server_ip", ""))
+        # KV pool group this store's KVTransferSpec is published under; the
+        # store nodes absorbing this pool's evictions name the same group.
+        # Empty falls back to the raiden job name, which the DP suffix below
+        # makes per-replica -- set it explicitly whenever another party must
+        # resolve this pool's spec.
+        self.kv_pool_group = str(self.extra_config.get("kv_pool_group", ""))
 
         # Generate the compatibility namespace hash to isolate global registry
         # entries across incompatible engine configurations.
@@ -1402,6 +1412,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 raiden_job_name=self.raiden_job_name,
                 global_registry_address=self.global_registry_address,
                 store_server_ip=self.store_server_ip,
+                kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
             )
         return self._manager
