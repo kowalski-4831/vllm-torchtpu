@@ -36,6 +36,22 @@ POOLED_GDN_CONV_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[
 POOLED_GDN_SSM_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[POOLED_GDN_SSM_STATE_DTYPE]
 
 
+def unified_kv_layout_enabled_for_architecture(
+        architecture: str | None) -> bool:
+    """Whether `architecture` runs on the attention-shaped unified KV pool.
+
+    Split out of `platforms.tpu_block_size_utils.unified_kv_layout_enabled`
+    (which delegates here) so the GDN layer can ask the same question without
+    importing `vllm_torchtpu.platforms` -- that package's __init__ pulls in
+    TpuPlatform, which imports the layers back.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    override = tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+    if override is not None:
+        return override
+    return architecture in POOLED_GDN_ARCHITECTURES
+
+
 def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
     rows of conv_dim channels. The kernel keeps no spec-decode widening in
