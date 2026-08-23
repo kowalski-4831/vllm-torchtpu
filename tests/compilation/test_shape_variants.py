@@ -105,16 +105,32 @@ class FakeExecutable:
         CALLS.append((self.rows, self.waves))
         return (torch.zeros(self.rows, HIDDEN), )
 
+    def serialize(self):
+        """Stand in for the bundled AOTAutograd entry.
+
+        A method rather than an attribute set per instance: the adaptor pickles
+        whatever this returns, and a closure in the instance __dict__ would not
+        survive that. The real entry bundles a wrapper around an executable;
+        here the executable is the whole runnable, so it is its own entry.
+        """
+        return self
+
 
 CALLS: list[tuple[int, int]] = []
 
 
 class FakeTpuBackend:
-    """torch_tpu's TpuBackend, minus torch_tpu. Everything above it is real."""
+    """torch_tpu's TpuBackend, minus torch_tpu. Everything above it is real.
+
+    Mirrors the one part of the real contract the compiler adaptor depends on:
+    the returned runnable carries ``serialize()``, which hands back a picklable
+    bundled entry holding both the wrapper and the executable. The adaptor
+    caches that entry and nothing else, so a fake without it silently disables
+    the disk cache and every warm start recompiles.
+    """
 
     def __init__(self) -> None:
         self.compiled: list[tuple[int, int]] = []  # (bucket, waves)
-        self._compiled_executables: list[FakeExecutable] = []
 
     def __call__(self, graph: fx.GraphModule, example_inputs):
         rows = max(t.shape[0] for t in example_inputs
@@ -122,8 +138,7 @@ class FakeTpuBackend:
         waves = sum(1 for node in graph.graph.nodes
                     if "wave" in str(node.target))
         self.compiled.append((rows, waves))
-        self._compiled_executables.append(FakeExecutable(rows, waves))
-        return self._compiled_executables[-1]
+        return FakeExecutable(rows, waves)
 
 
 @dataclasses.dataclass
@@ -209,6 +224,9 @@ def prepare(cache_root: str, splitting_ops=None):
     vllm_torchtpu._patch_vllm_aot_compile_cache_key()
     backend = FakeTpuBackend()
     tpu_compiler._tpu_backend = backend
+    # A FakeExecutable never went through torch, so it cannot come back through
+    # torch's bundled-entry deserializer either; it is already the runnable.
+    tpu_compiler._deserialize_entry = lambda entry: entry
     CALLS.clear()
     return make_config(splitting_ops), backend
 
