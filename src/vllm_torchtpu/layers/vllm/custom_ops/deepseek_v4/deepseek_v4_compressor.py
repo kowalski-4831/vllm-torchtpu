@@ -348,6 +348,23 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 "kernel only emits the FP8/UE8M0 cache layout.")
         self.num_layers = get_current_vllm_config(
         ).model_config.hf_config.num_hidden_layers
+        self._wkv_wgate_transposed = False
+
+    def transpose_wkv_wgate(self) -> None:
+        """Stores ``fused_wkv_wgate.weight`` transposed, once, at load time.
+
+        vLLM lays linear weights out as [out_features, in_features], but the
+        compress-and-store kernel consumes them as
+        [hidden_size, 2 * coff * head_dim]. Transposing in the forward pass
+        makes XLA materialize the transposed copy on every step; the weight is
+        only ever read by that kernel, so it can just be stored that way.
+        """
+        if self._wkv_wgate_transposed:
+            return
+        weight = self.fused_wkv_wgate.weight.data.t().contiguous()
+        self.fused_wkv_wgate.weight = torch.nn.Parameter(weight,
+                                                         requires_grad=False)
+        self._wkv_wgate_transposed = True
 
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
     # head_dim == 512 without:      HCA, whose state lives on a CSA array.
@@ -534,9 +551,12 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                     "far too small to host it. Expected the runner to have "
                     "overlaid this state cache onto a CSA NoPE array.")
 
+        assert self._wkv_wgate_transposed, (
+            "fused_wkv_wgate must be transposed at load time; the model's "
+            "load_weights is expected to call transpose_wkv_wgate()")
         operands = (
             hidden_states,
-            self.fused_wkv_wgate.weight.T,
+            self.fused_wkv_wgate.weight,
             self.ape.clone(),
             self.norm.weight.clone(),
             rotary_emb.cos_sin_cache,

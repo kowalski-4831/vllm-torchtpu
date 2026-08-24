@@ -4453,6 +4453,10 @@ class TPUModelRunner(GPUModelRunner):
                             module, "indexer_op"):
                         _ = module.indexer_op
                         initialized_count += 1
+                    for op_name in ("mhc_ops", "mhc_post_op"):
+                        if hasattr(type(module), op_name):
+                            _ = getattr(module, op_name)
+                            initialized_count += 1
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)
