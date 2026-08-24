@@ -11,7 +11,7 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
-                                       MLAAttentionImpl, MultipleOf)
+                                       MLAAttentionImpl)
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
@@ -494,7 +494,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes():
         if envs.USE_BATCHED_RPA_LONGCTX:
-            return [MultipleOf(128)]
+            return [128, 256, 512, 1024, 2048, 4096]
         return [256]
 
     @staticmethod
