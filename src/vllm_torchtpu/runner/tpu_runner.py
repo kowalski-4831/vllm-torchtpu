@@ -4453,7 +4453,8 @@ class TPUModelRunner(GPUModelRunner):
                             module, "indexer_op"):
                         _ = module.indexer_op
                         initialized_count += 1
-                    for op_name in ("mhc_ops", "mhc_post_op"):
+                    for op_name in ("mhc_ops", "mhc_post_op", "qnorm_rope_op",
+                                    "kv_rope_op", "o_proj_op"):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
                             initialized_count += 1
