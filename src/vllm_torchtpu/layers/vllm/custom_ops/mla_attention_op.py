@@ -48,12 +48,6 @@ from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
 from vllm_torchtpu.utils import synchronize_tensors
 
-# streamindex_topk block-tuning knobs. NOT tuned: these are the first values
-# found to fit, not the result of a sweep -- benchmark before reading anything
-# into the kernel's throughput.
-STREAMIDX_NUM_KV_PAGES_PER_BLOCK = 8
-STREAMIDX_NUM_QUERIES_PER_BLOCK = 32
-
 
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
@@ -112,8 +106,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 k=topk,
                 compression_ratio=1,
-                num_kv_pages_per_block=STREAMIDX_NUM_KV_PAGES_PER_BLOCK,
-                num_queries_per_block=STREAMIDX_NUM_QUERIES_PER_BLOCK,
+                # The following parameters are tuned based on microbenchmark
+                # results.
+                num_kv_pages_per_block=(2, 2, 2),
+                num_queries_per_block=(1, 128, 128),
             )
             return cache_kv, topk_indices
 
