@@ -2760,6 +2760,23 @@ class TestTPURaidenConnectorWorker:
                    return_value=3):
             assert self.worker._num_raiden_slots(max_blocks=4) == 3
 
+    def test_num_slots_autosizes_sparse_mla_tuples(self):
+        runner = MagicMock()
+        nope = torch.empty((4, 8, 4, 128), dtype=torch.uint8)
+        rope = torch.empty((4, 2, 4, 128), dtype=torch.uint8)
+        idx = torch.empty((4, 2, 4, 256), dtype=torch.uint8)
+        runner.kv_caches = [(nope, rope), idx]
+        self.worker.runner = runner
+        with patch(f"{_MOD}.dist_utils.get_raiden_transfer_num_slots",
+                   return_value=0), \
+             patch(f"{_MOD}.dist_utils.get_kv_shm_pool_gb",
+                   return_value=1.0):
+            # Per-block bytes: nope 8*4*128=4096, rope 2*4*128=1024,
+            # idx 2*4*256=2048 -> 7168; x 4 blocks = 28672 per slot;
+            # budget 1 GiB / tp_size 4.
+            assert self.worker._num_raiden_slots(
+                max_blocks=4) == ((1024**3 // 4) // 28672)
+
     def test_dp_port_configurations(self):
         worker = _make_raiden_worker(dp_rank=0, tp_size=1)
         assert worker.kv_transfer_port == 9100
@@ -3397,6 +3414,22 @@ class TestTPUConnectorStats(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # GLM-5.2 admission topology: prefill tp{N}/dp1 -> decode tp1/dp{M} only.
 # ---------------------------------------------------------------------------
+
+
+def test_glm_tag_geometry_measures_manifest_in_fixed_tag_order():
+    from vllm_torchtpu.distributed.kv_transfer.raiden import \
+        pool_manifest as rpm
+
+    from .raiden_test_utils import glm_named_kv_caches
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=glm_named_kv_caches(),
+        raw_tensors=(),
+        block_size_tokens=1024)
+    geometry = TPURaidenConnectorWorker._measure_glm_tag_geometry(manifest)
+    assert list(geometry) == ["mla.nope", "mla.rope", "dsa.idx"]
+    assert geometry["mla.nope"] == (1024 * 512, 512)
+    assert geometry["mla.rope"] == (256 * 512, 512)
+    assert geometry["dsa.idx"] == (256 * 1024, 1024)
 
 
 @pytest.mark.parametrize(("is_producer", "tp_size", "dp_size", "expected"), [

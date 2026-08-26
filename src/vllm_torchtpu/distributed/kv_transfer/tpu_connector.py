@@ -98,7 +98,7 @@ _STAGE3_REGISTRATION_CANCELLED_ERROR = (
 # (FA first = H2D order rank 0).
 _STAGE3_TRANSFER_POOL_TAGS = ("fa", )
 _STAGE3_STATE_CLASS_TAGS = ("gdn.conv", "gdn.ssm")
-_STAGE3_GLM_TRANSFER_POOL_TAGS = ("fa", "dsa.idx")
+_STAGE3_GLM_TRANSFER_POOL_TAGS = ("mla.nope", "mla.rope", "dsa.idx")
 
 
 def _select_committed_mamba_blocks(
@@ -1600,14 +1600,13 @@ class TPURaidenConnectorWorker:
         self._raiden_admission_summary = dict(summary)
         logger.info(
             "Raiden GLM pool admission complete topology=%s role=%s "
-            "binding=%s pools=%d storages=%d fa=%d dsa.idx=%d",
+            "binding=%s pools=%d storages=%d tag_counts=%s",
             topology,
             role,
             manifest.binding,
             len(manifest.pools),
             len(manifest.storages),
-            counts.get(rpm.TAG_FA, 0),
-            counts.get(rpm.TAG_DSA_IDX, 0),
+            dict(counts),
         )
         for tag, geo in geometry.items():
             logger.info(
@@ -2339,7 +2338,7 @@ class TPURaidenConnectorWorker:
                     block_ids=list(scheduler_ids),
                 ) for tag in _STAGE3_GLM_TRANSFER_POOL_TAGS
             ]
-            # Both tags stripe identically, so one tag's span count is this
+            # Every tag stripes identically, so one tag's span count is this
             # rank's page count.
             owned_pages = len(pool_spans[0].spans)
             if not owned_pages:
@@ -3184,6 +3183,16 @@ class TPURaidenConnectorWorker:
                 return
             time.sleep(0.001)
 
+    def _flattened_kv_cache_tensors(self) -> list[Any]:
+        assert self.runner is not None
+        flat: list[Any] = []
+        for entry in self.runner.kv_caches:
+            if isinstance(entry, (tuple, list)):
+                flat.extend(entry)
+            else:
+                flat.append(entry)
+        return flat
+
     def _ensure_raiden_transfer_engine(self) -> "KVCacheManager":
         if self._raiden_transfer_engine is not None:
             return self._raiden_transfer_engine
@@ -3191,7 +3200,7 @@ class TPURaidenConnectorWorker:
             raise RuntimeError(
                 "register_runner must be called before transfer")
         engine = self._construct_raiden_transfer_engine(
-            list(self.runner.kv_caches))
+            self._flattened_kv_cache_tensors())
         self._raiden_transfer_engine = engine
         return engine
 
@@ -3307,12 +3316,15 @@ class TPURaidenConnectorWorker:
         if override > 0:
             return override
         assert self.runner is not None
-        kv_layer = self.runner.kv_caches[0]
-        dtype_bytes = torch.tensor([], dtype=kv_layer.dtype).element_size()
-        bytes_per_layer = dtype_bytes * max_blocks
-        for dim in kv_layer.shape[1:]:
-            bytes_per_layer *= int(dim)
-        bytes_per_slot = bytes_per_layer * len(self.runner.kv_caches)
+        # Sum per-block bytes over every flattened tensor: cache entries
+        # can be heterogeneous e.g. split MLA nope/rope tesnsor list
+        # and DSA indexer tensor.
+        bytes_per_slot = 0
+        for kv_tensor in self._flattened_kv_cache_tensors():
+            tensor_bytes = kv_tensor.element_size() * max_blocks
+            for dim in kv_tensor.shape[1:]:
+                tensor_bytes *= int(dim)
+            bytes_per_slot += tensor_bytes
         per_rank_budget = int(dist_utils.get_kv_shm_pool_gb() * (1024**3))
         per_rank_budget //= max(1, self.tp_size)
         return max(1, per_rank_budget // max(1, bytes_per_slot))

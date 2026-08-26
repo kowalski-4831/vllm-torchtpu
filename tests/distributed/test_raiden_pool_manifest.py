@@ -663,58 +663,19 @@ def test_pool_dicts_coerce_into_raiden_pool_specs():
 _GLM_BLOCK_SIZE = 1024
 
 
-def test_glm_manifest_row_regions_and_dtype_classification():
-    named = glm_named_kv_caches()
-    manifest = rpm.build_glm_mla_pool_manifest(
-        named_kv_caches=named,
-        raw_tensors=(),
-        block_size_tokens=_GLM_BLOCK_SIZE)
-
-    assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
-    assert manifest.tag_counts() == {rpm.TAG_FA: 2, rpm.TAG_DSA_IDX: 1}
-    assert len(manifest.storages) == 3
-    geometry = manifest.geometry_by_tag()
-    assert geometry[rpm.TAG_FA] == {
-        "num_blocks": 16,
-        "block_stride_bytes": 256 * 2560,
-        "live_bytes_per_block": 256 * 2560,
-    }
-    assert geometry[rpm.TAG_DSA_IDX]["live_bytes_per_block"] == 256 * 1024
-    for pool in manifest.pools:
-        (region, ) = pool.regions
-        row_bytes = 2560 if pool.tag == rpm.TAG_FA else 1024
-        assert region.name == ("mla_rows"
-                               if pool.tag == rpm.TAG_FA else "dsa_rows")
-        assert region.offset_bytes == 0
-        assert region.stride_bytes == region.unit_bytes == row_bytes
-        assert region.num_units == 256
-        assert region.units_per_stride == 1
-        assert pool.base_offset_bytes == 0
-    rpm.verify_storage_binding(manifest, named, raw_tensors=())
-
-
-def test_glm_manifest_accepts_bf16_pair_packing():
-    named = glm_named_kv_caches(fa_shape=(16, 512, 2, 640),
-                                fa_esz=2,
-                                fa_dtype="torch.bfloat16")
-    manifest = rpm.build_glm_mla_pool_manifest(
-        named_kv_caches=named,
-        raw_tensors=(),
-        block_size_tokens=_GLM_BLOCK_SIZE)
-    fa_pools = [p for p in manifest.pools if p.tag == rpm.TAG_FA]
-    (region, ) = fa_pools[0].regions
-    assert region.unit_bytes == 2 * 640 * 2
-    assert region.num_units == 512
-
-
 def test_glm_manifest_requires_private_typed_binding():
     raw = FakeTensor((16, 3 * 256 * 2560), 1, dtype="torch.uint8")
     named = {
-        "model.layers.0.self_attn.mla_attn":
-        FakeTensor((16, 256, 4, 640),
-                   1,
-                   dtype="torch.float8_e5m2",
-                   storage=raw.untyped_storage()),
+        "model.layers.0.self_attn.mla_attn": (
+            FakeTensor((16, 1024, 4, 128),
+                       1,
+                       dtype="torch.uint8",
+                       storage=raw.untyped_storage()),
+            FakeTensor((16, 256, 4, 128),
+                       1,
+                       dtype="torch.uint8",
+                       storage=raw.untyped_storage()),
+        ),
         "model.layers.0.self_attn.indexer":
         FakeTensor((16, 256, 4, 256),
                    1,
@@ -727,13 +688,58 @@ def test_glm_manifest_requires_private_typed_binding():
                                         block_size_tokens=_GLM_BLOCK_SIZE)
 
 
+def test_glm_manifest_sparse_mla_pairs():
+    named = glm_named_kv_caches()
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=named,
+        raw_tensors=(),
+        block_size_tokens=_GLM_BLOCK_SIZE)
+
+    assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
+    assert manifest.tag_counts() == {
+        rpm.TAG_MLA_NOPE: 2,
+        rpm.TAG_MLA_ROPE: 2,
+        rpm.TAG_DSA_IDX: 1,
+    }
+    assert len(manifest.storages) == 5
+    geometry = manifest.geometry_by_tag()
+    assert geometry[rpm.TAG_MLA_NOPE] == {
+        "num_blocks": 16,
+        "block_stride_bytes": 1024 * 512,
+        "live_bytes_per_block": 1024 * 512,
+    }
+    assert geometry[rpm.TAG_MLA_ROPE]["live_bytes_per_block"] == 256 * 512
+    assert geometry[rpm.TAG_DSA_IDX]["live_bytes_per_block"] == 256 * 1024
+    for pool in manifest.pools:
+        (region, ) = pool.regions
+        assert region.offset_bytes == 0
+        assert region.stride_bytes == region.unit_bytes
+        assert region.units_per_stride == 1
+        assert pool.base_offset_bytes == 0
+        if pool.tag == rpm.TAG_MLA_NOPE:
+            assert region.name == "mla_nope_rows"
+            assert region.unit_bytes == 512
+            assert region.num_units == 1024
+        elif pool.tag == rpm.TAG_MLA_ROPE:
+            assert region.name == "mla_rope_rows"
+            assert region.unit_bytes == 512
+            assert region.num_units == 256
+        else:
+            assert region.name == "dsa_rows"
+            assert region.unit_bytes == 1024
+            assert region.num_units == 256
+    rpm.verify_storage_binding(manifest, named, raw_tensors=())
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        (dict(fa_shape=(16, 1024, 640)), r"\[blocks, rows, packing, width\]"),
-        (dict(fa_shape=(16, 128, 4, 640)), "KV block size"),
-        (dict(fa_shape=(16, 512, 2, 640)), "32-bit word"),
-        (dict(fa_shape=(16, 256, 4, 600)), "lane-aligned"),
+        (dict(nope_shape=(16, 512, 4, 128)), "nope rows 512 do not match"),
+        (dict(rope_shape=(16, 512, 4, 128)), "KV block size"),
+        (dict(nope_shape=(16, 1024, 2, 128)), "32-bit word"),
+        (dict(nope_shape=(16, 1024, 512)),
+         r"\[blocks, rows, packing, width\]"),
+        (dict(rope_shape=(16, 256, 4, 120)), "lane-aligned"),
         (dict(idx_shape=(8, 256, 4, 256)), "disagree on num_blocks"),
     ],
 )
