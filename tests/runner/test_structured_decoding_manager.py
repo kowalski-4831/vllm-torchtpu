@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import contextlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -366,3 +367,90 @@ class TestPrepareSpecStructuredDecodingInput:
         assert require_bonus[:, 0].tolist() == [False, True]
         assert bonus_bitmask[0].tolist() == [0, 0]
         assert bonus_bitmask[1].tolist() == row(31)
+
+
+@contextlib.contextmanager
+def capture_trace():
+    """Captures PyTorch CPU profiler events during test execution."""
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        yield prof
+
+
+class TestMaskLogitsWithTrace:
+
+    def test_mask_logits(self, monkeypatch):
+        manager = make_manager(req_id_to_index={"req0": 0, "req1": 1})
+        grammar_output = make_grammar_output(
+            ["req0"],
+            [[ALLOW_ALL, BLOCK_ALL]],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)  # Padded to 4 rows for 2 requests
+        monkeypatch.setattr(manager, "structured_decode",
+                            manager._structured_decode)
+
+        with capture_trace() as prof:
+            out = manager.mask_logits(logits,
+                                      grammar_output,
+                                      cur_start_idx=0,
+                                      cur_end_idx=2)
+
+        # 1. Output correctness: row 0 masked on second half, row 1 untouched.
+        assert torch.equal(out[0, :32], logits[0, :32])
+        assert torch.isinf(out[0, 32:]).all()
+        assert torch.equal(out[1:], logits[1:])
+
+        # 2. TraceAnnotation verification.
+        events = [evt.name for evt in prof.events()]
+        assert any(
+            "SD:PrepareInput#num_reqs=2,padded_num_reqs=4,cur_start_idx=0,cur_end_idx=2#"
+            in name
+            for name in events), f"SD:PrepareInput not found in {events}"
+        assert any(
+            "SD:MaskLogits#num_reqs=2,padded_num_reqs=4,cur_start_idx=0,cur_end_idx=2#"
+            in name for name in events), f"SD:MaskLogits not found in {events}"
+
+    def test_mask_spec_logits(self, monkeypatch):
+        manager = make_manager(num_spec_tokens=1, req_id_to_index={"req0": 0})
+        grammar_output = make_grammar_output(
+            ["req0"],
+            [[ALLOW_ALL, BLOCK_ALL], [BLOCK_ALL, ALLOW_ALL]],
+        )
+        target_logits = torch.zeros(1, VOCAB_SIZE)
+        bonus_logits = torch.zeros(1, VOCAB_SIZE)
+        scheduled = {"req0": [1]}
+        draft_lengths = np.array([1], dtype=np.int32)
+        monkeypatch.setattr(manager, "structured_decode",
+                            manager._structured_decode)
+
+        with capture_trace() as prof:
+            out_target, out_bonus = manager.mask_spec_logits(
+                target_logits, bonus_logits, grammar_output, scheduled,
+                draft_lengths, 0, 1)
+
+        # 1. Output correctness: target masked top half, bonus masked bottom half.
+        assert torch.isinf(out_target[0, 32:]).all()
+        assert torch.isinf(out_bonus[0, :32]).all()
+
+        # 2. TraceAnnotation verification with target_logits.
+        events = [evt.name for evt in prof.events()]
+        assert any(
+            "SD:PrepareSpecInput#num_reqs=1,num_target_rows=1,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
+            in name
+            for name in events), f"SD:PrepareSpecInput not found in {events}"
+        assert any(
+            "SD:MaskSpecLogits#num_reqs=1,num_target_rows=1,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
+            in name
+            for name in events), f"SD:MaskSpecLogits not found in {events}"
+
+        # 3. TraceAnnotation verification when target_logits is None (non-draft chunk).
+        grammar_output_none = make_grammar_output(["req0"],
+                                                  [[ALLOW_ALL, BLOCK_ALL]])
+        with capture_trace() as prof_none:
+            manager.mask_spec_logits(None, bonus_logits, grammar_output_none,
+                                     {}, None, 0, 1)
+        events_none = [evt.name for evt in prof_none.events()]
+        assert any(
+            "SD:PrepareSpecInput#num_reqs=1,num_target_rows=0,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
+            in name for name in events_none
+        ), f"SD:PrepareSpecInput (target=None) not found in {events_none}"
