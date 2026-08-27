@@ -48,6 +48,13 @@ from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
 from vllm_torchtpu.utils import synchronize_tensors
 
+# Skip indexer scoring when every sequence in the batch is shorter than
+# `index_topk`, where the top-k is the identity and the scores decide nothing.
+# The guard is batch-wide, so this fires during warmup and on short-context
+# traffic and not at all once any request in the batch is past `index_topk`
+# tokens.
+STREAMIDX_ENABLE_EARLY_EXIT = True
+
 
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
@@ -110,6 +117,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 # results.
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
+                enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
             )
             return cache_kv, topk_indices
 
