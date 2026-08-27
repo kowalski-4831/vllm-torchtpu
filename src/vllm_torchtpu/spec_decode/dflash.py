@@ -218,8 +218,11 @@ class DFlashProposer:
             "load_model() must run before draft attention metadata is built")
 
         saved_ctx = runner._attn_metadata_builder_ctx
+        # Must be the REAL request count: the staging walk copies ctx.num_reqs
+        # rows from a source sized max_num_reqs, which padded_num_reqs (a draft
+        # token bucket) can exceed. Padding rows then stage as the null block.
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
-            num_reqs=padded_num_reqs,
+            num_reqs=chunk.num_reqs,
             start_index=chunk.start_index,
             use_max_model_len=chunk_ctx.use_max_model_len,
             seq_lens=seq_lens,

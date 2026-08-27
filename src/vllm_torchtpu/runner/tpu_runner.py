@@ -78,7 +78,7 @@ from vllm_torchtpu.kv_cache_spec_normalizer import \
     normalize_kv_cache_specs_for_tpu
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
-    AttentionMetadataBuilderContext)
+    AttentionMetadataBuilderContext, stage_block_table_uploads)
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm import token_padding
@@ -689,6 +689,7 @@ class TPUModelRunner(GPUModelRunner):
                                         device="cpu",
                                         pin_memory=PIN_MEMORY)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
+        self._block_table_stage_cpu: torch.Tensor | None = None
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(self.max_num_tokens,
                                                dtype=torch.bool,
@@ -1349,6 +1350,39 @@ class TPUModelRunner(GPUModelRunner):
             exempt_layers=ds_v4_layers,
         )
 
+    def _build_attention_metadata(
+        self,
+        num_tokens: int = 0,
+        num_reqs: int = 0,
+        max_query_len: int = 1,
+        num_tokens_padded: int | None = None,
+        num_reqs_padded: int | None = None,
+        slot_mappings: torch.Tensor | None = None,
+    ) -> tuple[dict[str, AttentionMetadata], None]:
+        """Lean TPU group walk: stage one batched block-table upload, then
+        build every group's metadata straight from the builder context.
+        """
+        ctx = self._attn_metadata_builder_ctx
+        effective_num_reqs_padded = (num_reqs_padded if num_reqs_padded
+                                     is not None else num_reqs)
+
+        if ctx.staged_block_tables is None:
+            # One batched H2D for every group's block table (zero-filled for
+            # dummy runs); see `stage_block_table_uploads`.
+            stage_block_table_uploads(self, ctx, effective_num_reqs_padded)
+
+        common = SimpleNamespace(num_reqs=effective_num_reqs_padded)
+        per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
+        for group_list in self.attn_groups:
+            for group in group_list:
+                built = group.metadata_builders[0].build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                )
+                for layer_name in group.layer_names:
+                    per_layer_attn_metadata[layer_name] = built
+        return per_layer_attn_metadata, None
+
     def build_attention_metadata_for_layers(
         self,
         layer_names: Collection[str],
@@ -1369,19 +1403,32 @@ class TPUModelRunner(GPUModelRunner):
         # `AttentionMetadataBuilder.build` takes only `num_reqs` off the
         # common metadata; everything else it needs comes from
         # `_attn_metadata_builder_ctx`.
-        common = SimpleNamespace(num_reqs=num_reqs_padded)
-        metadata: dict[str, AttentionMetadata] = {}
+        selected_groups = []
         for group_list in self.attn_groups:
             for group in group_list:
                 selected = [n for n in group.layer_names if n in layer_names]
-                if not selected:
-                    continue
-                built = group.metadata_builders[0].build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common,
-                )
-                for name in selected:
-                    metadata[name] = built
+                if selected:
+                    selected_groups.append((group, selected))
+        ctx = self._attn_metadata_builder_ctx
+        if ctx.staged_block_tables is None and selected_groups:
+            # One H2D for exactly the groups this targeted walk will build.
+            stage_block_table_uploads(
+                self,
+                ctx,
+                num_reqs_padded,
+                gids={
+                    group.metadata_builders[0].kv_cache_group_id
+                    for group, _ in selected_groups
+                })
+        common = SimpleNamespace(num_reqs=num_reqs_padded)
+        metadata: dict[str, AttentionMetadata] = {}
+        for group, selected in selected_groups:
+            built = group.metadata_builders[0].build(
+                common_prefix_len=0,
+                common_attn_metadata=common,
+            )
+            for name in selected:
+                metadata[name] = built
         return metadata
 
     @staticmethod
@@ -3329,6 +3376,7 @@ class TPUModelRunner(GPUModelRunner):
         for _ in range(num_chunks):
             self._run_dp_dummy_chunk(bucket)
         # Phase 2: all DRAFT dummy forwards (num_chunks * K).
+        # use_eagle() covers every hidden-state drafter, dflash included.
         spec = self.speculative_config
         if num_chunks > 0 and spec is not None and spec.use_eagle():
             self.drafter.run_dp_dummy_draft(num_chunks)
