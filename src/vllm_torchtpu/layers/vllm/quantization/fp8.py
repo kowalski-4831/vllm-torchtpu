@@ -635,9 +635,29 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
     @property
     def supports_internal_mk(self) -> bool:
-        # We need to take control of collective communication (AllGather/ReduceScatter)
-        # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        """Whether this method owns the DP/EP dispatch and combine.
+
+        vLLM brackets `apply_monolithic` with an all-gather and a
+        reduce-scatter unless the method claims them
+        (`MoERunner.do_naive_dispatch_combine`). Two independent paths claim
+        them, and either one alone has to suppress vLLM's pair:
+
+        - chunk pipelining stages the same two collectives itself so they
+          overlap the compute;
+        - the fused EP kernel does the exchange inside its own program.
+
+        The fused half asks `fused_moe_ep_supported` about this method, not
+        `envs.USE_MOE_FUSED_EP_KERNEL`: the env var only says the operator
+        asked for the kernel, while `prebuild_fused_moe_ep` is what decides
+        whether this layer was actually armed. Claiming ownership on the
+        request would strip vLLM's collectives in every configuration prebuild
+        refuses -- TP, PCP, over the SMEM bound, under the token threshold, or
+        a weight or routing layout the kernel cannot serve.
+        """
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            fused_moe_ep_supported
+        return (enable_pipelined_collective_and_compute()
+                or fused_moe_ep_supported(self))
 
     def maybe_roundup_sizes(
         self,
@@ -811,6 +831,19 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        # Resolve the EP mesh here, not on the first forward: it maps ranks to
+        # TPU device ids with an all_gather_object, and Dynamo cannot trace a
+        # collective inside the compiled graph. The result is recorded on this
+        # method, which vLLM builds one of per MoE layer, so a layer the kernel
+        # cannot serve is refused on its own rather than for the process.
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
+        setattr(
+            self, FUSED_MOE_EP_OP_ATTR,
+            prebuild_fused_moe_ep(layer,
+                                  topk=layer.moe_config.experts_per_token,
+                                  renormalize=layer.renormalize,
+                                  activation=activation_str))
 
     def apply_monolithic(
         self,
@@ -821,6 +854,16 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
+        # The fused EP kernel takes this rank's own tokens and returns this
+        # rank's own tokens: it routes, exchanges, computes and combines inside
+        # one program. Keyed on the same predicate `supports_internal_mk` uses,
+        # so ownership and the path that exercises it cannot disagree.
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            fused_moe_ep, fused_moe_ep_supported)
+        if fused_moe_ep_supported(self):
+            return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
+                                layer.w13_weight_scale_inv,
+                                layer.w2_weight_scale_inv, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
