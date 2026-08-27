@@ -101,12 +101,30 @@ PREFILL_OFFLOAD_CONTROLLER_PORT="${PREFILL_OFFLOAD_CONTROLLER_PORT:-47800}"
 DECODE_OFFLOAD_CONTROLLER_PORT="${DECODE_OFFLOAD_CONTROLLER_PORT:-48800}"
 PREFILL_CPU_BYTES_TO_USE="${PREFILL_CPU_BYTES_TO_USE:-68719476736}"
 DECODE_CPU_BYTES_TO_USE="${DECODE_CPU_BYTES_TO_USE:-8589934592}"
+PREFILL_SB_PORT_BASE="${PREFILL_SB_PORT_BASE:-29500}"
+DECODE_SB_PORT_BASE="${DECODE_SB_PORT_BASE:-29510}"
+DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29520}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 PREFILL_PCP="${PREFILL_PCP:-1}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-1}"
 DECODE_TP="${DECODE_TP:-2}"
 DECODE_DP="${DECODE_DP:-1}"
+
+# One slicebuilder address per worker in each instance's TorchTPU slice.
+# The count must equal the instance's TorchTPU world size, or
+# _prepare_singlehost_tpu_env falls back to random ports.
+prefill_sb_workers=$((PREFILL_TP * PREFILL_PCP))
+decode_sb_workers=$((DECODE_TP * DECODE_DP))
+prefill_sb_addresses=""
+for ((i = 0; i < prefill_sb_workers; i++)); do
+  prefill_sb_addresses+="${prefill_sb_addresses:+,}localhost:$((PREFILL_SB_PORT_BASE + i))"
+done
+decode_sb_addresses=""
+for ((i = 0; i < decode_sb_workers; i++)); do
+  decode_sb_addresses+="${decode_sb_addresses:+,}localhost:$((DECODE_SB_PORT_BASE + i))"
+done
+
 # Temporary same-host P4/D2 test hook. This is intentionally DEBUG-prefixed:
 # it offsets TorchTPU's physical LOCAL_RANK binding for the decode server and
 # is not a CUDA_VISIBLE_DEVICES-style remapping mechanism.
@@ -179,6 +197,13 @@ for offset in 0 1 2 3; do
   managed_ports+=("$((PREFILL_OFFLOAD_CONTROLLER_PORT + offset))")
   managed_ports+=("$((DECODE_OFFLOAD_CONTROLLER_PORT + offset))")
 done
+for ((i = 0; i < prefill_sb_workers; i++)); do
+  managed_ports+=("$((PREFILL_SB_PORT_BASE + i))")
+done
+for ((i = 0; i < decode_sb_workers; i++)); do
+  managed_ports+=("$((DECODE_SB_PORT_BASE + i))")
+done
+managed_ports+=("${DECODE_DP_MASTER_PORT}")
 mapfile -t managed_ports < <(printf '%s\n' "${managed_ports[@]}" | sort -u)
 if [[ "${RESTART_EXISTING}" == "1" ]]; then
   stop_port_listeners "${managed_ports[@]}"
@@ -383,8 +408,8 @@ fi
 printf '%q ' "${prefill_args[@]}" >"${RUN_DIR}/prefill_vllm_args.quoted"
 printf '%q ' "${decode_args[@]}" >"${RUN_DIR}/decode_vllm_args.quoted"
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"
