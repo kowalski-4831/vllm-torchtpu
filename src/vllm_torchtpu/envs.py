@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
     TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
+    TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -281,6 +282,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("TPU_RAIDEN_RESHARD_PORT_BASE") or "27000"),
     "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE":
     lambda: int(os.getenv("TPU_RAIDEN_STORE_DISPATCH_PORT_BASE") or "27100"),
+    # Decode-side prefix-cache-aware reshard loads: when true, the consumer
+    # subtracts the local prefix-cache hit and transfers only the missing
+    # FA suffix (page-aligned dst_skip_bytes clip planned by the source
+    # store); GDN state always transfers whole. When false, or when the
+    # installed client lacks dst_skip_bytes support, partial local hits skip
+    # the remote transfer and compute their missing suffix on decode.
+    "TPU_RAIDEN_PREFIX_AWARE_LOAD":
+    env_bool("TPU_RAIDEN_PREFIX_AWARE_LOAD", False),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors
