@@ -333,6 +333,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
     def __init__(self, *args, **kwargs) -> None:
         orig_state_cache = dsv4_compressor.CompressorStateCache
+        self._wkv_wgate_transposed = False
         dsv4_compressor.CompressorStateCache = VllmCompressorStateCache
         try:
             super().__init__(*args, **kwargs)
@@ -348,7 +349,6 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 "kernel only emits the FP8/UE8M0 cache layout.")
         self.num_layers = get_current_vllm_config(
         ).model_config.hf_config.num_hidden_layers
-        self._wkv_wgate_transposed = False
 
     def transpose_wkv_wgate(self) -> None:
         """Stores ``fused_wkv_wgate.weight`` transposed, once, at load time.
@@ -553,7 +553,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
         assert self._wkv_wgate_transposed, (
             "fused_wkv_wgate must be transposed at load time; the model's "
-            "load_weights is expected to call transpose_wkv_wgate()")
+            "load_weights is expected to call transpose_wkv_wgate(). It has "
+            "quant_config=None, so it never reaches a TPU linear method and "
+            "the canonical (k, n) flip does not apply to it.")
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,

@@ -499,7 +499,11 @@ class DFlashProposer:
         with runner._precompile_timed("drafter first pass"):
             fc_layer = getattr(self.draft_model.model, "fc", None)
             if fc_layer is not None:
-                hidden_dim = fc_layer.weight.shape[1]
+                # `input_size` rather than `weight.shape[1]`: TPU linear
+                # methods store the weight in the canonical (k, n) layout, so
+                # the trailing axis is the OUTPUT dim, not the input dim. The
+                # attribute is layout independent.
+                hidden_dim = fc_layer.input_size
             else:
                 hidden_dim = self.vllm_config.model_config.get_hidden_size()
             dtype = self.draft_model.model.embed_tokens.weight.dtype
@@ -712,7 +716,11 @@ class DFlashProposer:
         if self._dummy_kv_hidden_spec is None:
             fc_layer = getattr(self.draft_model.model, "fc", None)
             self._dummy_kv_hidden_spec = (
-                fc_layer.weight.shape[1] if fc_layer is not None else
+                # `input_size`, not `weight.shape[1]`: TPU linear methods store
+                # the weight in the canonical (k, n) layout, so the trailing
+                # axis is the OUTPUT dim. Matches the drafter-first-pass
+                # precompile above.
+                fc_layer.input_size if fc_layer is not None else
                 self.vllm_config.model_config.get_hidden_size(),
                 self.draft_model.model.embed_tokens.weight.dtype)
         hidden_dim, dtype = self._dummy_kv_hidden_spec
@@ -784,7 +792,7 @@ class DFlashProposer:
         # Collapse the concatenated aux hidden states to the draft's width.
         # `combine_hidden_states` is the modern spelling; bare `fc` is what
         # drafters that predate it expose, and `precompile` still reads
-        # `fc.weight.shape[1]` to size its dummy input — so the two must agree
+        # `fc.input_size` to size its dummy input — so the two must agree
         # on whether `fc` is applied.
         if hasattr(self.draft_model, "combine_hidden_states"):
             target_hidden = self.draft_model.combine_hidden_states(
