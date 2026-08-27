@@ -1471,8 +1471,10 @@ class _FakeAdmissionRaidenEngine:
         self.transfer_address = transfer_address
         self.listener_address = listener_address
 
-    def register_pools(self, pools):
+    def register_pools(self, pools, **kwargs):
         self.registered_pools = list(pools)
+        # Bounded host staging kwargs (RESHARD_BOUNDED_STAGING_DESIGN.md).
+        self.register_pools_kwargs = dict(kwargs)
         storage_indices = {
             pool["storage_index"]
             for pool in self.registered_pools
@@ -1481,6 +1483,10 @@ class _FakeAdmissionRaidenEngine:
             "admitted": True,
             "pools": len(self.registered_pools),
             "storages": len(storage_indices),
+            "host_staging": {
+                "mode": "bounded" if kwargs.get("staging_leases") else "full",
+                "leases": kwargs.get("staging_leases", 0),
+            },
         }
 
 
@@ -1734,6 +1740,18 @@ class TestTPURaidenConnectorWorker:
             construct_call = worker._construct_raiden_transfer_engine.call_args
             wrapped_storages = construct_call.args[0]
             assert construct_call.kwargs == {"num_slots": 1}
+            # Bounded host staging: the connector passes the lease count and
+            # one per-pool hint (FA: pages per max-length request, GDN: 1).
+            staging_kwargs = engine.register_pools_kwargs
+            assert staging_kwargs["staging_leases"] == 8
+            hints = staging_kwargs["staging_blocks_per_pool"]
+            assert len(hints) == len(engine.registered_pools)
+            for pool_dict, hint in zip(engine.registered_pools, hints):
+                tag = str(pool_dict["tag"])
+                if tag.startswith("fa"):
+                    assert hint == worker._max_request_blocks()
+                else:
+                    assert hint == 1, (tag, hint)
             typed_storages = set()
             for cache in named.values():
                 tensors = cache if isinstance(cache, tuple) else (cache, )

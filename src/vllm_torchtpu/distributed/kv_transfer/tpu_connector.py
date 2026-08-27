@@ -17,6 +17,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 ``kv_connector_extra_config.use_hma_connector``.
 """
 
+import importlib
 import json
 import queue
 import threading
@@ -1711,7 +1712,7 @@ class TPURaidenConnectorWorker:
         logger.info(
             "TPURaidenConnectorWorker rank%d --> registering %d pools with transfer engine",
             self.tp_rank, len(manifest.pools))
-        summary = dict(engine.register_pools(manifest.pool_dicts()))
+        summary = self._register_raiden_pools(engine, manifest)
         logger.info(
             "TPURaidenConnectorWorker rank%d --> transfer engine pools registered",
             self.tp_rank)
@@ -1816,7 +1817,7 @@ class TPURaidenConnectorWorker:
 
         storages = list(manifest.storages)
         engine = self._construct_raiden_transfer_engine(storages, num_slots=1)
-        summary = dict(engine.register_pools(manifest.pool_dicts()))
+        summary = self._register_raiden_pools(engine, manifest)
 
         registration = self._register_raiden_stage3_work_unit(
             engine=engine,
@@ -1947,9 +1948,8 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _new_raiden_id(fields: dict[str, Any]) -> Any:
-        from tpu_sync.rpc.raiden_controller import RaidenId
-
-        return RaidenId(**fields)
+        rpc = importlib.import_module("tpu_sync.rpc.raiden_controller")
+        return rpc.RaidenId(**fields)
 
     @staticmethod
     def _new_raiden_manager(**kwargs: Any) -> "KVCacheManager":
@@ -2685,9 +2685,8 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _raiden_hbm_memory_type() -> Any:
-        from tpu_sync.rpc.raiden_controller import RaidenMemoryType
-
-        return RaidenMemoryType.HBM
+        rpc = importlib.import_module("tpu_sync.rpc.raiden_controller")
+        return rpc.RaidenMemoryType.HBM
 
     def _stage3_source_work_units(self,
                                   req_meta: _Stage3LoadMeta) -> list[Any]:
@@ -3986,6 +3985,76 @@ class TPURaidenConnectorWorker:
         block_size = self.vllm_config.cache_config.block_size
         max_model_len = self.vllm_config.model_config.max_model_len
         return max(1, (max_model_len + block_size - 1) // block_size)
+
+    def _raiden_staging_blocks_per_pool(self,
+                                        pool_dicts: list[dict]) -> list[int]:
+        """Bounded host staging hints, one per pool in manifest order.
+
+        The most blocks of each pool one transfer can touch: full-attention
+        pools see every page of the request (<= pages per max-length request),
+        GDN conv/ssm state pools see one state block per group. Unknown pool
+        kinds get 0, which keeps their storage on the full host mirror (see
+        RESHARD_BOUNDED_STAGING_DESIGN.md).
+        """
+        from vllm_torchtpu.distributed.kv_transfer.raiden import \
+            pool_manifest as rpm
+
+        fa_pages = int(self._max_request_blocks())
+        hints: list[int] = []
+        for pool in pool_dicts:
+            tag = str(pool.get("tag", ""))
+            if tag.startswith(rpm.TAG_FA):
+                hints.append(fa_pages)
+            elif tag.startswith(rpm.TAG_GDN_CONV) or tag.startswith(
+                    rpm.TAG_GDN_SSM):
+                hints.append(1)
+            else:
+                hints.append(0)
+        return hints
+
+    def _register_raiden_pools(self, engine: Any, manifest: Any) -> dict:
+        """Registers the manifest's pools, with bounded host staging when the
+        installed tpu_sync supports it (TPU_RAIDEN_POOL_STAGING_LEASES > 0).
+
+        The full host shadow of the device KV pool does not fit libtpu's
+        premapped (pinned) pool once the pool is auto-sized, which silently
+        routes every D2H/H2D through the staged-copy slow path; bounded
+        staging leases N transfers' worth of pages instead.
+        """
+        pool_dicts = manifest.pool_dicts()
+        leases = int(dist_utils.get_raiden_pool_staging_leases())
+        summary: dict
+        if leases > 0:
+            hints = self._raiden_staging_blocks_per_pool(pool_dicts)
+            try:
+                summary = dict(
+                    engine.register_pools(pool_dicts,
+                                          staging_leases=leases,
+                                          staging_blocks_per_pool=hints))
+            except TypeError as exc:
+                # Older tpu_sync wheels predate bounded staging.
+                logger.warning(
+                    "Raiden bounded host staging unavailable in the installed "
+                    "tpu_sync (%s); falling back to the full host mirror "
+                    "(make sure TPU_PREMAPPED_BUFFER_SIZE covers it)", exc)
+                summary = dict(engine.register_pools(pool_dicts))
+        else:
+            summary = dict(engine.register_pools(pool_dicts))
+        staging = summary.get("host_staging")
+        if isinstance(staging, dict):
+            logger.info(
+                "Raiden host staging mode=%s leases=%s "
+                "bounded_bytes_per_shard=%s full_mirror_bytes_per_shard=%s "
+                "storages=%d",
+                staging.get("mode"),
+                staging.get("leases"),
+                staging.get("bounded_storage_bytes_per_shard"),
+                staging.get("full_storage_bytes_per_shard"),
+                len(staging.get("storages") or ()),
+            )
+        else:
+            logger.info("Raiden host staging mode=full (legacy tpu_sync)")
+        return summary
 
     def _num_raiden_slots(self, max_blocks: int) -> int:
         override = dist_utils.get_raiden_transfer_num_slots()
