@@ -4721,8 +4721,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
-            arange = self.structured_decoding_manager.structured_decode_arange.to(
-                self.device)
+            arange = self.structured_decoding_manager.structured_decode_arange
             for num_reqs in self.num_reqs_paddings:
                 out = self.structured_decoding_manager.structured_decode(
                     self.structured_decoding_manager.
