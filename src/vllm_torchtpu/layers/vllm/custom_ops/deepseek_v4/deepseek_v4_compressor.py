@@ -270,12 +270,13 @@ class VllmCompressorStateCache(CompressorStateCache):
         that the compressor kernel indexes with, so it must be the number of
         token states that physically fit in one page of the *hosting* array.
         CSA's and the indexer's state caches overlay their own compressed-KV
-        array; HCA's overlays a *CSA NoPE* array, which is why the host page
-        size is asked for separately.
+        array; HCA's overlays a *CSA NoPE* array, so it is the hosting array's
+        page that sets the count, not this mode's own.
 
         Not a closed form: HCA writes two rows per record, the indexer array
-        is 256 lanes wide, and HCA's state is hosted on a *CSA* page. Ask the
-        kernel's own layout model instead of guessing.
+        is 256 lanes wide, HCA's state is hosted on a *CSA* page, and CSA and
+        the indexer are floored to a shared value so vLLM groups them
+        together. Ask the kernel's own layout model instead of guessing.
         """
         try:
             if kv_cache_block_size // self.compress_ratio <= 0:
@@ -284,18 +285,12 @@ class VllmCompressorStateCache(CompressorStateCache):
                     f"compressed row at compress_ratio {self.compress_ratio}")
             mode = compressor_config.select_mode(self.head_dim,
                                                  self.compress_ratio == 4)
-            cfgs = compressor_config.Configs.make(
+            block_size = compressor_config.state_block_size(
                 mode,
-                size_n=0,
-                physical_page_size=compressor_config.physical_page_size(
-                    mode, kv_cache_block_size, self.compress_ratio),
-                state_physical_page_size=compressor_config.
-                state_host_page_size(mode, kv_cache_block_size,
-                                     self.compress_ratio),
-                head_dim=self.head_dim,
+                kv_cache_block_size,
                 compress_ratio=self.compress_ratio,
+                head_dim=self.head_dim,
             )
-            block_size = cfgs.state_block_size
             if block_size <= 0:
                 raise ValueError(
                     f"{mode.value} state rows do not fit in a page derived "
@@ -309,7 +304,7 @@ class VllmCompressorStateCache(CompressorStateCache):
         return block_size
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # `_build_compressor_op` bakes this in as the kernel's
+        # `_build_compressor_op` bakes `block_size` in as the kernel's
         # `state_block_size`, so spec and kernel must not disagree.
         self.block_size = self._derive_block_size(
             vllm_config.cache_config.block_size)
