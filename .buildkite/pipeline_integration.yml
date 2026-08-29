@@ -28,6 +28,18 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
+        key: "integration_qwen35_pcp8_dp8_disagg_correctness"
+        agents:
+          queue: "tpu_v7x_16_queue"
+        env:
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "/perf_eval_results/qwen35_pcp8_dp8_disagg_ci"
+        commands:
+          - "bash .buildkite/scripts/run_disagg_multihost.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Presubmit: disagg-single-host"
         key: "presubmit_disagg_single_host"
         if: "build.pull_request.id != null"
