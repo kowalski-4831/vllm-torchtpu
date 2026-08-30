@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
+    VLLM_TPU_BLOCK_MAJOR_KV: bool = False
 
 
 def env_with_choices(
@@ -409,6 +410,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # Enables the block-major KV cache layout for Raiden offloading. Bundles all
+    # attention layer fragments into a single contiguous array in HBM, collapsing
+    # per-block transfers from F independent DMAs into a single hardware DMA.
+    # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
+    "VLLM_TPU_BLOCK_MAJOR_KV":
+    env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
 }
 
 
