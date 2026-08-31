@@ -23,11 +23,12 @@ reinterpreted in VMEM via Mosaic `ref.bitcast` when the element type
 differs — the only place a cross-dtype view is free on TPU (an XLA-level
 bitcast of a pool slice forces a pool-sized layout copy per step).
 
-Regions are token-ranges `[tok0, tok0 + ntok)` within a block with
-`tok0 % ntok == 0`, so the block spec covers exactly the region and one
-grid step moves only the region's bytes. Scatters alias the pool in place
-(`input_output_aliases`); the unwritten complement is preserved via the
-HBM alias, with no read-modify-write.
+Regions are token-ranges `[tok0, tok0 + ntok)` within a block. Aligned
+ranges (`tok0 % ntok == 0`) are served by a single block spec covering
+exactly the region, so one grid step moves only the region's bytes;
+unaligned ranges decompose into aligned gcd-sized chunks. Scatters alias
+the pool in place (`input_output_aliases`); the unwritten complement is
+preserved via the HBM alias, with no read-modify-write.
 """
 import math
 
@@ -130,15 +131,23 @@ def gather_region(pool,
 
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
-    assert tok0 % ntok == 0 and tok0 + ntok <= block_size
+    assert tok0 + ntok <= block_size
+    # Unaligned regions (tok0 % ntok != 0) move as chunks of
+    # g = gcd(tok0, ntok) tokens, one grid step per (request, chunk) pair of
+    # a single pallas_call — chaining one aliased call per chunk would race
+    # on the shared pool buffer. The output keeps one row-block per chunk so
+    # the block dims stay equal to the array dims (Pallas's escape hatch for
+    # sub-8 rows).
+    g = ntok if tok0 % ntok == 0 else math.gcd(tok0, ntok)
+    chunks = ntok // g
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(out_dtype)
     out_payload = (payload if same_dtype else _bitcast_payload(
         payload, pool.dtype, out_dtype))
-    out_rows = _out_rows(out_payload, ntok)
+    out_rows = _out_rows(out_payload, g)
     if not payload and not same_dtype:
         # 3-D pool: the block ref is 2-D and the bitcast rescales the
         # token/row dim itself (the old validated sublane convention).
-        out_rows = _rescale_rows(ntok, pool.dtype, out_dtype)
+        out_rows = _rescale_rows(g, pool.dtype, out_dtype)
     lane_split = 1
     if out_lanes is not None and out_lanes != lanes:
         assert lanes % out_lanes == 0, (lanes, out_lanes)
@@ -156,16 +165,18 @@ def gather_region(pool,
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na, ),
+            grid=(na * chunks, ),
             in_specs=[
-                pl.BlockSpec((1, ntok) + payload + (lanes, ), lambda i, s:
-                             (s[i], tok0 // ntok) + pad)
+                pl.BlockSpec((1, g) + payload + (lanes, ), lambda p, s:
+                             (s[p // chunks], (tok0 +
+                                               (p % chunks) * g) // g) + pad)
             ],
-            out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda i, s:
-                                   (i, 0, 0)),
+            out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda p, s:
+                                   (p, 0, 0)),
         ),
-        out_shape=jax.ShapeDtypeStruct((na, out_rows, o_lanes), out_dtype),
-    )(state_indices, pool)
+        out_shape=jax.ShapeDtypeStruct((na * chunks, out_rows, o_lanes),
+                                       out_dtype),
+    )(state_indices, pool).reshape(na, chunks * out_rows, o_lanes)
 
 
 def _gather_window(pool,
@@ -322,13 +333,17 @@ def scatter_region(pool,
 
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
-    assert tok0 % ntok == 0 and tok0 + ntok <= block_size
+    assert tok0 + ntok <= block_size
+    # Unaligned regions move as aligned gcd-sized chunks, one grid step per
+    # (request, chunk) pair; see gather_region.
+    g = ntok if tok0 % ntok == 0 else math.gcd(tok0, ntok)
+    chunks = ntok // g
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(vals.dtype)
     val_payload = (payload if same_dtype else _bitcast_payload(
         payload, pool.dtype, vals.dtype))
-    out_rows = _out_rows(val_payload, ntok)
+    out_rows = _out_rows(val_payload, g)
     if not payload and not same_dtype:
-        out_rows = _rescale_rows(ntok, pool.dtype, vals.dtype)
+        out_rows = _rescale_rows(g, pool.dtype, vals.dtype)
     v_lanes = vals.shape[-1]
     lane_split = 1
     if v_lanes != lanes:
@@ -337,12 +352,13 @@ def scatter_region(pool,
         assert lanes % v_lanes == 0, (lanes, v_lanes)
         lane_split = lanes // v_lanes
     v_rows = out_rows * lane_split
-    assert vals.shape == (na, v_rows, v_lanes), (vals.shape, v_rows, v_lanes)
+    assert vals.shape == (na, chunks * v_rows,
+                          v_lanes), (vals.shape, chunks * v_rows, v_lanes)
     pad = (0, ) * (len(payload) + 1)
 
     def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
-        # The output block covers exactly the region and is fully written;
-        # the complement is preserved via the HBM alias.
+        # The output block covers exactly the region chunk and is fully
+        # written; the complement is preserved via the HBM alias.
         typed_ldst.store_typed(pool_out_ref.at[0],
                                val_ref[0],
                                lane_split=lane_split)
@@ -351,18 +367,19 @@ def scatter_region(pool,
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na, ),
+            grid=(na * chunks, ),
             in_specs=[
-                pl.BlockSpec((1, v_rows, v_lanes), lambda i, s: (i, 0, 0)),
+                pl.BlockSpec((1, v_rows, v_lanes), lambda p, s: (p, 0, 0)),
                 # Aliased with the output; never read, so leave it in HBM.
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
-            out_specs=pl.BlockSpec((1, ntok) + payload + (lanes, ),
-                                   lambda i, s: (s[i], tok0 // ntok) + pad),
+            out_specs=pl.BlockSpec((1, g) + payload + (lanes, ), lambda p, s:
+                                   (s[p // chunks],
+                                    (tok0 + (p % chunks) * g) // g) + pad),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
-    )(state_indices, vals, pool)
+    )(state_indices, vals.reshape(na * chunks, v_rows, v_lanes), pool)
 
 
 def copy_blocks(pool, src_indices, dst_indices):
