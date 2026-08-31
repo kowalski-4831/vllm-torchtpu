@@ -173,11 +173,11 @@ run_mp_multihost() {
     umask 000
     rm -rf /perf_eval_results/*
     bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config "$1" --host localhost --port "$2" --results-dir /perf_eval_results/"$1" "${@:3}"
-  ' -- "${CONFIG_NAME}" "${PORT}" "${EXTRA_EVAL_FLOW_ARGS[@]}"
-  EXIT_CODE=$?
+  ' -- "${CONFIG_NAME}" "${PORT}" "${EXTRA_EVAL_FLOW_ARGS[@]}" 2>&1 | tee "${MULTIHOST_RUN_LOG}"
+  EXIT_CODE=${PIPESTATUS[0]}
   set -e
 
-  echo "--- Collecting server logs"
+  echo "~~~ Collecting server logs"
   docker logs node --tail 2000 > perf_eval_results/head_server.log 2>&1 || true
   widx=0
   for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do

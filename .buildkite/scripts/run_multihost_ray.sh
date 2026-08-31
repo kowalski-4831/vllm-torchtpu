@@ -98,11 +98,11 @@ run_ray_multihost() {
     umask 000
     rm -rf /perf_eval_results/*
     "$@"
-  ' -- "$@"
-  EXIT_CODE=$?
+  ' -- "$@" 2>&1 | tee "${MULTIHOST_RUN_LOG}"
+  EXIT_CODE=${PIPESTATUS[0]}
   set -e
 
-  echo "--- Collecting Ray session logs"
+  echo "~~~ Collecting Ray session logs"
   docker exec node bash -c 'cd /tmp/ray/session_latest/logs 2>/dev/null && tar czf - .' \
     > perf_eval_results/ray_logs_head.tgz 2>/dev/null || true
   widx=0

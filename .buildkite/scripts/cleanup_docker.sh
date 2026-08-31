@@ -30,7 +30,9 @@ echo "=== Starting Docker resource cleanup ==="
 echo "Target images: ${TARGET_IMAGES[*]}"
 
 for IMG in "${TARGET_IMAGES[@]}"; do
-  echo "----------------------------------------"
+  # Not "---...": Buildkite reads a leading `---` as a log group header, so a
+  # plain dashed rule silently opens three anonymous groups per run.
+  echo "========================================"
   echo "Cleaning up images matching: ${IMG}"
 
   # Get image IDs matching either exact name or registry repository name
@@ -52,14 +54,14 @@ for IMG in "${TARGET_IMAGES[@]}"; do
     fi
 
     echo "Removing old ${IMG} image(s)..."
-    echo "$OLD_IMAGES" | xargs -r docker rmi -f || true
+    echo "$OLD_IMAGES" | xargs -r docker rmi -f >/dev/null 2>&1 || true
   else
     echo "No images matching ${IMG} found to clean up."
   fi
 done
 
-echo "----------------------------------------"
+echo "========================================"
 echo "Pruning old Docker build cache..."
-docker builder prune -f || true
+docker builder prune -f >/dev/null 2>&1 || true
 
 echo "=== Cleanup complete ==="

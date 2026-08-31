@@ -37,11 +37,18 @@ COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
 IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "--- Cleaning up old Docker images and cache"
+
+# Buildkite expands the last `---` group whenever a log contains no `+++` group
+# at all. Every group below that is pure housekeeping is therefore `~~~`
+# (collapsed *and* de-emphasized, so consecutive ones fold into a single
+# expander row), and the only `+++` we ever emit is the failure summary at the
+# very end. Without that, a red job opened on `docker rmi` output.
+echo "~~~ Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
-echo "--- Pulling Docker Image: ${IMAGE_TAG}"
-docker pull "${IMAGE_TAG}"
+# -q: the layer-by-layer pull progress is ~600 lines of a ~2000-line job log.
+echo "~~~ Pulling Docker Image: ${IMAGE_TAG}"
+docker pull -q "${IMAGE_TAG}"
 
 # Ensure cache directory exists on the host
 mkdir -p /mnt/disks/persist/models
@@ -59,10 +66,14 @@ mkdir -p perf_eval_results
 set +e
 
 CONTAINER_NAME="vllm-torchtpu-ci"
-echo "--- Cleaning up any existing container: ${CONTAINER_NAME}"
+echo "~~~ Cleaning up any existing container: ${CONTAINER_NAME}"
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
-trap 'docker kill "${CONTAINER_NAME}" 2>/dev/null || true' EXIT INT TERM
+# Container output is teed here so the failure summary can quote it without
+# making the reader scroll the collapsed run group.
+RUN_LOG="$(mktemp)"
+
+trap 'docker kill "${CONTAINER_NAME}" 2>/dev/null || true; rm -f "${RUN_LOG}"' EXIT INT TERM
 
 # Buildkite and test suite related environment variables and volume mounts
 export BUILDKITE_PARALLEL_JOB="${BUILDKITE_PARALLEL_JOB:-0}"
@@ -119,18 +130,32 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64
     umask 000
     rm -rf /perf_eval_results/*
     "$@"
-  ' -- "$@"
-DOCKER_EXIT_CODE=$?
+  ' -- "$@" 2>&1 | tee "${RUN_LOG}"
+DOCKER_EXIT_CODE=${PIPESTATUS[0]}
 set -e
 
-echo "--- Copying test results back to workspace for artifact upload"
+echo "~~~ Copying test results back to workspace for artifact upload"
 cp -r /mnt/disks/persist/perf_eval_results/* perf_eval_results/ 2>/dev/null || true
 # Clean up any broken symlinks on the host to prevent buildkite-agent upload failures
 find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 
 echo "[INFO] Docker finished with exit code ${DOCKER_EXIT_CODE}."
 
-echo "--- Cleaning up pulled Docker image"
-docker rmi "${IMAGE_TAG}" || true
+echo "~~~ Cleaning up pulled Docker image"
+docker rmi "${IMAGE_TAG}" >/dev/null 2>&1 || true
 
-exit $DOCKER_EXIT_CODE
+# Must be the last thing printed: `+++` is expanded by default, and its mere
+# presence stops Buildkite from expanding the trailing cleanup group instead.
+if [ "${DOCKER_EXIT_CODE}" -ne 0 ]; then
+  echo "+++ :boom: ${BUILDKITE_LABEL:-Command} failed (exit ${DOCKER_EXIT_CODE})"
+  FATAL_LINES="$(grep -m5 -E '\b[A-Za-z_]*(Error|Exception): |\[Errno [0-9]+\]|_FAIL:|^FAILED ' "${RUN_LOG}" || true)"
+  if [ -n "${FATAL_LINES}" ]; then
+    echo "First errors in the container output:"
+    echo "${FATAL_LINES}"
+    echo
+  fi
+  echo "Last 40 lines of container output:"
+  tail -n 40 "${RUN_LOG}"
+fi
+
+exit "$DOCKER_EXIT_CODE"

@@ -69,7 +69,7 @@ RUN_CLUSTER_MP="${REPO_DIR}/scripts/multihost/run_cluster_mp.sh"
 
 SSH_USER="${SSH_USER:-$(whoami)}"
 if [ ! -f ~/.ssh/id_rsa ]; then
-  echo "--- Auto-generating SSH key for passwordless auth"
+  echo "~~~ Auto-generating SSH key for passwordless auth"
   mkdir -p ~/.ssh
   ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa -q
 fi
@@ -130,8 +130,13 @@ mkdir -p perf_eval_results
 # ---------------------------------------------------------------------------
 # Cleanup on exit
 # ---------------------------------------------------------------------------
+# Buildkite expands the last `---` group whenever a log contains no `+++` group
+# at all. Housekeeping groups are therefore `~~~` (collapsed and de-emphasized,
+# so consecutive ones fold into one expander row) and the only `+++` we emit is
+# the failure summary at the very end -- otherwise a red job opens on cleanup
+# output rather than on the error.
 cleanup() {
-  echo "--- Cleaning up ${BACKEND}-backend containers"
+  echo "~~~ Cleaning up ${BACKEND}-backend containers"
   for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" "docker rm -f node >/dev/null 2>&1 || true" || true
   done
@@ -142,7 +147,7 @@ trap cleanup EXIT INT TERM
 cleanup
 
 # Free disk before pulling this commit's image (100G boot disk only).
-echo "--- Cleaning up old Docker images"
+echo "~~~ Cleaning up old Docker images"
 bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
 
 # Worker hosts pull the same ~9G image every build but never pruned it, so they
@@ -151,6 +156,10 @@ bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
 for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
   ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" "bash -s" < "${SCRIPT_DIR}/cleanup_docker.sh" || true
 done
+
+# The backends tee the command they run in the head container here so the
+# failure summary below can quote it.
+MULTIHOST_RUN_LOG="$(mktemp)"
 
 # Test suite and BigQuery tracking env vars
 TEST_SUITE_VARS=()
@@ -195,7 +204,7 @@ CONTAINER_ENV_HEAD=(
   "${BQ_EVAL_VARS[@]}"
 )
 
-echo "--- Pre-start scorched-earth cleanup"
+echo "~~~ Pre-start scorched-earth cleanup"
 docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
 if [ "$BACKEND" = "ray" ]; then
   sudo -n pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || true
@@ -221,8 +230,28 @@ else
   exit 1
 fi
 
-echo "--- Copying results back for artifact upload"
+echo "~~~ Copying results back for artifact upload"
 cp -r "${PERSIST_ROOT}/perf_eval_results"/* perf_eval_results/ 2>/dev/null || true
 find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
+
+# Must be the last thing printed: `+++` is expanded by default, and its mere
+# presence stops Buildkite from expanding the trailing cleanup group instead.
+#
+# An empty run log means the backend died during cluster bring-up, before the
+# command ever ran. There is nothing to summarise, so skip the `+++` on purpose
+# and let Buildkite's own fallback expand the last `---` group -- which in that
+# case is the bring-up step that actually failed.
+if [ "${EXIT_CODE}" -ne 0 ] && [ -s "${MULTIHOST_RUN_LOG}" ]; then
+  echo "+++ :boom: ${BUILDKITE_LABEL:-Command} failed (exit ${EXIT_CODE})"
+  FATAL_LINES="$(grep -m5 -E '\b[A-Za-z_]*(Error|Exception): |\[Errno [0-9]+\]|_FAIL:|^FAILED ' "${MULTIHOST_RUN_LOG}" || true)"
+  if [ -n "${FATAL_LINES}" ]; then
+    echo "First errors in the head-container output:"
+    echo "${FATAL_LINES}"
+    echo
+  fi
+  echo "Last 40 lines of head-container output:"
+  tail -n 40 "${MULTIHOST_RUN_LOG}"
+fi
+rm -f "${MULTIHOST_RUN_LOG}"
 
 exit "${EXIT_CODE}"
