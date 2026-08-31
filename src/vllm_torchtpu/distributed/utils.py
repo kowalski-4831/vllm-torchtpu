@@ -19,22 +19,15 @@ def set_node_kv_ip_port(ip_port: tuple[int, str, int]):
 
 def get_kv_ips() -> str:
     if envs.TPU_MULTIHOST_BACKEND == "ray":
-        num_nodes = len(_NODES_KV_IP_PORT)
-        ips = []
-        for node_id in range(num_nodes):
-            ips.append(_NODES_KV_IP_PORT[node_id][0])
-        return ips
+        # Node-sorted: the consumer indexes the advertised lists by node id.
+        return [ip for _, (ip, _) in sorted(_NODES_KV_IP_PORT.items())]
     else:
         return get_host_ip()
 
 
 def get_kv_ports() -> str:
     if envs.TPU_MULTIHOST_BACKEND == "ray":
-        num_nodes = len(_NODES_KV_IP_PORT)
-        ports = []
-        for node_id in range(num_nodes):
-            ports.append(_NODES_KV_IP_PORT[node_id][1])
-        return ports
+        return [port for _, (_, port) in sorted(_NODES_KV_IP_PORT.items())]
     else:
         return get_kv_transfer_port()
 

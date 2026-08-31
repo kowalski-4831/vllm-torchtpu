@@ -3509,12 +3509,15 @@ class TPURaidenConnectorWorker:
 
     def _resolve_remote_endpoint(self, req_meta: LoadMeta) -> str:
         if isinstance(req_meta.remote_host, list):
-            host = req_meta.remote_host[self.node_id]
-            base_port = int(req_meta.remote_port[self.node_id])
+            # If the producer is sharded across nodes, fetch the shard from
+            # the same counterpart node. Otherwise, fetch everything from the one node.
+            node_idx = (self.node_id if len(req_meta.remote_host) > 1 else 0)
+            host = req_meta.remote_host[node_idx]
+            base_port = int(req_meta.remote_port[node_idx])
             # Per-node bases already carry the node offset (each entry is that
             # node's first-rank control port), so dial with the node-local rank.
             ranks_per_node = max(1, self.tp_size // len(req_meta.remote_host))
-            local_rank = self.tp_rank - self.node_id * ranks_per_node
+            local_rank = self.tp_rank - node_idx * ranks_per_node
             return f"{host}:{self._rank_control_port(base_port, rank=local_rank)}"
         host = req_meta.remote_host
         base_port = int(req_meta.remote_port)
