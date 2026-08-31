@@ -21,6 +21,9 @@ NUM_PROMPTS=2048
 RANDOM_RANGE_RATIO="0.0"
 
 export VLLM_ENGINE_READY_TIMEOUT_S=7200
+# mmlu_llama prefills an assistant turn, which needs this to render
+# without a trailing eos_token.
+export TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE=1
 SERVER_READY_WAIT_MIN=120
 
 # With DP, vllm starts one API frontend per rank and they race resolving the

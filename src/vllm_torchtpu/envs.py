@@ -177,6 +177,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT":
     env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
+    # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
+    # Off by default so tokenizer behavior matches stock vLLM; the DSv4
+    # eval config turns it on, since a prefilled assistant turn needs it.
+    "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE":
+    env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),
