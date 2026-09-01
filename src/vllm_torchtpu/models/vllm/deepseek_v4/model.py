@@ -45,10 +45,13 @@ from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor imp
     VllmDeepseekCompressor  # noqa: E501
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
     MHCOps, get_mhc_ops, get_mhc_post_op)
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import \
     VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -177,6 +180,62 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
+
+
+class _HostStagedParams:
+    """Redirects weight-loading writes into host memory, one device write out.
+
+    On this TPU backend, ``copy_()`` into an already-materialized slice/view of
+    a device tensor allocates a fresh buffer per call instead of overwriting in
+    place, so every per-expert / per-shard slice write during weight loading
+    leaks its own size. A whole-tensor ``copy_()`` into the same destination is
+    free.
+
+    Every loader reached from ``load_weights`` writes through the parameter it
+    is handed, so handing it a host-backed stand-in of the same class turns
+    those slice writes into ordinary in-place host writes.
+    Each staged parameter is then flushed with exactly one whole-tensor device
+    ``copy_()``.
+    """
+
+    def __init__(self):
+        # name -> (parameter, its real device tensor).
+        self._staged: dict[str, tuple[torch.nn.Parameter, torch.Tensor]] = {}
+
+    def stage(self, name: str,
+              param: torch.nn.Parameter) -> torch.nn.Parameter:
+        """Return a host-backed stand-in for `param` for loaders to write."""
+        if name not in self._staged:
+            # ``_make_subclass`` is how nn.Parameter builds itself from a
+            # tensor; using it keeps the stand-in the parameter's own class, so
+            # upstream's isinstance dispatch (BlockQuantScaleParameter in
+            # MergedColumnParallelLinear.weight_loader, say) still picks the
+            # right branch and class-level loader methods bind to the stand-in.
+            # ``param.data`` cannot simply be re-pointed at host storage:
+            # this backend's tensors carry their own TensorImpl and set_data
+            # rejects the dispatch-key change.
+            host = torch.Tensor._make_subclass(type(param),
+                                               param.data.to("cpu"), False)
+            host.__dict__.update(param.__dict__)
+            self._staged[name] = (param, host)
+        return self._staged[name][1]
+
+    def _flush(self, name: str) -> None:
+        param, host = self._staged.pop(name)
+        param.data.copy_(host.data)
+        # `host` was the only reference to the staging buffer; dropping it
+        # here returns that host memory to the allocator.
+        del host
+
+    def flush_all(self) -> None:
+        """Flush every staged parameter and release all host buffers."""
+        staged_bytes = sum(h.numel() * h.element_size()
+                           for _, h in self._staged.values())
+        logger.info(
+            "Writing %d staged parameters (%.1f GiB of host memory) to the "
+            "device.", len(self._staged), staged_bytes / 2**30)
+        for name in list(self._staged):
+            self._flush(name)
 
 
 @support_torch_compile(dynamic_arg_dims={
@@ -365,6 +424,11 @@ class DeepseekV4Model(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Weight loading writes each parameter in slices (per expert, per
+        # shard, per TP rank), which leaks TPU HBM on this backend -- see
+        # _HostStagedParams. Staging redirects those writes to host memory and
+        # flushes each parameter to the device in one whole-tensor copy_.
+        staged = _HostStagedParams()
 
         # attn_sink is stored per global head; each rank keeps its own slice.
         tp_size = get_tensor_model_parallel_world_size()
@@ -377,79 +441,84 @@ class DeepseekV4Model(nn.Module):
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
 
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if ".experts." in name:
-                    continue
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
+        try:
+            for name, loaded_weight in weights:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    # Skip non-stacked layers and experts (experts handled below).
+                    if ".experts." in name:
+                        continue
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
 
-                if is_pp_missing_parameter(name, self):
+                    if is_pp_missing_parameter(name, self):
+                        break
+                    if name not in params_dict:
+                        continue
+                    param = staged.stage(name, params_dict[name])
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(name)
                     break
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if ".experts." in name:
-                    # E8M0 scales are stored as float8_e8m0fnu in
-                    # checkpoints but the MoE param is uint8. copy_()
-                    # would do a numeric conversion (e.g. 2^-7 → 0),
-                    # destroying the raw exponent bytes.
-                    if ("weight_scale" in name
-                            and loaded_weight.dtype == torch.float8_e8m0fnu):
-                        loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, expert_shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name_mapped = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name_mapped, self):
-                            continue
-                        if name_mapped not in params_dict:
-                            continue
-                        param = params_dict[name_mapped]
-                        weight_loader = typing.cast(Callable[..., bool],
-                                                    param.weight_loader)
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=expert_shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            loaded_params.add(name_mapped)
-                            break
-                    continue
-                elif "attn_sink" in name:
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    if name not in params_dict:
-                        continue
-                    narrow_weight = loaded_weight[
-                        head_rank_start:head_rank_end]
-                    n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
-                    loaded_params.add(name)
-                    continue
                 else:
-                    if is_pp_missing_parameter(name, self):
+                    if ".experts." in name:
+                        # E8M0 scales are stored as float8_e8m0fnu in
+                        # checkpoints but the MoE param is uint8. copy_()
+                        # would do a numeric conversion (e.g. 2^-7 → 0),
+                        # destroying the raw exponent bytes.
+                        if ("weight_scale" in name and loaded_weight.dtype
+                                == torch.float8_e8m0fnu):
+                            loaded_weight = loaded_weight.view(torch.uint8)
+                        for mapping in expert_mapping:
+                            param_name, weight_name, expert_id, expert_shard_id = mapping
+                            if weight_name not in name:
+                                continue
+                            name_mapped = name.replace(weight_name, param_name)
+                            if is_pp_missing_parameter(name_mapped, self):
+                                continue
+                            if name_mapped not in params_dict:
+                                continue
+                            param = staged.stage(name_mapped,
+                                                 params_dict[name_mapped])
+                            weight_loader = typing.cast(
+                                Callable[..., bool], param.weight_loader)
+                            success = weight_loader(
+                                param,
+                                loaded_weight,
+                                name_mapped,
+                                shard_id=expert_shard_id,
+                                expert_id=expert_id,
+                                return_success=True,
+                            )
+                            if success:
+                                loaded_params.add(name_mapped)
+                                break
                         continue
-                    if name not in params_dict:
+                    elif "attn_sink" in name:
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        if name not in params_dict:
+                            continue
+                        narrow_weight = loaded_weight[
+                            head_rank_start:head_rank_end]
+                        n = narrow_weight.shape[0]
+                        param = staged.stage(name, params_dict[name])
+                        param.data[:n].copy_(narrow_weight)
+                        loaded_params.add(name)
                         continue
-                    param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
-                    continue
+                    else:
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        if name not in params_dict:
+                            continue
+                        param = staged.stage(name, params_dict[name])
+                        weight_loader = getattr(param, "weight_loader",
+                                                default_weight_loader)
+                        weight_loader(param, loaded_weight)
+                        loaded_params.add(name)
+                        continue
+        finally:
+            staged.flush_all()
 
         return loaded_params
 
