@@ -151,10 +151,7 @@ class FakeRoutedExperts(RoutedExperts):
 class TestW4MoEWeightPreprocessing:
     """Verify CPU weight packing and sign-extension logic."""
 
-    @patch(
-        "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16.select_wna16_moe_backend",
-        return_value=(None, None))
-    def test_xor_sign_conversion(self, _):
+    def test_xor_sign_conversion(self):
         """Symmetric unsigned INT4 [0, 15] should be converted to signed [-8, 7] via XOR."""
         layer = FakeRoutedExperts(experts_per_token=2)
         layer.activation = FakeActivation("silu")
@@ -195,42 +192,46 @@ class TestW4MoEWeightPreprocessing:
             method.create_weights(layer, num_experts, 8, 8, torch.float32,
                                   **extra_weight_attrs)
 
-        loader_hook = layer.w13_weight_packed.weight_loader
-        assert loader_hook is not None
+            loader_hook = layer.w13_weight_packed.weight_loader
+            assert loader_hook is not None
 
-        # Zero-initialize TPU param to ensure we verify the copy
-        layer.w13_weight_packed.data.zero_()
-        layer.w2_weight_packed.data.zero_()
+            # Zero-initialize TPU param to ensure we verify the copy
+            layer.w13_weight_packed.data.zero_()
+            layer.w2_weight_packed.data.zero_()
 
-        # 2. Simulate loading shards using the hook
-        # w13_weight_packed has shape [2, 1, 16] (num_experts, in_dim, out_dim_packed)
-        # Shards from loader: [weight_shard_size, ...]
-        # We load shape [8, 1] filled with initial_carrier
-        shard_w1_e0 = torch.tensor([[initial_carrier]] * 8, dtype=torch.int32)
-        shard_w3_e0 = torch.tensor([[initial_carrier]] * 8, dtype=torch.int32)
-        shard_w1_e1 = torch.tensor([[initial_carrier]] * 8, dtype=torch.int32)
-        shard_w3_e1 = torch.tensor([[initial_carrier]] * 8, dtype=torch.int32)
+            # 2. Simulate loading shards using the hook
+            # w13_weight_packed has shape [2, 1, 16] (num_experts, in_dim, out_dim_packed)
+            # Shards from loader: [weight_shard_size, ...]
+            # We load shape [8, 1] filled with initial_carrier
+            shard_w1_e0 = torch.tensor([[initial_carrier]] * 8,
+                                       dtype=torch.int32)
+            shard_w3_e0 = torch.tensor([[initial_carrier]] * 8,
+                                       dtype=torch.int32)
+            shard_w1_e1 = torch.tensor([[initial_carrier]] * 8,
+                                       dtype=torch.int32)
+            shard_w3_e1 = torch.tensor([[initial_carrier]] * 8,
+                                       dtype=torch.int32)
 
-        # Load all shards for w13 to trigger copy
-        loader_hook(layer.w13_weight_packed, shard_w1_e0, "w13_weight_packed",
-                    "w1", 0)
-        loader_hook(layer.w13_weight_packed, shard_w3_e0, "w13_weight_packed",
-                    "w3", 0)
-        loader_hook(layer.w13_weight_packed, shard_w1_e1, "w13_weight_packed",
-                    "w1", 1)
-        loader_hook(layer.w13_weight_packed, shard_w3_e1, "w13_weight_packed",
-                    "w3", 1)
+            # Load all shards for w13 to trigger copy
+            loader_hook(layer.w13_weight_packed, shard_w1_e0,
+                        "w13_weight_packed", "w1", 0)
+            loader_hook(layer.w13_weight_packed, shard_w3_e0,
+                        "w13_weight_packed", "w3", 0)
+            loader_hook(layer.w13_weight_packed, shard_w1_e1,
+                        "w13_weight_packed", "w1", 1)
+            loader_hook(layer.w13_weight_packed, shard_w3_e1,
+                        "w13_weight_packed", "w3", 1)
 
-        # Call process_weights_after_loading to perform the H2D copy and cleanup scratchpad
-        method.process_weights_after_loading(layer)
+            # Call process_weights_after_loading to perform the H2D copy and cleanup scratchpad
+            method.process_weights_after_loading(layer)
 
-        # Expected output after XORing with 0x88888888: 0xF0F98710
-        # signed int32 equivalent: -252082416
-        expected_carrier = ctypes.c_int32(0xF0F98710).value
+            # Expected output after XORing with 0x88888888: 0xF0F98710
+            # signed int32 equivalent: -252082416
+            expected_carrier = ctypes.c_int32(0xF0F98710).value
 
-        # Verify TPU param content
-        assert layer.w13_weight_packed[0, 0, 0].item() == expected_carrier
-        assert layer.w13_weight_packed[1, 0, 0].item() == expected_carrier
+            # Verify TPU param content
+            assert layer.w13_weight_packed[0, 0, 0].item() == expected_carrier
+            assert layer.w13_weight_packed[1, 0, 0].item() == expected_carrier
 
 
 class TestW4MoECorrectness:
@@ -264,10 +265,7 @@ class TestW4MoECorrectness:
 
         mock_routing.assert_called_once()
 
-    @patch(
-        "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16.select_wna16_moe_backend",
-        return_value=(None, None))
-    def test_fused_moe_w4a16_correctness(self, _, device):
+    def test_fused_moe_w4a16_correctness(self, device):
         """Verify mathematical correctness of W4A16 MoE on TPU against CPU reference."""
         if device.type != "tpu":
             pytest.skip(
@@ -400,3 +398,317 @@ class TestW4MoECorrectness:
                                    expected_cpu,
                                    rtol=0.03,
                                    atol=0.03)
+
+    def test_fused_moe_fp4_requant_correctness(self, device):
+        """Verify execution of FP4 requantized MoE on TPU."""
+        if device.type != "tpu":
+            pytest.skip(
+                "Pallas W4A16 MoE kernel execution requires TPU device.")
+
+        # Test parameters
+        num_experts = 4
+        topk = 2
+        hidden_size = 256
+        intermediate_size = 256
+        group_size = 16
+        requant_block_size = 64
+        num_tokens = 8
+
+        layer = FakeRoutedExperts(experts_per_token=topk)
+        layer.activation = FakeActivation("silu")
+        layer.renormalize = True
+        layer.experts_start = None
+
+        weight_quant = FakeQuantArgs(num_bits=4,
+                                     strategy="group",
+                                     group_size=group_size)
+        method = VllmCompressedTensorsW4A16MoEMethod(weight_quant, None,
+                                                     layer.moe_config)
+        method.moe = MagicMock()
+        method.moe.tp_size = 1
+        method.moe.tp_rank = 0
+        layer._map_global_expert_id_to_local_expert_id = MagicMock(
+            side_effect=lambda x: x)
+
+        extra_weight_attrs = {
+            "weight_loader": MagicMock(),
+            "intermediate_size_full": intermediate_size,
+        }
+        with torch.device(device):
+            method.create_weights(layer, num_experts, hidden_size,
+                                  intermediate_size, torch.float32,
+                                  **extra_weight_attrs)
+
+        loader_hook = layer.w13_weight_packed.weight_loader
+        torch.manual_seed(42)
+
+        for e in range(num_experts):
+            w1_bf16 = (torch.rand(
+                intermediate_size, hidden_size, dtype=torch.bfloat16) -
+                       0.5) / 10
+            w3_bf16 = (torch.rand(
+                intermediate_size, hidden_size, dtype=torch.bfloat16) -
+                       0.5) / 10
+            w2_bf16 = (torch.rand(
+                hidden_size, intermediate_size, dtype=torch.bfloat16) -
+                       0.5) / 10
+
+            packed_w1, scale_w1, _ = quantize_and_pack_shard_w4(
+                w1_bf16, group_size)
+            packed_w3, scale_w3, _ = quantize_and_pack_shard_w4(
+                w3_bf16, group_size)
+            packed_w2, scale_w2, _ = quantize_and_pack_shard_w4(
+                w2_bf16, group_size)
+
+            loader_hook(layer.w13_weight_packed, packed_w1,
+                        "w13_weight_packed", "w1", e)
+            loader_hook(layer.w13_weight_packed, packed_w3,
+                        "w13_weight_packed", "w3", e)
+            loader_hook(layer.w2_weight_packed, packed_w2, "w2_weight_packed",
+                        "w2", e)
+
+            loader_hook(layer.w13_weight_scale, scale_w1, "w13_weight_scale",
+                        "w1", e)
+            loader_hook(layer.w13_weight_scale, scale_w3, "w13_weight_scale",
+                        "w3", e)
+            loader_hook(layer.w2_weight_scale, scale_w2, "w2_weight_scale",
+                        "w2", e)
+
+        with patch(
+                "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16.envs.MOE_REQUANTIZE_WEIGHT_DTYPE",
+                "float4_e2m1fn"
+        ), patch(
+                "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16.envs.MOE_REQUANTIZE_BLOCK_SIZE",
+                str(requant_block_size)):
+            method.process_weights_after_loading(layer)
+
+        x = torch.rand(num_tokens,
+                       hidden_size,
+                       dtype=torch.bfloat16,
+                       device=device)
+        router_logits = (torch.rand(
+            num_tokens, num_experts, dtype=torch.bfloat16, device=device) -
+                         0.5) * 5
+
+        result_tpu = method.apply_monolithic(layer, x, router_logits)
+        assert result_tpu.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result_tpu.cpu()).any()
+
+
+def test_w4a16_requantize_block():
+    """Verify that INT4 MoE weights are correctly requantized when MOE_REQUANTIZE_BLOCK_SIZE is set."""
+    from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import \
+        requantize_and_transpose_int4_weights
+
+    num_experts = 4
+    hidden_size = 128
+    intermediate_size_per_partition = 64
+    in_group_size = 16
+    requant_block_size = 64
+
+    layer = FakeRoutedExperts(experts_per_token=2)
+    layer.activation = FakeActivation("silu")
+    layer._map_global_expert_id_to_local_expert_id = lambda x: x
+
+    weight_quant = FakeQuantArgs(num_bits=4,
+                                 strategy="group",
+                                 group_size=in_group_size)
+    method = VllmCompressedTensorsW4A16MoEMethod(weight_quant, None,
+                                                 layer.moe_config)
+    method.moe = MagicMock()
+    method.moe.tp_size = 1
+    method.moe.tp_rank = 0
+
+    extra_weight_attrs = {
+        "weight_loader": MagicMock(),
+        "intermediate_size_full": intermediate_size_per_partition,
+    }
+
+    with patch.object(VllmCompressedTensorsW4A16MoEMethod, "_validate_w4a16_scheme"), \
+         patch.object(VllmCompressedTensorsW4A16MoEMethod, "_validate_int32_weight_carriers"):
+        method.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=torch.float32,
+            **extra_weight_attrs,
+        )
+
+    weight_loader = layer.w13_weight_packed.weight_loader
+
+    # w13: in_dim = hidden_size (128), out_dim = 64
+    # w13 packed carrier per shard: [64, 128 // 8] = [64, 16]
+    # w13 scale per shard: [64, 128 // 16] = [64, 8]
+    w13_packed_val = torch.randint(-2147483648,
+                                   2147483647, (64, 16),
+                                   dtype=torch.int32)
+    w13_scale_val = torch.rand(64, 8, dtype=torch.float32) + 0.1
+
+    # w2: in_dim = intermediate_size (64), out_dim = hidden_size (128)
+    # w2 packed carrier: [128, 64 // 8] = [128, 8]
+    # w2 scale: [128, 64 // 16] = [128, 4]
+    w2_packed_val = torch.randint(-2147483648,
+                                  2147483647, (128, 8),
+                                  dtype=torch.int32)
+    w2_scale_val = torch.rand(128, 4, dtype=torch.float32) + 0.1
+
+    for expert_id in range(num_experts):
+        weight_loader(layer.w13_weight_packed, w13_packed_val,
+                      "w13_weight_packed", "w1", expert_id)
+        weight_loader(layer.w13_weight_packed, w13_packed_val,
+                      "w13_weight_packed", "w3", expert_id)
+        weight_loader(layer.w13_weight_scale, w13_scale_val,
+                      "w13_weight_scale", "w1", expert_id)
+        weight_loader(layer.w13_weight_scale, w13_scale_val,
+                      "w13_weight_scale", "w3", expert_id)
+        weight_loader(layer.w2_weight_packed, w2_packed_val,
+                      "w2_weight_packed", "w2", expert_id)
+        weight_loader(layer.w2_weight_scale, w2_scale_val, "w2_weight_scale",
+                      "w2", expert_id)
+
+    # Save original CPU scratch data (prior to XOR and requant)
+    w13_packed_orig = layer.w13_weight_packed._cpu_scratch.data.clone()
+    w13_scale_orig = layer.w13_weight_scale._cpu_scratch.data.clone()
+
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16.envs.MOE_REQUANTIZE_BLOCK_SIZE",
+            str(requant_block_size)
+    ), patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16.prebuild_fused_moe_kernel"
+    ):
+        method.process_weights_after_loading(layer)
+
+    # Verify shapes:
+    # w13_weight_packed: [E, K//8, 2N] = [4, 16, 128]
+    # w13_weight_scale:  [E, K//block, 2N] = [4, 2, 128]
+    # w2_weight_packed:  [E, N//8, K] = [4, 8, 128]
+    # w2_weight_scale:   [E, N//block, K] = [4, 1, 128]
+    assert layer.w13_weight_packed.shape == (4, 16, 128)
+    assert layer.w13_weight_scale.shape == (4, 2, 128)
+    assert layer.w2_weight_packed.shape == (4, 8, 128)
+    assert layer.w2_weight_scale.shape == (4, 1, 128)
+
+    # Reference calculation on w13:
+    # requantize and transpose directly
+    w13_req_packed_expected_kmajor, w13_scale_expected_transposed = requantize_and_transpose_int4_weights(
+        w13_packed_orig,
+        w13_scale_orig,
+        requant_block_size,
+        ctypes.c_int32(0x88888888).value,
+        in_group_size=in_group_size)
+
+    torch.testing.assert_close(layer.w13_weight_packed.cpu(),
+                               w13_req_packed_expected_kmajor.cpu())
+    torch.testing.assert_close(layer.w13_weight_scale.cpu(),
+                               w13_scale_expected_transposed.cpu())
+
+
+def test_w4a16_requantize_to_fp4():
+    """Verify that INT4 MoE weights are correctly requantized to FP4 (torch.float8_e4m3fn) when MOE_REQUANTIZE_WEIGHT_DTYPE is set."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import \
+        requantize_and_transpose_int4_to_fp4_weights
+
+    num_experts = 4
+    hidden_size = 128
+    intermediate_size_per_partition = 64
+    in_group_size = 16
+    requant_block_size = 64
+
+    layer = FakeRoutedExperts(experts_per_token=2)
+    layer.activation = FakeActivation("silu")
+    layer._map_global_expert_id_to_local_expert_id = lambda x: x
+
+    weight_quant = FakeQuantArgs(num_bits=4,
+                                 strategy="group",
+                                 group_size=in_group_size)
+    method = VllmCompressedTensorsW4A16MoEMethod(weight_quant, None,
+                                                 layer.moe_config)
+    method.moe = MagicMock()
+    method.moe.tp_size = 1
+    method.moe.tp_rank = 0
+
+    extra_weight_attrs = {
+        "weight_loader": MagicMock(),
+        "intermediate_size_full": intermediate_size_per_partition,
+    }
+
+    with patch.object(VllmCompressedTensorsW4A16MoEMethod, "_validate_w4a16_scheme"), \
+         patch.object(VllmCompressedTensorsW4A16MoEMethod, "_validate_int32_weight_carriers"):
+        method.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=torch.float32,
+            **extra_weight_attrs,
+        )
+
+    weight_loader = layer.w13_weight_packed.weight_loader
+
+    w13_packed_val = torch.randint(-2147483648,
+                                   2147483647, (64, 16),
+                                   dtype=torch.int32)
+    w13_scale_val = torch.rand(64, 8, dtype=torch.float32) + 0.1
+
+    w2_packed_val = torch.randint(-2147483648,
+                                  2147483647, (128, 8),
+                                  dtype=torch.int32)
+    w2_scale_val = torch.rand(128, 4, dtype=torch.float32) + 0.1
+
+    for expert_id in range(num_experts):
+        weight_loader(layer.w13_weight_packed, w13_packed_val,
+                      "w13_weight_packed", "w1", expert_id)
+        weight_loader(layer.w13_weight_packed, w13_packed_val,
+                      "w13_weight_packed", "w3", expert_id)
+        weight_loader(layer.w13_weight_scale, w13_scale_val,
+                      "w13_weight_scale", "w1", expert_id)
+        weight_loader(layer.w13_weight_scale, w13_scale_val,
+                      "w13_weight_scale", "w3", expert_id)
+        weight_loader(layer.w2_weight_packed, w2_packed_val,
+                      "w2_weight_packed", "w2", expert_id)
+        weight_loader(layer.w2_weight_scale, w2_scale_val, "w2_weight_scale",
+                      "w2", expert_id)
+
+    w13_packed_orig = layer.w13_weight_packed._cpu_scratch.data.clone()
+    w13_scale_orig = layer.w13_weight_scale._cpu_scratch.data.clone()
+
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16.envs.MOE_REQUANTIZE_WEIGHT_DTYPE",
+            "float4_e2m1fn"
+    ), patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16.envs.MOE_REQUANTIZE_BLOCK_SIZE",
+            str(requant_block_size)
+    ), patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16.prebuild_fused_moe_kernel"
+    ):
+        method.process_weights_after_loading(layer)
+
+    # Verify shapes and types:
+    # w13_weight_packed: [E, K//2, 2N] = [4, 64, 128]
+    # w13_weight_scale:  [E, K//block, 2N] = [4, 2, 128]
+    # w2_weight_packed:  [E, N//2, K] = [4, 32, 128]
+    # w2_weight_scale:   [E, N//block, K] = [4, 1, 128]
+    assert layer.w13_weight_packed.shape == (4, 64, 128)
+    assert layer.w13_weight_scale.shape == (4, 2, 128)
+    assert layer.w2_weight_packed.shape == (4, 32, 128)
+    assert layer.w2_weight_scale.shape == (4, 1, 128)
+
+    assert layer.w13_weight_packed.dtype == torch.float8_e4m3fn
+    assert layer.w2_weight_packed.dtype == torch.float8_e4m3fn
+    assert layer._rhs_quant_dtype == jnp.float4_e2m1fn
+
+    # Reference calculation on w13:
+    w13_req_packed_expected_kmajor, w13_scale_expected_transposed = requantize_and_transpose_int4_to_fp4_weights(
+        w13_packed_orig,
+        w13_scale_orig,
+        requant_block_size,
+        in_group_size=in_group_size)
+
+    torch.testing.assert_close(
+        layer.w13_weight_packed.cpu().view(torch.uint8),
+        w13_req_packed_expected_kmajor.cpu().view(torch.uint8))
+    torch.testing.assert_close(layer.w13_weight_scale.cpu(),
+                               w13_scale_expected_transposed.cpu())
