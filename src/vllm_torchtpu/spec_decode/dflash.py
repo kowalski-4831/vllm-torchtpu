@@ -25,7 +25,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
                                              maybe_share_embeddings,
-                                             maybe_share_lm_head)
+                                             maybe_share_lm_head,
+                                             normalize_draft_config)
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
@@ -50,14 +51,10 @@ class DFlashProposer:
         self.speculative_config = vllm_config.speculative_config
         assert self.speculative_config is not None
 
-        # Read DFlash specific configurations
+        # Read and normalize draft configurations
         hf_config = self.speculative_config.draft_model_config.hf_config
-        hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
-        self.dflash_config = hf_dict.get("dflash_config", {})
-        self.mask_token_id = self.dflash_config.get("mask_token_id")
-        assert self.mask_token_id is not None, (
-            "DFlash requires `mask_token_id` to be defined in the draft model's config.json "
-            "under the `dflash_config` dictionary.")
+        self.dflash_config = normalize_draft_config(hf_config)
+        self.mask_token_id = self.dflash_config["mask_token_id"]
         self._target_layer_ids = list(
             self.dflash_config.get("target_layer_ids", []))
 
@@ -102,8 +99,9 @@ class DFlashProposer:
 
     @property
     def block_size(self) -> int:
-        """Tokens per request in a draft forward: 1 base + K mask slots."""
-        return self.speculative_config.num_speculative_tokens + 1
+        """Tokens per request in a draft forward (see _query_block_size)."""
+        return self._query_block_size(
+            self.speculative_config.num_speculative_tokens)
 
     def _get_static_attn_tensors(
             self, padded_num_reqs: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -117,6 +115,16 @@ class DFlashProposer:
                               device=self.runner.device)
             self._static_attn_tensors_cache[padded_num_reqs] = (qsl, rd)
         return self._static_attn_tensors_cache[padded_num_reqs]
+
+    # Whether load_model overwrites the draft's embed_tokens/lm_head with the
+    # target's unconditionally. DSpark sets this False to honor the draft's
+    # has_own_embed_tokens / has_own_lm_head flags instead.
+    _force_share_target_embeddings = True
+
+    def _query_block_size(self, K: int) -> int:
+        """Query tokens per request: 1 anchor + K mask slots. DSpark's dense
+        layout overrides this to K (the anchor is the first prediction)."""
+        return K + 1
 
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
@@ -148,16 +156,18 @@ class DFlashProposer:
         self._draft_attn_layer_names = (set(all_attn_layers.keys()) -
                                         target_attn_layer_names)
 
-        # Share Embeddings and LM Head
+        # Share Embeddings and LM Head. DFlash drafts always predict target
+        # vocab, so sharing is forced; DSpark overrides the flag because a
+        # reduced-vocab checkpoint carries its own lm_head/embed_tokens.
         maybe_share_embeddings(self.draft_model,
                                target_model,
                                self._draft_tp_matches_target,
-                               force_share=True)
+                               force_share=self._force_share_target_embeddings)
         maybe_share_lm_head(self.draft_model,
                             target_model,
                             self._draft_replicated,
                             self._draft_tp_matches_target,
-                            force_share=True)
+                            force_share=self._force_share_target_embeddings)
 
         if hasattr(self.draft_model, "get_draft_attn_causal"):
             layer_causal_list = self.draft_model.get_draft_attn_causal()

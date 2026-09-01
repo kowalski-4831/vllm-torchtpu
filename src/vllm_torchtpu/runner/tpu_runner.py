@@ -109,8 +109,10 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
-from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
+from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
+                                             normalize_draft_config)
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
@@ -466,6 +468,13 @@ class TPUModelRunner(GPUModelRunner):
         # TPU uses AOT bucket precompile (_precompile_* methods) instead.
         vllm_config.compilation_config.cudagraph_capture_sizes = []
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        # DSpark/DFlash checkpoints may spell the mask token dspark_noise_token_id;
+        # the parent __init__ transiently builds an upstream EagleProposer
+        # that raises unless dflash_config.mask_token_id resolves.
+        if (vllm_config.speculative_config is not None and
+                vllm_config.speculative_config.method in ("dflash", "dspark")):
+            normalize_draft_config(
+                vllm_config.speculative_config.draft_model_config.hf_config)
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
@@ -934,6 +943,8 @@ class TPUModelRunner(GPUModelRunner):
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
+            elif self.speculative_config.method == "dspark":
+                self.drafter = DSparkProposer(self, self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = Eagle3Proposer(self, self.vllm_config)
             else:

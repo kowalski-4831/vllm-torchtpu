@@ -105,6 +105,14 @@ def get_mtp_test_prompts():
     ]
 
 
+def get_dspark_test_prompts():
+    num_prompts = 10
+    return [
+        "Predict the continuation of this sequence: 1 2 3 4 5 6 7 8"
+        for _ in range(num_prompts)
+    ]
+
+
 def get_test_prompts(speculative_config: dict):
     method = speculative_config["method"]
     if method == "ngram":
@@ -115,6 +123,8 @@ def get_test_prompts(speculative_config: dict):
         return get_dflash_test_prompts()
     if method == "mtp":
         return get_mtp_test_prompts()
+    if method == "dspark":
+        return get_dspark_test_prompts()
     raise NotImplementedError(f"{method} is not supported yet.")
 
 
@@ -508,6 +518,46 @@ def test_dflash_correctness_greedy(
      pytest.param(True, id="async")])
 @pytest.mark.parametrize(
     "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(10, id="bs10")])
+def test_dspark_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    """DSpark must not change greedy output vs a no-spec reference.
+
+    Rejection sampling guarantees equality regardless of what the block
+    drafter proposes; a mismatch means the Markov sampling loop, the dense
+    query-block layout (K slots, anchor is the first prediction), or the
+    draft KV plumbing corrupted the verify pass.
+    """
+    model_name = "Qwen/Qwen3-4B"
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        model_name,
+        {
+            "method": "dspark",
+            "model": "deepseek-ai/dspark_qwen3_4b_block7",
+            "num_speculative_tokens": 7,
+            "draft_tensor_parallel_size": 1,
+        },
+        max_num_seqs=max_num_seqs,
+        async_scheduling=async_scheduling,
+        extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
                      pytest.param(4, id="bs4")])
 def test_qwen35_mtp_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
@@ -692,6 +742,48 @@ def test_dflash_performance_greedy(
             "method": "dflash",
             "model": "z-lab/Qwen3-4B-DFlash-b16",
             "num_speculative_tokens": 15,
+            "draft_tensor_parallel_size": 1,
+        },
+        min_acceptance_rate=min_acceptance_rate,
+        max_num_seqs=max_num_seqs,
+        model_name="Qwen/Qwen3-4B",
+        async_scheduling=async_scheduling,
+        extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs, min_acceptance_rate",
+    [pytest.param(1, 0.05, id="bs1"),
+     pytest.param(4, 0.07, id="bs4")])
+def test_dspark_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    min_acceptance_rate: float,
+    async_scheduling: bool,
+):
+    """DSpark proposes and gets drafts accepted at a useful rate.
+
+    The floor is a collapse guard, not a quality target: it catches a
+    drafter that silently stops proposing or whose Markov-biased drafts
+    stop matching the target entirely.
+    """
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        {
+            "method": "dspark",
+            "model": "deepseek-ai/dspark_qwen3_4b_block7",
+            "num_speculative_tokens": 7,
             "draft_tensor_parallel_size": 1,
         },
         min_acceptance_rate=min_acceptance_rate,

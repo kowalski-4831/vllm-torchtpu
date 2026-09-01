@@ -1343,6 +1343,49 @@ def _patch_vllm_config_triton_tpu() -> None:
     logger.info("Applied TPU patch: bypass V2 model runner Triton check.")
 
 
+def _patch_vllm_force_v1_runner_tpu() -> None:
+    """Keep ``use_v2_model_runner`` False for DSpark on TPU.
+
+    Upstream forces the flag True for dspark (and for hybrid DFlash drafts
+    via ``_dflash_needs_multi_kv_group``), because those methods are only
+    implemented by the V2 *GPU* model runner. The flag is not just a runner
+    selector: the scheduler, async scheduler, and input processor all branch
+    on it and emit V2-shaped request data (resumed requests folded into
+    scheduled_new_reqs, no prev_step_scheduled_req_ids, ...). TPUModelRunner
+    subclasses the V1 GPUModelRunner and expects V1-shaped output, so the
+    flag must stay False for DSpark. An explicit VLLM_USE_V2_MODEL_RUNNER env
+    setting still wins, matching upstream's own precedence.
+    """
+    from vllm.config.vllm import VllmConfig
+
+    if getattr(VllmConfig, "_tpu_force_v1_runner_patch", False):
+        return
+
+    original_prop = VllmConfig.use_v2_model_runner
+    if not isinstance(original_prop, property):
+        logger.warning(
+            "VllmConfig.use_v2_model_runner is no longer a property; skipping "
+            "the TPU V1-runner patch. DSpark on TPU may misbehave until this "
+            "is updated for the current vLLM version.")
+        return
+
+    def patched_use_v2(self):
+        import vllm.envs as envs
+        if envs.VLLM_USE_V2_MODEL_RUNNER is not None:
+            return original_prop.fget(self)
+        device_config = getattr(self, "device_config", None)
+        spec_config = getattr(self, "speculative_config", None)
+        if (device_config is not None and device_config.device_type == "tpu"
+                and spec_config is not None
+                and getattr(spec_config, "method", None) == "dspark"):
+            return False
+        return original_prop.fget(self)
+
+    VllmConfig.use_v2_model_runner = property(patched_use_v2)
+    VllmConfig._tpu_force_v1_runner_patch = True
+    logger.info("Applied TPU patch: force V1 model runner semantics on TPU.")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations
