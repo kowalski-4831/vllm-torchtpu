@@ -690,7 +690,9 @@ class TPUModelRunner(GPUModelRunner):
         # Manager-block -> pool-block split: >1 when the pool is born at a
         # smaller attention-kernel granularity (batched RPA).
         self._pool_block_split: int = 1
-        self._pending_mamba_state_copies: list[tuple[torch.Tensor,
+        # Each entry seeds one set of raw pool buffers with the same
+        # (src, dst) pairs in one program: (raws, src_ids, dst_ids).
+        self._pending_mamba_state_copies: list[tuple[list[torch.Tensor],
                                                      torch.Tensor,
                                                      torch.Tensor]] = []
         if self.uses_mrope:
@@ -2219,9 +2221,13 @@ class TPUModelRunner(GPUModelRunner):
         window = self._mamba_ckpt_window
         spec_seed = self.mamba_slot_read_offsets is not None and window > 1
 
-        per_raw: dict[int, tuple[torch.Tensor, list[int], list[int]]] = {}
-        per_raw_dev: dict[int, tuple[torch.Tensor, list[torch.Tensor],
-                                     list[torch.Tensor]]] = {}
+        # Keyed by the set of raw buffers a group lives on; groups sharing
+        # the same buffers are seeded by one program.
+        per_raw: dict[tuple[int, ...], tuple[list[torch.Tensor], list[int],
+                                             list[int]]] = {}
+        per_raw_dev: dict[tuple[int, ...],
+                          tuple[list[torch.Tensor], list[torch.Tensor],
+                                list[torch.Tensor]]] = {}
         # Manager-level (src, dst) block pairs across mamba groups: without
         # spec decoding the per-block read offsets just follow the state to
         # the request's new state block.
@@ -2263,10 +2269,10 @@ class TPUModelRunner(GPUModelRunner):
                                      dtype=torch.int32).to(self.device,
                                                            non_blocking=True)
                 src_t, dst_t = self._expand_pool_split(src_t, dst_t)
-                for raw in raws:
-                    entry = per_raw_dev.setdefault(id(raw), (raw, [], []))
-                    entry[1].append(src_t)
-                    entry[2].append(dst_t)
+                key = tuple(id(raw) for raw in raws)
+                entry = per_raw_dev.setdefault(key, (raws, [], []))
+                entry[1].append(src_t)
+                entry[2].append(dst_t)
                 continue
             offset_pairs.extend(pairs)
             if self._pool_block_split > 1:
@@ -2275,10 +2281,10 @@ class TPUModelRunner(GPUModelRunner):
                 pairs = [(s * self._pool_block_split + j,
                           d * self._pool_block_split + j) for s, d in pairs
                          for j in range(self._pool_block_split)]
-            for raw in raws:
-                entry = per_raw.setdefault(id(raw), (raw, [], []))
-                entry[1].extend(p[0] for p in pairs)
-                entry[2].extend(p[1] for p in pairs)
+            key = tuple(id(raw) for raw in raws)
+            entry = per_raw.setdefault(key, (raws, [], []))
+            entry[1].extend(p[0] for p in pairs)
+            entry[2].extend(p[1] for p in pairs)
 
         if spec_seed and spec_dsts:
             # The seeded checkpoint is checkpoint 0 of the new group.
@@ -2302,19 +2308,19 @@ class TPUModelRunner(GPUModelRunner):
             _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t,
                                       dst_t)
 
-        for raw, srcs_dev, dsts_dev in per_raw_dev.values():
+        for raws, srcs_dev, dsts_dev in per_raw_dev.values():
             src_t = self._pad_dev_to_bucket(torch.cat(srcs_dev))
             dst_t = self._pad_dev_to_bucket(torch.cat(dsts_dev))
-            self._pending_mamba_state_copies.append((raw, src_t, dst_t))
+            self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
-        for raw, srcs, dsts in per_raw.values():
+        for raws, srcs, dsts in per_raw.values():
             src_t = torch.tensor(self._pad_to_bucket(srcs),
                                  dtype=torch.int32).to(self.device,
                                                        non_blocking=True)
             dst_t = torch.tensor(self._pad_to_bucket(dsts),
                                  dtype=torch.int32).to(self.device,
                                                        non_blocking=True)
-            self._pending_mamba_state_copies.append((raw, src_t, dst_t))
+            self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
     @staticmethod
     def _bucket_len(n: int) -> int:
@@ -2382,8 +2388,8 @@ class TPUModelRunner(GPUModelRunner):
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
             return
-        for raw, src_t, dst_t in self._pending_mamba_state_copies:
-            copy_mamba_state_blocks(raw, src_t, dst_t)
+        for raws, src_t, dst_t in self._pending_mamba_state_copies:
+            copy_mamba_state_blocks(raws, src_t, dst_t)
         self._pending_mamba_state_copies.clear()
 
     def _maybe_set_num_blocks_override(self, attn_page_size_bytes: int,
@@ -4175,11 +4181,6 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        self.maybe_wait_for_kv_save()
-        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
-         invalid_block_group_index,
-         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
-
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
             # TODO: concatenate the LogprobsTensors (torch) first, then
@@ -4224,6 +4225,23 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
+        next_tokens_tpu = None
+        copy_state = None
+        if combined_selected_tokens:
+            copy_state = AsyncTPUCopyState.from_device_chunks(
+                combined_selected_tokens, combined_selected_tokens_real_lens)
+
+        if self.scheduler_config.async_scheduling:
+            self._modify_prev_results()
+
+        # Poll the KV connector only now: the wait above proves the previous
+        # forward finished, so a store deferred behind it can be handed to
+        # raiden in this step rather than the next.
+        self.maybe_wait_for_kv_save()
+        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
+         invalid_block_group_index,
+         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
+
         kv_connector_output = (None if (
             finished_sending is None and finished_recving is None
             and kv_worker_meta is None and not invalid_block_ids
@@ -4235,15 +4253,6 @@ class TPUModelRunner(GPUModelRunner):
                 invalid_block_group_index=invalid_block_group_index,
                 kv_connector_stats=kv_connector_stats,
             ))
-
-        next_tokens_tpu = None
-        copy_state = None
-        if combined_selected_tokens:
-            copy_state = AsyncTPUCopyState.from_device_chunks(
-                combined_selected_tokens, combined_selected_tokens_real_lens)
-
-        if self.scheduler_config.async_scheduling:
-            self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
         # (mirrors the tpu-inference reference, where a single
@@ -5147,6 +5156,37 @@ class TPUModelRunner(GPUModelRunner):
                     "warmup left token buckets uncompiled: "
                     f"{sorted(buckets.refused)}")
 
+    def _precompile_mamba_state_seed_copies(self) -> None:
+        """Warm the seed-copy program for every raw-pool set at every bucket
+        length, so the first real block-boundary crossing does not compile
+        mid-serving. Runs right after the pool zero-fill sync: the pools must
+        be quiescent when their donation is first compiled (see the note in
+        initialize_kv_cache). All-zero indices copy the null block onto
+        itself; src and dst are distinct tensors (dynamo specializes on
+        src-is-dst otherwise).
+        """
+        if not self._mamba_copy_plan:
+            return
+        raw_sets: dict[tuple[int, ...], list[torch.Tensor]] = {}
+        for _, raws in self._mamba_copy_plan:
+            raw_sets.setdefault(tuple(id(r) for r in raws), raws)
+        # Serving calls the program under execute_model's no_grad, and dynamo
+        # guards on grad mode: compile it the same way.
+        with self._precompile_timed(
+                "mamba state seed copies"), torch.no_grad():
+            limit = self._bucket_len(
+                len(self._mamba_copy_plan) * self.max_num_reqs *
+                self._pool_block_split)
+            n = 8
+            while n <= limit:
+                src = torch.zeros(n, dtype=torch.int32).to(self.device)
+                dst = torch.zeros(n, dtype=torch.int32).to(self.device)
+                for raws in raw_sets.values():
+                    copy_mamba_state_blocks(raws, src, dst)
+                n *= 4
+            for raws in raw_sets.values():
+                synchronize_tensors(raws)
+
     def _precompile_mamba_rollback_helpers(self) -> None:
         """Warm the compiled rollback scatters at every bucket length.
 
@@ -5756,6 +5796,9 @@ class TPUModelRunner(GPUModelRunner):
             # gpu_memory_utilization).
             if self.kv_cache_raw_tensors:
                 synchronize_tensors(self.kv_cache_raw_tensors)
+            # Same rule for the seed-copy program: compile it while the pools
+            # are quiescent, before any dummy forward leaves writes pending.
+            self._precompile_mamba_state_seed_copies()
 
         logger.info(
             "%s",
