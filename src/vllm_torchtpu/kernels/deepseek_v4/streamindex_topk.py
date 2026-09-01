@@ -22,6 +22,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
+
 Enum = enum.Enum
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -45,12 +47,7 @@ def get_dtype_packing(dtype):
 
 
 class MlaCase(Enum):
-    """Represents the different cases for MLA.
-
-  - DECODE: Sequences are in decode-only mode (q_len = 1).
-  - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
-  - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
-  """
+    """Represents the different cases for MLA."""
 
     DECODE = 0
     PREFILL = 1
@@ -65,27 +62,27 @@ class MlaCase(Enum):
         }[self]
 
 
-def _scores_kernel(
+def kernel(
     # Prefetch
-    seq_lens_ref,  # [max_num_seqs]
-    page_indices_ref,  # [max_num_seqs * pages_per_seq]
-    cu_q_lens_ref,  # [max_num_seqs + 1]
-    start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
-    sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    bo_sz_ref,  # [2] row count of each output buffer's in-flight DMA (-1 = none)
+    seq_lens_ref,  # Shape: [max_num_seqs], Memory: SMEM
+    page_indices_ref,  # Shape: [max_num_seqs * pages_per_seq], Memory: SMEM
+    cu_q_lens_ref,  # Shape: [max_num_seqs + 1], Memory: SMEM
+    start_end_seq_idx_ref,  # Shape: [2], Memory: SMEM
+    sem_ids_ref,  # Shape: [3], Memory: SMEM
+    bo_sz_ref,  # Shape: [2], Memory: SMEM
     # Input
-    q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    indexer_weights_hbm_ref,  # [max_num_tokens, num_q_heads]
-    cache_kv_hbm_ref,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
-    scores_in_hbm_ref,  # aliased to the output
+    q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
+    indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
+    cache_kv_hbm_ref,  # Shape: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim], Memory: HBM
+    scores_in_hbm_ref,  # Shape: [max_num_tokens, num_sublanes_total, 128], Memory: HBM (aliased to output)
     # Output
-    scores_hbm_ref,  # [max_num_tokens, num_sublanes_total, 128]
+    scores_hbm_ref,  # Shape: [max_num_tokens, num_sublanes_total, 128], Memory: HBM
     # Scratch
-    bkv_x2_ref,  # [2, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim]
-    bq_x2_ref,  # [2, bq_sz, num_q_heads, head_dim]
-    bq_weights_x2_ref,  # [2, bq_sz, num_q_heads]
-    scores_block_x2_ref,  # [2, bq_sz, num_sublanes_bkv, 128]
-    sems,  # [4, 2]
+    bkv_x2_ref,  # Shape: [2, seq_batch_size, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim], Memory: VMEM
+    bq_x2_ref,  # Shape: [2, seq_batch_size, bq_sz, num_q_heads, head_dim], Memory: VMEM
+    bq_weights_x2_ref,  # Shape: [2, seq_batch_size, bq_sz, num_q_heads], Memory: VMEM
+    scores_block_x2_ref,  # Shape: [2, seq_batch_size * bq_sz, num_sublanes_bkv, 128], Memory: VMEM
+    sems,  # Shape: [4, 2, seq_batch_size], Memory: Semaphore
     *,
     compression_ratio: int,
     static_q_len: int,
@@ -93,6 +90,8 @@ def _scores_kernel(
     bq_sz: int,
     seq_batch_size: int,
 ):
+    """Core kernel logic that operates on memory references."""
+
     _, num_q_heads, head_dim = q_hbm_ref.shape
     lkv_dim = cache_kv_hbm_ref.shape[-1]
 
@@ -102,13 +101,7 @@ def _scores_kernel(
     max_num_seqs = seq_lens_ref.shape[0]
     num_page_indices = page_indices_ref.shape[0]
 
-    assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
-
-    # Validate against the KV dtype.
-    kv_dtype = cache_kv_hbm_ref.dtype
-    assert get_dtype_packing(kv_dtype) == kv_packing
-    assert head_dim % 128 == 0
 
     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
     bkv_sz = bkv_sz_per_kv_packing * kv_packing
@@ -133,7 +126,6 @@ def _scores_kernel(
         kv_lens.append(kv_len)
 
     def wait_send_scores(bo_sem_idx):
-        # Wait for the output buffer's previous DMA (if any) before reusing it.
         old_sz = bo_sz_ref[bo_sem_idx]
 
         @pl.when(old_sz >= 0)
@@ -269,21 +261,18 @@ def _scores_kernel(
             bkv = bkv_x2_ref.at[bkv_sem_idx,
                                 batch_idx, :bkv_sz_per_kv_packing][...]
 
-            # Unpack quantized values and scales from the DSv4 FP8 cache format.
             flat_bkv = bkv.reshape(-1, bkv.shape[-1])
             fp8_val = flat_bkv[:, :head_dim]
             fp8_val = pltpu.bitcast(fp8_val, jnp.float8_e4m3fn)
             scale_val = pltpu.bitcast(flat_bkv[:, head_dim:head_dim + 1].T,
                                       jnp.float8_e8m0fnu).astype(jnp.bfloat16)
 
-            # NOTE: Do NOT multiply the scales here. Return them separately.
             bkvs.append(fp8_val.reshape(bkv_sz, head_dim))
             bkv_scales.append(scale_val)
         return bkvs, bkv_scales
 
     def process():
-        # num_bkv is determined by the longest sequence length in the batch.
-        kv_len_max = jnp.max(jnp.array(kv_lens))
+        kv_len_max = jnp.max(jnp.stack(kv_lens))
         num_bkv = jnp.maximum(1, cdiv(kv_len_max, bkv_sz))
         if static_q_len is None:
             assert seq_batch_size == 1
@@ -320,39 +309,49 @@ def _scores_kernel(
             bq_pos_compressed_vec,
             bkv_idx,
         ):
-            assert len(bq_vec) == seq_batch_size
-            assert len(bkv_vec) == seq_batch_size
-            assert len(scale_val_vec) == seq_batch_size
-            assert len(bq_weights_vec) == seq_batch_size
-            assert len(bq_pos_compressed_vec) == seq_batch_size
-            ret = []
+            # Vectorized batched matmul
+            bq_stacked = jnp.stack(
+                bq_vec
+            )  # Shape: (seq_batch_size, bq_sz * num_q_heads, head_dim)
+            bkv_stacked = jnp.stack(
+                bkv_vec)  # Shape: (seq_batch_size, bkv_sz, head_dim)
+            scale_val_stacked = jnp.stack(
+                scale_val_vec)  # Shape: (seq_batch_size, 1, bkv_sz)
+            bq_weights_stacked = jnp.stack(
+                bq_weights_vec)  # Shape: (seq_batch_size, bq_sz, num_q_heads)
+            bq_pos_compressed_stacked = jnp.stack(
+                bq_pos_compressed_vec)  # Shape: (seq_batch_size, bq_sz)
 
-            for batch_idx in range(seq_batch_size):
-                bq = bq_vec[batch_idx].reshape(-1, head_dim)
-                bkv = bkv_vec[batch_idx]
-                scale_val = scale_val_vec[batch_idx]
-                bq_weights = bq_weights_vec[batch_idx]
-                bq_pos_compressed = bq_pos_compressed_vec[batch_idx]
+            # Compute in Registers
+            s = jnp.einsum(
+                "bnd,bmd->bnm",
+                bq_stacked,
+                bkv_stacked,
+                preferred_element_type=jnp.float32,
+            )  # Shape: (seq_batch_size, bq_sz * num_q_heads, bkv_sz)
+            s = s.reshape(seq_batch_size, bq_sz, num_q_heads, bkv_sz)
+            s = jnp.maximum(s, 0.0)
+            s = s * bq_weights_stacked.astype(jnp.float32)[:, :, :, None]
+            s_summed = s.sum(axis=2)  # Shape: (seq_batch_size, bq_sz, bkv_sz)
 
-                s = jnp.einsum(
-                    "nd,md->nm",
-                    bq,
-                    bkv,
-                    preferred_element_type=jnp.float32,
-                )
-                s = s.reshape(-1, num_q_heads, s.shape[-1])
-                s = jnp.maximum(s, 0.0)
-                s = s * bq_weights.astype(jnp.float32)[:, :, None]
-                s_summed = s.sum(axis=1)
-                s_summed = s_summed * scale_val
-                k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
-                    jnp.int32, s_summed.shape, 1)
-                valid_mask = k_span < kv_lens[batch_idx]
-                causal_mask = k_span <= bq_pos_compressed[:, None]
-                mask = jnp.logical_and(valid_mask, causal_mask)
-                s_summed = jnp.where(mask, s_summed, -jnp.inf)
-                ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
-            return jnp.concatenate(ret, axis=0)
+            s_summed = (s_summed * scale_val_stacked
+                        )  # Shape: (seq_batch_size, bq_sz, bkv_sz)
+
+            k_span = bkv_idx * bkv_sz + jnp.arange(
+                bkv_sz, dtype=jnp.int32)  # Shape: (bkv_sz,)
+
+            kv_lens_stacked = jnp.stack(kv_lens)  # Shape: (seq_batch_size,)
+            valid_mask = (k_span[None, None, :] < kv_lens_stacked[:, None,
+                                                                  None]
+                          )  # Shape: (seq_batch_size, 1, bkv_sz)
+            causal_mask = (k_span[None, None, :]
+                           <= bq_pos_compressed_stacked[:, :, None]
+                           )  # Shape: (seq_batch_size, bq_sz, bkv_sz)
+
+            mask = jnp.logical_and(valid_mask, causal_mask)
+            s_summed = jnp.where(mask, s_summed, -jnp.inf)
+
+            return s_summed  # Shape: (seq_batch_size, bq_sz, bkv_sz)
 
         def compute_with_bq(bq_idx, _):
 
@@ -399,20 +398,20 @@ def _scores_kernel(
                 wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
                 bkv_vec, scale_val_vec = load_bkv(bkv_sem_idx)
 
-                scores = compute_scores(
+                s_summed = compute_scores(
                     bq_vec,
                     bkv_vec,
                     scale_val_vec,
                     bq_weights_vec,
                     bq_pos_compressed_vec,
                     bkv_idx,
-                )
+                )  # Shape: (seq_batch_size, bq_sz, bkv_sz)
 
-                # Double-buffered vreg -> VMEM -> HBM: reuse a buffer only after its
-                # previous DMA has drained, so the HBM write overlaps the next compute.
                 bo_sem_idx = sem_ids_ref[2]
                 wait_send_scores(bo_sem_idx)
-                scores_block_x2_ref[bo_sem_idx, ...] = scores
+                scores_block_x2_ref[bo_sem_idx, ...] = s_summed.astype(
+                    scores_block_x2_ref.dtype).reshape(seq_batch_size * bq_sz,
+                                                       num_sublanes_bkv, 128)
                 start_send_scores(bo_sem_idx, sz, token_start, bkv_idx)
                 sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
 
@@ -480,6 +479,33 @@ def prepare_outputs(out):
     return out
 
 
+def _effective_row_lengths(
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    num_tokens: int,
+    num_positions: int,
+    compression_ratio: int,
+) -> jax.Array:  # i32[num_tokens]
+    """Visible compressed KV positions per token row of the score matrix."""
+    max_num_seqs = seq_lens.shape[0]
+    num_seqs = distribution[2]
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_mask = token_ids[:, None] >= cu_q_lens[None, 1:max_num_seqs + 1]
+    seq_mask = jnp.where(
+        jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False)
+    seq_ids = jnp.sum(seq_mask, axis=1)
+
+    q_start = cu_q_lens[seq_ids]
+    q_len = cu_q_lens[seq_ids + 1] - q_start
+    seq_len = seq_lens[seq_ids]
+    token_pos = seq_len - q_len + (token_ids - q_start)
+    kv_len = seq_len // compression_ratio
+    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    valid = token_ids < cu_q_lens[num_seqs]
+    return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -530,11 +556,9 @@ def streamindex_topk(
     num_queries_per_block: number of queries to be processed in one block in the
       pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
-    enable_early_exit: skip scoring entirely when every sequence in the batch
-      already fits in k, where top-k is the identity and the scores carry no
-      information. The guard is batch-wide, so one long sequence disables it
-      for all of them; when it does fire the scoring kernel, the -inf fill and
-      the top-k reduction are all skipped.
+    enable_early_exit: whether to enable early exit using jax.lax.cond when k >=
+      kv_len for all sequences in the batch. Defaults to False.
+    decode_req_batch_size: maximum decode batch size per iteration.
 
   Returns:
     Top-K indices (in compressed space).
@@ -569,22 +593,22 @@ def streamindex_topk(
     page_size = page_size_per_kv_packing * kv_packing
     pages_per_seq = page_indices.shape[0] // max_num_seqs
 
-    # Validate bkv_sz alignment due to TPU DMA constraints
     for bkv_p in num_kv_pages_per_blocks:
         bkv_sz = page_size * bkv_p
         if bkv_sz % 128 != 0:
             raise ValueError(
                 f"bkv_sz ({page_size} * {bkv_p} = {bkv_sz}) must be a multiple"
                 " of 128.")
+
     num_sublanes_total = max(
         align_to(pages_per_seq, bkv_p) * page_size // 128
         for bkv_p in num_kv_pages_per_blocks)
 
-    def run_topk_kernel(
+    def run_scores_kernel(
         q,
         prepared_indexer_weights,
         cache_kv,
-        scores,
+        scores_init,
         seq_lens,
         page_indices,
         cu_q_lens,
@@ -594,6 +618,7 @@ def streamindex_topk(
         num_kv_pages_per_block,
         num_queries_per_block,
         seq_batch_size,
+        out_dtype,
         case=MlaCase.MIXED,
     ):
         _, num_q_heads, head_dim = q.shape
@@ -610,7 +635,8 @@ def streamindex_topk(
             bq_sz = num_queries_per_block
         bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
         bkv_buf_sz_per_kv_packing = bkv_sz_per_kv_packing
-        num_sublanes_bkv = bkv_sz_per_kv_packing * kv_packing // 128
+        bkv_sz = bkv_p * page_size
+        num_sublanes_bkv = bkv_sz // 128
 
         # If seq_batch_size > 1, caller already guaranteed that
         # end_seq_idx - start_seq_idx % seq_batch_size == 0.
@@ -655,7 +681,7 @@ def streamindex_topk(
             prepared_indexer_weights.dtype,
         )
         bo_scores_double_buf = pltpu.VMEM(
-            (2, seq_batch_size * bq_sz, num_sublanes_bkv, 128), jnp.float32)
+            (2, seq_batch_size * bq_sz, num_sublanes_bkv, 128), out_dtype)
 
         scratch_shapes = [
             bkv_double_buf,
@@ -675,9 +701,9 @@ def streamindex_topk(
         )
 
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
-        kernel = jax.named_scope(scope_name)(pl.pallas_call(
+        pallas_kernel = jax.named_scope(scope_name)(pl.pallas_call(
             functools.partial(
-                _scores_kernel,
+                kernel,
                 compression_ratio=compression_ratio,
                 static_q_len=static_q_len,
                 bq_sz=bq_sz,
@@ -698,58 +724,37 @@ def streamindex_topk(
             ),
             out_shape=jax.ShapeDtypeStruct(
                 shape=(q.shape[0], num_sublanes_total, 128),
-                dtype=jnp.float32,
+                dtype=out_dtype,
             ),
             input_output_aliases={len(scalar_prefetches) + 3: 0},
             name=scope_name,
         ))
-        return kernel(
+        return pallas_kernel(
             *scalar_prefetches,
             q,
             prepared_indexer_weights,
             cache_kv,
-            scores,
+            scores_init,
         )
-
-    def _fast_path(_):
-        """Top-k for a batch where every sequence already fits in k.
-
-        Once a sequence's compressed length is <= k, every visible position is
-        selected, so the scores decide nothing but the order and the answer is
-        just `[0, 1, ..., last_visible, -1, ...]`. The guard below is
-        batch-wide, so this only runs when that holds for every sequence.
-        """
-        token_idx = jnp.arange(q.shape[0], dtype=jnp.int32)
-        seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
-            max_num_seqs - 1,
-        )
-        seq_len = seq_lens[seq_idx]
-        q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
-        q_abs_pos = (seq_len - q_len) + (token_idx - cu_q_lens[seq_idx])
-        last_visible = jnp.minimum(seq_len // compression_ratio - 1,
-                                   q_abs_pos // compression_ratio)
-        # Padding tokens past the last real query select nothing.
-        last_visible = jnp.where(token_idx < cu_q_lens[-1], last_visible, -1)
-        slot = jnp.arange(k, dtype=jnp.int32)[None, :]
-        return jnp.where(slot <= last_visible[:, None], slot, -1)
 
     def _common_path(_):
+        out_dtype = jnp.float32
+
         # Pre-fill the output with -inf and alias it, so masked / unwritten
         # columns are already -inf.
         scores_init = jnp.full(
             (q.shape[0], num_sublanes_total, 128),
             -jnp.inf,
-            dtype=jnp.float32,
+            dtype=out_dtype,
         )
 
         # TODO: we shall sort the sequences by length, so that multiple decode
-        # sequences in one batch have similar lengths to reduce waste of
-        # compute. With the same batch size, the longest sequence will
-        # determine number of blocks to run computation for.
+        # sequences in one batch have similar lengths to reduce waste of compute.
+        # With the same batch size, the longest sequence will determine number of
+        # blocks to run computation for.
         decode_batch_end = (distribution[0] // decode_req_batch_size *
                             decode_req_batch_size)
-        scores = run_topk_kernel(
+        scores = run_scores_kernel(
             q,
             prepared_indexer_weights,
             cache_kv,
@@ -763,10 +768,11 @@ def streamindex_topk(
             end_seq_idx=decode_batch_end,
             static_q_len=1,
             seq_batch_size=decode_req_batch_size,
+            out_dtype=out_dtype,
             case=MlaCase.DECODE,
         )
         # Handle num_decode_seqs % decode_req_batch_size != 0 case.
-        scores = run_topk_kernel(
+        scores = run_scores_kernel(
             q,
             prepared_indexer_weights,
             cache_kv,
@@ -780,10 +786,11 @@ def streamindex_topk(
             end_seq_idx=distribution[1],
             static_q_len=1,
             seq_batch_size=1,
+            out_dtype=out_dtype,
             case=MlaCase.DECODE,
         )
 
-        scores = run_topk_kernel(
+        scores = run_scores_kernel(
             q,
             prepared_indexer_weights,
             cache_kv,
@@ -797,6 +804,7 @@ def streamindex_topk(
             end_seq_idx=distribution[2],
             static_q_len=None,
             seq_batch_size=1,
+            out_dtype=out_dtype,
             case=MlaCase.MIXED,
         )
 
@@ -808,27 +816,48 @@ def streamindex_topk(
                 constant_values=-jnp.inf,
             )
 
-        # TODO: Re-evaluate replacing this with the sparsecore_topk kernel
-        # once SparseCore supports direct VMEM access (e.g., on TPU v8).
-        # Currently, jax.lax.approx_max_k wins due to the HBM read/write tax,
-        # but direct VMEM streaming will allow SC to beat TensorCore
-        # performance.
+        scores_to_reduce = scores
+        if scores_to_reduce.dtype != jnp.float32:
+            scores_to_reduce = scores_to_reduce.astype(jnp.float32)
 
-        # jax.lax.approx_max_k(recall_target=1.0) is equivalent to
-        # jax.lax.top_k but faster.
-        top_vals, top_idxs = jax.lax.approx_max_k(scores,
-                                                  k,
-                                                  reduction_dimension=-1,
-                                                  recall_target=1.0)
-        topk_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
+        eff_row_lengths = _effective_row_lengths(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            num_tokens=q.shape[0],
+            num_positions=scores_to_reduce.shape[1],
+            compression_ratio=compression_ratio,
+        )
+        topk_idxs = sparsecore_topk(
+            scores_to_reduce,
+            k,
+            row_lengths=eff_row_lengths,
+            write_empty_rows=True,
+        )
+
         return topk_idxs[:q.shape[0], :k]
+
+    def _fast_path(_):
+        token_idx = jnp.arange(q.shape[0])
+        seq_idx = jnp.minimum(
+            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+            seq_lens.shape[0] - 1,
+        )
+        seq_len = seq_lens[seq_idx]
+        q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
+        q_start = cu_q_lens[seq_idx]
+        q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
+        max_valid_idx = jnp.minimum(
+            seq_len // compression_ratio - 1,
+            q_abs_pos // compression_ratio,
+        )
+        max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
+        s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
+        return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 
     if not enable_early_exit:
         return _common_path(None)
-    # Batch-wide: a single sequence past k puts the whole batch back on the
-    # scoring kernel. `scores_init` is built inside the branch, so nothing
-    # outside holds it and the pallas donation stays valid.
-    return lax.cond(
+    return jax.lax.cond(
         jnp.max(seq_lens) // compression_ratio <= k,
         _fast_path,
         _common_path,
