@@ -35,6 +35,21 @@ import pytest
 import torch
 
 
+def pytest_collection_modifyitems(items):
+    """Run whole-slice worker-spawning tests before in-process TPU tests.
+
+    Once the pytest process itself initializes the TPU runtime (any test that
+    runs jax/torch_tpu in-process), a test that later spawns a fresh
+    ``torch.distributed.run`` worker group can no longer bootstrap the slice:
+    the workers fail with "PjRtClient is not initialized" and libtpu may tear
+    down the whole session with SLICE_FAILURE_SW_INJECT_ERROR. libtpu exposes
+    no release API, so the only safe ordering is spawn-first. The sort is
+    stable, so relative order within each group is unchanged.
+    """
+    items.sort(key=lambda item: 0
+               if item.get_closest_marker("spawns_tpu_workers") else 1)
+
+
 def pytest_addoption(parser):
     """Add --use-tpu command line option."""
     parser.addoption(
