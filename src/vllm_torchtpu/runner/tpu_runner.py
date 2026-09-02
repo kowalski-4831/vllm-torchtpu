@@ -1293,7 +1293,7 @@ class TPUModelRunner(GPUModelRunner):
                     # imply, with no other signal that it did. Take the backend
                     # off this layer so it always matches the dimensions below.
                     _warn_if_kv_cache_is_padded(
-                        attn_module.get_attn_backend(),
+                        backend_cls,
                         block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,
@@ -1377,6 +1377,7 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
+            attention_backend=backend_cls,
         )
 
     def _build_attention_metadata(
@@ -2133,8 +2134,11 @@ class TPUModelRunner(GPUModelRunner):
         self._mamba_copy_plan = plan
         for raw in raw_tensors:
             if raw.dim() > 1:
+                kernel_block_size = (raw.shape[-1]
+                                     if envs.USE_BATCHED_RPA_SEQ_ON_LANE else
+                                     raw.shape[1])
                 self._pool_block_split = (self.cache_config.block_size //
-                                          raw.shape[1])
+                                          kernel_block_size)
                 break
 
     def _collect_mamba_state_seed_copies(self, scheduler_output,
