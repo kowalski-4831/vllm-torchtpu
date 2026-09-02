@@ -354,7 +354,6 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
     from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
     from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
-    from vllm_torchtpu import _patch_vllm_offloading_connector_spec  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_pcp_v2_validation()
@@ -372,7 +371,6 @@ def apply_tpu_patches() -> None:
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_offloading_config_build()
-    _patch_vllm_offloading_connector_spec()
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
@@ -1114,7 +1112,6 @@ class TpuPlatform(Platform):
                 "TPUConnector",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
-                "OffloadingConnector",
                 "TPURaidenOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
@@ -1124,8 +1121,7 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    in ("OffloadingConnector",
-                                        "TPURaidenOffloadingConnector")
+                                    == "TPURaidenOffloadingConnector"
                                     and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):
