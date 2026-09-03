@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
-    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
 
 
@@ -188,7 +188,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT":
-    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore",
+    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore",
                      ["sparsecore", "tensorcore"]),
     "TPU_SPARSE_MLA_ROPE_LAYOUT":
     env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore",
