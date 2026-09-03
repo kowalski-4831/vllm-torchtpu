@@ -946,7 +946,8 @@ class TPUModelRunner(GPUModelRunner):
         self.drafter = None
         self.rejection_sampler = None
         if self.speculative_config:
-            self.rejection_sampler = RejectionSampler()
+            self.rejection_sampler = RejectionSampler(self.speculative_config,
+                                                      self.device)
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
@@ -3974,6 +3975,12 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_k,
                     req_top_p,
                     all_greedy=False).view(-1)
+        accept_u = None
+        if self.rejection_sampler.synthetic_mode or not all_greedy:
+            accept_u = torch.rand(md.draft_token_ids.shape,
+                                  dtype=torch.float32,
+                                  device=target_logits.device,
+                                  generator=sampling_generator)
         if all_greedy:
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
@@ -3984,11 +3991,9 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices=md.group_indices,
                 max_draft_tokens=self.speculative_config.
                 num_speculative_tokens,
+                accept_u=accept_u,
             )
-        accept_u = torch.rand(md.draft_token_ids.shape,
-                              dtype=torch.float32,
-                              device=target_logits.device,
-                              generator=sampling_generator)
+        assert accept_u is not None
         recover_u = torch.rand_like(target_logits,
                                     dtype=torch.float32,
                                     generator=sampling_generator)
@@ -4938,6 +4943,9 @@ class TPUModelRunner(GPUModelRunner):
                     bonus_logits_indices = torch.zeros(num_reqs,
                                                        dtype=torch.int32,
                                                        device=self.device)
+                    warm_accept_u = torch.zeros(num_tokens,
+                                                dtype=torch.float32,
+                                                device=self.device)
                     # --- greedy verify path (do_sampling=False) ---
                     bonus_token_ids, target_logits_warm = (
                         self.spec_bonus_and_target_logits(
@@ -4951,6 +4959,9 @@ class TPUModelRunner(GPUModelRunner):
                         segment_ids=segment_ids,
                         group_indices=group_indices,
                         max_draft_tokens=k,
+                        accept_u=(warm_accept_u
+                                  if self.rejection_sampler.synthetic_mode else
+                                  None),
                     )
                     synchronize_tensors(out)
                     # --- non-greedy verify path (do_sampling=True) ---
@@ -4967,9 +4978,6 @@ class TPUModelRunner(GPUModelRunner):
                     warm_top_p = torch.ones((num_tokens, 1),
                                             dtype=torch.float32,
                                             device=self.device)
-                    warm_accept_u = torch.zeros(num_tokens,
-                                                dtype=torch.float32,
-                                                device=self.device)
                     warm_recover_u = torch.zeros((num_tokens, self.vocab_size),
                                                  dtype=torch.float32,
                                                  device=self.device)

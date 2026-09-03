@@ -13,9 +13,15 @@
 # limitations under the License.
 """Torch-based rejection sampler for speculative decoding on TPU."""
 
+from typing import TYPE_CHECKING
+
 import torch
+from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
 from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
+
+if TYPE_CHECKING:
+    from vllm.config.speculative import SpeculativeConfig
 
 # Placeholder token ID for rejected tokens
 PLACEHOLDER_TOKEN_ID = -1
@@ -29,8 +35,22 @@ TEMPERATURE_EPS = 1e-9
 class RejectionSampler:
     """Torch-based rejection sampler for speculative decoding on TPU."""
 
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        speculative_config: "SpeculativeConfig | None" = None,
+        device: torch.device | None = None,
+    ):
+        self.synthetic_conditional_rates: torch.Tensor | None = None
+        if (speculative_config is not None
+                and speculative_config.rejection_sample_method == "synthetic"):
+            rates = speculative_config.synthetic_acceptance_rates
+            assert rates is not None
+            self.synthetic_conditional_rates = torch.tensor(
+                unconditional_to_conditional_rates(rates),
+                dtype=torch.float32,
+                device=device,
+            )
+        self.synthetic_mode = self.synthetic_conditional_rates is not None
 
     def __call__(
         self,
@@ -124,7 +144,11 @@ class RejectionSampler:
                 top_p,
                 accept_u,
                 recover_u,
+                self.synthetic_conditional_rates,
+                self.synthetic_mode,
             )
+        if self.synthetic_mode and accept_u is None:
+            raise ValueError("Synthetic rejection sampling requires accept_u.")
         return _greedy_rejection_sample_with_segment(
             draft_token_ids,
             target_logits,
@@ -133,6 +157,9 @@ class RejectionSampler:
             segment_ids,
             group_indices,
             max_draft_tokens,
+            accept_u,
+            self.synthetic_conditional_rates,
+            self.synthetic_mode,
         )
 
 
@@ -172,6 +199,9 @@ def _greedy_rejection_sample_with_segment(
     segment_ids: torch.Tensor,
     group_indices: torch.Tensor,
     max_draft_tokens: int,
+    accept_u: torch.Tensor | None,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
 ) -> torch.Tensor:
     """Vectorized greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -192,11 +222,19 @@ def _greedy_rejection_sample_with_segment(
     large_value = total_tokens
 
     if total_tokens > 0:
-        mismatches = draft_token_ids != target_logits_argmax
+        if synthetic_mode:
+            assert accept_u is not None
+            assert synthetic_conditional_rates is not None
+            conditional_rates = synthetic_conditional_rates[group_indices.to(
+                torch.int64)]
+            accepted = ((accept_u < conditional_rates)
+                        & (draft_token_ids >= 0))
+        else:
+            accepted = draft_token_ids == target_logits_argmax
         mismatch_indices = torch.where(
-            mismatches,
-            group_indices,
+            accepted,
             torch.tensor(large_value, dtype=torch.int32, device=device),
+            group_indices,
         )
 
         masked_mismatch_indices = torch.where(
@@ -217,13 +255,18 @@ def _greedy_rejection_sample_with_segment(
         first_mismatch_idx_broadcast = first_mismatch_idx_per_segment[
             segment_ids]
 
-        # Valid if group_index <= first_mismatch_idx
+        before_mismatch = group_indices < first_mismatch_idx_broadcast
+        at_mismatch = group_indices == first_mismatch_idx_broadcast
         main_tokens = torch.where(
-            group_indices <= first_mismatch_idx_broadcast,
-            target_logits_argmax,
-            torch.tensor(PLACEHOLDER_TOKEN_ID,
-                         dtype=torch.int32,
-                         device=device),
+            before_mismatch,
+            draft_token_ids,
+            torch.where(
+                at_mismatch,
+                target_logits_argmax,
+                torch.tensor(PLACEHOLDER_TOKEN_ID,
+                             dtype=torch.int32,
+                             device=device),
+            ),
         )
     else:
         main_tokens = torch.tensor([], dtype=torch.int32, device=device)
@@ -285,6 +328,8 @@ def _random_rejection_sample_with_segment(
     top_p: torch.Tensor,
     accept_u: torch.Tensor,
     recover_u: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -293,6 +338,8 @@ def _random_rejection_sample_with_segment(
     vocab_size = target_logits.shape[-1]
 
     draft_token_ids = draft_token_ids.to(torch.int64)
+    valid_draft_token_ids = draft_token_ids >= 0
+    safe_draft_token_ids = draft_token_ids.clamp(min=0)
 
     # Shape the target distribution with temperature + top-k/top-p, then
     # softmax. Greedy rows carry temperature == 0.0, so dividing by
@@ -306,15 +353,26 @@ def _random_rejection_sample_with_segment(
     # Our draft is greedy for now, so for q: drafted token
     # x (q(x) == 1, 0 elsewhere) and the ratio collapses to p(x).
     target_token_probs = target_probs.gather(
-        -1, draft_token_ids.unsqueeze(-1)).squeeze(-1)
-    accepted = target_token_probs >= accept_u
+        -1, safe_draft_token_ids.unsqueeze(-1)).squeeze(-1)
+    if synthetic_mode:
+        assert synthetic_conditional_rates is not None
+        conditional_rates = synthetic_conditional_rates[group_indices.to(
+            torch.int64)]
+        accepted = accept_u < conditional_rates
+    else:
+        accepted = target_token_probs >= accept_u
+    accepted = accepted & valid_draft_token_ids
 
     # On rejection, resample from the residual max(0, p - q). With q a delta at
     # x, subtracting q only touches entry x, so the residual is just p with the
     # drafted token zeroed out.
-    draft_token_mask = torch.nn.functional.one_hot(draft_token_ids,
+    draft_token_mask = torch.nn.functional.one_hot(safe_draft_token_ids,
                                                    num_classes=vocab_size).to(
                                                        torch.bool)
+    # Placeholder drafts have no q mass to subtract, so their recovery
+    # distribution remains the full target distribution. In particular, do
+    # not let the safe clamp above accidentally mask vocabulary token 0.
+    draft_token_mask = draft_token_mask & valid_draft_token_ids.unsqueeze(-1)
     recovered_dist = torch.where(
         draft_token_mask,
         torch.tensor(0.0, dtype=target_probs.dtype, device=device),
@@ -330,6 +388,16 @@ def _random_rejection_sample_with_segment(
         recovered_dist / (exp_noise + torch.finfo(target_probs.dtype).tiny),
         dim=-1,
     ).to(torch.int32)
+    # A synthetic rejection can reject a greedy draft that matches the target
+    # argmax. In that case p and q are the same one-hot distribution, leaving
+    # no residual mass. Match upstream's greedy path by recovering the target
+    # argmax instead of letting argmax(all-zero) fall through to token 0.
+    has_recovery_mass = torch.any(recovered_dist > 0, dim=-1)
+    recovered_token_ids = torch.where(
+        has_recovery_mass,
+        recovered_token_ids,
+        torch.argmax(target_probs, dim=-1).to(torch.int32),
+    )
 
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
