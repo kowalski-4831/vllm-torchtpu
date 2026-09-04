@@ -762,6 +762,10 @@ class TPUModelRunner(GPUModelRunner):
         self._combined_request_distribution_cpu = torch.zeros(
             6, dtype=torch.int32)
         self._decode_device_cache_key: tuple | None = None
+        # Snapshot of the in-flight uploads from the host staging tensors
+        # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...); the next chunk
+        # waits on it before rewriting them.
+        self._input_staging_fence: Any = None
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
@@ -2879,6 +2883,7 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
         assert start_index < num_reqs
+        self._wait_input_staging_fence()
 
         # Get the number of scheduled tokens for each request.
         use_max_model_len = self.most_model_len is None
@@ -3278,6 +3283,25 @@ class TPUModelRunner(GPUModelRunner):
             layout_plan,
         )
 
+    def _record_input_staging_fence(self) -> None:
+        """Fence the uploads issued from the reusable host staging tensors.
+
+        Every `.to(self.device, non_blocking=True)` of a staging tensor keeps
+        reading its host memory until the transfer completes, and the same
+        tensors are rewritten by the next chunk's input preparation. The
+        event is recorded before the forward is dispatched, so waiting on it
+        never waits for the forward itself.
+        """
+        fence = torch.tpu.Event()
+        fence.record()
+        self._input_staging_fence = fence
+
+    def _wait_input_staging_fence(self) -> None:
+        fence = self._input_staging_fence
+        if fence is not None:
+            fence.synchronize()
+            self._input_staging_fence = None
+
     def _get_model_inputs(
         self,
         input_ids: torch.Tensor,
@@ -3603,6 +3627,7 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_embeds = []
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
+            self._record_input_staging_fence()
             input_ids, inputs_embeds = self._get_model_inputs(
                 input_ids, chunk_mm_inputs)
             # Run the decoder
@@ -4736,7 +4761,8 @@ class TPUModelRunner(GPUModelRunner):
                                    dtype=torch.int32,
                                    device=out.device)
                 _ = self.compute_selected_logits(out, _idx)
-            synchronize_tensors(out)
+            if not dp_lockstep:
+                synchronize_tensors(out)
         self._hidden_states_dtype = out.dtype
 
     @contextlib.contextmanager

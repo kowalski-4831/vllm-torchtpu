@@ -1175,3 +1175,23 @@ class TestVllmGatedDeltaNetAttention:
         assert attn.out_proj.call_args[0][0].shape == (num_tokens, 64)
 
         assert torch.all(output == 5)
+
+
+class TestConvWeightReHome:
+    """process_weights_after_loading backs the 3-D conv weight, a view over
+    the 2-D ColumnParallelLinear buffer, with a buffer of its own shape."""
+
+    def test_weight_is_copied_into_its_own_buffer(self):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        base = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        weight = torch.nn.Parameter(base.unsqueeze(1), requires_grad=False)
+        attn.conv1d = SimpleNamespace(weight=weight)
+        aliased_ptr = weight.data_ptr()
+        VllmGatedDeltaNetAttention.process_weights_after_loading(
+            attn, torch.bfloat16)
+        w = attn.conv1d.weight
+        assert w is weight
+        assert tuple(w.shape) == (6, 1, 4)
+        assert w.dtype == torch.float32
+        assert w.data_ptr() != aliased_ptr
+        assert torch.equal(w.data.squeeze(1), base)

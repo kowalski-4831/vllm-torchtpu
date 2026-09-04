@@ -2908,3 +2908,49 @@ class TestBuildAttentionMetadataForLayers:
 
         assert out == {}
         group.metadata_builders[0].build.assert_not_called()
+
+
+class _FakeTpuEvent:
+    instances: list["_FakeTpuEvent"] = []
+
+    def __init__(self):
+        self.recorded = False
+        self.synchronized = 0
+        _FakeTpuEvent.instances.append(self)
+
+    def record(self):
+        self.recorded = True
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+class TestInputStagingFence:
+    """A chunk records a fence after uploading from the reusable host staging
+    tensors; the next chunk synchronizes on it before rewriting them, once."""
+
+    def test_record_then_wait_synchronizes_once(self, monkeypatch):
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(torch,
+                            "tpu",
+                            SimpleNamespace(Event=_FakeTpuEvent),
+                            raising=False)
+        runner = SimpleNamespace(_input_staging_fence=None)
+        TPUModelRunner._record_input_staging_fence(runner)
+        fence = runner._input_staging_fence
+        assert fence is _FakeTpuEvent.instances[-1]
+        assert fence.recorded
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert fence.synchronized == 1
+        assert runner._input_staging_fence is None
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert fence.synchronized == 1
+
+    def test_wait_without_fence_is_noop(self, monkeypatch):
+        monkeypatch.setattr(torch,
+                            "tpu",
+                            SimpleNamespace(Event=_FakeTpuEvent),
+                            raising=False)
+        runner = SimpleNamespace(_input_staging_fence=None)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._input_staging_fence is None

@@ -410,6 +410,23 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             conv_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Back the conv weight with a buffer of its own 3-D shape.
+
+        The upstream layer rebinds `conv1d.weight` to an `unsqueeze(1)` view
+        of the 2-D ColumnParallelLinear buffer and the sharded loader fills it
+        through row slices, so the device buffer behind the Parameter stays
+        2-D. torch_tpu hands a compiled executable the buffer behind each
+        argument and re-materializes a shape-mismatched argument as a
+        standalone `tt_jit_as_strided` program before every forward. One
+        contiguous copy at load time removes that per-step program.
+        """
+        del act_dtype
+        w = self.conv1d.weight
+        self.conv1d.weight.data = torch.empty(w.shape,
+                                              dtype=w.dtype,
+                                              device=w.device).copy_(w)
+
     def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         conv_state_shape, temporal_state_shape = super().get_state_shape()
         conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
