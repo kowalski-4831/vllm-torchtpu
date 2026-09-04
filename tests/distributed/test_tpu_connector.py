@@ -1229,16 +1229,15 @@ class TestTPURaidenConnectorScheduler:
 
     @pytest.mark.parametrize(("requested", "supported"),
                              ((False, True), (True, False)))
-    def test_stage3_consumer_partial_hit_falls_back_to_local_compute(
+    def test_stage3_consumer_partial_hit_without_feature_pulls_full_payload(
             self, requested, supported):
+        """Feature off: legacy full pull into every page, no release."""
         req = MagicMock()
-        req.request_id = "local-suffix-fallback"
-        # vLLM assigns the admitted local hit only after the connector update;
-        # zero here makes the unused producer registration release promptly.
+        req.request_id = "legacy-partial-hit"
         req.num_computed_tokens = 0
         req.prompt_token_ids = [0] * 4096
         req.kv_transfer_params = {
-            "req_id": "local-suffix-fallback-src",
+            "req_id": "legacy-partial-hit-src",
             "uuid": 994,
             "num_tokens": 4095,
             "src_controller_address": "prefill-controller.test:27000",
@@ -1248,6 +1247,7 @@ class TestTPURaidenConnectorScheduler:
             "src_parallelism": 8,
         }
         blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([50, 51, 52, 53], )
 
         with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
                    "raiden",
@@ -1265,16 +1265,17 @@ class TestTPURaidenConnectorScheduler:
             matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
             consumer.update_state_after_alloc(req, blocks, matched)
 
-        assert matched == 0
-        assert not is_async
-        blocks.get_block_ids.assert_not_called()
-        release = consumer.reqs_to_load[req.request_id]
-        assert release.release_only
-        assert release.source_req_id == "local-suffix-fallback-src"
-        assert release.local_block_ids == []
+        assert matched == 2047
+        assert is_async
+        load = consumer.reqs_to_load[req.request_id]
+        assert not load.release_only
+        assert load.skip_tokens == 0
+        assert load.local_block_ids == [50, 51, 52, 53]
+        assert load.num_tokens == 4095
+        assert load.source_req_id == "legacy-partial-hit-src"
 
-    def test_stage3_consumer_full_hit_enqueues_release_only(self):
-        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+    @staticmethod
+    def _full_hit_request():
         req = MagicMock()
         req.request_id = "full-hit"
         req.num_computed_tokens = 0
@@ -1289,11 +1290,23 @@ class TestTPURaidenConnectorScheduler:
             "src_data_replica_idx": 0,
             "src_parallelism": 8,
         }
+        return req
+
+    def test_stage3_consumer_full_hit_enqueues_release_only(self):
+        req = self._full_hit_request()
         blocks = MagicMock()
 
         with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
                    "raiden",
-                   create=True):
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
+                   True,
+                   create=True), \
+             patch(f"{_MOD}._prefix_aware_load_supported",
+                   return_value=True):
+            consumer = _make_raiden_scheduler(is_producer=False,
+                                              block_size=1024,
+                                              enable_prefix_caching=True)
             matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
             consumer.update_state_after_alloc(req, blocks, matched)
 
@@ -1305,8 +1318,34 @@ class TestTPURaidenConnectorScheduler:
         assert load.uuid == 995
         assert load.source_req_id == "full-hit-src"
 
+    @pytest.mark.parametrize(("requested", "supported"),
+                             ((False, True), (True, False)))
+    def test_stage3_consumer_full_hit_without_feature_emits_no_release(
+            self, requested, supported):
+        """Feature off: a full hit leaves the registration to the TTL."""
+        req = self._full_hit_request()
+        blocks = MagicMock()
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
+                   requested,
+                   create=True), \
+             patch(f"{_MOD}._prefix_aware_load_supported",
+                   return_value=supported):
+            consumer = _make_raiden_scheduler(is_producer=False,
+                                              block_size=1024,
+                                              enable_prefix_caching=True)
+            matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
+            consumer.update_state_after_alloc(req, blocks, matched)
+
+        assert matched == 0
+        assert not is_async
+        assert consumer.reqs_to_load == {}
+        blocks.get_block_ids.assert_not_called()
+
     def test_stage3_consumer_post_load_resume_does_not_release(self):
-        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
         req = MagicMock()
         req.request_id = "resumed"
         # The async-load completion set num_computed_tokens before this
@@ -1323,7 +1362,15 @@ class TestTPURaidenConnectorScheduler:
 
         with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
                    "raiden",
-                   create=True):
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
+                   True,
+                   create=True), \
+             patch(f"{_MOD}._prefix_aware_load_supported",
+                   return_value=True):
+            consumer = _make_raiden_scheduler(is_producer=False,
+                                              block_size=1024,
+                                              enable_prefix_caching=True)
             consumer.update_state_after_alloc(req, blocks, 0)
 
         assert consumer.reqs_to_load == {}

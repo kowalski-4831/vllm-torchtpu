@@ -310,8 +310,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # subtracts the local prefix-cache hit and transfers only the missing
     # FA suffix (page-aligned dst_skip_bytes clip planned by the source
     # store); GDN state always transfers whole. When false, or when the
-    # installed client lacks dst_skip_bytes support, partial local hits skip
-    # the remote transfer and compute their missing suffix on decode.
+    # installed client lacks dst_skip_bytes support, local hits are ignored
+    # and the full payload is pulled into every destination page.
     "TPU_RAIDEN_PREFIX_AWARE_LOAD":
     env_bool("TPU_RAIDEN_PREFIX_AWARE_LOAD", False),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP

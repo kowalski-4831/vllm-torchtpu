@@ -887,9 +887,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 and not self._stage3_prefix_aware_load_enabled):
             log = (logger.warning
                    if _prefix_aware_load_requested() else logger.info)
-            log("Prefix-aware Stage-3 loads are unavailable; partial "
-                "decode-local prefix hits will skip the remote transfer and "
-                "compute the missing suffix locally")
+            log("Prefix-aware Stage-3 loads are unavailable; decode-local "
+                "prefix hits are ignored and the full producer payload is "
+                "pulled into every destination page")
         # req_id -> (uuid, global block ids, exact token count, wire params).
         # This survives build_connector_meta() so a duplicate request_finished
         # callback cannot mint a conflicting UUID or enqueue a second D5
@@ -942,19 +942,6 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 raise ValueError(
                     "Stage-3 metadata requires a positive num_tokens")
             count = max(transfer_tokens - num_computed_tokens, 0)
-            if (num_computed_tokens > 0 and count > 0
-                    and not self._stage3_prefix_aware_load_enabled):
-                # A full transfer would overwrite the adopted prefix pages.
-                # Preserve the local hit, decline the external load, and let
-                # the scheduler allocate/compute the missing suffix locally.
-                # update_state_after_alloc() then emits the existing
-                # release-only metadata for the unused producer registration.
-                logger.info(
-                    "Stage-3 partial prefix hit falls back to decode-local "
-                    "suffix computation req_id=%s local_tokens=%d "
-                    "missing_tokens=%d", request.request_id,
-                    num_computed_tokens, count)
-                return 0, False
             if count > 0 and dist_utils.get_raiden_inline_load():
                 return count, False
             return count, count > 0
@@ -1060,7 +1047,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # unless released. request.num_computed_tokens is still 0 here
             # only on first admission — the post-async-load resume re-enters
             # with the loaded count set, and must not re-release.
-            if int(request.num_computed_tokens) == 0:
+            if (self._stage3_prefix_aware_load_enabled
+                    and int(request.num_computed_tokens) == 0):
                 self._enqueue_stage3_release(request)
             return
         params = request.kv_transfer_params
@@ -1123,13 +1111,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             raise ValueError(
                 "External token count exceeds the published reshard payload: "
                 f"external={external_tokens}, num_tokens={num_tokens}")
-        skip_tokens = num_tokens - external_tokens
+        skip_tokens = (num_tokens - external_tokens
+                       if self._stage3_prefix_aware_load_enabled else 0)
         if skip_tokens:
             # Partial local prefix hit: pull only the suffix, and only into
             # the trailing (newly allocated) pages — the leading adopted
-            # cache pages are shared and must never be transfer targets. The
-            # earlier matched-token decision emits a positive external suffix
-            # only when the prefix-aware capability is enabled.
+            # cache pages are shared and must never be transfer targets.
             if skip_tokens % self.block_size != 0:
                 raise ValueError(
                     "Prefix hits must be destination-page aligned: "
