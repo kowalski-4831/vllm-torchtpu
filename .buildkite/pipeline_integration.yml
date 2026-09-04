@@ -103,6 +103,31 @@ steps:
                 --max-num-batched-tokens 256 \
                 --max-tokens 32
 
+      - label: "Integration: Nightly dsv4-offload-correctness"
+        key: "integration_nightly_dsv4_offload_correctness"
+        # Nightly only: a full DSv4 boot is ~27 min of weight load plus compile
+        # before the smoke even starts, which is too much to spend on every PR.
+        # The same boot cost is why the Buildkite default timeout is not enough
+        # headroom here.
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          RUN_ROOT: "/perf_eval_results/dsv4_offload_ci"
+        commands:
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/"
+          # MODEL is not on run_in_docker.sh's forwarding list, and the rig
+          # defaults it to a dev-box path; hand it the HF id the staged
+          # snapshot resolves under HF_HOME instead.
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            env MODEL=deepseek-ai/DeepSeek-V4-Flash
+            bash ./scripts/vllm/integration/run_dsv4_offload_correctness.sh
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
         agents:
