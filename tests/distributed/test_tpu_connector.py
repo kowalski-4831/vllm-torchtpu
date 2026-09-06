@@ -1513,6 +1513,16 @@ class _FakeRaidenControllerFacade:
         return self.start_transfer_result
 
 
+def _flush_stage3_submits(worker):
+    """Waits until every queued Stage-3 submission has posted its outcome.
+
+    Coordination RPCs run on background submit workers; joining the task
+    queue fences the outcome mailbox so the next poll drains it
+    deterministically.
+    """
+    worker._stage3_submit_queue.join()
+
+
 def _seed_stateful_stage3_producer(worker,
                                    facade,
                                    *,
@@ -2445,9 +2455,16 @@ class TestTPURaidenConnectorWorker:
                           MagicMock(return_value=3)), \
              patch.object(worker, "_stage3_fa_token_bytes", return_value=64):
             worker._submit_stage3_loads(meta, MagicMock())
+            _flush_stage3_submits(worker)
 
         assert facade.start_transfer.call_count == 2
-        clipped = facade.start_transfer.call_args_list[0].kwargs
+        # Submit workers run concurrently, so match the calls by uuid rather
+        # than by execution order.
+        by_uuid = {
+            call.kwargs["uuid"]: call.kwargs
+            for call in facade.start_transfer.call_args_list
+        }
+        clipped = by_uuid[997]
         assert clipped["dst_skip_bytes"] == [2048 * 64]
         assert clipped["dst_device_block_ids"] == [52, 53]
         assert clipped["dst_block_counts"] == [2]
@@ -2457,7 +2474,7 @@ class TestTPURaidenConnectorWorker:
         assert worker._load_block_ids["dst-suffix"] == [52, 53]
         # Skip-free submissions must stay byte-identical on the wire: the
         # kwarg is omitted entirely rather than passed as zeros.
-        unclipped = facade.start_transfer.call_args_list[1].kwargs
+        unclipped = by_uuid[998]
         assert "dst_skip_bytes" not in unclipped
         assert unclipped["dst_device_block_ids"] == [50, 51, 52, 53]
 
@@ -2485,12 +2502,217 @@ class TestTPURaidenConnectorWorker:
                           "_require_stage3_controller",
                           return_value=(MagicMock(), "10.0.0.2:28000")):
             worker._submit_stage3_loads(meta, MagicMock())
+            _flush_stage3_submits(worker)
 
         facade.cancel_request_blocks_if_unclaimed.assert_called_once_with(
             req_id="src-hit", uuid=999)
         facade.start_transfer.assert_not_called()
         assert worker._stage3_submitted_loads == {}
         assert "dst-hit" not in worker._load_block_ids
+
+    @staticmethod
+    def _make_stage3_load_meta(destination_req_id, source_req_id, uuid,
+                               local_block_ids):
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load[destination_req_id] = _Stage3LoadMeta(
+            uuid=uuid,
+            source_req_id=source_req_id,
+            local_block_ids=local_block_ids,
+            num_tokens=2048,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+        )
+        return meta
+
+    def test_stage3_async_submit_defers_native_terminal_until_outcome(self):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker._raiden_work_unit = MagicMock()
+        engine = _FakeRaidenEngine()
+        # The armed receiver completes while the coordination RPC is still
+        # blocked on the source controller.
+        engine.poll_results = [([], ["src-slow"], []), ([], [], [])]
+        worker._raiden_transfer_engine = engine
+        rpc_gate = threading.Event()
+        facade = MagicMock()
+        facade.start_transfer.side_effect = (
+            lambda **kwargs: rpc_gate.wait(10.0))
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        meta = self._make_stage3_load_meta("dst-slow", "src-slow", 1001,
+                                           [7, 8])
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch.object(worker,
+                          "_require_stage3_controller",
+                          return_value=(MagicMock(), "10.0.0.2:28000")), \
+             patch.object(worker,
+                          "_stage3_source_work_units",
+                          return_value=[MagicMock()]), \
+             patch.object(worker,
+                          "_raiden_hbm_memory_type",
+                          MagicMock(return_value=3)):
+            worker._submit_stage3_loads(meta, MagicMock())
+            # The step thread is not blocked on the in-flight RPC.
+            assert "dst-slow" in worker._stage3_inflight_submits
+            # The native terminal is parked, not dropped and not reported.
+            assert worker.get_finished() == (set(), set())
+            assert worker._stage3_deferred_native_failures == {
+                "dst-slow": False
+            }
+            rpc_gate.set()
+            _flush_stage3_submits(worker)
+            assert worker.get_finished() == (set(), {"dst-slow"})
+            assert worker._stage3_deferred_native_failures == {}
+            assert worker._stage3_inflight_submits == {}
+        assert worker.get_block_ids_with_load_errors() == set()
+
+    def test_stage3_async_submit_abandons_overdue_rpc(self):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker._raiden_work_unit = MagicMock()
+        engine = _FakeRaidenEngine()
+        engine.poll_results = []
+        worker._raiden_transfer_engine = engine
+        rpc_gate = threading.Event()
+        facade = MagicMock()
+        facade.start_transfer.side_effect = (
+            lambda **kwargs: rpc_gate.wait(10.0))
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        meta = self._make_stage3_load_meta("dst-hang", "src-hang", 1002,
+                                           [9, 10])
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                   return_value=0.0), \
+             patch.object(worker,
+                          "_require_stage3_controller",
+                          return_value=(MagicMock(), "10.0.0.2:28000")), \
+             patch.object(worker,
+                          "_stage3_source_work_units",
+                          return_value=[MagicMock()]), \
+             patch.object(worker,
+                          "_raiden_hbm_memory_type",
+                          MagicMock(return_value=3)):
+            worker._submit_stage3_loads(meta, MagicMock())
+            # A zero deadline abandons the still-blocked RPC on the next
+            # poll, and the zero uncertainty window expires in the same
+            # pass: the request surfaces as a failed load with its exact
+            # destination blocks staged for recompute.
+            assert worker.get_finished() == (set(), {"dst-hang"})
+            assert worker.get_block_ids_with_load_errors() == {9, 10}
+            assert "dst-hang" in worker._stage3_abandoned_submits
+            rpc_gate.set()
+            _flush_stage3_submits(worker)
+            # The late outcome is discarded; nothing is re-reported and the
+            # abandonment marker is consumed.
+            assert worker.get_finished() == (set(), set())
+            assert "dst-hang" not in worker._stage3_abandoned_submits
+        assert facade.start_transfer.call_count == 1
+
+    def _park_missing_registration_load(self, worker, facade_side_effect,
+                                        registration_wait_s):
+        """Submits one load whose first coordination attempt reports a
+        missing producer registration and returns the facade."""
+        worker._raiden_work_unit = MagicMock()
+        engine = _FakeRaidenEngine()
+        engine.poll_results = []
+        worker._raiden_transfer_engine = engine
+        facade = MagicMock()
+        facade.start_transfer.side_effect = facade_side_effect
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        meta = self._make_stage3_load_meta("dst-late", "src-late", 1003,
+                                           [11, 12])
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.dist_utils.get_stage3_deferred_submit_enabled",
+                   return_value=True), \
+             patch(f"{_MOD}.dist_utils.get_stage3_registration_wait_s",
+                   return_value=registration_wait_s), \
+             patch.object(worker,
+                          "_require_stage3_controller",
+                          return_value=(MagicMock(), "10.0.0.2:28000")), \
+             patch.object(worker,
+                          "_stage3_source_work_units",
+                          return_value=[MagicMock()]), \
+             patch.object(worker,
+                          "_raiden_hbm_memory_type",
+                          MagicMock(return_value=3)):
+            worker._submit_stage3_loads(meta, MagicMock())
+            _flush_stage3_submits(worker)
+        return engine, facade
+
+    def test_stage3_async_submit_parks_missing_registration_then_retries(self):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        engine, facade = self._park_missing_registration_load(
+            worker, [
+                RuntimeError("Missing producer block registration for rank 3"),
+                True,
+            ],
+            registration_wait_s=30.0)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            # The missing-registration outcome parks the request instead of
+            # failing it; nothing is reported and no block is invalidated.
+            assert worker.get_finished() == (set(), set())
+            assert "dst-late" in worker._stage3_pending_submits
+            assert "dst-late" not in worker._stage3_inflight_submits
+            assert worker.get_block_ids_with_load_errors() == set()
+            # Re-attempts are paced by the interval; once it has elapsed the
+            # next step re-dispatches the prepared call to a submit worker.
+            with patch(f"{_MOD}._STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S",
+                       0.0):
+                assert worker.get_finished() == (set(), set())
+            assert "dst-late" not in worker._stage3_pending_submits
+            assert "dst-late" in worker._stage3_inflight_submits
+            _flush_stage3_submits(worker)
+            engine.poll_results = [([], ["src-late"], [])]
+            assert worker.get_finished() == (set(), {"dst-late"})
+            assert worker._stage3_inflight_submits == {}
+        assert facade.start_transfer.call_count == 2
+        assert worker.get_block_ids_with_load_errors() == set()
+
+    def test_stage3_async_submit_parked_load_aborted_by_scheduler(self):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        _, facade = self._park_missing_registration_load(
+            worker,
+            [RuntimeError("Missing producer block registration for rank 3")],
+            registration_wait_s=30.0)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            assert worker.get_finished() == (set(), set())
+            assert "dst-late" in worker._stage3_pending_submits
+            # The scheduler finishes (aborts) the request while it is parked:
+            # the load resolves as a pre-arm failure with its destination
+            # blocks staged, so vLLM's delayed block free completes.
+            assert worker.get_finished({"dst-late"}) == (set(), {"dst-late"})
+            assert worker.get_block_ids_with_load_errors() == {11, 12}
+            assert worker._stage3_pending_submits == {}
+        assert facade.start_transfer.call_count == 1
+
+    def test_stage3_async_submit_registration_wait_deadline_fails(self):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        _, facade = self._park_missing_registration_load(
+            worker,
+            [RuntimeError("Missing producer block registration for rank 3")],
+            registration_wait_s=0.0)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            # The wait budget is already exhausted when the outcome lands, so
+            # the same missing-registration error is the pre-arm failure
+            # terminal.
+            assert worker.get_finished() == (set(), {"dst-late"})
+            assert worker.get_block_ids_with_load_errors() == {11, 12}
+            assert worker._stage3_pending_submits == {}
+        assert facade.start_transfer.call_count == 1
 
     def test_v3_stage3_sender_failure_is_terminal_and_releases_d5(self):
         worker = _make_raiden_worker(tp_rank=0,
@@ -2650,6 +2872,7 @@ class TestTPURaidenConnectorWorker:
                            create=True), patch(f"{_MOD}.logger.info") as log:
             worker.process_send_load(meta)
             worker.process_send_load(meta)
+            _flush_stage3_submits(worker)
             assert worker.get_finished() == (set(), set())
             assert worker.get_finished() == (set(), {"proxy-id-decode5678"})
             # _reported_recving preserves the existing at-most-once contract.
@@ -2756,6 +2979,7 @@ class TestTPURaidenConnectorWorker:
                        create=True):
             worker.process_send_load(meta)
             worker.process_send_load(meta)
+            _flush_stage3_submits(worker)
             assert worker.get_finished() == (set(), {"failed-load-decode"})
             assert worker.get_finished() == (set(), set())
 
@@ -2825,6 +3049,7 @@ class TestTPURaidenConnectorWorker:
                            f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
                            return_value=30.0):
             worker.process_send_load(meta)
+            _flush_stage3_submits(worker)
             assert worker.get_finished() == (set(), set())
             assert worker.get_block_ids_with_load_errors() == set()
             assert worker.get_finished() == (set(), {"uncertain-load"})

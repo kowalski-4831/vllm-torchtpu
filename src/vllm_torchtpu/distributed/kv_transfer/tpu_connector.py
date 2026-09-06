@@ -18,6 +18,8 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 """
 
 import json
+import queue
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -103,6 +105,10 @@ _STAGE3_REGISTRATION_CANCELLED_ERROR = (
 _STAGE3_TRANSFER_POOL_TAGS = ("fa", )
 _STAGE3_STATE_CLASS_TAGS = ("gdn.conv", "gdn.ssm")
 _STAGE3_GLM_TRANSFER_POOL_TAGS = ("mla.nope", "mla.rope", "dsa.idx")
+# Concurrent Stage-3 coordination RPCs per worker. The source controller
+# handles concurrent coordinations (plan claims are per request), so a small
+# pool keeps an admission burst from queueing behind one slow peer.
+_STAGE3_SUBMIT_WORKERS = 4
 
 
 def _select_committed_mamba_blocks(
@@ -184,6 +190,40 @@ class _Stage3PendingSubmit:
     wait_logged: bool = False
     # RPC rate limiting for re-attempts.
     last_attempt_s: float = 0.0
+    # The prepared coordination call, staged once per submission and reused
+    # by every re-attempt (_Stage3SubmitTask).
+    task: Any = None
+
+
+@dataclass(frozen=True)
+class _Stage3SubmitTask:
+    """One staged source-controller coordination call.
+
+    Everything scheduler-visible about the request is recorded in the worker
+    tables before the task is created, so executing the RPC needs no
+    connector state beyond the facade and the prepared call arguments.
+    """
+
+    pending: _Stage3PendingSubmit
+    skip_tokens: int
+    fa_skip_bytes: int
+    source_units: int
+    facade: Any
+    call_kwargs: dict[str, Any]
+    # Legacy inline-poll mode: the RPC call itself retries a missing producer
+    # registration for a short bounded interval instead of reporting it.
+    retry_inline: bool
+
+
+@dataclass(frozen=True)
+class _Stage3SubmitOutcome:
+    """Result of one coordination RPC, applied on the model-runner thread."""
+
+    task: _Stage3SubmitTask
+    error: Optional[BaseException]
+    submit_ms: float
+    # perf_counter() when the RPC was issued; paces re-attempts.
+    attempted_at: float
 
 
 @dataclass(frozen=True)
@@ -1478,6 +1518,27 @@ class TPURaidenConnectorWorker:
         # Loads parked for per-step re-attempt while their producer
         # request-block registrations are in flight (_Stage3PendingSubmit).
         self._stage3_pending_submits: dict[str, _Stage3PendingSubmit] = {}
+        # Stage-3 coordination runs on background submit threads so the
+        # multi-hop source-controller RPC never blocks a model-runner step.
+        # The model-runner thread stages every scheduler-visible table before
+        # enqueueing a task; the workers touch nothing but the facade RPC and
+        # hand results back through _stage3_submit_outcomes, drained under
+        # _stage3_submit_lock at the top of each poll.
+        # queue.Queue for its task tracking: join() fences "every enqueued
+        # submission has appended its outcome".
+        self._stage3_submit_queue: queue.Queue = queue.Queue()
+        self._stage3_submit_lock = threading.Lock()
+        self._stage3_submit_outcomes: list[_Stage3SubmitOutcome] = []
+        self._stage3_submit_threads: list[threading.Thread] = []
+        # Model-runner-thread-only submission lifecycle: deadline per
+        # RPC-in-flight request, requests abandoned at that deadline (their
+        # late outcomes are discarded), and native terminal records that
+        # arrived while the submission RPC was still in flight (replayed once
+        # the outcome resolves). Values in the deferred map record whether
+        # the parked terminal was a failure.
+        self._stage3_inflight_submits: dict[str, float] = {}
+        self._stage3_abandoned_submits: set[str] = set()
+        self._stage3_deferred_native_failures: dict[str, bool] = {}
         self._done_sending: set[str] = set()
         self._done_recving: set[str] = set()
         self._failed_recving: set[str] = set()
@@ -2186,7 +2247,11 @@ class TPURaidenConnectorWorker:
             return
 
         if self._raiden_stage3_enabled():
-            self._submit_stage3_loads(metadata, engine)
+            # Inline mode waits for the loads below, so the coordination RPCs
+            # must have run before the wait loop starts polling.
+            self._submit_stage3_loads(metadata,
+                                      engine,
+                                      synchronous=wait_for_completion)
             submitted_loads = set(metadata.reqs_to_load)
             if wait_for_completion:
                 self._wait_for_recving(submitted_loads)
@@ -2890,45 +2955,67 @@ class TPURaidenConnectorWorker:
         return self._stage3_destination_req_ids.get(source_req_id)
 
     def _stage3_release_producer_registration(
-            self, destination_req_id: str, req_meta: _Stage3LoadMeta) -> None:
+            self,
+            destination_req_id: str,
+            req_meta: _Stage3LoadMeta,
+            synchronous: bool = False) -> None:
         """Full local hit: cancel the producer's unclaimed request-block
         registration.
 
         cancel_request_blocks_if_unclaimed is claim-safe — a concurrently
         claimed (in-flight) registration refuses cancellation — and the TTL
-        remains the backstop, so this is best-effort fire-and-forget."""
+        remains the backstop, so this is best-effort fire-and-forget and
+        rides the submit workers instead of the model-runner thread."""
         address = str(req_meta.src_controller_address).strip()
-        cancelled = False
-        try:
-            facade = self._stage3_source_facades.get(address)
-            if facade is None:
-                facade = self._new_raiden_controller_facade(address)
-                self._stage3_source_facades[address] = facade
-            cancelled = bool(
-                facade.cancel_request_blocks_if_unclaimed(
-                    req_id=req_meta.source_req_id, uuid=int(req_meta.uuid)))
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(
-                "Release-only cancellation failed req_id=%s "
-                "uuid=%d: %s (p2p_wait_pull_timeout remains the backstop)",
-                req_meta.source_req_id, int(req_meta.uuid), exc)
-        logger.info(
-            "%s",
-            json.dumps(
-                {
-                    "event": "raiden_stage3_release_only",
-                    "req_id": req_meta.source_req_id,
-                    "destination_req_id": destination_req_id,
-                    "uuid": int(req_meta.uuid),
-                    "cancelled": cancelled,
-                },
-                sort_keys=True,
-            ),
-        )
+        facade = self._stage3_source_facades.get(address)
+        if facade is None:
+            facade = self._new_raiden_controller_facade(address)
+            self._stage3_source_facades[address] = facade
+        source_req_id = req_meta.source_req_id
+        uuid = int(req_meta.uuid)
 
-    def _submit_stage3_loads(self, metadata: TPUConnectorMetadata,
-                             engine: "KVCacheManager") -> None:
-        """Starts exactly one source-controller transfer per request."""
+        def _release() -> None:
+            cancelled = False
+            try:
+                cancelled = bool(
+                    facade.cancel_request_blocks_if_unclaimed(
+                        req_id=source_req_id, uuid=uuid))
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(
+                    "Release-only cancellation failed req_id=%s "
+                    "uuid=%d: %s (p2p_wait_pull_timeout remains the backstop)",
+                    source_req_id, uuid, exc)
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage3_release_only",
+                        "req_id": source_req_id,
+                        "destination_req_id": destination_req_id,
+                        "uuid": uuid,
+                        "cancelled": cancelled,
+                    },
+                    sort_keys=True,
+                ),
+            )
+
+        if synchronous:
+            _release()
+            return
+        self._stage3_submit_queue.put(_release)
+        self._ensure_stage3_submit_workers()
+
+    def _submit_stage3_loads(self,
+                             metadata: TPUConnectorMetadata,
+                             engine: "KVCacheManager",
+                             synchronous: bool = False) -> None:
+        """Starts exactly one source-controller transfer per request.
+
+        Each request's scheduler-visible tables are staged here, on the
+        model-runner thread; the coordination RPC itself then runs on a
+        background submit worker (or inline when ``synchronous``) and its
+        outcome is applied when the poll drains the mailbox.
+        """
         del engine  # Completion is observed through the manager in poll_stats.
         _, dst_controller_address = self._require_stage3_controller()
         if self._raiden_work_unit is None:
@@ -2942,7 +3029,7 @@ class TPURaidenConnectorWorker:
                     f"{type(req_meta).__name__}")
             if getattr(req_meta, "release_only", False):
                 self._stage3_release_producer_registration(
-                    destination_req_id, req_meta)
+                    destination_req_id, req_meta, synchronous=synchronous)
                 continue
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens)
@@ -2980,33 +3067,22 @@ class TPURaidenConnectorWorker:
                 defer_deadline=(None if defer_wait_s is None else now +
                                 defer_wait_s),
                 first_attempt_s=now)
-            if self._attempt_stage3_load_submit(pending) == "pending":
-                self._stage3_pending_submits[destination_req_id] = pending
+            self._dispatch_stage3_load_submit(pending, synchronous)
 
-    def _attempt_stage3_load_submit(self,
-                                    pending: "_Stage3PendingSubmit") -> str:
-        """One submit attempt for a load: source-store coordination plus
-        terminal bookkeeping. Returns "accepted" | "failed" | "uncertain" |
-        "pending" — the last meaning the producer's request-block registrations were not
-        visible yet (side-effect free, before receiver arming) and the caller
-        must park (or keep) the request for a re-attempt next step."""
+    def _stage_stage3_submit_task(
+            self, pending: _Stage3PendingSubmit,
+            synchronous: bool) -> Optional[_Stage3SubmitTask]:
+        """Prepares the coordination call for one staged load.
+
+        Model-runner thread only. A failure here precedes any controller
+        contact, so the load resolves to the pre-arm failure terminal and
+        None is returned.
+        """
+        req_meta = pending.req_meta
         source_req_id = pending.source_req_id
         destination_req_id = pending.destination_req_id
         uuid = pending.uuid
-        num_tokens = pending.num_tokens
         local_blocks = pending.local_blocks
-        req_meta = pending.req_meta
-        defer_deadline = pending.defer_deadline
-        now = time.perf_counter()
-        if (defer_deadline is not None and pending.wait_logged
-                and now < defer_deadline and now - pending.last_attempt_s
-                < _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S):
-            # RPC rate limit for re-attempts (never the first attempt).
-            return "pending"
-        pending.last_attempt_s = now
-        controller_contacted = False
-        fa_accepted = False
-        submit_ms = None
         try:
             src_units = self._stage3_source_work_units(req_meta)
             src_controller_address = str(
@@ -3020,12 +3096,6 @@ class TPURaidenConnectorWorker:
                     src_controller_address)
                 self._stage3_source_facades[src_controller_address] = (
                     source_facade)
-            # The facade RPC returns only after the source controller
-            # server has awaited its RaidenFuture (receiver arm + sender
-            # dispatch). Actual byte completion is deliberately *not*
-            # inferred from that acknowledgement; get_finished polls the
-            # local manager.
-            controller_contacted = True
             # ONE transfer carries every replicated cache class; tag
             # order fixes the H2D order ranks executor-side (the first
             # tag = group 0 uploads first). Each tag replays over the
@@ -3063,14 +3133,27 @@ class TPURaidenConnectorWorker:
                 fa_skip_bytes = skip_tokens * token_bytes
                 clip_kwargs["dst_skip_bytes"] = ([fa_skip_bytes] + [0] *
                                                  (len(transfer_tags) - 1))
-            start_submit = time.perf_counter()
-            transfer_kwargs = dict(
+        except Exception as exc:  # pylint: disable=broad-except
+            # Local staging failed before any controller contact, so no
+            # receiver can have been armed and no late H2D is possible.
+            self._record_stage3_load_failure(destination_req_id, local_blocks)
+            logger.error(
+                "Stage-3 controller transfer failed before receiver "
+                "arming req_id=%s destination_req_id=%s uuid=%d: %s",
+                source_req_id, destination_req_id, uuid, exc)
+            return None
+        return _Stage3SubmitTask(
+            pending=pending,
+            skip_tokens=skip_tokens,
+            fa_skip_bytes=fa_skip_bytes,
+            source_units=len(src_units),
+            facade=source_facade,
+            call_kwargs=dict(
                 src_units=src_units,
                 dst_units=list(pending.dst_units),
                 # The registration is keyed by the producer's internal
-                # request ID. The
-                # destination's independently randomized ID is strictly a
-                # local scheduler lifecycle key.
+                # request ID. The destination's independently randomized
+                # ID is strictly a local scheduler lifecycle key.
                 req_id=source_req_id,
                 dst_device_block_ids=dst_blocks,
                 dst_mem_type=self._raiden_hbm_memory_type(),
@@ -3079,35 +3162,142 @@ class TPURaidenConnectorWorker:
                 dst_controller_address=pending.dst_controller_address,
                 uuid=uuid,
                 is_sender=True,
-                num_tokens=num_tokens,
+                num_tokens=pending.num_tokens,
                 transfer_pool_tags=transfer_tags,
                 dst_block_counts=dst_counts,
                 **clip_kwargs,
-            )
-            if defer_deadline is None:
+            ),
+            retry_inline=pending.defer_deadline is None or synchronous,
+        )
+
+    def _dispatch_stage3_load_submit(self,
+                                     pending: _Stage3PendingSubmit,
+                                     synchronous: bool = False) -> None:
+        """Issues one coordination attempt for a staged load.
+
+        Synchronous (inline-load) mode runs the RPC on the calling thread and
+        applies its outcome at once; otherwise the RPC rides a submit worker
+        and the outcome is applied by the poll that drains the mailbox.
+        """
+        task = pending.task
+        if task is None:
+            task = self._stage_stage3_submit_task(pending, synchronous)
+            if task is None:
+                return
+            pending.task = task
+        if synchronous:
+            self._apply_stage3_submit_outcome(
+                self._execute_stage3_submit(task))
+            return
+        # The uncertainty window opens at enqueue: past this deadline a
+        # still-unresolved RPC is treated exactly like a post-arm failure
+        # (blocks held, request abandoned) so one black-holed peer cannot
+        # pin a request forever.
+        self._stage3_inflight_submits[pending.destination_req_id] = (
+            time.perf_counter() +
+            float(dist_utils.get_p2p_wait_pull_timeout()))
+        self._stage3_submit_queue.put(task)
+        self._ensure_stage3_submit_workers()
+
+    def _ensure_stage3_submit_workers(self) -> None:
+        if self._stage3_submit_threads:
+            return
+        for index in range(_STAGE3_SUBMIT_WORKERS):
+            thread = threading.Thread(
+                target=self._stage3_submit_worker_loop,
+                name=f"raiden-stage3-submit-r{self.tp_rank}-{index}",
+                daemon=True)
+            thread.start()
+            self._stage3_submit_threads.append(thread)
+
+    def _stage3_submit_worker_loop(self) -> None:
+        while True:
+            task = self._stage3_submit_queue.get()
+            try:
+                # Release-only cancellations ride the queue as bare
+                # callables; they have no scheduler-visible outcome to hand
+                # back.
+                if callable(task):
+                    task()
+                    continue
+                outcome = self._execute_stage3_submit(task)
+                with self._stage3_submit_lock:
+                    self._stage3_submit_outcomes.append(outcome)
+            finally:
+                self._stage3_submit_queue.task_done()
+
+    def _execute_stage3_submit(
+            self, task: _Stage3SubmitTask) -> _Stage3SubmitOutcome:
+        """Runs one coordination RPC; safe on any thread.
+
+        The facade RPC returns only after the source controller has awaited
+        its transfer future (receiver arm + sender dispatch). Actual byte
+        completion is deliberately *not* inferred from that acknowledgement;
+        get_finished polls the local manager.
+        """
+        start_submit = time.perf_counter()
+        error: Optional[BaseException] = None
+        try:
+            if task.retry_inline:
                 accepted = self._start_stage3_transfer_with_d5_retry(
-                    source_facade, **transfer_kwargs)
+                    task.facade, **task.call_kwargs)
             else:
-                # Deferred mode: one non-blocking attempt per step; a
-                # missing registration classifies as "pending" below
-                # and the caller re-attempts next step instead of
-                # spinning the worker step here.
-                accepted = source_facade.start_transfer(**transfer_kwargs)
-            submit_ms = (time.perf_counter() - start_submit) * 1000
+                # Deferred mode: one attempt. A missing registration is
+                # handed back as an outcome and the request is re-attempted
+                # from a later step instead of spinning here.
+                accepted = task.facade.start_transfer(**task.call_kwargs)
             if accepted is not True:
                 raise RuntimeError(
                     "source controller rejected Stage-3 transfer")
-            fa_accepted = True
         except Exception as exc:  # pylint: disable=broad-except
-            missing_registration = "Missing producer block registration" in str(
-                exc)
-            if (defer_deadline is not None and controller_contacted
-                    and missing_registration and not fa_accepted
-                    and time.perf_counter() < defer_deadline):
+            error = exc
+        return _Stage3SubmitOutcome(
+            task=task,
+            error=error,
+            submit_ms=(time.perf_counter() - start_submit) * 1000,
+            attempted_at=start_submit)
+
+    def _apply_stage3_submit_outcome(self,
+                                     outcome: _Stage3SubmitOutcome) -> None:
+        """Applies one RPC outcome to the scheduler-visible tables.
+
+        Model-runner thread only: every table it touches pairs with the
+        get_finished/get_block_ids_with_load_errors drain of the same pass.
+        """
+        task = outcome.task
+        pending = task.pending
+        destination_req_id = pending.destination_req_id
+        source_req_id = pending.source_req_id
+        uuid = pending.uuid
+        self._stage3_inflight_submits.pop(destination_req_id, None)
+        if destination_req_id in self._stage3_abandoned_submits:
+            self._stage3_abandoned_submits.discard(destination_req_id)
+            logger.warning(
+                "Discarding Stage-3 submission outcome for an abandoned "
+                "request req_id=%s destination_req_id=%s uuid=%d error=%s",
+                source_req_id, destination_req_id, uuid, outcome.error)
+            return
+        if destination_req_id not in self._stage3_submitted_loads:
+            logger.warning(
+                "Discarding Stage-3 submission outcome for an already "
+                "released request req_id=%s destination_req_id=%s uuid=%d "
+                "error=%s", source_req_id, destination_req_id, uuid,
+                outcome.error)
+            return
+        if outcome.error is not None:
+            exc = outcome.error
+            missing_registration = ("Missing producer block registration"
+                                    in str(exc))
+            aborted = (destination_req_id
+                       in self._stage3_finished_loads_pending_cleanup)
+            if (missing_registration and pending.defer_deadline is not None
+                    and not aborted
+                    and time.perf_counter() < pending.defer_deadline):
                 # The precise pre-arm missing-registration result is
                 # side-effect free (registrations ride a later producer
                 # scheduler step): park for a per-step re-attempt until the
                 # deadline.
+                pending.last_attempt_s = outcome.attempted_at
                 if not pending.wait_logged:
                     pending.wait_logged = True
                     logger.info(
@@ -3116,18 +3306,20 @@ class TPURaidenConnectorWorker:
                         "destination_req_id=%s uuid=%d wait_budget_s=%.1f",
                         source_req_id, destination_req_id, uuid,
                         dist_utils.get_stage3_registration_wait_s())
-                return "pending"
-            if not controller_contacted or (missing_registration
-                                            and not fa_accepted):
-                # The FA registration lookup and local validation fail
-                # before receiver arming, so no late H2D is possible.
+                self._stage3_pending_submits[destination_req_id] = pending
+                return
+            if missing_registration:
+                # The FA registration lookup fails before receiver arming,
+                # so no late H2D is possible. A request the scheduler already
+                # finished resolves here as well, so its delayed block-free
+                # path completes.
                 self._record_stage3_load_failure(destination_req_id,
-                                                 local_blocks)
+                                                 pending.local_blocks)
                 logger.error(
                     "Stage-3 controller transfer failed before receiver "
                     "arming req_id=%s destination_req_id=%s uuid=%d: %s",
                     source_req_id, destination_req_id, uuid, exc)
-                return "failed"
+                return
             # Generic RPC rejection can occur after receiver arming.
             # Keep the request blocked and accept native terminal
             # records; only surface recompute after manager failure or
@@ -3142,7 +3334,7 @@ class TPURaidenConnectorWorker:
                 "waiting for native terminal state req_id=%s "
                 "destination_req_id=%s uuid=%d: %s", source_req_id,
                 destination_req_id, uuid, exc)
-            return "uncertain"
+            return
         self._stage3_controller_accepted.add(destination_req_id)
         logger.info(
             "%s",
@@ -3152,13 +3344,13 @@ class TPURaidenConnectorWorker:
                     "req_id": source_req_id,
                     "destination_req_id": destination_req_id,
                     "uuid": uuid,
-                    "num_tokens": num_tokens,
-                    "skip_tokens": skip_tokens,
-                    "fa_skip_bytes": fa_skip_bytes,
+                    "num_tokens": pending.num_tokens,
+                    "skip_tokens": task.skip_tokens,
+                    "fa_skip_bytes": task.fa_skip_bytes,
                     "recv_armed_before_push": True,
                     "state_group_count": self._stage3_state_group_count,
-                    "destination_pages": len(local_blocks),
-                    "controller_submit_ms": submit_ms,
+                    "destination_pages": len(pending.local_blocks),
+                    "controller_submit_ms": outcome.submit_ms,
                 },
                 sort_keys=True,
             ),
@@ -3185,15 +3377,40 @@ class TPURaidenConnectorWorker:
             source_req_id,
             destination_req_id,
             uuid,
-            len(src_units),
-            len(local_blocks),
-            int(req_meta.num_tokens),
+            task.source_units,
+            len(pending.local_blocks),
+            pending.num_tokens,
         )
-        return "accepted"
+
+    def _drain_stage3_submit_outcomes(self) -> None:
+        """Applies queued RPC outcomes and abandons overdue submissions."""
+        with self._stage3_submit_lock:
+            outcomes = self._stage3_submit_outcomes
+            self._stage3_submit_outcomes = []
+        for outcome in outcomes:
+            self._apply_stage3_submit_outcome(outcome)
+        now = time.perf_counter()
+        for req_id, deadline in list(self._stage3_inflight_submits.items()):
+            if deadline > now:
+                continue
+            # The receiver may already be armed by an RPC this slow, so the
+            # request follows the post-arm-failure path: blocks stay held on
+            # the uncertainty deadline instead of being freed under a
+            # possible late H2D.
+            self._stage3_inflight_submits.pop(req_id)
+            self._stage3_abandoned_submits.add(req_id)
+            self._stage3_controller_accepted.add(req_id)
+            self._stage3_pending_controller_failures[req_id] = (
+                now + float(dist_utils.get_p2p_wait_pull_timeout()))
+            logger.error(
+                "Stage-3 controller submission RPC exceeded its deadline and "
+                "was abandoned; waiting for native terminal state "
+                "destination_req_id=%s", req_id)
 
     def _drain_stage3_pending_submits(
             self, finished_req_ids: set[str] | None) -> None:
-        """Re-attempts parked Stage-3 loads once per scheduler step."""
+        """Re-attempts parked Stage-3 loads once per scheduler step, paced
+        by the re-attempt interval."""
         if finished_req_ids:
             for req_id in finished_req_ids:
                 pending = self._stage3_pending_submits.pop(req_id, None)
@@ -3207,10 +3424,14 @@ class TPURaidenConnectorWorker:
                     "Stage-3 deferred load aborted before producer "
                     "registration req_id=%s destination_req_id=%s uuid=%d",
                     pending.source_req_id, req_id, pending.uuid)
+        now = time.perf_counter()
         for destination_req_id in list(self._stage3_pending_submits):
             pending = self._stage3_pending_submits[destination_req_id]
-            if self._attempt_stage3_load_submit(pending) != "pending":
-                self._stage3_pending_submits.pop(destination_req_id, None)
+            if (now - pending.last_attempt_s
+                    < _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S):
+                continue
+            del self._stage3_pending_submits[destination_req_id]
+            self._dispatch_stage3_load_submit(pending)
 
     def get_finished(
             self,
@@ -3268,6 +3489,8 @@ class TPURaidenConnectorWorker:
             self._stage3_submitted_load_tokens.pop(req_id, None)
             self._stage3_controller_accepted.discard(req_id)
             self._stage3_pending_controller_failures.pop(req_id, None)
+            self._stage3_pending_submits.pop(req_id, None)
+            self._stage3_deferred_native_failures.pop(req_id, None)
             self._stage3_terminal_loads.discard(req_id)
             self._stage3_finished_loads_pending_cleanup.discard(req_id)
         self._done_sending = set()
@@ -3275,6 +3498,8 @@ class TPURaidenConnectorWorker:
         return done_sending, done_recving
 
     def _poll_finished(self, engine: "KVCacheManager") -> None:
+        if not self.is_producer and self._raiden_stage3_enabled():
+            self._drain_stage3_submit_outcomes()
         done_sending, done_recving, failed_recving = engine.poll_stats()
         sender_failures: set[str] = set()
         cancelled_sends: set[str] = set()
@@ -3326,13 +3551,35 @@ class TPURaidenConnectorWorker:
                 logger.warning(
                     "Ignoring unmapped Stage-3 native terminal request IDs: "
                     "%s", sorted(unmapped_terminal_ids))
+            # An armed receiver can complete while its coordination RPC is
+            # still in flight on a submit worker. Park such terminals and
+            # replay them through the acceptance filter once the submission
+            # outcome has resolved.
+            if self._stage3_deferred_native_failures:
+                replayed = [
+                    req_id for req_id in self._stage3_deferred_native_failures
+                    if req_id not in self._stage3_inflight_submits
+                ]
+                for req_id in replayed:
+                    if self._stage3_deferred_native_failures.pop(req_id):
+                        failed_recving.append(req_id)
+                    else:
+                        done_recving.append(req_id)
+            for req_id in done_recving:
+                if req_id in self._stage3_inflight_submits:
+                    self._stage3_deferred_native_failures[req_id] = False
+            for req_id in failed_recving:
+                if req_id in self._stage3_inflight_submits:
+                    self._stage3_deferred_native_failures[req_id] = True
             done_recving = [
                 req_id for req_id in done_recving
                 if req_id in self._stage3_controller_accepted
+                and req_id not in self._stage3_inflight_submits
             ]
             failed_recving = [
                 req_id for req_id in failed_recving
                 if req_id in self._stage3_controller_accepted
+                and req_id not in self._stage3_inflight_submits
             ]
             terminal_recvs = set(done_recving) | set(failed_recving)
             for req_id in terminal_recvs:
