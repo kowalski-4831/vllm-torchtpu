@@ -91,6 +91,10 @@ class _DoneFuture:
 _DONE_FUTURE = _DoneFuture()
 _STAGE3_FINISH_DEDUP_LIMIT = 4096
 _STAGE3_D5_REGISTRATION_WAIT_S = 5.0
+# tpu_sync GetRequestBlockStatusResponse.Status values reported by the
+# reshard client's get_request_block_status probe.
+_STAGE3_REGISTRY_STATUS_UNKNOWN = 1
+_STAGE3_REGISTRY_STATUS_CANCELLED = 4
 # Deferred-submit re-attempts ride cheap no-forward steps, which can cycle at
 # kHz while a load waits; rate-limit the controller RPCs per parked request.
 _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S = 0.05
@@ -1497,6 +1501,8 @@ class TPURaidenConnectorWorker:
         # native terminal (or was cancelled unclaimed) and is drained into
         # the scheduler report exactly once.
         self._stage3_send_outcomes: dict[str, str] = {}
+        # req_id -> next registry status probe time (perf_counter seconds).
+        self._stage3_status_probe_next: dict[str, float] = {}
         # vLLM independently randomizes the internal request ID on the
         # prefill and decode engines. D5 and the controller/native transfer
         # use the producer ID, while every scheduler-facing lifecycle table
@@ -2889,6 +2895,75 @@ class TPURaidenConnectorWorker:
         }
         return done, failed, cancelled
 
+    def _probe_stage3_registrations(self, facade: Any, now: float) -> None:
+        """Observes consumer-side cancellations of this rank's unclaimed
+        request-block registrations.
+
+        cancel_request_blocks_if_unclaimed retires only the source store's
+        registry row and no native transfer terminal follows, so without this
+        probe the registration (and vLLM's delayed block free that waits on
+        every rank's send terminal) would sit until p2p_wait_pull_timeout.
+        Registrations older than the probe interval and still without a
+        terminal are batch-queried at most once per interval; a cancelled
+        (or vanished) row is recorded as a cancelled terminal, exactly what
+        the TTL sweep records for its own cancellation."""
+        probe_s = dist_utils.get_stage3_status_probe_s()
+        probe = getattr(facade, "get_request_block_status", None)
+        if probe_s <= 0 or probe is None:
+            return
+        for req_id in list(self._stage3_status_probe_next):
+            if req_id not in self._stage3_registered_sends:
+                del self._stage3_status_probe_next[req_id]
+        due: list[str] = []
+        for req_id in self._stage3_registered_sends:
+            if (req_id in self._stage3_terminal_cleanup
+                    or req_id in self._stage3_send_outcomes):
+                continue
+            next_probe = self._stage3_status_probe_next.get(req_id)
+            if next_probe is None:
+                # Grace period: a healthy registration is claimed and
+                # completes natively well within one interval.
+                self._stage3_status_probe_next[req_id] = now + probe_s
+            elif next_probe <= now:
+                due.append(req_id)
+        if not due:
+            return
+        for req_id in due:
+            self._stage3_status_probe_next[req_id] = now + probe_s
+        keys = [(req_id, int(self._stage3_registered_sends[req_id].uuid))
+                for req_id in due]
+        try:
+            statuses = [int(status) for status in probe(keys)]
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "Stage-3 registry status probe failed for %d registrations; "
+                "p2p_wait_pull_timeout remains the backstop: %s", len(keys),
+                exc)
+            return
+        if len(statuses) != len(keys):
+            raise RuntimeError(
+                "Stage-3 registry status probe returned "
+                f"{len(statuses)} statuses for {len(keys)} keys")
+        for req_id, status in zip(due, statuses):
+            if status not in (_STAGE3_REGISTRY_STATUS_CANCELLED,
+                              _STAGE3_REGISTRY_STATUS_UNKNOWN):
+                continue
+            self._stage3_send_outcomes[req_id] = "cancelled"
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage3_registration_cancelled",
+                        "req_id": req_id,
+                        "uuid": int(
+                            self._stage3_registered_sends[req_id].uuid),
+                        "registry_status": status,
+                        "transfer_rank": self._local_raiden_transfer_rank(),
+                    },
+                    sort_keys=True,
+                ),
+            )
+
     @staticmethod
     def _start_stage3_transfer_with_d5_retry(facade: Any,
                                              **kwargs: Any) -> bool:
@@ -3600,6 +3675,7 @@ class TPURaidenConnectorWorker:
         if self.is_producer and self._raiden_stage3_enabled():
             facade, _ = self._require_stage3_controller()
             now = time.perf_counter()
+            self._probe_stage3_registrations(facade, now)
             expired_candidates = {
                 req_id
                 for req_id, registration in

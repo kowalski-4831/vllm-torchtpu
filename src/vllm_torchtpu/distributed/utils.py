@@ -116,6 +116,21 @@ def get_p2p_wait_pull_timeout() -> int:
     return int(timeout_str)
 
 
+def get_stage3_status_probe_s() -> float:
+    """Interval, in seconds, at which a Stage-3 producer worker probes the
+    source store's request-block registry for its registrations that have
+    not reached a native terminal. A consumer's release-only cancellation
+    retires only the registry row, so without the probe the registration
+    (and vLLM's delayed block free waiting on it) sits until
+    p2p_wait_pull_timeout. 0 disables the probe."""
+    val_str = os.getenv("TPU_RAIDEN_STAGE3_STATUS_PROBE_S", "1.0")
+    try:
+        val = float(val_str)
+    except ValueError:
+        val = 1.0
+    return max(val, 0.0)
+
+
 def get_stage3_deferred_submit_enabled() -> bool:
     """Per-step deferred re-attempt for Stage-3 loads whose producer
     request-block registrations have not arrived yet (default on; the

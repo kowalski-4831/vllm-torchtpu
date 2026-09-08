@@ -1494,6 +1494,14 @@ class _FakeRaidenControllerFacade:
         self.start_transfer_calls = []
         self.start_transfer_result = True
         self.cancel_request_blocks_result = True
+        # (req_id, uuid) -> GetRequestBlockStatusResponse.Status; keys not
+        # listed read as registered (2).
+        self.request_block_statuses = {}
+        self.get_request_block_status_calls = []
+
+    def get_request_block_status(self, keys):
+        self.get_request_block_status_calls.append(list(keys))
+        return [self.request_block_statuses.get(tuple(key), 2) for key in keys]
 
     def register_work_unit(self, **kwargs):
         self.register_work_unit_calls.append(kwargs)
@@ -2757,6 +2765,99 @@ class TestTPURaidenConnectorWorker:
             "unit": unit,
         }]
         assert worker._stage3_registered_sends == {}
+
+    @staticmethod
+    def _registered_stage3_producer(req_id="cancelled-by-consumer", uuid=77):
+        """A producer rank with one registered send and no native terminal:
+        the state a consumer's release-only cancel leaves behind."""
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=True,
+                                     dp_size=1,
+                                     pcp_size=8,
+                                     block_size=4096)
+        engine = _FakeRaidenEngine()
+        engine.poll_results = []
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "prefill-controller.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(job_name="prefill",
+                                                   job_replica_id="rank0",
+                                                   data_name="kv.fa",
+                                                   data_replica_idx=0)
+        worker._local_raiden_transfer_rank = MagicMock(return_value=0)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send[req_id] = MagicMock(uuid=uuid,
+                                              local_block_ids=[0, 1],
+                                              num_tokens=65_023,
+                                              expiration_time=1e20)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                       8,
+                       create=True):
+            worker.process_send_load(meta)
+        assert req_id in worker._stage3_registered_sends
+        return worker, facade
+
+    def test_v3_stage3_status_probe_reports_consumer_cancel_as_terminal(self):
+        """The PR #487 producer leak: a release-only cancel retires only the
+        registry row. The probe turns it into a send terminal within one
+        interval instead of p2p_wait_pull_timeout."""
+        worker, facade = self._registered_stage3_producer()
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.dist_utils.get_stage3_status_probe_s",
+                       return_value=1e-9):
+            # First poll only arms the probe (grace period); the row is
+            # still registered, so nothing is terminal.
+            assert worker.get_finished() == (set(), set())
+            assert worker.get_finished() == (set(), set())
+            assert facade.get_request_block_status_calls == [[
+                ("cancelled-by-consumer", 77)
+            ]]
+            # The consumer's cancel lands at the store.
+            facade.request_block_statuses[("cancelled-by-consumer", 77)] = 4
+            done_sending, done_recving = worker.get_finished()
+
+        assert done_sending == {"cancelled-by-consumer"}
+        assert done_recving == set()
+        # Cancelled, not completed: no completion vote, no force release.
+        assert facade.complete_request_blocks_calls == []
+        assert facade.cancel_request_blocks_calls == []
+        assert worker._stage3_registered_sends == {}
+        assert "cancelled-by-consumer" in worker._stage3_terminal_sends
+        # Reported exactly once.
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            assert worker.get_finished() == (set(), set())
+
+    def test_v3_stage3_status_probe_is_rate_limited_and_optional(self):
+        worker, facade = self._registered_stage3_producer()
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.dist_utils.get_stage3_status_probe_s",
+                       return_value=3600.0):
+            for _ in range(3):
+                assert worker.get_finished() == (set(), set())
+        # Within the interval the registry is never queried.
+        assert facade.get_request_block_status_calls == []
+
+        # Older clients without the probe degrade to the TTL backstop.
+        facade.get_request_block_status = None
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.dist_utils.get_stage3_status_probe_s",
+                       return_value=1e-9):
+            assert worker.get_finished() == (set(), set())
+            assert worker.get_finished() == (set(), set())
+        assert "cancelled-by-consumer" in worker._stage3_registered_sends
 
     def test_v3_stage3_d5_release_failure_retries_without_ttl_leak(self):
         worker = _make_raiden_worker(tp_rank=0,
