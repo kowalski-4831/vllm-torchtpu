@@ -18,6 +18,8 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.experimental.batched_rpa import \
+    configs as batched_rpa_configs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
@@ -37,10 +39,6 @@ MAX_ALLOWED_PAGE_INDICES_N = (
 # Default and experimental batched RPA kernels are loaded unconditionally.
 # Selection happens per attention layer via the `use_batched_rpa` flag plumbed
 # from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
-#
-if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not envs.USE_BATCHED_RPA_LONGCTX:
-    raise ValueError(
-        "USE_BATCHED_RPA_SEQ_ON_LANE requires USE_BATCHED_RPA_LONGCTX=1.")
 
 # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
 if envs.USE_BATCHED_RPA_LONGCTX:
@@ -321,15 +319,20 @@ def sharded_ragged_paged_attention(
     shard: bool = True,
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout | None = None,
 ):
     """Shards along KV heads."""
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
-    if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not use_hd64:
-        kv_cache_spec = P(None, "model", None, None, None)
-    else:
-        kv_cache_spec = P(None, None, "model", None, None)
+    layout_kwargs: dict[str, Any] = {}
+    kv_cache_spec = P(None, None, "model", None, None)
+    page_size_axis = 1
+    if kv_layout is not None and not use_hd64:
+        layout_kwargs["kv_layout"] = rpa_batched.configs.KVLayout(kv_layout)
+        if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+            kv_cache_spec = P(None, "model", None, None, None)
+            page_size_axis = 4
     in_specs = (
         qkv_spec,  # q
         qkv_spec,  # k
@@ -362,7 +365,7 @@ def sharded_ragged_paged_attention(
     # Speculative decoding draft-only VMEM relief: cap the KV-fetch block on the local path.
     block_kwargs: dict[str, Any] = {}
     if not shard and kv_block_cap is not None and not use_hd64:
-        page_size = kv_cache.shape[1]
+        page_size = kv_cache.shape[page_size_axis]
         max_num_seqs = kv_lens.shape[0]
         pages_per_seq = page_indices.shape[0] // max_num_seqs
         cap_tokens = max(page_size, (kv_block_cap // page_size) * page_size)
@@ -401,6 +404,7 @@ def sharded_ragged_paged_attention(
             soft_cap=soft_cap,
             skip_kv_update=skip_kv_update,
             use_causal_mask=use_causal_mask,
+            **layout_kwargs,
             **block_kwargs,
         )
 
@@ -539,6 +543,7 @@ def attention(
     shard: bool = True,
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -579,6 +584,7 @@ def attention(
         v_scale=v_scale,
         skip_kv_update=skip_kv_update,
         rpa_func=rpa_func,
+        kv_layout=kv_layout,
         soft_cap=soft_cap,
         shard=shard,
         kv_block_cap=kv_block_cap,

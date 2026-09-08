@@ -146,8 +146,6 @@ def get_kv_cache_shape(
     kv_dtype,
     kv_layout: configs.KVLayout | None = None,
 ):
-    # No caller selects SEQ_ALONG_LANE yet; it is reachable only by passing
-    # `kv_layout` explicitly, which the tests do.
     if kv_layout is None:
         kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
     num_lanes = pltpu.get_tpu_info().num_lanes

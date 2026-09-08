@@ -89,7 +89,11 @@ class TestVllmGatedDeltaNetAttention:
     def test_seq_on_lane_preserves_manager_physical_page_split(
             self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim,
             dtype):
-        monkeypatch.setenv("USE_BATCHED_RPA_SEQ_ON_LANE", "1")
+        # SEQ_ALONG_LANE is selected by VLLM_KV_CACHE_LAYOUT=HND; vLLM caches
+        # its envs process-wide, so disable that for the duration.
+        from vllm import envs as vllm_envs
+        vllm_envs.disable_envs_cache()
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         manager_block_size = 4096 if page_size == 512 else 4352
         vllm_config = _vllm_config(block_size=manager_block_size)
 
@@ -101,7 +105,7 @@ class TestVllmGatedDeltaNetAttention:
         raw_values = (
             np.arange(1, total_elements + 1, dtype=np.float32) % 120 + 1)
         recurrent_state = jnp.array(raw_values.reshape(shape), dtype=dtype)
-        pooled_state = _pooled_gdn_state_view(recurrent_state)
+        pooled_state = _pooled_gdn_state_view(recurrent_state, True)
 
         packed_num_heads = cdiv(num_kv_heads_x2, kv_packing)
         expected_gdn_kernel_block_size = (
@@ -112,7 +116,7 @@ class TestVllmGatedDeltaNetAttention:
         expected_tokens = (manager_block_size //
                            page_size) * expected_gdn_kernel_block_size
         assert _pooled_gdn_block_tokens(vllm_config, recurrent_state,
-                                        pooled_state) == expected_tokens
+                                        pooled_state, True) == expected_tokens
 
         # Assert values: verify that the underlying flattened memory buffer is
         # bitwise-identical and that round-trip reshape restores exact values.
@@ -181,7 +185,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size, ssm_cache_dtype,
-            expected_dtype):
+            expected_dtype, vllm_config_context):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
@@ -348,7 +352,8 @@ class TestVllmGatedDeltaNetAttention:
         ],
     )
     def test_pooled_op_reads_block_size_at_call_time(self, ssm_cache_dtype,
-                                                     expected_dtype):
+                                                     expected_dtype,
+                                                     vllm_config_context):
         """The pooled op must not freeze cache_config.block_size at build.
 
         Hybrid models construct GDN layers during load_model(), but the
@@ -394,7 +399,8 @@ class TestVllmGatedDeltaNetAttention:
         assert mock_core.call_args.kwargs[
             "recurrent_state_dtype"] == jnp.dtype(expected_dtype)
 
-    def test_pooled_impl_forwards_every_operand_the_forward_passes(self):
+    def test_pooled_impl_forwards_every_operand_the_forward_passes(
+            self, vllm_config_context):
         """`gdn_impl` must accept exactly what `forward` calls it with.
 
         The pooled operand list is threaded through four layers (forward ->
@@ -528,7 +534,8 @@ class TestVllmGatedDeltaNetAttention:
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pcp_compact_and_unified_ops_construct_with_mtp_k1(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size,
+            vllm_config_context):
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
         attn.num_spec = 1
