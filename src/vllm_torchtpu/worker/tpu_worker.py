@@ -487,6 +487,9 @@ class TPUWorker(WorkerBase):
     def pp_settle(self):
         return self.model_runner.pp_settle()
 
+    def profile_pipeline_chunks(self) -> dict:
+        return self.model_runner.profile_pipeline_chunks()
+
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
 

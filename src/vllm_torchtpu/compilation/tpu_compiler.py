@@ -124,6 +124,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # The HBM reserve that feeds block-count sizing comes from
     # kv_transfer_config, not from this variable.
     "TPU_USE_RAIDEN_CONNECTOR",
+    # Pipeline chunk sizing: scheduling and the extra token buckets, which
+    # are keyed by shape inside the same cache.
+    "TPU_PP_DYNAMIC_CHUNKS",
+    "TPU_PP_CHUNK_SLACK",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

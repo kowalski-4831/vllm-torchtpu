@@ -117,6 +117,8 @@ def _make_runner(*,
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True
     runner._pp_is_last = True
+    # The stub runs no attention kernel: nothing to bound.
+    runner._check_attention_schedule = lambda *args: None
     # Spec-decode mamba rollback is inactive in these PCP layout tests; the
     # runner leaves the read-offset buffer unset (None) unless speculative
     # decoding is enabled, so _prepare_inputs / dummy_run skip the windowed

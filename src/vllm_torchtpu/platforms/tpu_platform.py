@@ -882,6 +882,7 @@ class TpuPlatform(Platform):
             from vllm_torchtpu.distributed.pp_push import \
                 patch_executor_for_pp_wave
             patch_executor_for_pp_wave(vllm_config)
+            _configure_pipeline_chunks(vllm_config)
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
@@ -1270,6 +1271,37 @@ def _get_exponential_token_paddings(min_token_size: int,
         num *= 2
     paddings.append(max_token_size)
     return paddings
+
+
+def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
+    """Install the time-budget scheduler for a pipeline and the engine-core
+    hook that times the stages. Off when the env disables it, when the DP
+    scheduler or another scheduler is configured, or when chunked prefill is
+    disabled."""
+    from vllm_torchtpu.core.pp_chunk_scheduler import (
+        SCHEDULER_CLS, patch_engine_core_for_pp_chunks)
+    scheduler_config = vllm_config.scheduler_config
+    if not envs.TPU_PP_DYNAMIC_CHUNKS:
+        return
+    if (envs.DP_SCHED_ENABLED
+            and vllm_config.parallel_config.data_parallel_size > 1):
+        logger.warning(
+            "Pipeline chunk sizing is off: the DP scheduler is enabled.")
+        return
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+        logger.warning(
+            "Pipeline chunk sizing is off: scheduler %s is configured.",
+            scheduler_config.scheduler_cls)
+        return
+    if not scheduler_config.enable_chunked_prefill:
+        logger.warning(
+            "Pipeline chunk sizing is off: chunked prefill is disabled.")
+        return
+    if envs.TPU_PP_CHUNK_SLACK < 0:
+        raise ValueError("TPU_PP_CHUNK_SLACK must not be negative: "
+                         f"{envs.TPU_PP_CHUNK_SLACK}")
+    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    patch_engine_core_for_pp_chunks(vllm_config)
 
 
 def _get_token_paddings(
