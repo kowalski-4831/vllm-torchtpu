@@ -212,7 +212,8 @@ python3 examples/offline_inference.py \
 
 PP currently requires `--no-async-scheduling`, and Ray deployments require
 the Ray V2 executor (`VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1`); it does not yet
-support speculative decoding or KV transfer connectors.
+support speculative decoding or KV transfer connectors other than
+`TPURaidenConnector`, which needs a full-attention layer in every stage.
 
 The stages advance in lockstep, so a step lasts as long as the slowest
 chunk in flight, and a prefill chunk late in a long prompt costs more than
