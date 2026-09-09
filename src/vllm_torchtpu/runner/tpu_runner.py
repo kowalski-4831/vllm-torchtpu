@@ -72,6 +72,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
     materialize_kv_cache_tensors)
@@ -782,6 +783,22 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
+
+        # Pipeline parallelism: this worker runs one stage's layer slice.
+        # Stages before the last hand their hidden states to the next stage
+        # instead of sampling; stages after the first take them as input.
+        self._pp_is_first, self._pp_is_last = pp_rank_flags(
+            self.parallel_config)
+        # Hand-off wave over ICI; built in capture_model, where every stage
+        # reaches the same point.
+        self._pp_wave: PPWave | None = None
+        # Per-key (trailing shape, dtype) of the tensors a stage receives.
+        self._pp_intermediate_template: dict[str,
+                                             tuple[tuple[int, ...],
+                                                   torch.dtype]] | None = None
+        # The step whose KV-connector progress an intermediate stage still
+        # owes in sample_tokens.
+        self._pp_pending_scheduler_output: SchedulerOutput | None = None
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
@@ -3500,7 +3517,7 @@ class TPUModelRunner(GPUModelRunner):
         # GPUModelRunner.execute_model does this; our override must do it
         # explicitly, otherwise the encoder never runs, image placeholder
         # tokens get plain text embeddings, and the model produces garbage.
-        if self.supports_mm_inputs:
+        if self.supports_mm_inputs and self._pp_is_first:
             has_encoder_inputs = bool(
                 scheduler_output.scheduled_encoder_inputs)
             if has_encoder_inputs:
@@ -3537,7 +3554,7 @@ class TPUModelRunner(GPUModelRunner):
         is_mm_embed_full = None
         mm_tok_cumsum = None
         mm_cumsum_np = None
-        if self.supports_mm_inputs:
+        if self.supports_mm_inputs and self._pp_is_first:
             mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
                 scheduler_output)
             if mm_embeds_list:
@@ -3649,8 +3666,13 @@ class TPUModelRunner(GPUModelRunner):
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             self._record_input_staging_fence()
-            input_ids, inputs_embeds = self._get_model_inputs(
-                input_ids, chunk_mm_inputs)
+            if self._pp_is_first:
+                input_ids, inputs_embeds = self._get_model_inputs(
+                    input_ids, chunk_mm_inputs)
+            else:
+                # Later stages start from the previous stage's hidden
+                # states; the token ids only size the forward.
+                inputs_embeds = None
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
@@ -3659,6 +3681,10 @@ class TPUModelRunner(GPUModelRunner):
             num_tokens_padded = (input_ids if input_ids is not None else
                                  inputs_embeds).shape[0]
             self._token_padding_update(num_tokens_padded)
+            intermediate_tensors = None
+            if self._pp_wave is not None:
+                intermediate_tensors = self._pp_wave.start_forward(
+                    num_tokens_padded)
 
             trace_kwargs = {}
             if TraceAnnotation.is_enabled():
@@ -3710,7 +3736,19 @@ class TPUModelRunner(GPUModelRunner):
                     input_ids=input_ids,
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
+                    intermediate_tensors=intermediate_tensors,
                 )
+
+            if not self._pp_is_last:
+                # The next stage continues this chunk; logits and sampling
+                # happen on the last stage.
+                self._pp_wave.end_forward(hidden_states.tensors,
+                                          num_tokens_padded)
+                start_index = end_index
+                chunk_index += 1
+                continue
+            if self._pp_wave is not None:
+                self._pp_wave.end_forward(None, num_tokens_padded)
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
@@ -3792,6 +3830,9 @@ class TPUModelRunner(GPUModelRunner):
             start_index = end_index
             chunk_index += 1
 
+        if not self._pp_is_last:
+            self._pp_pending_scheduler_output = scheduler_output
+            return None
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=logits_list,
@@ -4076,7 +4117,9 @@ class TPUModelRunner(GPUModelRunner):
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if self.execute_model_state is None:
-            # Nothing to do (PP non-final rank case), output isn't used.
+            if not self._pp_is_last:
+                return self._sample_tokens_pp_intermediate_stage()
+            # Nothing to do, output isn't used.
             return None  # type: ignore[return-value]
 
         state = self.execute_model_state
@@ -4757,6 +4800,10 @@ class TPUModelRunner(GPUModelRunner):
         if padding_state is not None:
             # Every row of a dummy step is padding.
             padding_state.update(0, num_tokens)
+        intermediate_tensors = None
+        if not self._pp_is_first:
+            intermediate_tensors = self._pp_intermediate_tensors(num_tokens,
+                                                                 zeros=True)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -4772,9 +4819,16 @@ class TPUModelRunner(GPUModelRunner):
                     kv_cache_bundle=self._kv_cache_bundle,
                 ),
         ):
-            out, _ = self.forward_model(input_ids=input_ids,
-                                        positions=position_ids,
-                                        inputs_embeds=inputs_embeds)
+            out, _ = self.forward_model(
+                input_ids=input_ids,
+                positions=position_ids,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors)
+            if isinstance(out, IntermediateTensors):
+                # A stage before the last produces no logits; nothing
+                # consumes its output in a warmup.
+                synchronize_tensors(list(out.tensors.values()))
+                return
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
@@ -5065,6 +5119,9 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
         are visible to vLLM's available-memory probe in profile_run."""
+        if not self._pp_is_last:
+            # Only the last stage holds the lm_head and samples.
+            return
         self._precompile_compute_selected_logits()
         if (_get_sequence_layout_planner_for_runner(
                 self).uses_selected_logits_hidden_states):
@@ -5075,6 +5132,13 @@ class TPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
+        if (self.parallel_config.pipeline_parallel_size > 1
+                and self._pp_wave is None):
+            self._pp_intermediate_tensors(1, zeros=True)
+            assert self._pp_intermediate_template is not None
+            self._pp_wave = PPWave(self.device, self.max_num_tokens,
+                                   self._pp_intermediate_template)
+            self._pp_wave.warmup()
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -6549,12 +6613,24 @@ class TPUModelRunner(GPUModelRunner):
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
-    def forward_model(self, input_ids, positions, inputs_embeds=None):
+    def forward_model(self,
+                      input_ids,
+                      positions,
+                      inputs_embeds=None,
+                      intermediate_tensors=None):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
+        kwargs = {}
+        if intermediate_tensors is not None:
+            kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(input_ids=input_ids,
                          positions=positions,
-                         inputs_embeds=inputs_embeds)
+                         inputs_embeds=inputs_embeds,
+                         **kwargs)
+        # A stage before the last returns the tensors the next stage
+        # consumes rather than hidden states to sample from.
+        if isinstance(out, IntermediateTensors):
+            return out, None
         # @support_torch_compile may wrap a single tensor in a 1-element
         # list/tuple; unwrap that first.
         if isinstance(out, (list, tuple)) and len(out) == 1:
@@ -6565,6 +6641,57 @@ class TPUModelRunner(GPUModelRunner):
         if isinstance(out, (list, tuple)) and len(out) == 2:
             out, aux_hidden_states = out
         return out, aux_hidden_states
+
+    def _pp_intermediate_tensors(self, num_tokens: int,
+                                 zeros: bool) -> IntermediateTensors:
+        """Buffers shaped like this stage's input from the previous stage."""
+        if self._pp_intermediate_template is None:
+            probe = self.model.make_empty_intermediate_tensors(
+                batch_size=1,
+                dtype=self.model_config.dtype,
+                device=self.device)
+            self._pp_intermediate_template = {
+                key: (tuple(tensor.shape[1:]), tensor.dtype)
+                for key, tensor in probe.items()
+            }
+        alloc = torch.zeros if zeros else torch.empty
+        return IntermediateTensors({
+            key:
+            alloc((num_tokens, *shape), dtype=dtype, device=self.device)
+            for key, (shape, dtype) in self._pp_intermediate_template.items()
+        })
+
+    def pp_settle(self) -> None:
+        """Close the current hand-off burst so in-flight forwards drain."""
+        if self._pp_wave is not None:
+            self._pp_wave.settle()
+
+    def _sample_tokens_pp_intermediate_stage(self) -> ModelRunnerOutput:
+        """Sampling runs on the last stage only; earlier stages report just
+        their KV-connector progress so the aggregated step output is
+        complete."""
+        scheduler_output = self._pp_pending_scheduler_output
+        self._pp_pending_scheduler_output = None
+        if scheduler_output is None:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        self.maybe_wait_for_kv_save()
+        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
+         invalid_block_group_index,
+         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
+        if (finished_sending is None and finished_recving is None
+                and kv_worker_meta is None and not invalid_block_ids
+                and kv_connector_stats is None):
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.kv_connector_output = _build_kv_connector_output(
+            finished_sending=finished_sending,
+            finished_recving=finished_recving,
+            kv_connector_worker_meta=kv_worker_meta,
+            invalid_block_ids=invalid_block_ids,
+            invalid_block_group_index=invalid_block_group_index,
+            kv_connector_stats=kv_connector_stats,
+        )
+        return output
 
     def _build_padded_sampling_params(
         self,

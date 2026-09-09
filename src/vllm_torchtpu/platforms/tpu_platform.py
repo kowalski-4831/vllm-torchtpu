@@ -20,6 +20,8 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.platforms.pp_validation import \
+    validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
 
@@ -387,11 +389,12 @@ def apply_tpu_patches() -> None:
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import (
         patch_default_loader_ep_weight_filter,
-        patch_default_model_loader_page_cache,
+        patch_default_model_loader_page_cache, patch_moe_expert_write_staging,
         patch_runai_sharded_expert_streaming)
     patch_runai_sharded_expert_streaming()
     patch_default_loader_ep_weight_filter()
     patch_default_model_loader_page_cache()
+    patch_moe_expert_write_staging()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -871,6 +874,14 @@ class TpuPlatform(Platform):
         if pcp_config.enabled:
             logger.info("Using vLLM native multiprocess PCP world; PCP is not "
                         "represented as a JAX mesh axis.")
+        validate_pipeline_parallel_config(vllm_config)
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
+            # get the hand-off settle here; engine-core processes install it
+            # again on their side.
+            from vllm_torchtpu.distributed.pp_settle import \
+                patch_executor_for_pp_wave
+            patch_executor_for_pp_wave(vllm_config)
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
