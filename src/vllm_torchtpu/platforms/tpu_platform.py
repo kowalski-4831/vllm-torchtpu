@@ -848,6 +848,11 @@ class TpuPlatform(Platform):
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
         _validate_phased_profiling_config(vllm_config)
+        if "USE_MOE_EP_KERNEL" in os.environ:
+            raise ValueError(
+                "USE_MOE_EP_KERNEL is no longer supported and enables "
+                "nothing. Unset it; the fused expert-parallel MoE kernel is "
+                "USE_MOE_FUSED_EP_KERNEL=1.")
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
         _register_tpu_kv_connectors()
