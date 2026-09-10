@@ -342,13 +342,11 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_explicit_pcp_collectives,
-                               _patch_moe_no_ep_tp_scope,
                                _patch_moe_runner_fused_output_is_reduced,
                                _patch_rowparallel_defer_bias,
                                _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
-                               _patch_vllm_hybrid_producer_prefix_hits,
-                               _patch_vllm_tpu_group_custom_ops)
+                               _patch_vllm_hybrid_producer_prefix_hits)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
@@ -357,17 +355,14 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
-    tpu_plugin._patch_vllm_pcp_v2_validation()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
     tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
-    _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_moe_explicit_pcp_collectives()
     _patch_moe_runner_fused_output_is_reduced()
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
-    _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
@@ -379,12 +374,11 @@ def apply_tpu_patches() -> None:
     tpu_plugin._patch_vllm_vocab_parallel_embedding()
     from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
     from vllm_torchtpu import (  # isort: skip
-        _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
+        _patch_dflash_bypass_v2_runner_check,
         _patch_multiproc_worker_global_rank_env,
         _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
         _patch_vllm_force_v1_runner_tpu,
         _patch_vllm_merge_multimodal_embeddings, _patch_vllm_piecewise_backend)
-    _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     _patch_vllm_reset_compile_wrapper()
     _patch_vllm_piecewise_backend()
