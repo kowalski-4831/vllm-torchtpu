@@ -45,6 +45,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    TPU_MLA_MASKED_DENSE_ENABLED: bool = False
+    TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
+    TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
@@ -350,6 +353,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
+    # Off by default until the model and hardware scope of the cost model is
+    # broadened or selected automatically from an explicit model profile.
+    "TPU_MLA_MASKED_DENSE_ENABLED":
+    env_bool("TPU_MLA_MASKED_DENSE_ENABLED", default=False),
+    # Longest per-sequence KV length for which an enabled sparse-MLA step runs
+    # the masked-dense kernel instead of the gather kernel. ANALYTIC is the
+    # cheaper masked-dense tier, which computes the causal mask in registers
+    # and needs its limit at or under the indexer's topk; the other is the
+    # tier that materializes the CSA bitmap on SparseCore. Unset uses the
+    # measured default; 0 disables that tier; any other value must be a
+    # multiple of the streamed KV block size. These controls take effect only
+    # when TPU_MLA_MASKED_DENSE_ENABLED=1 and only for eligible prefill; a
+    # batch containing any decode always uses sparse gather attention.
+    "TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN":
+    env_optional_int("TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN"),
+    "TPU_MLA_MASKED_DENSE_MAX_KV_LEN":
+    env_optional_int("TPU_MLA_MASKED_DENSE_MAX_KV_LEN"),
     # Most model length cap for TPU compile bucketing
     "VLLM_TPU_MOST_MODEL_LEN":
     lambda: int(val)
