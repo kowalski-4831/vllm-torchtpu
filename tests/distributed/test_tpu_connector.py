@@ -1741,7 +1741,10 @@ class TestTPURaidenConnectorWorker:
             wrapped_storages = construct_call.args[0]
             assert construct_call.kwargs == {"num_slots": 1}
             # Bounded host staging: the connector passes the lease count and
-            # one per-pool hint (FA: pages per max-length request, GDN: 1).
+            # one hint per pool: the distinct blocks one transfer touches on
+            # the pool's storage. Every typed cache is its own storage here,
+            # so FA pools report pages per max-length request and GDN state
+            # pools report their single block.
             staging_kwargs = engine.register_pools_kwargs
             assert staging_kwargs["staging_leases"] == 8
             hints = staging_kwargs["staging_blocks_per_pool"]
@@ -1829,6 +1832,15 @@ class TestTPURaidenConnectorWorker:
         assert len(engine.registered_pools) == 105
         assert len({pool["storage_index"]
                     for pool in engine.registered_pools}) == 15
+        # Every raw storage hosts one FA layer plus one layer of each of the
+        # three GDN groups (conv + ssm). Raiden sizes a storage's staging
+        # arena from max(hint) over its pools, so each pool reports the
+        # storage-wide union: FA pages plus one block per GDN group.
+        staging_kwargs = engine.register_pools_kwargs
+        assert staging_kwargs["staging_leases"] == 8
+        hints = staging_kwargs["staging_blocks_per_pool"]
+        assert len(hints) == 105
+        assert set(hints) == {worker._max_request_blocks() + 3}
         summary = worker.raiden_admission_summary()
         assert summary["binding"] == "aliased_raw"
         assert summary["pools"] == 105
@@ -1847,6 +1859,43 @@ class TestTPURaidenConnectorWorker:
                          if pool["tag"] == "gdn.conv")
         assert [region["units_per_stride"]
                 for region in conv_pool["regions"]] == [2, 2, 4]
+
+    def test_raiden_staging_hints_cover_every_block_table_on_a_storage(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+        fa_pages = worker._max_request_blocks()
+        groups = (
+            SimpleNamespace(layer_names=("fa.0", "fa.1")),
+            SimpleNamespace(layer_names=("gdn.0", )),
+            SimpleNamespace(layer_names=("gdn.1", )),
+            SimpleNamespace(layer_names=("gdn.2", )),
+        )
+
+        def pool(tag, layer_name, storage_index):
+            return SimpleNamespace(tag=tag,
+                                   layer_name=layer_name,
+                                   storage_index=storage_index)
+
+        manifest = SimpleNamespace(pools=[
+            # Storage 0: FA pages plus one block per GDN group; a group's
+            # conv and ssm pools share that block.
+            pool("fa", "fa.0", 0),
+            pool("gdn.conv.g0", "gdn.0", 0),
+            pool("gdn.ssm.g0", "gdn.0", 0),
+            pool("gdn.conv.g1", "gdn.1", 0),
+            pool("gdn.ssm.g1", "gdn.1", 0),
+            pool("gdn.conv.g2", "gdn.2", 0),
+            pool("gdn.ssm.g2", "gdn.2", 0),
+            # Storage 1: only full attention.
+            pool("fa", "fa.1", 1),
+            # Storage 2: an unknown pool kind keeps the whole storage on the
+            # full host mirror.
+            pool("fa", "fa.1", 2),
+            pool("opaque", "fa.1", 2),
+        ])
+
+        hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+
+        assert hints == [fa_pages + 3] * 7 + [fa_pages] + [0, 0]
 
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (

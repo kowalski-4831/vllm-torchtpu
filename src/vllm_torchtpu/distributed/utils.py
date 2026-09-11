@@ -240,8 +240,10 @@ def get_raiden_pool_staging_leases() -> int:
     overflows libtpu's 16 GiB premapped pool and D2H/H2D silently fall back to
     the staged-copy slow path (2-4x slower transfers, see
     RESHARD_BOUNDED_STAGING_DESIGN.md). With N > 0 the connector asks tpu-sync
-    for a bounded staging arena of N x (pages per max-length request) storage
-    pages per KV storage, leased per transfer. 0 keeps the full host mirror.
+    for a bounded staging arena per KV storage of N x the distinct blocks one
+    transfer touches on that storage (pages per max-length request plus one
+    state block per GDN group sharing it), leased per transfer. 0 keeps the
+    full host mirror.
     """
     return envs.TPU_RAIDEN_POOL_STAGING_LEASES
 

@@ -1712,7 +1712,8 @@ class TPURaidenConnectorWorker:
         logger.info(
             "TPURaidenConnectorWorker rank%d --> registering %d pools with transfer engine",
             self.tp_rank, len(manifest.pools))
-        summary = self._register_raiden_pools(engine, manifest)
+        summary = self._register_raiden_pools(engine, manifest,
+                                              kv_cache_groups)
         logger.info(
             "TPURaidenConnectorWorker rank%d --> transfer engine pools registered",
             self.tp_rank)
@@ -1817,7 +1818,10 @@ class TPURaidenConnectorWorker:
 
         storages = list(manifest.storages)
         engine = self._construct_raiden_transfer_engine(storages, num_slots=1)
-        summary = self._register_raiden_pools(engine, manifest)
+        summary = self._register_raiden_pools(
+            engine, manifest,
+            getattr(getattr(runner, "kv_cache_config", None),
+                    "kv_cache_groups", None))
 
         registration = self._register_raiden_stage3_work_unit(
             engine=engine,
@@ -3986,33 +3990,62 @@ class TPURaidenConnectorWorker:
         max_model_len = self.vllm_config.model_config.max_model_len
         return max(1, (max_model_len + block_size - 1) // block_size)
 
-    def _raiden_staging_blocks_per_pool(self,
-                                        pool_dicts: list[dict]) -> list[int]:
+    def _raiden_staging_blocks_per_pool(self, manifest: Any,
+                                        kv_cache_groups: Any) -> list[int]:
         """Bounded host staging hints, one per pool in manifest order.
 
-        The most blocks of each pool one transfer can touch: full-attention
-        pools see every page of the request (<= pages per max-length request),
-        GDN conv/ssm state pools see one state block per group. Unknown pool
-        kinds get 0, which keeps their storage on the full host mirror (see
+        Raiden sizes each storage's staging arena as leases x max(hint) over
+        the pools on that storage and leases one slot per distinct device
+        block id a transfer touches there. One transfer carries a request's
+        full-attention pages plus one state block per GDN group under a
+        single uuid, and pools of different kv-cache groups draw block ids
+        from different block tables, so pools sharing a storage touch
+        disjoint ids. Every pool therefore reports the union for its whole
+        storage: pages per max-length request for each full-attention group
+        present plus one per GDN group present (a group's conv and ssm pools
+        address the same block). A storage holding a pool of unknown kind
+        reports 0, which keeps it on the full host mirror (see
         RESHARD_BOUNDED_STAGING_DESIGN.md).
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden import \
             pool_manifest as rpm
 
+        group_of_layer: dict[str, int] = {}
+        for index, group in enumerate(kv_cache_groups or ()):
+            for layer_name in getattr(group, "layer_names", ()):
+                group_of_layer[str(layer_name)] = index
         fa_pages = int(self._max_request_blocks())
-        hints: list[int] = []
-        for pool in pool_dicts:
-            tag = str(pool.get("tag", ""))
+        # storage -> {block table: blocks one transfer touches from it}
+        tables_by_storage: dict[int, dict[Any, int]] = {}
+        full_mirror: set[int] = set()
+        for pool in manifest.pools:
+            tag = str(pool.tag)
+            storage = int(pool.storage_index)
             if tag.startswith(rpm.TAG_FA):
-                hints.append(fa_pages)
+                blocks = fa_pages
             elif tag.startswith(rpm.TAG_GDN_CONV) or tag.startswith(
                     rpm.TAG_GDN_SSM):
-                hints.append(1)
+                blocks = 1
             else:
+                full_mirror.add(storage)
+                continue
+            # Layers of one kv-cache group share a block table; a layer
+            # outside every group is its own table.
+            layer_name = str(pool.layer_name)
+            table = group_of_layer.get(layer_name, layer_name)
+            tables = tables_by_storage.setdefault(storage, {})
+            tables[table] = max(tables.get(table, 0), blocks)
+        hints: list[int] = []
+        for pool in manifest.pools:
+            storage = int(pool.storage_index)
+            if storage in full_mirror:
                 hints.append(0)
+            else:
+                hints.append(sum(tables_by_storage[storage].values()))
         return hints
 
-    def _register_raiden_pools(self, engine: Any, manifest: Any) -> dict:
+    def _register_raiden_pools(self, engine: Any, manifest: Any,
+                               kv_cache_groups: Any) -> dict:
         """Registers the manifest's pools, with bounded host staging when the
         installed tpu_sync supports it (TPU_RAIDEN_POOL_STAGING_LEASES > 0).
 
@@ -4025,7 +4058,8 @@ class TPURaidenConnectorWorker:
         leases = int(dist_utils.get_raiden_pool_staging_leases())
         summary: dict
         if leases > 0:
-            hints = self._raiden_staging_blocks_per_pool(pool_dicts)
+            hints = self._raiden_staging_blocks_per_pool(
+                manifest, kv_cache_groups)
             try:
                 summary = dict(
                     engine.register_pools(pool_dicts,
