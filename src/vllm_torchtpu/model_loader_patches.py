@@ -436,8 +436,9 @@ class ExpertWriteTracker:
     A w13 parameter receives a ``w1`` and a ``w3`` shard per expert, a w2
     parameter one ``w2`` shard. The shard being written says which kind the
     parameter is, so the count of writes that completes it is known from
-    the first one, whatever order the shards arrive in. Experts the loader
-    never writes leave the parameter incomplete.
+    the first one, whatever order the shards arrive in. Writes with any
+    other shard id (a loader that copies all experts at once passes None)
+    and experts the loader never writes leave the parameter incomplete.
     """
 
     def __init__(self) -> None:
@@ -445,9 +446,12 @@ class ExpertWriteTracker:
 
     def record(self, param: torch.Tensor, expert_id: int,
                shard_id: str) -> bool:
+        shards = _SHARDS_PER_EXPERT.get(shard_id)
+        if shards is None:
+            return False
         seen = self._seen.setdefault(id(param), set())
         seen.add((expert_id, shard_id))
-        complete = len(seen) == param.shape[0] * _SHARDS_PER_EXPERT[shard_id]
+        complete = len(seen) == param.shape[0] * shards
         if complete:
             del self._seen[id(param)]
         return complete

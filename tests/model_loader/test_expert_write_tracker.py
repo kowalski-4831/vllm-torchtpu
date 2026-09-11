@@ -36,6 +36,15 @@ def test_one_local_expert_needs_both_shards():
     assert tracker.record(w13, 5, "w3")
 
 
+def test_whole_tensor_writes_never_complete_a_parameter():
+    # gpt-oss MXFP4 checkpoints copy every expert in one write with no
+    # shard or expert id; such a parameter is written at the end of loading.
+    tracker = ExpertWriteTracker()
+    w13 = torch.empty(1, 6, 8)
+    assert not tracker.record(w13, None, None)
+    assert not tracker.record(w13, None, None)
+
+
 def test_parameters_are_tracked_apart():
     tracker = ExpertWriteTracker()
     a, b = torch.empty(2, 4, 4), torch.empty(2, 4, 4)
@@ -147,11 +156,23 @@ def test_interleaved_parameters_sharing_pooled_buffers_keep_their_experts():
         assert torch.equal(param.data[:, 2:], torch.full((2, 2, 2), float(w3)))
 
 
-def test_the_patched_loader_keeps_the_upstream_loader_attributes():
+def test_the_patched_loader_keeps_the_upstream_loader_attributes(monkeypatch):
     from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.model_loader import base_loader
 
     from vllm_torchtpu.model_loader_patches import \
         patch_moe_expert_write_staging
+
+    # The patch is process-wide; undo it after the test so later tests load
+    # expert weights through the stock loader.
+    monkeypatch.setattr(RoutedExperts, "weight_loader",
+                        RoutedExperts.weight_loader)
+    monkeypatch.setattr(RoutedExperts,
+                        "_tpu_expert_staging_patch",
+                        False,
+                        raising=False)
+    monkeypatch.setattr(base_loader, "process_weights_after_loading",
+                        base_loader.process_weights_after_loading)
     patch_moe_expert_write_staging()
     loader = RoutedExperts.weight_loader
     assert loader.supports_moe_loading is True
