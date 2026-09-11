@@ -16,7 +16,6 @@ src/vllm_torchtpu/executors/ray_distributed_executor.py:TORCH_TPU_XPROF_SESSION_
 src/vllm_torchtpu/executors/ray_distributed_executor_v2.py:TORCH_TPU_BASE_PORT
 src/vllm_torchtpu/executors/ray_distributed_executor_v2.py:TORCH_TPU_DP_MASTER_PORT
 src/vllm_torchtpu/executors/ray_distributed_executor_v2.py:TORCH_TPU_XPROF_SESSION_ID
-src/vllm_torchtpu/kernels/kimi_k3/chunk_kda.py:PALLAS_INTERPRET
 src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_FWD_MB
 src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_MANUAL_H0_DMA
 src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_MANUAL_HT_DMA
@@ -26,8 +25,6 @@ src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_OVERLAP_HT_DMA
 src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_PACKED_METADATA
 src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py:KDA_PACK_HEAD_INV
 src/vllm_torchtpu/layers/common/pcp_sequence_layout.py:VLLM_TPU_DEBUG_PCP_LAYOUT
-src/vllm_torchtpu/layers/vllm/custom_ops/kda_attention_op.py:VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL
-src/vllm_torchtpu/layers/vllm/custom_ops/kda_attention_op.py:VLLM_TORCHTPU_KDA_FUSED
 src/vllm_torchtpu/model_loader_patches.py:TPU_SHARDED_LOAD_SYNC_EVERY
 src/vllm_torchtpu/offload/raiden_connector.py:RAIDEN_DISABLE_SINGLETON_WORKER
 src/vllm_torchtpu/offload/raiden_store.py:RAIDEN_SHM_KEY
