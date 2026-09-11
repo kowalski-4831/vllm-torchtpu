@@ -13,8 +13,11 @@ with tokens have been dispatched, and this module counts steps. While the
 engine keeps dispatching, this happens by itself. When the engine stops to
 wait for a result before that, the launches that would carry the step the
 rest of the way are never issued. This module wraps the executor so that,
-in that case, the engine first tells every worker to issue them
-(``pp_settle``, sent without waiting for a reply) and then waits.
+in that case, the engine first tells every worker to issue them, one
+``pp_push`` per missing step (sent without waiting for a reply), and then
+waits. A push is a forward that carries nothing, so the forwards in flight
+keep their places and the next real step follows them; nothing drains and
+nothing restarts.
 
 The engine and its workers exchange messages through shared-memory ring
 buffers, vLLM's ``MessageQueue``, which hold ten messages by default. The
@@ -25,10 +28,10 @@ its own ring, which the engine reads in the order it made the calls; with a
 KV connector attached every worker replies to every call, so while the
 engine waits for the last stage's reply to an old step, the other stages
 keep replying to later steps and a short ring fills and blocks them before
-they reach the settle message. Both rings are widened to
+they reach the push message. Both rings are widened to
 ``rpc_ring_chunks`` messages.
 
-The settle is installed on ``MultiprocExecutor`` before the executor is
+The push is installed on ``MultiprocExecutor`` before the executor is
 built: from the platform's config check for engines built in this process,
 and from the engine-core process otherwise. It is installed once per
 process; every executor keeps its own step count and reads its own pipeline
@@ -51,52 +54,83 @@ class _WaveState:
 
     def __init__(self, stages: int):
         self.stages = stages
-        # Steps with tokens dispatched since startup.
+        # Steps with tokens dispatched since startup, pushes included, and
+        # the number of the last one the scheduler produced.
         self.steps = 0
+        self.last_step = 0
+        # Steps the scheduler produced since startup.
+        self.real_steps = 0
         # A step was dispatched since the last settle.
         self.open = False
+        self.pushes = 0
         self.settles = 0
 
-    def settle_before_waiting(self, executor: Any, step: int) -> None:
-        """Send ``pp_settle`` unless enough later steps have been dispatched
-        to carry ``step`` to the last stage on their own."""
-        later = self.steps - step
-        if not self.open or later >= self.stages - 2:
+    def dispatched(self) -> int:
+        """Records a scheduler step and returns its number."""
+        self.steps += 1
+        self.last_step = self.steps
+        self.real_steps += 1
+        self.open = True
+        return self.steps
+
+    def before_waiting(self, executor: Any, step: int, real_step: int) -> None:
+        """Send what carries ``step`` to the last stage before the engine
+        waits for it: the settle when it is the newest step the scheduler
+        produced, since nothing else is in flight and the stages can rest
+        afterwards; otherwise one ``pp_push`` for every later step it still
+        lacks, counting the pushes as later steps for the waits that
+        follow."""
+        if not self.open:
             return
-        self.open = False
-        self.settles += 1
-        if self.settles <= 5 or self.settles % 100 == 0:
+        if real_step == self.real_steps:
+            self.open = False
+            self.settles += 1
+            if self.settles <= 5 or self.settles % 100 == 0:
+                logger.debug("PP wave settle %d before waiting on step %d",
+                             self.settles, step)
+            executor.collective_rpc("pp_settle",
+                                    non_block=True,
+                                    unique_reply_rank=executor.output_rank)
+            return
+        need = self.stages - 2 - (self.steps - step)
+        if need <= 0:
+            return
+        self.pushes += need
+        if self.pushes <= 5 or self.pushes % 100 == 0:
             logger.debug(
-                "PP wave settle %d: waiting on step %d with %d later "
-                "in flight", self.settles, step, later)
-        executor.collective_rpc("pp_settle",
-                                non_block=True,
-                                unique_reply_rank=executor.output_rank)
+                "PP wave: %d pushes (%d total) before waiting on "
+                "step %d of %d", need, self.pushes, step, self.steps)
+        for _ in range(need):
+            executor.collective_rpc("pp_push",
+                                    non_block=True,
+                                    unique_reply_rank=executor.output_rank)
+        self.steps += need
 
 
-class _SettleFuture(Future):
+class _PushFuture(Future):
     """The result of one forward or sampling call.
 
     Every method forwards to the executor's own future. The two that wait
-    for it, ``result`` and ``exception``, first send ``pp_settle`` when too
-    few later steps have been dispatched to carry this one to the last
-    stage.
+    for it, ``result`` and ``exception``, first send what carries this
+    step to the last stage: the settle when nothing else is in flight,
+    pushes otherwise.
     """
 
     def __init__(self, inner: Future, executor: Any, wave: _WaveState,
-                 step: int):
+                 step: int, real_step: int):
         super().__init__()
         self._inner = inner
         self._executor = executor
         self._wave = wave
         self._step = step
+        self._real_step = real_step
 
     def result(self, timeout=None):
-        self._wave.settle_before_waiting(self._executor, self._step)
+        self._wave.before_waiting(self._executor, self._step, self._real_step)
         return self._inner.result(timeout)
 
     def exception(self, timeout=None):
-        self._wave.settle_before_waiting(self._executor, self._step)
+        self._wave.before_waiting(self._executor, self._step, self._real_step)
         # The executor's future resolves only inside result(); a stored
         # exception raises there and is read back below.
         try:
@@ -127,7 +161,8 @@ def rpc_ring_chunks(stages: int) -> int:
     The engine keeps up to ``stages`` steps in flight, each of them two
     calls (execute_model and sample_tokens), so a worker reads a step's
     calls up to that many steps late and, with a KV connector, holds up to
-    that many unread replies; settle messages add a few more.
+    that many unread replies; a wait adds at most ``stages - 2`` pushes
+    or one settle.
     """
     return 4 * stages + 8
 
@@ -173,7 +208,8 @@ def widen_message_rings(vllm_config: Any) -> None:
 
 
 def patch_executor_for_pp_wave(vllm_config: Any) -> None:
-    """Install the settle and the wider ring buffer on ``MultiprocExecutor``.
+    """Install the push, the settle and the wider ring buffer on
+    ``MultiprocExecutor``.
 
     Does nothing without a pipeline; safe to call more than once per
     process, and a later call for a deeper pipeline widens the rings.
@@ -203,22 +239,25 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         state = _state(self)
         if scheduler_output.total_num_scheduled_tokens <= 0:
             return orig_execute(self, scheduler_output, non_block=non_block)
-        state.steps += 1
-        state.open = True
+        step = state.dispatched()
         # For pooling models and for steps without sampling the engine
-        # waits on this future directly, so it settles like the sampling one.
+        # waits on this future directly, so it pushes like the sampling one.
         inner = orig_execute(self, scheduler_output, non_block=True)
-        future = _SettleFuture(inner, self, state, state.steps)
+        future = _PushFuture(inner, self, state, step, state.real_steps)
         return future if non_block else future.result()
 
     def sample_tokens(self, grammar_output, non_block=False):
         state = _state(self)
         inner = orig_sample(self, grammar_output, non_block=True)
-        future = _SettleFuture(inner, self, state, state.steps)
+        # Sampling belongs to the last dispatched step, whatever pushes
+        # went out since.
+        future = _PushFuture(inner, self, state, state.last_step,
+                             state.real_steps)
         return future if non_block else future.result()
 
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
     MultiprocExecutor._tpu_pp_wave_patch = True
-    logger.info("PP wave: engine settle installed, message ring %d chunks",
-                _ring_chunks_needed)
+    logger.info(
+        "PP wave: engine push and settle installed, message ring "
+        "%d chunks", _ring_chunks_needed)

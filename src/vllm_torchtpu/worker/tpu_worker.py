@@ -84,7 +84,7 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu.platforms.tpu_platform import apply_tpu_patches
         apply_tpu_patches()
         # This process creates the worker's reply ring to the engine.
-        from vllm_torchtpu.distributed.pp_settle import widen_message_rings
+        from vllm_torchtpu.distributed.pp_push import widen_message_rings
         widen_message_rings(vllm_config)
 
         super().__init__(vllm_config=vllm_config,
@@ -480,6 +480,9 @@ class TPUWorker(WorkerBase):
 
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
+
+    def pp_push(self):
+        return self.model_runner.pp_push()
 
     def pp_settle(self):
         return self.model_runner.pp_settle()

@@ -40,9 +40,9 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         # The KV transfer connectors assume every worker holds every layer.
         unsupported = "KV transfer connectors"
     elif _legacy_ray_executor():
-        # The pipeline drains through the executor's settle hook, which the
-        # multiprocess executor and the Ray V2 executor share; the legacy
-        # Ray executor has no such hook.
+        # The pipeline's hand-off pushes go through the executor hook that
+        # the multiprocess executor and the Ray V2 executor share; the
+        # legacy Ray executor has no such hook.
         unsupported = "the legacy Ray executor"
         remedy = " Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
     if unsupported is not None:

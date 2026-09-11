@@ -877,9 +877,9 @@ class TpuPlatform(Platform):
         validate_pipeline_parallel_config(vllm_config)
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
-            # get the hand-off settle here; engine-core processes install it
+            # get the hand-off push here; engine-core processes install it
             # again on their side.
-            from vllm_torchtpu.distributed.pp_settle import \
+            from vllm_torchtpu.distributed.pp_push import \
                 patch_executor_for_pp_wave
             patch_executor_for_pp_wave(vllm_config)
 

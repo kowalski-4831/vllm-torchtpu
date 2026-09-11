@@ -4,8 +4,8 @@
 Every stage runs its own event stream in a thread. The fake ring behaves like
 the runtime: a launch completes only when every stage has issued the same
 launch number, and it hands stage r-1's payload of that launch to stage r. A
-schedule that leaves the stages with unequal counts therefore deadlocks and
-fails the join timeout instead of passing by accident.
+schedule whose launches do not pair therefore deadlocks and fails the join
+timeout instead of passing by accident.
 """
 import random
 import threading
@@ -69,63 +69,109 @@ def stages(monkeypatch):
     return ring, waves
 
 
-def _run_stage(wave, bursts, results, errors):
+SETTLE = "settle"
+
+
+def _run_stage(wave, events, results, errors):
     """One stage's event stream: a forward adds 1 to the hidden states it
     received and passes the residual on; the first stage seeds each forward
     with its number as hidden states and a residual of 0.5, which every
-    later stage must see as part of the sum."""
+    later stage must see as part of the sum. A push is the engine's
+    hand-off that carries nothing; a settle closes the burst."""
     try:
         wave.warmup()
         g = 0
-        for burst in bursts:
-            for rows in burst:
-                received = wave.start_forward(rows)
-                if wave.rank == 0:
-                    h = torch.full((rows, HIDDEN), float(g))
-                    r = torch.full((rows, HIDDEN), 0.5)
-                else:
-                    assert torch.equal(received["residual"],
-                                       torch.zeros(rows, HIDDEN))
-                    h = received["hidden_states"] + 1
-                    r = received["residual"]
-                    assert h.shape == (rows, HIDDEN)
-                if wave.rank == wave.last:
-                    results.append((g, rows, h, r))
-                    wave.end_forward(None, rows)
-                else:
-                    wave.end_forward({"hidden_states": h, "residual": r}, rows)
-                g += 1
-            wave.settle()
+        for rows in events:
+            if rows is None:
+                wave.push()
+                continue
+            if rows == SETTLE:
+                wave.settle()
+                continue
+            received = wave.start_forward(rows)
+            if wave.rank == 0:
+                h = torch.full((rows, HIDDEN), float(g))
+                r = torch.full((rows, HIDDEN), 0.5)
+            else:
+                assert torch.equal(received["residual"],
+                                   torch.zeros(rows, HIDDEN))
+                h = received["hidden_states"] + 1
+                r = received["residual"]
+                assert h.shape == (rows, HIDDEN)
+            if wave.rank == wave.last:
+                results.append((g, rows, h, r))
+                wave.end_forward(None, rows)
+            else:
+                wave.end_forward({"hidden_states": h, "residual": r}, rows)
+            g += 1
     except BaseException as exc:  # reported by the test thread
         errors.append((wave.rank, exc))
 
 
-def test_random_bursts_deliver_every_forward_and_keep_counts_equal(stages):
-    ring, waves = stages
-    rng = random.Random(7)
-    bursts = [[
-        rng.choice(BUCKETS) for _ in range(rng.choice((1, 2, 3, 5, 9)))
-    ] for _ in range(6)]
+def _events(rng, forwards, stages, bursts=3):
+    """Forwards with pushes where the engine would send them: after a
+    forward, with some probability the engine waits for a step that still
+    needs pushes. Each burst ends with the pushes that carry its last
+    forward and a settle."""
+    events = []
+    for _ in range(bursts):
+        dispatched = 0
+        for _ in range(forwards):
+            events.append(rng.choice(BUCKETS))
+            dispatched += 1
+            if rng.random() < 0.4:
+                waited = rng.randint(max(1, dispatched - stages), dispatched)
+                need = max(stages - 2 - (dispatched - waited), 0)
+                events.extend([None] * need)
+                dispatched += need
+        events.extend([None] * (stages - 2))
+        events.append(SETTLE)
+    return events
+
+
+def _run(waves, events, timeout=60):
     results, errors = [], []
     threads = [
         threading.Thread(target=_run_stage,
-                         args=(w, bursts, results, errors),
+                         args=(w, events, results, errors),
                          daemon=True) for w in waves
     ]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=60)
+        t.join(timeout=timeout)
     assert not any(t.is_alive() for t in threads), "a stage never finished"
     assert not errors, errors
-    total = sum(len(b) for b in bursts)
-    assert len(results) == total
+    return results
+
+
+def test_random_forwards_and_pushes_deliver_every_forward(stages):
+    ring, waves = stages
+    rng = random.Random(7)
+    events = _events(rng, 12, len(waves))
+    results = _run(waves, events)
+    forwards = [e for e in events if e is not None and e != SETTLE]
+    assert len(results) == len(forwards)
     last = waves[-1].rank
     for g, rows, h, r in results:
+        assert rows == forwards[g]
         assert torch.equal(h, torch.full((rows, HIDDEN), g + last + 0.5))
         assert torch.equal(r, torch.zeros(rows, HIDDEN))
+    # Every burst costs its forwards and pushes plus stages - 1 launches;
+    # the warmup adds one.
+    moves = len(events) - events.count(SETTLE)
     assert len({w.launches for w in waves}) == 1
-    assert waves[0].launches == 1 + total + len(bursts) * (len(waves) - 1)
+    assert waves[0].launches == 1 + moves + events.count(SETTLE) * last
+    assert all(w.bursts == events.count(SETTLE) for w in waves)
+
+
+def test_pushes_alone_carry_a_lone_forward_to_the_last_stage(stages):
+    ring, waves = stages
+    events = [16] + [None] * (len(waves) - 2) + [SETTLE]
+    results = _run(waves, events, timeout=30)
+    assert len(results) == 1
+    # one forward, six pushes, then the settle's stages - 1 launches
+    assert [w.launches for w in waves] == [1 + 7 + 7] * 8
 
 
 def test_settle_without_an_open_burst_is_a_noop(stages):
@@ -134,22 +180,14 @@ def test_settle_without_an_open_burst_is_a_noop(stages):
     assert waves[3].launches == 0
 
 
-def test_a_single_forward_burst_launches_stages_plus_forwards_minus_one(
-        stages):
-    ring, waves = stages
-    bursts = [[16]]
-    results, errors = [], []
-    threads = [
-        threading.Thread(target=_run_stage,
-                         args=(w, bursts, results, errors),
-                         daemon=True) for w in waves
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
-    assert not errors, errors
-    assert [w.launches for w in waves] == [1 + 1 + 7] * 8
+def test_a_launch_count_off_by_one_is_caught(stages):
+    _, waves = stages
+    w = waves[0]
+    w.burst_open = True
+    w.burst_launches = 3
+    w.forwards = 1
+    with pytest.raises(RuntimeError, match="issued 3 launches, expected 2"):
+        w._check_count()
 
 
 def test_the_hand_off_carries_hidden_states_and_residual_only(monkeypatch):

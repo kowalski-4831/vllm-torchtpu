@@ -6661,8 +6661,15 @@ class TPUModelRunner(GPUModelRunner):
             for key, (shape, dtype) in self._pp_intermediate_template.items()
         })
 
+    def pp_push(self) -> None:
+        """A pipeline hand-off that carries nothing, so the forwards in
+        flight move one stage further; a no-op without a pipeline."""
+        if self._pp_wave is not None:
+            self._pp_wave.push()
+
     def pp_settle(self) -> None:
-        """Close the current hand-off burst so in-flight forwards drain."""
+        """Close the pipeline hand-off burst once nothing is in flight; a
+        no-op without a pipeline."""
         if self._pp_wave is not None:
             self._pp_wave.settle()
 
