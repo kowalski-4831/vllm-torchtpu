@@ -250,10 +250,9 @@ def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
     two = _install_on_fake_executor(monkeypatch, stages=2)
     four = type(two)(stages=4)
     pp_push.patch_executor_for_pp_wave(four.vllm_config)
-    # two stages: a lone step needs no later step, so no push, and the
-    # settle after it closes the burst
+    # two stages: every launch pairs on its own, so neither push nor settle
     assert two.execute_model(_step(16, 1)) == ("forward", 1)
-    assert [c[0] for c in two.calls] == ["pp_settle"]
+    assert two.calls == []
     # four stages: the same lone step settles as well
     assert four.execute_model(_step(16, 1)) == ("forward", 1)
     assert [c[0] for c in four.calls] == ["pp_settle"]

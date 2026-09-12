@@ -80,7 +80,9 @@ class _WaveState:
         afterwards; otherwise one ``pp_push`` for every later step it still
         lacks, counting the pushes as later steps for the waits that
         follow."""
-        if not self.open:
+        # With one or two stages every launch pairs on its own: stage 1's
+        # launch before forward m is stage 0's launch after it.
+        if not self.open or self.stages <= 2:
             return
         if real_step == self.real_steps:
             self.open = False
