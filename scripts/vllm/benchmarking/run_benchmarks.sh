@@ -511,6 +511,9 @@ fi
 # quotes would close the string literal below, so encode rather than interpolate.
 lm_eval_gen_kwargs_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$LM_EVAL_GEN_KWARGS")
 
+# Eval generation arguments can contain nested JSON.
+lm_eval_gen_kwargs_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$LM_EVAL_GEN_KWARGS")
+
 # Save config metadata
 cat > "$RESULTS_DIR/config.json" << EOF
 {
