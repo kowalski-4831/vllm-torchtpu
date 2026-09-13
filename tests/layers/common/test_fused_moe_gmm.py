@@ -73,49 +73,180 @@ def test_owner_output_mode_rejects_invalid_value(monkeypatch):
         getter()
 
 
-def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
-    gmm_outputs = iter([
-        jnp.ones((2, 4), dtype=jnp.bfloat16),
-        jnp.ones((2, 4), dtype=jnp.bfloat16),
-    ])
-    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
-                        lambda *args, **kwargs: next(gmm_outputs))
+@pytest.mark.parametrize("configured_version", ["v1", "v2", "v3"])
+@pytest.mark.parametrize(
+    "use_ep,use_sparse_core,threshold,dtype,hidden,topk,num_tokens,source_rows,sc_lanes,expected_path",
+    [
+        (True, True, 0, jnp.bfloat16, 4, 2, 2, None, 16, "ep"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2047, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 64, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 256, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 511, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 512, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 544, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 682, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 683, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 1025, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 3, 512, 4096, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2457, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2458, 16, "v3"),
+        (False, True, 0, jnp.float32, 4096, 10, 2048, None, 16, None),
+        (False, True, 20480, jnp.bfloat16, 4096, 10, 2048, None, 16, None),
+        (False, True, 20481, jnp.bfloat16, 4096, 10, 2048, None, 16, None),
+        (False, False, 0, jnp.bfloat16, 4096, 10, 2048, None, 16, None),
+        (True, False, 0, jnp.bfloat16, 4, 2, 2, None, 16, None),
+        (False, True, 0, jnp.float16, 4096, 10, 2048, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 512, 10, 1024, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1023, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1024, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1100, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 2880, 4, 2048, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4608, 10, 2048, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 5120, 10, 255, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 5120, 10, 256, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 5120, 10, 300, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 7168, 10, 2048, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 1, 2048, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 1, 4096, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 2048, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 3, 2048, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 4, 2048, None, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 8, 2048, None, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, None, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, 8, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, "no-tpu-info",
+         None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, 1 << 20, 16, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048,
+         (1 << 20) + 1, 16, None),
+    ],
+    ids=[
+        "ep-selected",
+        "tokens-2048",
+        "tokens-2047",
+        "tokens-64",
+        "tokens-256",
+        "tokens-511",
+        "tokens-512",
+        "tokens-544-half-padded",
+        "tokens-682-half-padded",
+        "tokens-683",
+        "tokens-1025",
+        "topk-3-tokens-512-padded",
+        "topk-2-tensorcore-fallback",
+        "source-below-vmem-cutoff",
+        "source-above-vmem-cutoff",
+        "fp32",
+        "threshold-equal",
+        "threshold-above",
+        "sc-disabled",
+        "ep-sc-disabled",
+        "fp16",
+        "width-512-below-alignment",
+        "width-2048-tokens-1023",
+        "width-2048-tokens-1024",
+        "width-2048-tokens-1100-padded",
+        "width-2880-unaligned",
+        "width-4608",
+        "width-5120-tokens-255",
+        "width-5120-tokens-256",
+        "width-5120-tokens-300-padded",
+        "width-7168",
+        "topk-1",
+        "topk-1-large",
+        "topk-2",
+        "topk-3",
+        "topk-4",
+        "topk-8",
+        "no-sc",
+        "sc-lanes-8",
+        "no-tpu-info",
+        "source-limit",
+        "source-over-limit",
+    ],
+)
+def test_moe_gmm_uses_selected_ragged_gather_reduce(
+        monkeypatch, configured_version, use_ep, use_sparse_core, threshold,
+        dtype, hidden, topk, num_tokens, source_rows, sc_lanes, expected_path):
+    routes = num_tokens * topk
+    source_rows = routes if source_rows is None else source_rows
+    indices = jnp.arange(routes, dtype=jnp.int32)
+    weights = jnp.full((routes, ), 0.125, dtype=jnp.bfloat16)
+    valid = jnp.ones((routes, ), dtype=jnp.bool_)
+    sc_info = (None
+               if sc_lanes in (None, "no-tpu-info") else types.SimpleNamespace(
+                   num_lanes=sc_lanes, num_cores=2, num_subcores=16))
+
+    def get_tpu_info():
+        if sc_lanes == "no-tpu-info":
+            raise ValueError("unsupported device kind")
+        return types.SimpleNamespace(sparse_core=sc_info,
+                                     num_lanes=128,
+                                     vmem_capacity_bytes=64 << 20)
+
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", get_tpu_info)
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
                         lambda *args, **kwargs: 1)
-
-    expected = jnp.full((1, 4), 7, dtype=jnp.bfloat16)
     calls = []
 
-    def fake_ragged_gather_reduce(*args, **kwargs):
-        calls.append((args, kwargs))
-        return expected
+    def fake_combine(path, *args, **kwargs):
+        calls.append((path, args, kwargs))
+        return jnp.full((num_tokens, hidden), 7, dtype=dtype)
 
-    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce",
-                        fake_ragged_gather_reduce)
+    monkeypatch.setattr(
+        fused_moe_gmm, f"ragged_gather_reduce_{configured_version}",
+        lambda *args, **kwargs: fake_combine("ep", *args, **kwargs))
+    monkeypatch.setattr(
+        fused_moe_gmm, "ragged_gather_reduce",
+        fused_moe_gmm._select_ragged_gather_reduce(configured_version))
+    monkeypatch.setattr(
+        fused_moe_gmm, "ragged_gather_reduce_v3",
+        lambda *args, **kwargs: fake_combine("v3", *args, **kwargs))
 
-    actual = fused_moe_gmm.moe_gmm(
-        x=jnp.ones((2, 4), dtype=jnp.bfloat16),
-        w1=jnp.ones((1, 4, 4), dtype=jnp.bfloat16),
-        w1_scale=None,
-        w1_bias=None,
-        w2=jnp.ones((1, 4, 4), dtype=jnp.bfloat16),
-        w2_scale=None,
-        w2_bias=None,
-        group_sizes=jnp.array([2], dtype=jnp.int32),
-        argsort_revert_indices=jnp.array([0, 1], dtype=jnp.int32),
-        topk_weights_flat=jnp.array([0.25, 0.75], dtype=jnp.float32),
-        valid_mask_flat=jnp.array([True, True]),
-        token_indices_sorted=jnp.array([0, 0], dtype=jnp.int32),
-        activation="silu",
-        num_tokens=1,
-        topk=2,
-        use_ep=True,
-        use_sparse_core=True,
-    )
+    def run(source):
+        gmm_outputs = iter([jnp.ones((routes, 4), dtype=dtype), source])
+        monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                            lambda *args, **kwargs: next(gmm_outputs))
+        return fused_moe_gmm.moe_gmm(
+            x=jnp.ones((routes, 4), dtype=dtype),
+            w1=jnp.ones((1, 4, 4), dtype=dtype),
+            w1_scale=None,
+            w1_bias=None,
+            w2=jnp.ones((1, 4, hidden), dtype=dtype),
+            w2_scale=None,
+            w2_bias=None,
+            group_sizes=jnp.array([routes], dtype=jnp.int32),
+            argsort_revert_indices=indices,
+            topk_weights_flat=weights,
+            valid_mask_flat=valid,
+            token_indices_sorted=indices // topk,
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=threshold,
+        )
 
-    np.testing.assert_array_equal(actual, expected)
-    assert len(calls) == 1
-    assert calls[0][1]["reduce_group_size"] == 2
+    # Abstract source shapes exercise the 20-bit boundary without allocating
+    # a multi-gigabyte route tensor.
+    actual = jax.eval_shape(run,
+                            jax.ShapeDtypeStruct((source_rows, hidden), dtype))
+    assert actual.shape == (num_tokens, hidden)
+    assert actual.dtype == dtype
+    if expected_path is None:
+        assert not calls
+    else:
+        assert len(calls) == 1
+        path, args, kwargs = calls[0]
+        assert path == expected_path
+        assert kwargs["reduce_group_size"] == topk
+        assert args[0].shape == (source_rows, hidden)
+        np.testing.assert_array_equal(args[1], indices)
+        np.testing.assert_array_equal(args[2], weights)
+        np.testing.assert_array_equal(args[3], valid)
 
 
 def _require_tpu() -> None:
@@ -125,6 +256,87 @@ def _require_tpu() -> None:
         pytest.fail(f"JAX TPU backend failed to initialize: {exc}")
     if backend != "tpu":
         pytest.fail(f"Expected JAX TPU backend, got {backend}.")
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize(
+    "num_tokens,topk,hidden,uses_v3",
+    [(64, 10, 4096, False), (256, 3, 4096, False), (512, 8, 4096, False),
+     (511, 10, 4096, False), (512, 10, 4096, True), (544, 10, 4096, False),
+     (704, 10, 4096, True), (1024, 2, 4096, False), (1024, 3, 4096, True),
+     (2047, 2, 4096, True), (2047, 3, 4096, True), (2048, 10, 4096, True),
+     (1023, 10, 2048, False), (1024, 10, 2048, True), (256, 10, 5120, True),
+     (300, 10, 5120, False)],
+    ids=[
+        "t64-k10", "t256-k3", "t512-k8", "t511-k10", "t512-k10", "t544-k10",
+        "t704-k10", "t1024-k2", "t1024-k3", "t2047-k2", "t2047-k3",
+        "t2048-k10", "t1023-k10-h2048", "t1024-k10-h2048", "t256-k10-h5120",
+        "t300-k10-h5120"
+    ],
+)
+def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
+        monkeypatch, masked, num_tokens, topk, hidden, uses_v3):
+    _require_tpu()
+    num_routes = num_tokens * topk
+    # These route counts are coprime with 37, so the mapping is a permutation.
+    rows = jnp.arange(num_routes, dtype=jnp.int32)
+    indices = (rows * 37 + 11) % num_routes
+    weights = jnp.full((num_routes, ), 0.125, dtype=jnp.bfloat16)
+    valid = jnp.ones((num_routes, ), dtype=jnp.bool_)
+    if masked:
+        valid = (rows % 17 != 0) & (rows < num_routes - topk)
+    source_valid = valid[jnp.argsort(indices)]
+    source = ((rows[:, None] % 17) + (jnp.arange(hidden)[None, :] % 7) -
+              11).astype(jnp.bfloat16)
+    source = jnp.where(source_valid[:, None], source, jnp.nan)
+    gathered = source[indices]
+    weighted = jnp.where(valid[:, None], gathered * weights[:, None], 0)
+    expected = weighted.reshape(num_tokens, topk, hidden).sum(axis=1)
+
+    gmm_outputs = iter([jnp.zeros((num_routes, 1), jnp.bfloat16), source])
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda *args, **kwargs: next(gmm_outputs))
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+    calls = []
+
+    combine_v3 = fused_moe_gmm.ragged_gather_reduce_v3
+
+    def checked_combine(*args, **kwargs):
+        calls.append(kwargs["reduce_group_size"])
+        return combine_v3(*args, **kwargs)
+
+    def unexpected_ep_combine(*args, **kwargs):
+        pytest.fail("Non-EP prefill used the EP-configured combine")
+
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3",
+                        checked_combine)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce",
+                        unexpected_ep_combine)
+    actual = moe_gmm(
+        x=jnp.zeros((num_routes, 1), jnp.bfloat16),
+        w1=jnp.zeros((1, 1, 1), jnp.bfloat16),
+        w1_scale=None,
+        w1_bias=None,
+        w2=jnp.zeros((1, 1, hidden), jnp.bfloat16),
+        w2_scale=None,
+        w2_bias=None,
+        group_sizes=jnp.array([num_routes], dtype=jnp.int32),
+        argsort_revert_indices=indices,
+        topk_weights_flat=weights,
+        valid_mask_flat=valid,
+        token_indices_sorted=jnp.argsort(indices) // topk,
+        activation="silu",
+        num_tokens=num_tokens,
+        topk=topk,
+        use_ep=False,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=512,
+    )
+    assert calls == ([topk] if uses_v3 else [])
+    assert actual.dtype == jnp.bfloat16
+    assert np.isfinite(np.asarray(actual)).all()
+    np.testing.assert_array_equal(actual, expected)
 
 
 def _reference_fused_moe(hidden_states, w1, w2, w1_bias, w2_bias, topk_weights,

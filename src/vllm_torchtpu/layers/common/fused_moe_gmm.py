@@ -28,6 +28,8 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
     ragged_gather_reduce_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
     ragged_gather_reduce as ragged_gather_reduce_v3
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
+    token_block_alignment
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.logger import init_logger
 
@@ -43,8 +45,9 @@ def _select_ragged_gather_reduce(version: str):
 
 
 # The server sets its environment before importing model code, so the selected
-# implementation remains fixed for the process lifetime. The default is v2;
-# set RAGGED_GATHER_REDUCE_VERSION=v3 to enable the destination-major kernel.
+# EP combine remains fixed for the process lifetime. The default is v2; set
+# RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
+# The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(
     envs.RAGGED_GATHER_REDUCE_VERSION)
 
@@ -383,6 +386,45 @@ def moe_gmm(
                            zero_initialize=False,
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
+    # The destination-major kernel packs source indices into 20 bits and
+    # processes 16-lane SparseCore tiles.
+    use_local_ragged_combine = (
+        # Local SparseCore path; route-pair metadata needs at least two routes.
+        use_sparse_core and not use_ep and topk >= 2
+        # TensorCore combine handles top-8 batches.
+        and topk != 8
+        # Honor the configured SparseCore dispatch cutoff.
+        and argsort_revert_indices.size > onehot_moe_permute_threshold
+        # BF16 kernel input.
+        and gmm2_res.dtype == jnp.bfloat16
+        # Packed source-index capacity.
+        and gmm2_res.shape[0] <= 1 << 20)
+    if use_local_ragged_combine:
+        try:
+            tpu_info = pltpu.get_tpu_info()
+        except ValueError:
+            # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+            tpu_info = None
+        sc_info = tpu_info.sparse_core if tpu_info is not None else None
+        # Lane-aligned width, 16-lane SparseCore, and v3's own cutoff (two
+        # BF16 buffers use at least 60% of VMEM).
+        if (sc_info is not None and sc_info.num_lanes == 16
+                and gmm2_res.shape[-1] % tpu_info.num_lanes == 0
+                and gmm2_res.size * 4 >= tpu_info.vmem_capacity_bytes * 0.6):
+            # The kernel pads destination tokens to one 64-token block per
+            # SparseCore row partition: require at least one full block and
+            # padding of at most half the batch.
+            alignment = token_block_alignment(gmm2_res.shape[-1], tpu_info)
+            padded_tokens = -(-num_tokens // alignment) * alignment
+            if (num_tokens >= alignment
+                    and padded_tokens * 2 <= num_tokens * 3):
+                return ragged_gather_reduce_v3(
+                    gmm2_res,
+                    argsort_revert_indices,
+                    topk_weights_flat,
+                    valid_mask_flat,
+                    reduce_group_size=topk,
+                ).astype(x.dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
