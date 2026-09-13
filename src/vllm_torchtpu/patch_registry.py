@@ -49,7 +49,7 @@ PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering",
           ("import", )),
-    Patch("vllm_torchtpu.layers.vllm.custom_ops:_register_custom_ops",
+    Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops",
           _ACTIVE),
 
     # Compilation and cache keys.
@@ -101,7 +101,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
           _ENGINE,
           refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings"),
-    Patch("vllm_torchtpu.layers.vllm.vision_attention", _ACTIVE),
+    Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
 
     # Platform runtime configuration.
     Patch(

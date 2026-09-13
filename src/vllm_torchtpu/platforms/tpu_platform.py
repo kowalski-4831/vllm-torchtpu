@@ -1093,7 +1093,7 @@ class TpuPlatform(Platform):
                 # DSv4 pages hold compressed rows. Its backend's
                 # get_preferred_block_size is a hardcoded 256, which does not fit
                 # the packed latent record, so take the MLA page size directly.
-                from vllm_torchtpu.layers.vllm.attention import \
+                from vllm_torchtpu.layers.adapter.attention import \
                     PallasMLAttentionBackend
                 cache_config.block_size = (  # type: ignore[assignment]
                     PallasMLAttentionBackend.get_page_size(vllm_config))

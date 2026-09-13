@@ -54,7 +54,7 @@ Patch(
 | `refresh` | Optional lazy target invoked on subsequent eligible calls after the primary target completes. It receives no arguments. |
 
 Prefer an explicit callback for additions. The existing bare-module entry for
-`vllm_torchtpu.layers.vllm.vision_attention` relies on import side effects; the
+`vllm_torchtpu.layers.adapter.vision_attention` relies on import side effects; the
 registry does not reload modules.
 
 ## Completion, retries, and model selection

@@ -29,11 +29,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.sequence_layout import \
-    is_pcp_streaming_attention_metadata
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
+from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op, build_kimi_pooled_kda_op)
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.sequence_layout import \
+    is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)

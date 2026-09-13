@@ -14,9 +14,9 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
-from vllm_torchtpu.layers.vllm.latent_proj_intra_chip import \
+from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import \
     make_latent_projection
-from vllm_torchtpu.layers.vllm.moe_hierarchical import (
+from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config, hierarchical_split_or_none)
 
 from .layers import KimiMLP

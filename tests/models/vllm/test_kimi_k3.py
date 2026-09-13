@@ -29,7 +29,7 @@ import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
 from vllm_torchtpu.compilation.shape_variants import (trace_shape_env,
                                                       unsupported_reason)
 from vllm_torchtpu.layers import register_layers
-from vllm_torchtpu.layers.vllm.custom_ops import \
+from vllm_torchtpu.layers.adapter.custom_ops import \
     kda_attention_op as kimi_custom_ops
 from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
                                                KimiK3ForConditionalGeneration,

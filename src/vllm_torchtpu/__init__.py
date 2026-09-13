@@ -249,7 +249,7 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         if getattr(self.moe_config, "skip_final_all_reduce", False):
             return original.fget(self)
         try:
-            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
         except ImportError:
             return original.fget(self)
@@ -309,7 +309,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
                 return False
-            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
             return fused_moe_ep_supported(getattr(self, "_quant_method", None))
 
