@@ -78,11 +78,9 @@ class TPUWorker(WorkerBase):
         devices=None,
         ip: str = "localhost",
     ):
-        # Re-apply patches that were done in check_and_update_config.
-        # Workers may be spawned (not forked) so module-level patches
-        # from the parent process are lost.
-        from vllm_torchtpu.platforms.tpu_platform import apply_tpu_patches
-        apply_tpu_patches()
+        from vllm_torchtpu import patch_registry
+
+        patch_registry.apply("worker_init")
         # This process creates the worker's reply ring to the engine.
         from vllm_torchtpu.distributed.pp_push import widen_message_rings
         widen_message_rings(vllm_config)
@@ -620,9 +618,9 @@ class TPUWorker(WorkerBase):
         return key
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        from vllm_torchtpu.platforms.tpu_platform import \
-            _apply_model_specific_patches
-        _apply_model_specific_patches(self.model_config)
+        from vllm_torchtpu import patch_registry
+
+        patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
