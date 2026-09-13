@@ -7,8 +7,9 @@ from typing import Any, ClassVar
 
 import jax
 import torch
+from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
@@ -20,12 +21,15 @@ from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
+from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       KVCacheType,
                                                       SparseMLAKVCacheSpec)
@@ -34,6 +38,8 @@ from vllm_torchtpu.layers.adapter.cp_attention import \
     build_dcp_kernels as _build_dcp_kernels
 from vllm_torchtpu.layers.adapter.cp_attention import \
     forward_with_dcp as _forward_with_dcp
+from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+    all_gather_heads, merge_lse_partials_scatter_heads)
 from vllm_torchtpu.layers.core.attention_interface import (
     attention, attention_bundled, mla_attention, ragged_paged_attention,
     ragged_paged_attention_batched)
@@ -56,6 +62,29 @@ else:
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
+
+_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
+    P(DCP_AXIS_NAME),  # kv_cache_nope, this rank's position shard
+    P(DCP_AXIS_NAME),  # kv_cache_rope
+    P(),  # ql_nope
+    P(),  # q_pe
+    P(),  # kv_c_normed -- no all-gather: every rank already has it
+    P(),  # k_pe
+    # This rank's slice of every token's global top-k, already local indices.
+    # Sharded, so the global leading dim is `dcp_size * num_tokens`.
+    P(DCP_AXIS_NAME),  # local_topk_indices
+    P(),  # seq_lens
+    P(),  # block_tables (virtual page ordinals)
+    P(),  # query_start_loc
+    P(),  # request_distribution
+)
+_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS = (
+    P(DCP_AXIS_NAME),  # updated nope cache
+    P(DCP_AXIS_NAME),  # updated rope cache
+    P(DCP_AXIS_NAME),  # partial attention output over this rank's KV positions
+    # Matching log-sum-exps, `-inf` where this rank owns nothing.
+    P(DCP_AXIS_NAME),  # partial lse
+)
 
 # Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
 # from to fp32 directly. That's why it has a dtype mapping different from GPU
@@ -1501,6 +1530,34 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
 
+        parallel_config = getattr(get_current_vllm_config_or_none(),
+                                  "parallel_config", None)
+        dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
+        self.dcp_size = dcp_size if isinstance(dcp_size,
+                                               int) and dcp_size > 1 else 1
+        self.dcp_interleave_size = getattr(parallel_config,
+                                           "cp_kv_cache_interleave_size", 1)
+        self._dcp_mesh = None
+        if self.dcp_size > 1:
+            # The indexer refuses pcp>1 and dcp>1 together (see
+            # `VllmTPUSparseAttnIndexer.__init__`)
+            pcp_size = getattr(parallel_config,
+                               "prefill_context_parallel_size", 1)
+            if isinstance(pcp_size, int) and pcp_size > 1:
+                raise NotImplementedError(
+                    f"pcp_size={pcp_size} and dcp_size={self.dcp_size} are "
+                    "both >1; sparse MLA has one KV-position interleave, "
+                    "not two.")
+            if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
+                raise ValueError(
+                    "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
+                    f"a multiple of {kv_cache_utils.WORD_BYTES} "
+                    f"(kv_cache_utils.WORD_BYTES), got "
+                    f"{self.dcp_interleave_size}. It is also the best value for "
+                    "top-k load balance across the shards -- coarser cycles "
+                    "let a contiguous run of winners land on fewer ranks.")
+            self._dcp_mesh = get_or_create_dcp_mesh()
+
     def _get_kv_scales(
             self,
             layer: Any) -> tuple[float | None, float | None, float | None]:
@@ -1687,6 +1744,113 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_impl
 
+    def _build_sparse_mla_dcp_op(self, layer: Any, dcp_size: int,
+                                 interleave_size: int):
+        """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
+
+        In DCP the queries are replicated. `kv_c_normed`/`k_pe` in particular
+        need no all-gather -- they are computed from a replicated residual
+        stream, so every rank already holds every row and only its write mask
+        (owner rank) differs.
+
+        The op returns unmerged partials. Combining them is one log-sum-exp
+        reduction over the DCP group, is done by the torch
+        caller (`cp_mla_attention.merge_lse_partials_scatter_heads`), which
+        also narrows the head axis back down.
+        """
+        from vllm_torchtpu.layers.core.attention_interface import \
+            sparse_mla_attention_dcp
+
+        mesh = self._dcp_mesh
+
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def sparse_mla_attention_core_tpu_dcp(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention_dcp(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
+
+        op_name = ("pallas::sparse_mla_attention_dcp_"
+                   f"{layer.layer_name.replace('.', '_')}")
+        sparse_mla_jax_op = pcp_streaming_jax_op(
+            op_name,
+            sparse_mla_attention_core_tpu_dcp,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
+            output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
+        )
+
+        # We must overwrite the default fake implementation as vLLM uses
+        # dynamic dimensions for the query.
+        def _fake_sparse_mla_dcp(kv_cache_nope, kv_cache_rope, ql_nope, *rest,
+                                 **kwargs):
+            del rest, kwargs
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                torch.empty_like(ql_nope),
+                # LSE: one f32 per (token, head).
+                ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32),
+            )
+
+        sparse_mla_jax_op.register_fake(_fake_sparse_mla_dcp)
+
+        def sparse_mla_dcp_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor],
+            ql_nope: torch.Tensor,
+            q_pe: torch.Tensor,
+            kv_c_normed: torch.Tensor,
+            k_pe: torch.Tensor,
+            local_topk_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope, outputs, lse = sparse_mla_jax_op(
+                nope_cache, rope_cache, ql_nope, q_pe, kv_c_normed, k_pe,
+                local_topk_indices, seq_lens, block_tables, query_start_loc,
+                request_distribution)
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            return outputs, lse
+
+        return sparse_mla_dcp_impl
+
     def forward(
         self,
         layer: Any,
@@ -1752,22 +1916,51 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     and len(kv_cache) == 2), (
                         "sparse MLA layers use a native (nope, rope) split "
                         f"cache; got {type(kv_cache)}")
-            if (not hasattr(layer, "sparse_mla_op")
-                    or layer.sparse_mla_op is None):
-                layer.sparse_mla_op = self._build_sparse_mla_op(layer)
+            if self.dcp_size > 1:
+                assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
+                    "DCP sparse MLA op was never built; "
+                    "`process_weights_after_loading` must run first.")
+                # DCP re-spends `dcp_size` of TP's ways on positions instead of
+                # heads, so attention runs at `tp // dcp` head sharding: every
+                # rank attends with the whole DCP group's heads over its own
+                # KV shard, and the head axis is scattered back after the
+                # merge.
+                ql_nope_dcp = all_gather_heads(ql_nope_flat)
+                q_pe_dcp = all_gather_heads(q_pe_flat)
+                # `topk_indices` here is not global positions: the DCP indexer
+                # already resolved each token's global top-k into this rank's
+                # own local cache indices, `-1` where it owns nothing.
+                partial, lse = layer.sparse_mla_dcp_op(
+                    kv_cache,
+                    ql_nope_dcp,
+                    q_pe_dcp,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    topk_indices,
+                    attn_metadata.seq_lens,
+                    attn_metadata.block_tables,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution,
+                )
+                # The scatter undoes the head all-gather above.
+                outputs = merge_lse_partials_scatter_heads(partial, lse)
+            else:
+                if (not hasattr(layer, "sparse_mla_op")
+                        or layer.sparse_mla_op is None):
+                    layer.sparse_mla_op = self._build_sparse_mla_op(layer)
 
-            outputs = layer.sparse_mla_op(
-                kv_cache,
-                ql_nope_flat,
-                q_pe_flat,
-                kv_c_normed_flat,
-                k_pe_flat,
-                topk_indices,
-                attn_metadata.seq_lens,
-                attn_metadata.block_tables,
-                attn_metadata.query_start_loc,
-                attn_metadata.request_distribution,
-            )
+                outputs = layer.sparse_mla_op(
+                    kv_cache,
+                    ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    topk_indices,
+                    attn_metadata.seq_lens,
+                    attn_metadata.block_tables,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution,
+                )
         else:
             if not hasattr(layer, "mla_op") or layer.mla_op is None:
                 layer.mla_op = self._build_mla_op(layer,

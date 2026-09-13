@@ -18,13 +18,15 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
-    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
+    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache,
+    update_sparse_mla_kv_cache_dcp)
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -875,3 +877,161 @@ def sparse_mla_attention(
                                               block_tables, query_start_loc,
                                               request_distribution)
     return new_kv_cache_nope, new_kv_cache_rope, output
+
+
+def sparse_mla_attention_dcp(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    local_topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Sparse MLA attention over a DCP position-sharded latent cache.
+
+    Args:
+      ql_nope, q_pe: replicated queries, `[num_tokens, num_heads, *]`.
+      kv_c_normed, k_pe: this step's latents, replicated and identical on every
+        rank; the write mask, not the data, is what differs per rank.
+      kv_cache_nope, kv_cache_rope: this rank's position shards.
+      local_topk_indices: `streamindex_topk_dcp` output -- this rank's slice of
+        every token's global top-k, already in *rank-local* cache coordinates,
+        `-1` padded, sharded over `dcp_axis_name` with a global leading
+        dimension of `dcp_size * num_tokens`.
+      seq_lens, block_tables, query_start_loc, request_distribution: global
+        sequence coordinates, replicated. `block_tables` holds virtual page
+        ordinals, resolved per rank exactly as on the indexer side.
+      dcp_size, interleave_size: the shard layout.
+
+    Returns:
+      `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
+      `[dcp_size * num_tokens, num_heads, lkv_dim]` and `lse` is
+      `[dcp_size * num_tokens, num_heads]`, both sharded over `dcp_axis_name`
+      and both *partial*: they must go through the log-sum-exp merge above
+      before `W_UV`. `lse` is `-inf` wherever a rank owns none of a token's
+      top-k, which is what makes that merge a plain softmax with no separate
+      count channel.
+    """
+    if dcp_size <= 1:
+        raise ValueError(
+            f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
+            "use sparse_mla_attention for the unsharded case.")
+    if dcp_axis_name not in mesh.axis_names:
+        raise ValueError(f"dcp_size={dcp_size} requires a mesh with a "
+                         f"{dcp_axis_name!r} axis, got {mesh.axis_names}.")
+    if mesh.shape[dcp_axis_name] != dcp_size:
+        raise ValueError(
+            f"dcp_size={dcp_size} does not match mesh axis "
+            f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}.")
+    num_tokens = ql_nope.shape[0]
+    if local_topk_indices.shape[0] != dcp_size * num_tokens:
+        raise ValueError(
+            "local_topk_indices must carry one row per (rank, token): "
+            f"expected {dcp_size * num_tokens} rows for {num_tokens} tokens "
+            f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}.")
+
+    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+    word_bytes = kv_cache_utils.WORD_BYTES
+    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
+    assert (lkv_dim == word_bytes * lane_bytes
+            and rope_dim * 2 == lane_bytes), (
+                "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+                f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
+                f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+                f"{rope_dim}")
+
+    replicated_3d = P(None, None, None)
+    in_specs = (
+        replicated_3d,  # ql_nope
+        replicated_3d,  # q_pe
+        P(None, None),  # kv_c_normed
+        P(None, None),  # k_pe
+        P(dcp_axis_name),  # kv_cache_nope
+        P(dcp_axis_name),  # kv_cache_rope
+        P(dcp_axis_name, None),  # local_topk_indices
+        P(None),  # seq_lens
+        P(None),  # block_tables
+        P(None),  # query_start_loc
+        P(None),  # request_distribution
+    )
+    out_specs = (
+        P(dcp_axis_name),  # nope cache shard
+        P(dcp_axis_name),  # rope cache shard
+        P(dcp_axis_name, None, None),  # partial output
+        P(dcp_axis_name, None),  # partial lse
+    )
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+
+    def _local(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
+               topk_idx, seq_lens_, block_tables_, query_start_loc_,
+               request_distribution_):
+        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens_,
+            block_tables_,
+            query_start_loc_,
+            dcp_rank,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size)
+
+        # A rank owning none of a token's top-k still has to be handed one
+        # valid entry: the kernel derives `kv_len` from the `-1` tail and
+        # requires `kv_len >= 1`. Position 0 always exists, so it is the
+        # cheapest dummy; the softmax it produces is real but meaningless, and
+        # `owns` below is what keeps it out of the merge.
+        owns = jnp.any(topk_idx >= 0, axis=-1)
+        topk_idx = topk_idx.at[:, 0].set(
+            jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+
+        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        # Virtual page ordinal -> physical block in this rank's own shard, the
+        # same resolution the scatter above and `streamindex_topk_dcp` use.
+        local_block_tables = jnp.mod(block_tables_,
+                                     jnp.int32(nope_spec.num_pages))
+        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
+            q,
+            kv_cache_nope,
+            kv_cache_rope,
+            topk_idx,
+            local_block_tables,
+            query_start_loc_,
+            request_distribution_,
+            sm_scale=sm_scale or 1.0,
+            k_scale=dequant_scale,
+            return_lse=True,
+        )
+        lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        # Drop the rope tail: only the nope part is the MLA value (P @ latent).
+        return (kv_cache_nope, kv_cache_rope, output[..., :ql_nope.shape[-1]],
+                lse)
+
+    return jax.jit(
+        shard_map.shard_map(_local,
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
+                                              kv_cache_nope, kv_cache_rope,
+                                              local_topk_indices, seq_lens,
+                                              block_tables, query_start_loc,
+                                              request_distribution)
