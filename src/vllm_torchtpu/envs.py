@@ -99,6 +99,14 @@ if TYPE_CHECKING:
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
+    KDA_MANUAL_STATE_DMA: bool | None = None
+    KDA_MANUAL_H0_DMA: bool | None = None
+    KDA_MANUAL_HT_DMA: bool | None = None
+    KDA_OVERLAP_H0_DMA: bool = True
+    KDA_OVERLAP_HT_DMA: bool = True
+    KDA_PACK_HEAD_INV: bool = True
+    KDA_PACKED_METADATA: bool = True
+    KDA_FWD_MB: int | None = None
 
 
 def env_with_choices(
@@ -659,6 +667,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         for p in os.getenv("QUANTIZE_ON_LOAD_PREFIXES", "").split(",")
         if p.strip()
     ],
+    # Kimi K3 KDA kernel DMA and performance tuning knobs.
+    "KDA_MANUAL_STATE_DMA":
+    env_optional_bool("KDA_MANUAL_STATE_DMA"),
+    "KDA_MANUAL_H0_DMA":
+    env_optional_bool("KDA_MANUAL_H0_DMA"),
+    "KDA_MANUAL_HT_DMA":
+    env_optional_bool("KDA_MANUAL_HT_DMA"),
+    "KDA_OVERLAP_H0_DMA":
+    env_bool("KDA_OVERLAP_H0_DMA", default=True),
+    "KDA_OVERLAP_HT_DMA":
+    env_bool("KDA_OVERLAP_HT_DMA", default=True),
+    "KDA_PACK_HEAD_INV":
+    env_bool("KDA_PACK_HEAD_INV", default=True),
+    "KDA_PACKED_METADATA":
+    env_bool("KDA_PACKED_METADATA", default=True),
+    "KDA_FWD_MB":
+    env_optional_int("KDA_FWD_MB"),
 }
 
 

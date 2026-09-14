@@ -189,6 +189,14 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
     ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
     ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
     ("TPU_RAIDEN_INLINE_LOAD", False),
+    ("KDA_MANUAL_STATE_DMA", None),
+    ("KDA_MANUAL_H0_DMA", None),
+    ("KDA_MANUAL_HT_DMA", None),
+    ("KDA_OVERLAP_H0_DMA", True),
+    ("KDA_OVERLAP_HT_DMA", True),
+    ("KDA_PACK_HEAD_INV", True),
+    ("KDA_PACKED_METADATA", True),
+    ("KDA_FWD_MB", None),
 ])
 def test_migrated_knob_defaults(monkeypatch, name, expected):
     from vllm_torchtpu import envs
