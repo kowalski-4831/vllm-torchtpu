@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
+    QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
 
 
 def env_with_choices(
@@ -650,6 +651,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD":
     env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
+    # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
+    # Examples: QUANTIZE_ON_LOAD_PREFIXES="self_attn,shared_experts,layers.0.mlp"
+    "QUANTIZE_ON_LOAD_PREFIXES":
+    lambda: [
+        p.strip()
+        for p in os.getenv("QUANTIZE_ON_LOAD_PREFIXES", "").split(",")
+        if p.strip()
+    ],
 }
 
 

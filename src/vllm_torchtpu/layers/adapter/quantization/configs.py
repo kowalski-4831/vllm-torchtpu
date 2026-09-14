@@ -28,6 +28,13 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def should_quantize_on_load(prefix: str) -> bool:
+    """Return True if prefix matches any dot-bounded pattern in QUANTIZE_ON_LOAD_PREFIXES."""
+    padded = f".{prefix}."
+    return any(f".{p.strip('.')}." in padded
+               for p in envs.QUANTIZE_ON_LOAD_PREFIXES)
+
+
 class VllmQuantLinearConfig:
     """
     Configuration for quantized linear layers on TPU.

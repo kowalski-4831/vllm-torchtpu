@@ -1073,10 +1073,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     linear_quant_config=self._linear_quant_config,
                 ))
         else:
-            requant_dtype = torch.float8_e4m3fn
-            requant_block_size = None
-            blockwise_kernel = False
-            desired_quant_dtype = "fp8"
+            # Respect configured TPU quantization settings (dtype, block size, kernel flags) on load.
+            linear_quant_config = getattr(self, "_linear_quant_config", None)
+            if linear_quant_config is None:
+                linear_quant_config = _get_linear_quant_config(
+                    self.linear_config)
+            desired_quant_dtype, requant_dtype, requant_block_size, blockwise_kernel = (
+                linear_quant_config)
             weight, weight_scale = quantize_tensor(
                 layer.weight.data.to(torch.float32),
                 quant_dtype=requant_dtype,

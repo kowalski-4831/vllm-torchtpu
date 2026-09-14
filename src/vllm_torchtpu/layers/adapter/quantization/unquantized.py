@@ -57,7 +57,8 @@ from vllm_torchtpu.layers.adapter.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
                                                         WEIGHT_FLIPPED_ATTR)
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
-from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
+from vllm_torchtpu.layers.adapter.quantization.configs import (
+    VllmQuantConfig, should_quantize_on_load)
 from vllm_torchtpu.layers.core.quant_methods import (UNQUANTIZED,
                                                      get_tpu_quant_method)
 from vllm_torchtpu.logger import init_logger
@@ -169,6 +170,20 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             A QuantizeMethodBase implementation, or None to use defaults.
         """
         if isinstance(layer, LinearBase):
+            # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
+            # kv_b_proj.weight and quantizes them separately after loading.
+            if should_quantize_on_load(
+                    prefix) and "kv_b_proj" not in prefix.split("."):
+                from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+                    VllmFp8Config, VllmFp8LinearMethodTPU)
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+                return VllmFp8LinearMethodTPU(fp8_config,
+                                              self.get_linear_config(layer),
+                                              prefix=prefix)
+
             # TPU-native dense linear: canonical (k, n) weight layout so the
             # forward pass is (m, k) @ (k, n) rather than vLLM's
             # (m, k) @ (n, k).T.

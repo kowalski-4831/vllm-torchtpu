@@ -50,6 +50,8 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.quantization.configs import \
+    should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.utils import synchronize_tensors
@@ -588,6 +590,7 @@ class VllmTPUMLAAttention(MLAAttention):
                 selector.get_mla_prefill_backend = original_selector_get_backend
 
         # For compatibility reasons.
+        self.prefix = prefix
         self.kv_sharing_target_layer_name = None
         self.attn_type = AttentionType.DECODER
         self.sliding_window = None
@@ -620,14 +623,30 @@ class VllmTPUMLAAttention(MLAAttention):
 
         device = torch.device("tpu")
 
+        if should_quantize_on_load(self.prefix):
+            W_UK_T, w_uk_scale = quantize_tensor(self.W_UK_T.to(torch.float32),
+                                                 torch.float8_e4m3fn,
+                                                 axis=1)
+            W_UV, w_uv_scale = quantize_tensor(self.W_UV.to(torch.float32),
+                                               torch.float8_e4m3fn,
+                                               axis=1)
+            self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
+            self.W_UV = Parameter(W_UV, requires_grad=False)
+            self.W_UK_T_scale = Parameter(_fresh(
+                w_uk_scale.to(act_dtype)).to(device),
+                                          requires_grad=False)
+            self.W_UV_scale = Parameter(_fresh(
+                w_uv_scale.to(act_dtype)).to(device),
+                                        requires_grad=False)
+
         # move W_UK_T and W_UV into fresh contiguous buffers
         self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)
         self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
 
-        # Keep `W_UK_T`/`W_UV` in the activation dtype, matching upstream vLLM's
-        # `MLAAttention.process_weights_after_loading`: there is no quantized bmm
-        # for these two, so `forward_mla` upcasts them back to the activation
-        # dtype before `torch.bmm` anyway. Quantizing here only cost precision.
+        # Keep W_UK_T/W_UV in the activation dtype unless quantized on load via
+        # QUANTIZE_ON_LOAD_PREFIXES. There is no quantized bmm for these two, so
+        # forward_mla upcasts them back to the activation dtype before torch.bmm
+        # anyway; quantizing them on load is strictly a memory-saving technique
         # `kv_cache_quantized_dtype` still governs the KV cache itself.
         self.W_UK_T = Parameter(self.W_UK_T.to(device), requires_grad=False)
         self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
@@ -641,7 +660,10 @@ class VllmTPUMLAAttention(MLAAttention):
                 delattr(self.kv_b_proj, key)
 
         if self.W_UK_T.device.type == "tpu":
-            synchronize_tensors([self.W_UK_T, self.W_UV])
+            tensors = [self.W_UK_T, self.W_UV]
+            if hasattr(self, "W_UK_T_scale"):
+                tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
+            synchronize_tensors(tensors)
 
         q_scale, k_scale, v_scale = self.impl._get_kv_scales(self)
         self.mla_op = self.impl._build_mla_op(self,
