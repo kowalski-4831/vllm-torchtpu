@@ -27,7 +27,6 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
@@ -634,11 +633,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             raise ValueError(
                 f"local GDN V heads {local_num_v_heads} must be divisible "
                 f"by pcp_size={pcp_size}.")
-
-        if get_kv_cache_layout() == "HND":
-            raise NotImplementedError(
-                "GDN pooled PCP prefill is not supported with "
-                "VLLM_KV_CACHE_LAYOUT=HND.")
 
         vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim

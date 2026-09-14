@@ -789,9 +789,16 @@ class TpuPlatform(Platform):
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
+        kv_cache_layout = "NHD"
+        if parallel_config.prefill_context_parallel_size > 1:
+            from vllm.config import set_current_vllm_config
+            from vllm.v1.attention.backends.utils import get_kv_cache_layout
+            with set_current_vllm_config(vllm_config):
+                kv_cache_layout = get_kv_cache_layout()
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             multihost_backend=envs.TPU_MULTIHOST_BACKEND,
+            kv_cache_layout=kv_cache_layout,
         )
         pcp_size = pcp_config.pcp_size
         if pcp_config.enabled:
