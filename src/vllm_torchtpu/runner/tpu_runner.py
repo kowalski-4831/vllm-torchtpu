@@ -2607,12 +2607,6 @@ class TPUModelRunner(GPUModelRunner):
         current_req_ids = set(
             self.input_batch.req_ids[:self.input_batch.num_reqs])
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
-        if not previous_req_ids:
-            # An empty map means the previous step committed no tokens at all:
-            # every request in request_seq_lens was a partial (chunked-prefill)
-            # chunk.
-            self._pre_async_results = None
-            return
         if any(req_id in current_req_ids for req_id in previous_req_ids):
             return
         self._modify_prev_results()
