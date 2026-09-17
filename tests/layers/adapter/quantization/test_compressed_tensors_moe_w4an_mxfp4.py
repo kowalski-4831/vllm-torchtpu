@@ -370,8 +370,12 @@ def test_mxfp4_initializes_integer_dummy_weights():
             return_value=vllm_config):
         method._initialize_dummy_quantized_weights(layer)
 
-    for parameter in parameters:
-        assert torch.count_nonzero(parameter) == 0
+    for packed in (layer.w13_weight_packed, layer.w2_weight_packed):
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1)
+        assert set(codes.flatten().tolist()) == {1, 9}
+        assert not torch.equal(packed[0], packed[1])
+    assert torch.all(layer.w13_weight_scale == 123)  # round(log2(sqrt(128)))
+    assert torch.all(layer.w2_weight_scale == 124)  # log2(sqrt(64))
 
 
 def test_mxfp4_preserves_integer_checkpoint_weights():
@@ -530,3 +534,49 @@ def test_mxfp4_requantize_block():
                                w13_fp32_scale_4d,
                                rtol=1e-3,
                                atol=1e-3)
+
+
+def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import \
+        compressed_tensors_moe_w4an_mxfp4 as module
+
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod.__new__(
+        VllmCompressedTensorsW4ANMxfp4MoEMethod)
+    method._tpu_activation_str = 'situ'
+    layer = SimpleNamespace(w13_weight=None,
+                            w2_weight=None,
+                            w13_weight_scale=None,
+                            w2_weight_scale=None,
+                            _experts_start=28,
+                            moe_config=SimpleNamespace(experts_per_token=2))
+    x = torch.ones(4, 128, dtype=torch.bfloat16)
+    ids = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]])
+    weights = torch.full((4, 2), 0.5)
+    calls = []
+    monkeypatch.setattr(
+        module.moe_routing, 'route', lambda *args:
+        (calls.append('router') or (weights, ids)))
+
+    def mask(ids, weights, is_local_tensor):
+        assert not is_local_tensor
+        weights = weights.clone()
+        weights[-1] = 0
+        return ids, weights
+
+    monkeypatch.setattr(module.token_padding,
+                        'zero_routing_weights_for_padding', mask)
+    monkeypatch.setattr(module, 'enable_pipelined_collective_and_compute',
+                        lambda: False)
+    monkeypatch.setattr(module, 'fused_moe_gmm', lambda **kwargs: kwargs)
+    regular = method.apply_monolithic(layer, x, torch.zeros(4, 896))
+    selected = method.apply_with_routing(layer, x, weights, ids)
+    assert calls == ['router']
+    assert selected['topk_ids'].dtype == torch.int32
+    assert selected['topk_weights'].dtype == torch.bfloat16
+    assert selected['experts_start'] == 28
+    torch.testing.assert_close(selected['topk_weights'],
+                               regular['topk_weights'])
+    torch.testing.assert_close(selected['topk_ids'], regular['topk_ids'])
+    assert selected['topk_weights'][-1].count_nonzero() == 0
