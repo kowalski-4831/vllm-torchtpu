@@ -126,6 +126,12 @@ markers = [
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
 ]
 
+[tool.ruff]
+# Without this, ruff ignores its `exclude` lists for any path named directly
+# on the command line, which is exactly how pre-commit invokes it. Setting it
+# makes `exclude` hold for both `ruff format .` and the hook.
+force-exclude = true
+
 [tool.ruff.lint]
 # E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
 # I import sorting. Line length (E501) is in E5 and is not selected.
@@ -136,7 +142,6 @@ select = ["E4", "E7", "E9", "F", "I"]
 # under [tool.ruff.format] and in the isort and yapf excludes in
 # .pre-commit-config.yaml; all three move together, otherwise two tools format the
 # same file.
-"scripts/**" = ["I"]
 "src/**" = ["I"]
 "tests/**" = ["I"]
 
@@ -144,7 +149,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 docstring-code-format = true
 
 # Same paths as [tool.ruff.lint.per-file-ignores] above; see the note there.
-exclude = ["scripts/**", "src/**", "tests/**"]
+exclude = ["src/**", "tests/**"]
 
 [tool.pyrefly]
 project-includes = ["src"]
