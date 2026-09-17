@@ -350,7 +350,6 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
-    skip_padded_tokens: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -451,15 +450,13 @@ def moe_gmm(
                     valid_count,
                     num_tokens=num_tokens,
                 ).astype(x.dtype)
-            if skip_padded_tokens:
-                # Zero out the GMM output rows of padded tokens that
-                # skipped the GMM computation, otherwise those
-                # uninitialized values can be NaN and the one-hot matmul
-                # would spread them to every token in the batch.
-                computed = jnp.arange(
-                    gmm2_res.shape[0],
-                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
-                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            # Rows past the computed prefix (non-local experts under EP,
+            # skipped padded tokens) are never written by the GMM; zero them
+            # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
+            computed = jnp.arange(
+                gmm2_res.shape[0],
+                dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
@@ -598,6 +595,5 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
     )
     return x[:num_tokens, :hidden_size]
