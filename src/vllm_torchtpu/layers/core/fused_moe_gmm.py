@@ -119,10 +119,18 @@ def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
                          -2), jnp.expand_dims(jnp.swapaxes(scale, -1, -2), -2))
 
 
-def quantize_to_native_fp4_kmajor(w: jax.Array,
-                                  block: int) -> tuple[jax.Array, jax.Array]:
+def quantize_to_native_fp4_kmajor(
+        w: jax.Array,
+        block: int,
+        pack: bool = True) -> tuple[jax.Array, jax.Array]:
     """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and per-block FP32 scale.
     Returns uint8 to safely cross the PyTorch/JAX bridge before unpacking in gmm_v2.
+
+    ``pack=False`` returns the same values as ``float4_e2m1fn`` [..., K, N]
+    instead -- what the fused EP MoE kernel's FP4 form reads, and what torch
+    receives as a native ``torch.float4_e2m1fn_x2`` tensor. Only the transport
+    differs: the quantization above is one cast either way, so the two forms
+    carry bit-identical weights and a caller may choose per layer.
 
     TODO: Make a more generic version of this function; possibly combine with quantize_tensor_to_fp4
     """
@@ -140,13 +148,16 @@ def quantize_to_native_fp4_kmajor(w: jax.Array,
     quantized = quantized.reshape(*w.shape[:-2], size_k,
                                   w.shape[-1])  # [..., K, N]
 
+    scale = scale.astype(jnp.float32)  # [..., num_blocks, 1, N]
+    if not pack:
+        return quantized, scale
+
     # Real e2m1 bit-packing (2 values/byte along K), matching gmm_v2's own
     # should_unpack/bitcast(quant_dtype) unpacking convention.
     pairs = quantized.reshape(*w.shape[:-2], size_k // 2, 2, w.shape[-1])
     pairs = jnp.swapaxes(pairs, -1, -2)  # [..., K/2, N, 2] -- pair axis last
     packed = jax.lax.bitcast_convert_type(pairs, jnp.uint8)  # [..., K/2, N]
 
-    scale = scale.astype(jnp.float32)  # [..., num_blocks, 1, N]
     return packed, scale
 
 
