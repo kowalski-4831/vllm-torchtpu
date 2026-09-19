@@ -2058,13 +2058,12 @@ class TPURaidenConnectorWorker:
             return
         if self._local_raiden_transfer_rank() != 0:
             return
-        from tpu_sync.api.torch.reshard_store import RaidenId as _StoreRaidenId
-        from tpu_sync.api.torch.reshard_store import ReshardStore
+        from tpu_sync.api.torch import reshard_store as _reshard_store_mod
 
         default_job = "prefill" if self.is_producer else "decode"
         job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or default_job
-        self._reshard_store = ReshardStore(
-            raiden_id=_StoreRaidenId(
+        store_kwargs: dict[str, Any] = dict(
+            raiden_id=_reshard_store_mod.RaidenId(
                 job_name=job_name,
                 job_replica_id=self._raiden_engine_id(),
                 data_name="reshard_store",
@@ -2076,11 +2075,34 @@ class TPURaidenConnectorWorker:
                 int(self.dp_rank)),
             reshard_service_port=_reshard_service_port(self.dp_rank),
         )
+        # The registry must outlive the prefill lease. A producer pins its
+        # KV blocks for TPU_P2P_WAIT_PULL_TIMEOUT, and a registration purged
+        # before that will cause every later decoder pull fail.
+        registry_ttl_s = float(dist_utils.get_raiden_registry_ttl_s())
+        lease_s = int(dist_utils.get_p2p_wait_pull_timeout())
+        if getattr(_reshard_store_mod, "SUPPORTS_REQUEST_REGISTRY_TTL", False):
+            self._reshard_store = _reshard_store_mod.ReshardStore(
+                request_registry_ttl_s=registry_ttl_s, **store_kwargs)
+        else:
+            # For older tpu_sync wheels the registry TTL is hard-coded at 600s.
+            self._reshard_store = _reshard_store_mod.ReshardStore(
+                **store_kwargs)
+            registry_ttl_s = float(
+                getattr(self._reshard_store, "request_registry_ttl_s", 600.0)
+                or 600.0)
+            if registry_ttl_s < lease_s:
+                logger.warning(
+                    "Installed tpu_sync ReshardStore does not accept "
+                    "request_registry_ttl_s; its registry TTL stays at "
+                    "%.0fs while TPU_P2P_WAIT_PULL_TIMEOUT=%ds. Consumer "
+                    "pulls issued more than %.0fs after prefill will fail."
+                    " Consider upgrading tpu_sync to set the registry TTL.",
+                    registry_ttl_s, lease_s, registry_ttl_s)
         logger.info(
             "TPURaidenConnectorWorker rank%d --> hosting reshard store "
-            "service=%s dispatch=%s", self.tp_rank,
-            _reshard_service_address(self.dp_rank),
-            _reshard_dispatch_address(self.dp_rank))
+            "service=%s dispatch=%s registry_ttl_s=%.0f (lease %ds)",
+            self.tp_rank, _reshard_service_address(self.dp_rank),
+            _reshard_dispatch_address(self.dp_rank), registry_ttl_s, lease_s)
 
     def _raiden_interleave_tokens(self, page_tokens: int,
                                   transfer_parallelism: int) -> int:
