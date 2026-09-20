@@ -300,6 +300,7 @@ def test_mla_wrapper_rope_preserves_activation_dtype():
     wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
         VllmMultiHeadLatentAttentionWrapper)
     torch.nn.Module.__init__(wrapper)
+    wrapper.kimi_preprocess = None
     wrapper.q_lora_rank = None
     wrapper.kv_lora_rank = 4
     wrapper.qk_nope_head_dim = 3
