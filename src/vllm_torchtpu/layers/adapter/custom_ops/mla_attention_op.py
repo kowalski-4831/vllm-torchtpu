@@ -870,7 +870,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         k_pe = k_pe.unsqueeze(1)
 
         if self.rotary_emb is not None:
+            q_pe_dtype = q_pe.dtype
+            k_pe_dtype = k_pe.dtype
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            # RoPE caches/frequencies can be fp32 and promote the rotated
+            # tensors.  Dense MLA requires new KV values to exactly match the
+            # cache dtype, and queries should remain in the activation dtype.
+            q_pe = q_pe.to(dtype=q_pe_dtype)
+            k_pe = k_pe.to(dtype=k_pe_dtype)
 
         topk_indices = None
         if self.is_sparse:
