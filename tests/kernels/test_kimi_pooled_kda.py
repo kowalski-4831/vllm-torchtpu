@@ -74,7 +74,7 @@ def _initial_states(rng, num_seqs):
     return conv, ssm
 
 
-def _pack_pool(conv_init, ssm_init, block_ids):
+def _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads=None):
     """Write the given states into the pool's state regions; the rest of the
     pool (including block 0 and the attention rows of every block) keeps its
     sentinel bytes."""
@@ -84,11 +84,16 @@ def _pack_pool(conv_init, ssm_init, block_ids):
                        dtype=jnp.bfloat16)
     idx = jnp.asarray(block_ids, dtype=jnp.int32)
 
-    conv_vals = conv_init.reshape(len(block_ids), CONV_ELEMS)
-    conv_vals = jnp.pad(conv_vals,
-                        ((0, 0),
-                         (0, CONV_REGION_ROWS * LANES - CONV_ELEMS))).reshape(
-                             len(block_ids), CONV_REGION_ROWS, LANES)
+    shard_heads = NUM_HEADS if conv_shard_heads is None else conv_shard_heads
+    capacity = CONV_REGION_ROWS * LANES // (NUM_HEADS // shard_heads)
+    chunks = []
+    for start in range(0, NUM_HEADS, shard_heads):
+        chunk = conv_init[:, :, :, start:start + shard_heads].reshape(
+            len(block_ids), -1)
+        chunks.append(jnp.pad(chunk, ((0, 0), (0, capacity - chunk.shape[1]))))
+    conv_vals = jnp.concatenate(chunks,
+                                axis=1).reshape(len(block_ids),
+                                                CONV_REGION_ROWS, LANES)
     pool = pool_adapters.scatter_region(pool,
                                         conv_vals,
                                         idx,
@@ -107,7 +112,7 @@ def _pack_pool(conv_init, ssm_init, block_ids):
     return pool
 
 
-def _unpack_pool(pool, block_ids, split=1):
+def _unpack_pool(pool, block_ids, split=1, conv_shard_heads=None):
     idx = jnp.asarray(block_ids, dtype=jnp.int32)
     conv = pool_adapters.gather_region(pool,
                                        idx,
@@ -115,10 +120,16 @@ def _unpack_pool(pool, block_ids, split=1):
                                        ntok=LAYOUT.conv_tokens,
                                        out_dtype=jnp.bfloat16,
                                        split=split)
-    conv = conv.reshape(len(block_ids),
-                        -1)[:, :CONV_ELEMS].reshape(len(block_ids),
-                                                    KERNEL_SIZE - 1, 3,
-                                                    NUM_HEADS, HEAD_DIM)
+    shard_heads = NUM_HEADS if conv_shard_heads is None else conv_shard_heads
+    fragments = NUM_HEADS // shard_heads
+    conv = conv.reshape(len(block_ids), fragments, -1)
+    live = (KERNEL_SIZE - 1) * 3 * shard_heads * HEAD_DIM
+    conv = jnp.concatenate([
+        conv[:, i, :live].reshape(len(block_ids), KERNEL_SIZE - 1, 3,
+                                  shard_heads, HEAD_DIM)
+        for i in range(fragments)
+    ],
+                           axis=3)
     ssm = pool_adapters.gather_region(pool,
                                       idx,
                                       tok0=0,
@@ -161,7 +172,12 @@ def _fused_kda_core_dense(inputs, conv_init, ssm_init, distribution):
                                     NUM_HEADS, HEAD_DIM), new_ssm
 
 
-def _run_pooled(inputs, pool, block_ids, distribution, pool_block_tokens):
+def _run_pooled(inputs,
+                pool,
+                block_ids,
+                distribution,
+                pool_block_tokens,
+                conv_shard_heads=None):
     return _pooled_kda_core(
         inputs["mixed_qkv"],
         inputs["raw_gate"],
@@ -179,22 +195,26 @@ def _run_pooled(inputs, pool, block_ids, distribution, pool_block_tokens):
         lower_bound=LOWER_BOUND,
         eps=EPS,
         pool_block_tokens=pool_block_tokens,
+        conv_shard_heads=conv_shard_heads,
     )
 
 
 @pytest.mark.parametrize(
-    ("query_lens", "seq_lens", "decode_end"),
+    ("query_lens", "seq_lens", "decode_end", "conv_shard_heads"),
     [
         # One decode with history, one fresh prefill, one continuation.
-        ([1, 5, 3], [9, 5, 11], 1),
+        ([1, 5, 3], [9, 5, 11], 1, None),
         # Decode-only batch: the prefill segment is skipped entirely.
-        ([1, 1], [4, 7], 2),
+        ([1, 1], [4, 7], 2, None),
         # Prefill-only, all fresh: no initial state is ever read.
-        ([6, 2], [6, 2], 0),
+        ([6, 2], [6, 2], 0, None),
+        # Stage-3 rank-blocked convolution fragments.
+        ([1, 5, 3], [9, 5, 11], 1, 1),
     ],
-    ids=["mixed", "decode-only", "prefill-fresh"],
+    ids=["mixed", "decode-only", "prefill-fresh", "rank-blocked"],
 )
-def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end):
+def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end,
+                                          conv_shard_heads):
     num_seqs = len(query_lens)
     rng = np.random.default_rng(0)
     inputs = _inputs(rng, query_lens, seq_lens)
@@ -206,13 +226,14 @@ def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end):
     out_dense, conv_dense, ssm_dense = _fused_kda_core_dense(
         inputs, conv_init, ssm_init, distribution)
 
-    pool = _pack_pool(conv_init, ssm_init, block_ids)
+    pool = _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads)
     before = np.asarray(pool.view(jnp.uint16))
     out_pool, pool_after = _run_pooled(inputs,
                                        pool,
                                        block_ids,
                                        distribution,
-                                       pool_block_tokens=BLOCK_SIZE * PACK)
+                                       pool_block_tokens=BLOCK_SIZE * PACK,
+                                       conv_shard_heads=conv_shard_heads)
 
     # Same arithmetic on identical values, but compiled in a different graph
     # (gather-fed buffers instead of plain ones), so fusion can reassociate
@@ -222,7 +243,9 @@ def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end):
                                rtol=5e-2,
                                atol=4e-3)
 
-    conv_back, ssm_back = _unpack_pool(pool_after, block_ids)
+    conv_back, ssm_back = _unpack_pool(pool_after,
+                                       block_ids,
+                                       conv_shard_heads=conv_shard_heads)
     # The conv state update is pure data movement: bitwise equal.
     np.testing.assert_array_equal(np.asarray(conv_back.view(jnp.uint16)),
                                   np.asarray(conv_dense[1:].view(jnp.uint16)))

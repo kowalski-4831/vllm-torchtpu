@@ -33,6 +33,9 @@ class PoolByteSpan:
     src_stride_bytes: int = 0
     dst_stride_bytes: int = 0
     count: int = 1
+    # Destination work-unit ordinal in the transfer's ``dst_units``.
+    # ``None`` broadcasts the span to every destination.
+    dst_unit_ordinal: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -317,6 +320,65 @@ def lower_gdn_state_shard_spans(
         spans=tuple(spans),
         declared_bytes=taps * local_row_bytes,
     )
+
+
+def lower_kda_state_shard_spans(
+    *,
+    tag: str,
+    block_id: int,
+    transfer_rank: int,
+    parallelism: int,
+    dst_shards: int,
+    regions: Sequence[object],
+) -> PoolSpanRegistration:
+    """Concatenate aligned KDA head shards in the rank-blocked pool layout."""
+    if not tag:
+        raise ValueError("state pool tag must not be empty")
+    if block_id < 0:
+        raise ValueError("state block id must be non-negative")
+    if parallelism <= 0 or not 0 <= transfer_rank < parallelism:
+        raise ValueError(
+            f"transfer_rank {transfer_rank} is outside parallelism "
+            f"{parallelism}")
+    if dst_shards <= 0 or parallelism % dst_shards:
+        raise ValueError("destination shards must divide source parallelism: "
+                         f"parallelism={parallelism}, "
+                         f"dst_shards={dst_shards}")
+    fan_in = parallelism // dst_shards
+    dst_rank, rank_in_dst = divmod(transfer_rank, fan_in)
+
+    if tag == TAG_GDN_SSM or tag.startswith(f"{TAG_GDN_SSM}."):
+        # SSM is already dense head-major f32, like Qwen's SSM pool.
+        registration = lower_gdn_state_shard_spans(tag=tag,
+                                                   block_id=block_id,
+                                                   transfer_rank=rank_in_dst,
+                                                   parallelism=fan_in,
+                                                   regions=regions)
+    elif tag == TAG_GDN_CONV or tag.startswith(f"{TAG_GDN_CONV}."):
+        if len(regions) != 1:
+            raise ValueError("KDA conv requires one rank-blocked region")
+        region = regions[0]
+        row_bytes = int(_region_value(region, "unit_bytes"))
+        rows = int(_region_value(region, "num_units"))
+        if (_region_value(region, "name") != "kda_conv_rank_blocks"
+                or int(_region_value(region, "offset_bytes")) != 0
+                or int(_region_value(region, "stride_bytes")) != row_bytes
+                or int(_region_value(region, "units_per_stride")) != 1
+                or row_bytes <= 0 or row_bytes % 4 or rows <= 0):
+            raise ValueError("KDA conv requires aligned rank-blocked rows")
+        live_bytes = row_bytes * rows
+        registration = PoolSpanRegistration(
+            tag, (int(block_id), ),
+            (PoolByteSpan(0, 0, 0, rank_in_dst * live_bytes, live_bytes), ),
+            live_bytes)
+    else:
+        raise ValueError(f"unsupported KDA state tag {tag!r}")
+    destination_ordinal = dst_rank if dst_shards > 1 else None
+    return dataclasses.replace(
+        registration,
+        spans=tuple(
+            dataclasses.replace(span, dst_unit_ordinal=destination_ordinal)
+            for span in registration.spans))
 
 
 def lower_glm_row_spans(

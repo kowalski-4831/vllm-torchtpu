@@ -17,7 +17,8 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .pool_manifest import TAG_FA, TAG_MLA_NOPE, PoolManifest
+from .pool_manifest import (TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, TAG_MLA_NOPE,
+                            PoolManifest)
 from .tags import class_tag
 
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
@@ -25,6 +26,7 @@ EXPECTED_FA_TILES = ((4, 128), (4, 1))
 FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
 GLM_EXPECTED_MINOR_TO_MAJOR = (3, 2, 1, 0)
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
+KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA = "kimi-k3-row-layout-fingerprint-v1"
 
 
 def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
@@ -149,11 +151,68 @@ __all__ = [
     "EXPECTED_FA_TILES",
     "FA_LAYOUT_FINGERPRINT_SCHEMA",
     "GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA",
+    "KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA",
     "canonical_layout_fingerprint",
     "fa_page_tokens",
     "measured_fa_layout_fingerprint",
     "measured_glm_layout_fingerprint",
+    "measured_kimi_k3_layout_fingerprint",
 ]
+
+
+def measured_kimi_k3_layout_fingerprint(
+    manifest: PoolManifest,
+    *,
+    page_tokens: int,
+    state_fragment_heads: int,
+    state_fragments: int,
+    layout_getter: Callable[[Any], Any] | None = None,
+    package_version: Callable[[str], str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Normalize the existing packed-row fingerprint across Kimi TP sizes."""
+    if state_fragment_heads <= 0:
+        raise ValueError("state_fragment_heads must be positive")
+    if state_fragments <= 0:
+        raise ValueError("state_fragments must be positive")
+    if not any(pool.tag == TAG_FA for pool in manifest.pools):
+        raise ValueError("Kimi layout fingerprint requires an FA pool")
+    version = package_version or importlib.metadata.version
+    payload = {
+        "schema":
+        KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu":
+        version("torch_tpu"),
+        "libtpu":
+        version("libtpu"),
+        # The planner splits at destination page boundaries, so Kimi compares
+        # physical rows independent of the role's page size.
+        "layouts":
+        _measure_packed_row_layouts(manifest,
+                                    page_tokens=page_tokens,
+                                    layout_getter=layout_getter,
+                                    include_page_shape=False),
+    }
+
+    state_layouts: dict[str, int] = {}
+    for pool in manifest.pools:
+        state_tag = next((tag for tag in (TAG_GDN_CONV, TAG_GDN_SSM)
+                          if pool.tag.startswith(tag)), None)
+        if state_tag is None:
+            continue
+        live_bytes = pool.live_bytes_per_block
+        if live_bytes % state_fragments:
+            raise ValueError("Kimi live state must divide into source-sized "
+                             f"fragments: tag={pool.tag}")
+        fragment_bytes = live_bytes // state_fragments
+        known = state_layouts.setdefault(state_tag, fragment_bytes)
+        if known != fragment_bytes:
+            raise ValueError(f"Kimi {state_tag} pools disagree on live state")
+    if set(state_layouts) != {TAG_GDN_CONV, TAG_GDN_SSM}:
+        raise ValueError("Kimi layout requires gdn.conv and gdn.ssm pools")
+    payload["gdn_state_layouts"] = state_layouts
+    payload["gdn_conv_layout"] = "kda-rank-blocked-tap-qkv-head-dim-bf16-v1"
+    payload["state_fragment_heads"] = int(state_fragment_heads)
+    return canonical_layout_fingerprint(payload), payload
 
 
 def measured_glm_layout_fingerprint(
@@ -165,20 +224,43 @@ def measured_glm_layout_fingerprint(
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted GLM cache layout, compared across peers.
 
+    Hash per-page geometry only: both peers must agree on it, but they size
+    their pools independently.
+    """
+    layouts = _measure_packed_row_layouts(manifest,
+                                          page_tokens=page_tokens,
+                                          layout_getter=layout_getter,
+                                          include_page_shape=True)
+    version = package_version or importlib.metadata.version
+    payload = {
+        "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu": version("torch_tpu"),
+        "libtpu": version("libtpu"),
+        "page_tokens": int(page_tokens),
+        "layouts": layouts,
+    }
+    return canonical_layout_fingerprint(payload), payload
+
+
+def _measure_packed_row_layouts(
+    manifest: PoolManifest,
+    *,
+    page_tokens: int,
+    layout_getter: Callable[[Any], Any] | None,
+    include_page_shape: bool,
+) -> dict[str, Any]:
+    """Validate live packed-row storage for the model-specific fingerprints.
+
     The transfer copies raw bytes, so a prefix of rows must also be a byte
     prefix of the page. That only holds for the natural
     [blocks, rows, packing, width] physical order, so reject anything else --
     for every pool, since one odd layer would corrupt just that layer.
-
-    Hash per-page geometry only: both peers must agree on it, but they size
-    their pools independently.
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
     if page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
     getter = layout_getter or _default_layout_getter
-    version = package_version or importlib.metadata.version
 
     # Keyed by class tag: per-layer tags describe the same physical layout
     # per class, and a producer holding a layer subset must fingerprint
@@ -215,28 +297,21 @@ def measured_glm_layout_fingerprint(
                 f"page_tokens {page_tokens}")
         if minor_to_major != GLM_EXPECTED_MINOR_TO_MAJOR:
             raise RuntimeError(
-                "GLM row transfers require the natural physical order: "
+                "Packed-row transfers require the natural physical order: "
                 f"tag={pool.tag}, layer={pool.layer_name}, "
                 f"minor_to_major={minor_to_major}")
         if tiles != ((packing, 128), (packing, 1)):
             raise RuntimeError(
-                "GLM row transfers require the packed tile shape "
+                "Packed-row transfers require the packed tile shape "
                 f"(({packing},128),({packing},1)): tag={pool.tag}, "
                 f"layer={pool.layer_name}, tiles={tiles}")
-        per_tag.setdefault(
+        measured = per_tag.setdefault(
             tag, {
-                "page_shape": [rows, packing, width],
                 "row_bytes": packing * width * element_bits // 8,
                 "minor_to_major": list(minor_to_major),
                 "tiles": [list(tile) for tile in tiles],
                 "element_size_in_bits": element_bits,
             })
-
-    payload = {
-        "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
-        "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
-        "page_tokens": int(page_tokens),
-        "layouts": per_tag,
-    }
-    return canonical_layout_fingerprint(payload), payload
+        if include_page_shape:
+            measured["page_shape"] = [rows, packing, width]
+    return per_tag
