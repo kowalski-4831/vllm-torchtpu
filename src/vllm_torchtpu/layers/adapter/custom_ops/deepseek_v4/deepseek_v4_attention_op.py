@@ -223,8 +223,6 @@ def _attention_csa(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
-        gather_and_attention_chunk_size=64,
-        attention_kernel_batch_size=16,
     )
     return output, updated_sw_cache
 
