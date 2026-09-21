@@ -29,7 +29,7 @@ V_HEADS = 32
 HEAD_DIM = 128
 HIDDEN_SIZE = 128
 CONV_KERNEL_SIZE = 4
-TP_SIZES = [2, 4, 8, 16]
+TP_SIZES = [1, 2, 4, 8, 16]
 QUANTIZATIONS = ["bf16", "fp8_tensor", "fp8_channel", "fp8_block"]
 
 
@@ -249,27 +249,80 @@ def test_loader_does_not_treat_unknown_parameters_as_scales(
     torch.testing.assert_close(param.data, torch.zeros(4))
 
 
-@pytest.mark.parametrize("tp_size", [2, 4])
-def test_interleaved_checkpoint_keeps_group_sharding(make_gdn_attention,
-                                                     tp_size):
-    generator = torch.Generator().manual_seed(19)
-    # In Qwen3-Next the QKVZ rows are grouped by Q/K head, so each rank owns
-    # one contiguous interval of the full checkpoint instead of four slices.
-    qkvz = torch.randn(K_HEADS,
-                       2 * (1 + V_HEADS // K_HEADS) * HEAD_DIM,
-                       HIDDEN_SIZE,
-                       generator=generator).to(torch.bfloat16)
-    qkvz = qkvz.flatten(0, 1)
+@pytest.mark.parametrize("tp_size", TP_SIZES)
+@pytest.mark.parametrize("quantization", QUANTIZATIONS)
+def test_interleaved_replication_projection_and_conv(make_gdn_attention,
+                                                     tp_size, quantization):
+    dtype = torch.bfloat16 if quantization == "bf16" else torch.float8_e4m3fn
+    segments = _checkpoint_segments((HIDDEN_SIZE, ), dtype)
+    checkpoint = torch.cat(
+        [s.reshape(K_HEADS, -1, HIDDEN_SIZE) for s in segments],
+        dim=1).flatten(0, 1)
+    ba_segments = [
+        torch.arange(V_HEADS * HIDDEN_SIZE).reshape(
+            V_HEADS, HIDDEN_SIZE).float() + i for i in (0, 10000)
+    ]
+    ba_checkpoint = torch.cat(
+        [s.reshape(K_HEADS, -1, HIDDEN_SIZE) for s in ba_segments],
+        dim=1).flatten(0, 1).to(torch.bfloat16)
     conv_segments = _checkpoint_segments((1, CONV_KERNEL_SIZE),
                                          torch.bfloat16)[:3]
     for rank in range(tp_size):
         attention, _ = make_gdn_attention(tp_size,
                                           rank,
+                                          quantization,
                                           gqa_interleaved_layout=True)
         weight = attention.in_proj_qkvz.weight
-        weight.weight_loader(weight, qkvz)
-        torch.testing.assert_close(weight.data, qkvz.chunk(tp_size)[rank])
+        weight.weight_loader(weight, checkpoint)
+        kh, vh = _owned_heads(tp_size, rank)
+        expected = _select_heads(segments, tp_size, rank)
+        widths = [len(kh) * HEAD_DIM] * 2 + [len(vh) * HEAD_DIM] * 2
+        torch.testing.assert_close(weight.float(), expected, rtol=0, atol=0)
         conv = attention.conv1d.weight
         conv.weight_loader(conv, torch.cat(conv_segments))
         torch.testing.assert_close(conv.float(),
                                    _select_heads(conv_segments, tp_size, rank))
+
+        # B/A checkpoint groups must split on V heads, not at the midpoint
+        # of the combined group. Use the BF16 layer for projection arithmetic.
+        if quantization == "bf16":
+            ba_weight = attention.in_proj_ba.weight
+            ba_weight.weight_loader(ba_weight, ba_checkpoint)
+            x = torch.ones(2, HIDDEN_SIZE)
+            projected = x @ weight.float().T
+            ba = x @ ba_weight.float().T
+            q, k, v, z = projected.split(widths, dim=-1)
+            b, a = ba.chunk(2, dim=-1)
+            for actual, segment in zip((q, k, v, z), expected.split(widths)):
+                torch.testing.assert_close(actual.flatten(1), x @ segment.T)
+            for actual, segment in zip((b, a), ba_segments):
+                torch.testing.assert_close(
+                    actual, x @ segment.to(torch.bfloat16).float()[vh].T)
+
+
+@pytest.mark.parametrize("tp_size", TP_SIZES)
+@pytest.mark.parametrize("quantization", QUANTIZATIONS[1:])
+def test_interleaved_scale_partition(make_gdn_attention, tp_size,
+                                     quantization):
+    for rank in range(tp_size):
+        attention, _ = make_gdn_attention(tp_size,
+                                          rank,
+                                          quantization,
+                                          gqa_interleaved_layout=True)
+        scale = attention.in_proj_qkvz.weight_scale
+        if quantization == "fp8_tensor":
+            scale.weight_loader(scale, torch.tensor(0.5))
+            torch.testing.assert_close(scale.data, torch.full_like(scale, 0.5))
+            continue
+        channels = 1 if quantization == "fp8_block" else HEAD_DIM
+        segments = [
+            (torch.arange(heads * channels).float() + i * 1000).reshape(-1, 1)
+            for i, heads in enumerate((K_HEADS, K_HEADS, V_HEADS, V_HEADS))
+        ]
+        checkpoint = torch.cat([s.reshape(K_HEADS, -1, 1) for s in segments],
+                               dim=1).flatten(0, 1)
+        if quantization == "fp8_channel":
+            checkpoint = checkpoint.flatten()
+        scale.weight_loader(scale, checkpoint)
+        expected = _select_heads(segments, tp_size, rank, channels).flatten()
+        torch.testing.assert_close(scale.float().flatten(), expected)

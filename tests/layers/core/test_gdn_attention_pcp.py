@@ -74,6 +74,13 @@ _GDN_PCP_DESCRIPTOR_CASES = (
 )
 
 _GDN_PCP_FUSED_PROJECTION_CASES = (
+    pytest.param(2,
+                 4,
+                 16,
+                 2048, (17, 15, 32), (0, 17, 32), (5, 41, 9),
+                 jnp.float32,
+                 1280,
+                 id="gqa-multiple-groups-per-shard"),
     pytest.param(8,
                  4,
                  32,

@@ -41,7 +41,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.kernels.gdn.head_geometry import (GdnHeadGeometry,
                                                      derive_gdn_head_geometry)
-from vllm_torchtpu.layers.adapter.gdn_linear import GdnColumnParallelLinear
+from vllm_torchtpu.layers.adapter.gdn_linear import (
+    GdnColumnParallelLinear, GdnInterleavedColumnParallelLinear)
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention, run_jax_gdn_attention_pcp_tp_prefill,
@@ -327,13 +328,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                          quant_config: QuantizationConfig | None,
                          prefix: str) -> MergedColumnParallelLinear:
         if self.gqa_interleaved_layout:
-            # Qwen3-Next has a different checkpoint layout. Its existing
-            # interleaved loader requires complete Q/K groups per TP rank.
-            if self.tp_head_geometry.kq_replication_factor != 1:
-                raise NotImplementedError(
-                    "TP Q/K replication requires the Qwen3.5 QKVZ layout")
-            return super().create_qkvz_proj(hidden_size, key_dim, value_dim,
-                                            quant_config, prefix)
+            group_v = self.num_v_heads // self.num_k_heads * self.head_v_dim
+            return GdnInterleavedColumnParallelLinear(
+                input_size=hidden_size,
+                geometry=self.tp_head_geometry,
+                group_sizes=[
+                    self.head_k_dim, self.head_k_dim, group_v, group_v
+                ],
+                replicated_segments=[True, True, False, False],
+                quant_config=quant_config,
+                prefix=prefix)
         return GdnColumnParallelLinear(
             input_size=hidden_size,
             geometry=self.tp_head_geometry,
@@ -344,11 +348,22 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             prefix=prefix,
         )
 
-    def _create_conv1d(self) -> None:
+    def create_ba_proj(self, hidden_size: int, num_v_heads: int,
+                       quant_config: QuantizationConfig | None,
+                       prefix: str) -> MergedColumnParallelLinear:
         if self.gqa_interleaved_layout:
-            # Keep Qwen3-Next's existing checkpoint loader with its matching
-            # interleaved projection. TP replication here targets Qwen3.5.
-            return
+            group_v = num_v_heads // self.num_k_heads
+            return GdnInterleavedColumnParallelLinear(
+                input_size=hidden_size,
+                geometry=self.tp_head_geometry,
+                group_sizes=[group_v, group_v],
+                replicated_segments=[False, False],
+                quant_config=quant_config,
+                prefix=prefix)
+        return super().create_ba_proj(hidden_size, num_v_heads, quant_config,
+                                      prefix)
+
+    def _create_conv1d(self) -> None:
         # Upstream constructs conv1d directly and installs its Mamba loader
         # after create_qkvz_proj. Replace it before checkpoint loading, using
         # the same Q/K/V partitioning as the input projection.
@@ -812,11 +827,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def _require_pcp_projection_parameters(
             self) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Return BF16 or tensor/channel/block-scaled FP8 QKVZ parameters."""
-        if (hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz")
-                or self.gqa_interleaved_layout):
-            raise RuntimeError("GDN pooled PCP prefill requires the Qwen3.5 "
-                               "non-interleaved QKVZ layout.")
+        """Return BF16/FP8 QKVZ parameters in canonical runtime layout."""
+        if hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz"):
+            raise RuntimeError("GDN pooled PCP prefill requires a combined "
+                               "QKVZ projection.")
 
         projection = self.in_proj_qkvz
         weight = getattr(projection, "weight", None)
@@ -929,24 +943,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
 
-            if self.gqa_interleaved_layout:
-                # Qwen3-Next: unpack the interleaved GQA layout
-                query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                    mixed_qkvz, ba)
-                query, key, value = map(
-                    lambda x: rearrange(x, "l p d -> l (p d)"),
-                    (query, key, value))
-                mixed_qkv = torch.cat((query, key, value), dim=-1)
-            else:
-                # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
-                qkv_size = self.tp_head_geometry.local_conv_dim(
-                    self.head_k_dim, self.head_v_dim)
-                z_size = self.value_dim // self.tp_size
-                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-                z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = ba.chunk(2, dim=-1)
-                b = b.contiguous()
-                a = a.contiguous()
+            # Every checkpoint loader produces [q, k, v, z] and [b, a].
+            qkv_size = self.tp_head_geometry.local_conv_dim(
+                self.head_k_dim, self.head_v_dim)
+            z_size = self.value_dim // self.tp_size
+            mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, a = ba.chunk(2, dim=-1)
+            b = b.contiguous()
+            a = a.contiguous()
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
