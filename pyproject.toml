@@ -190,10 +190,6 @@ ignore = [
 # matches `/`, so `dir/*.py` silently covers the whole subtree.
 
 
-# kernels: fused_moe, gdn, kimi_k3
-"src/vllm_torchtpu/kernels/fused_moe/**" = ["I"]
-"src/vllm_torchtpu/kernels/gdn/**" = ["I"]
-"src/vllm_torchtpu/kernels/kimi_k3/**" = ["I"]
 
 # kernels: attention and the rest
 "src/vllm_torchtpu/kernels/causal_conv1d/**" = ["I"]
@@ -290,10 +286,6 @@ docstring-code-format = true
 exclude = [
 
 
-    # kernels: fused_moe, gdn, kimi_k3
-    "src/vllm_torchtpu/kernels/fused_moe/**",
-    "src/vllm_torchtpu/kernels/gdn/**",
-    "src/vllm_torchtpu/kernels/kimi_k3/**",
 
     # kernels: attention and the rest
     "src/vllm_torchtpu/kernels/causal_conv1d/**",
