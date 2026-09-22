@@ -54,6 +54,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        return False
+
+    @classmethod
     def supports_float64(cls) -> bool:
         return False
 

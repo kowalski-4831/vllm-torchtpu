@@ -47,17 +47,12 @@ dependencies = [
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # Capped below 5.11. vLLM 0.29.0 only sets a floor (>=5.10.4), and letting
-    # transformers float to 5.17.0 fails
-    # test_structured_output_spec_decode_correctness_greedy[single_chunk] with
-    # assert 1 == 0 -- a wrong answer under grammar-constrained decoding, not an
-    # import or API error, so nothing catches it before the test.
-    #
-    # 5.10.4 is vLLM's floor and the closest available release to 5.8.0, which
-    # was the last version this suite was green on. It is NOT a bisected ceiling:
-    # the break is somewhere in 5.11.0-5.17.0 and could be much later than 5.11.
-    # Widen it by bisecting against that test, not by bumping and hoping.
-    "transformers>=5.10.4,<5.11",
+    # Capped below 5.15. vLLM 0.29.0 sets a floor (>=5.10.4), and vllm-omni 0.29.0rc1
+    # requires transformers>=5.13.0,<5.15. The previous <5.11 ceiling was added
+    # defensively after floating to 5.17.0 produced an argmax tie-break divergence in
+    # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
+    # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
+    "transformers>=5.10.4,<5.15",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -114,7 +109,7 @@ benchmarking = [
 
 # vLLM-Omni optional dependency
 omni = [
-    "vllm-omni==0.27.0rc1",
+    "vllm-omni==0.29.0rc1",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
