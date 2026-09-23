@@ -55,13 +55,11 @@ def _k3_tp32_fp8_8k_page256_mixed_key() -> TuningKey:
     )
 
 
-def test_k3_bf16_mixed_uses_default_params() -> None:
-    key = _k3_mixed_key()
-    assert key not in tuned_params.tuned_params_mapping
-    tuned = get_tuned_params(key)
+def test_k3_mixed_tuned_params() -> None:
+    tuned = get_tuned_params(_k3_mixed_key())
 
-    assert tuned.num_kv_pages_per_block == 1
-    assert tuned.num_queries_per_block == 16
+    assert tuned.num_kv_pages_per_block == 4
+    assert tuned.num_queries_per_block == 256
     assert tuned.q_split == 1
 
 
@@ -87,8 +85,7 @@ def test_k3_mixed_tuned_params_require_matching_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(tuned_params, "logger", MagicMock())
-    mismatched_key = replace(_k3_tp32_fp8_8k_mixed_key(),
-                             page_size_per_kv_packing=64)
+    mismatched_key = replace(_k3_mixed_key(), page_size_per_kv_packing=64)
 
     tuned = get_tuned_params(mismatched_key)
 
