@@ -653,6 +653,22 @@ def _build_fused_ep_moe_kernel(
     # on this rather than deleted, because the two schedules differ only in
     # WHERE the start happens -- a visit ahead, or at the visit's own head.
     prefetches = prefetch_distance > 0
+
+    # Whether each expert's weights are waited by the block that first reads
+    # it rather than waiting at the beginning of each expert's visit.
+    # fp4, fp8 expert FFN are running different code paths. This flag can
+    # be activated only for fp4 expert FFN now. But the idea should be
+    # applicable to fp8 expert FFN as well.
+    streams_weights = rhs_packed4
+    # Whether issue async copy the NEXT expert's weights as soon as we finish
+    # reading the current expert's weights, instead of at the beginning of the
+    # next expert's visit.
+    #
+    # The overlap is free in VMEM, because the next start writes the slot its
+    # reader has just finished with: for example gate/up is dead from the
+    # last gate/up block of an expert's last tile, which is overlapped with
+    # a whole down matmul plus an epilogue.
+    starts_next_weights = streams_weights and not prefetches
     if rhs_packed4:
         # Asked here, beside the other device reads, because the packed
         # four-bit layout is the one place a written-down device fact and a
@@ -881,25 +897,41 @@ def _build_fused_ep_moe_kernel(
             """The down weight slab of `expert`, into weight slot `slot`."""
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
+        def w1s_copy(expert, slot):
+            return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
+
+        def w2s_copy(expert, slot):
+            return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
+
         def weight_starts(expert, slot):
-            """Start every buffer slot `slot` holds for `expert`."""
+            """Start every buffer slot `slot` holds for `expert`.
+
+            In the order the body consumes them, which is also the order a
+            single DMA queue will retire them -- WEIGHT_DMA_PRIORITY selects
+            a queue, it does not reorder within one. The scale tables go
+            first: they are half a megabyte and the first contraction block
+            needs them, so they are all a streamed visit's head waits for.
+            """
+            if has_scales:
+                w1s_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                w2s_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
             w1_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
             w2_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
-            if has_scales:
-                _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot).start(
-                    priority=WEIGHT_DMA_PRIORITY
-                )
-                _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot).start(
-                    priority=WEIGHT_DMA_PRIORITY
-                )
 
         def weight_waits(expert, slot):
-            """Wait for them, in the order they were started."""
-            w1_copy(expert, slot).wait()
-            w2_copy(expert, slot).wait()
+            """Wait for what the expert's first block needs.
+
+            A streamed slab is not waited for here: its wait sits in the block
+            that first reads it, where the wire has had longest to deliver, so
+            this head waits for the scale tables alone. Every other format
+            takes the slab in one matmul and keeps the whole-slab head wait.
+            """
+            if not streams_weights:
+                w1_copy(expert, slot).wait()
+                w2_copy(expert, slot).wait()
             if has_scales:
-                _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot).wait()
-                _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot).wait()
+                w1s_copy(expert, slot).wait()
+                w2s_copy(expert, slot).wait()
 
         def prologue():
             """Land the resident tables and start the first weight refills."""
@@ -920,23 +952,78 @@ def _build_fused_ep_moe_kernel(
         prologue()
         _all_pairs_barrier(ep)
 
-        def _fp4_block_readers(slot):
+        def _start_next_gate_up(visit_i, slot, last_tile):
+            """`() -> ()`: start the NEXT expert's gate/up slab, called from
+            the reader of the block that retires this expert's.
+
+            The reader is where the start belongs for the same reason the
+            wait is: it is the only place that knows which block is being
+            read. A later tile of this expert would still be reading the
+            slab, so only the last tile starts the next one.
+            """
+
+            def start():
+                @pl.when(jnp.logical_and(last_tile, visit_i + 1 < n_visit))
+                def _():
+                    w1_copy(visit_sm[visit_i + 1], slot).start(
+                        priority=WEIGHT_DMA_PRIORITY
+                    )
+
+            return start
+
+        def _slab_waiter(expert, slot, first_tile):
+            """`(copy, block) -> ()`: land the slab that block `block` opens,
+            on the expert's first tile.
+
+            A streamed visit owes each slab exactly one wait, and block 0 --
+            the first block of its matmul group -- is both where the wire has
+            had the longest to deliver it and the only place in the group
+            where no accumulation is in flight. Only the first tile owes
+            anything: a later tile of the same expert reads a slab that is
+            already whole, which is why the wait is predicated rather than
+            issued per tile.
+            """
+
+            def wait(copy, block):
+                if block:
+                    return
+
+                @pl.when(first_tile)
+                def _():
+                    copy(expert, slot).wait()
+
+            return wait
+
+        def _fp4_block_readers(slot, wait_slab=None, slab_retired=None):
             """(w1_block, w2_block) fp4 block readers at weight slot `slot`.
 
             The one genuinely fp4 place in the kernel: everything around it
             is four-bit generic, and these two lines are where the packed
             words are read as fp4 (e2m1) rather than as some other four-bit
             element type.
+
+            `wait_slab` is where a streamed slab is landed and
+            `slab_retired` fires at the last read of the gate/up one: the
+            reader is the one place that knows which block is about to be
+            contracted, so it is the one place either can sit without
+            costing a block of runway.
             """
             # Each widens one k-block: u32 [qb/8, N] -> fp4 [qb, N] -> fp8.
             packed_rows = rhs_qb // PACK4
 
             def w1_block(b):
-                return pltpu.bitcast(
+                if wait_slab is not None:
+                    wait_slab(w1_copy, b)
+                block = pltpu.bitcast(
                     w1_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
                 ).astype(FP8)
+                if slab_retired is not None and b == hidden // rhs_qb - 1:
+                    slab_retired()
+                return block
 
             def w2_block(b):
+                if wait_slab is not None:
+                    wait_slab(w2_copy, b)
                 return pltpu.bitcast(
                     w2_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
                 ).astype(FP8)
@@ -1159,7 +1246,7 @@ def _build_fused_ep_moe_kernel(
             # The weight slot indexes a contiguous counter so DISTANCE + 1 of
             # them occupy distinct slots; the DMA base stays the real expert.
             slot = lax.rem(visit_i, jnp.int32(nbuf))
-            if not prefetches:
+            if not prefetches and not starts_next_weights:
                 # No runway: nobody started this visit's weights, so it
                 # starts them itself and waits on the two lines below.
                 # Refilling the one slot cannot race the previous visit's
@@ -1168,6 +1255,15 @@ def _build_fused_ep_moe_kernel(
                 # they have all retired by the loop's back edge, which is
                 # before this.
                 weight_starts(e, slot)
+            if starts_next_weights:
+                # Every later visit had its weights started by the one before,
+                # which is the whole point; the first has nobody to start them
+                # for it.
+
+                @pl.when(visit_i == 0)
+                def _():
+                    weight_starts(e, slot)
+
             weight_waits(e, slot)
 
             # Refill the slot for the expert DISTANCE ahead: the previous
@@ -1431,7 +1527,20 @@ def _build_fused_ep_moe_kernel(
                         # not apply w2s again.
                         w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
                         w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
-                        w1_block, w2_block = _fp4_block_readers(slot)
+                        first_tile, last_tile = t == 0, t == n_tiles - 1
+                        w1_block, w2_block = _fp4_block_readers(
+                            slot,
+                            wait_slab=(
+                                _slab_waiter(e, slot, first_tile)
+                                if streams_weights
+                                else None
+                            ),
+                            slab_retired=(
+                                _start_next_gate_up(visit_i, slot, last_tile)
+                                if starts_next_weights
+                                else None
+                            ),
+                        )
                         acc2, mid_scale = expert_ffn_blockscale(
                             act_rows,
                             act_scales,
@@ -1556,6 +1665,23 @@ def _build_fused_ep_moe_kernel(
                 )
 
             carry = lax.fori_loop(0, n_tiles, tile_body, carry)
+
+            if starts_next_weights:
+                # What the tile loop was still reading to its last block: the
+                # down slab, and the scale tables, which are read a block at a
+                # time beside the weights they scale.
+
+                @pl.when(visit_i + 1 < n_visit)
+                def _():
+                    nxt = visit_sm[visit_i + 1]
+                    # Scales first: they are all the next visit's head waits
+                    # for, and the down slab behind them is a megabyte-scale
+                    # queue they would otherwise sit out.
+                    if has_scales:
+                        w1s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                        w2s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                    w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+
             # Cross-expert lookahead: prime the next visited expert's first
             # activation tile before this expert's commit drain and push. Its
             # index window went out on the last tile, so this is the wait and

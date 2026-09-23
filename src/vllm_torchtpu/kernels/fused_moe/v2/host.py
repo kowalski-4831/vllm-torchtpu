@@ -1519,7 +1519,7 @@ def vmem_estimate_bytes(
     capacity,
     hidden,
     inter,
-    nbuf=MAX_NBUF,
+    nbuf,
     weight_format=WeightFormat.FP8,
     rhs_qb=QB4,
     has_w1_bias=False,
@@ -1534,12 +1534,6 @@ def vmem_estimate_bytes(
     born. Nothing is left out, which is what a caller asking "will this
     fit" needs; a caller wanting the exact high-water mark should read the
     figure the compiler reports for a built kernel.
-
-    `nbuf` defaults to the ceiling, which is the most weight slots any build
-    asks for and so the most VMEM one can want: a caller answering "will
-    this shape fit at all" wants `fit_weight_slots` instead, which asks this
-    question at each depth the kernel would accept and reports the first one
-    that clears.
 
     Reads the chip's lane count and per-dtype sublane tiling off the device
     record, so a host with no chip to name raises rather than answering.
