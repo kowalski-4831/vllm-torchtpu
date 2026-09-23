@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runs one command on a single-host TPU pod.
+# Runs one command in a single pod: on one TPU host, or with SHAPE=cpu on the
+# fleet's cpu queue, for work that needs the test environment and no chip.
 #
-#   .buildkite/kubernetes/run.sh <machine-type>/<topology> <command> [args...]
+#   SHAPE=<machine-type>/<topology> .buildkite/kubernetes/run.sh <command> [args...]
+#   SHAPE=cpu                       .buildkite/kubernetes/run.sh <command> [args...]
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: SHAPE=<machine-type>/<topology> $0 <command> [args...]" >&2
+  echo "usage: SHAPE=<machine-type>/<topology>|cpu $0 <command> [args...]" >&2
   exit 2
 fi
 
@@ -28,11 +30,16 @@ fi
 # From the step's environment, not an argument: every step already sets SHAPE
 # from one of the shape anchors, and passed the same value straight back in.
 shape="${SHAPE:-}"
-machine_type="${shape%%/*}"
-topology="${shape#*/}"
-if [[ -z "$shape" || "$machine_type" == "$shape" || -z "$topology" ]]; then
-  echo "$0: SHAPE must be <machine-type>/<topology>, got '${shape}'" >&2
-  exit 2
+if [[ "$shape" == "cpu" ]]; then
+  hardware=(--cpu)
+else
+  machine_type="${shape%%/*}"
+  topology="${shape#*/}"
+  if [[ -z "$shape" || "$machine_type" == "$shape" || -z "$topology" ]]; then
+    echo "$0: SHAPE must be <machine-type>/<topology> or cpu, got '${shape}'" >&2
+    exit 2
+  fi
+  hardware=(--machine-type "$machine_type" --topology "$topology")
 fi
 
 # Exports WORKLOAD_IMAGE and fills `env_args`.
@@ -71,7 +78,6 @@ IN_POD='
 
 # shellcheck disable=SC2154  # env_args comes from common.sh
 exec /opt/launcher/launch \
-  --machine-type "$machine_type" \
-  --topology "$topology" \
+  "${hardware[@]}" \
   "${env_args[@]}" \
   -- bash -c "$IN_POD" -- "$@"

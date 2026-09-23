@@ -58,6 +58,8 @@ export SKIP_SPANNER_UPLOAD="1"
 # Names the launcher cannot guess. A name the step has not set is skipped
 # rather than injected empty, which several of these depend on.
 FORWARD=(
+  # cpu on the cpu queue; unset on a TPU host, where JAX finds the chips.
+  JAX_PLATFORMS
   FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU
   UV_INDEX_TORCH_TPU_REGISTRY_USERNAME UV_NO_CACHE
   CI_RUNNER SKIP_SPANNER_UPLOAD
