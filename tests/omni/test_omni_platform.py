@@ -1,18 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
 from unittest.mock import patch
 
 import pytest
 import torch
-
-try:
-    from . import mock_omni  # noqa: F401
-except (ImportError, ValueError):
-    from tests.omni import mock_omni  # noqa: F401
+import vllm_omni
+from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
+from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
+from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
+from .mock_omni import vllm_omni_mock
+
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture(scope="module", autouse=True)
+def cleanup_mock_omni():
+    yield
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "vllm_omni" or mod_name.startswith("vllm_omni."):
+            del sys.modules[mod_name]
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -72,8 +82,6 @@ def test_memory_methods(monkeypatch):
 
 
 def test_tpu_sdpa_attention_backend():
-    from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
-
     assert TpuSDPABackend.get_name() == "TPU_SDPA"
     assert TpuSDPABackend.get_impl_cls() is TpuSDPAImpl
     assert TpuSDPABackend.supports_attention_mask() is True
@@ -99,24 +107,11 @@ def test_tpu_sdpa_attention_backend():
 
 
 def test_vllm_omni_is_mocked():
-    import sys
-
-    import vllm_omni
-
-    try:
-        from .mock_omni import vllm_omni_mock
-    except (ImportError, ValueError):
-        from tests.omni.mock_omni import vllm_omni_mock
-
     assert sys.modules["vllm_omni"] is vllm_omni_mock
-    assert getattr(vllm_omni, "__file__", None) is None
+    assert not hasattr(vllm_omni, "__file__") or vllm_omni.__file__ is None
 
 
 def test_ltx2_safe_decode_output():
-    from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
-
-    from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
-
     apply_omni_model_specific_patches()
 
     class TrackedTensor(torch.Tensor):
