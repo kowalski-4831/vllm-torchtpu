@@ -8,57 +8,6 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
-    """Use a common local prefix boundary for hybrid TPU producers.
-
-    vLLM 0.27.0 assumes every KV connector can complete a divergent local
-    hybrid hit by restoring the recurrent state missing at the deeper
-    full-attention boundary. The Raiden offloading path used by GPC does not
-    provide that contract. Backport the conservative behavior from vLLM
-    #50344 at the producer manager instance boundary, while preserving
-    ``shared_prefix_boundary`` for adaptive Mamba checkpoint retention.
-    Stage-3 Raiden consumers support divergent hits and are unaffected.
-    """
-    from types import MethodType
-
-    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
-
-    kv_transfer_config = scheduler.vllm_config.kv_transfer_config
-    manager = scheduler.kv_cache_manager
-    if (kv_transfer_config is None or not kv_transfer_config.is_kv_producer
-            or not scheduler.has_mamba_layers
-            or not isinstance(manager.coordinator, HybridKVCacheCoordinator)):
-        return
-
-    def get_common_prefix_hit_for_connector(self, request):
-        blocks, hit_length, shared_prefix_boundary = self.get_computed_blocks(
-            request)
-        return blocks, hit_length, shared_prefix_boundary, False
-
-    manager.get_computed_blocks_for_connector = MethodType(
-        get_common_prefix_hit_for_connector, manager)
-    logger.info(
-        "Reconciled hybrid TPU producer prefix hits to a common boundary.")
-
-
-def _patch_vllm_hybrid_producer_prefix_hits() -> None:
-    """Backport connector-scoped hybrid hit handling from vLLM #50344."""
-    from vllm.v1.core.sched.scheduler import Scheduler
-
-    if Scheduler.__dict__.get("_tpu_hybrid_producer_prefix_hit_patch", False):
-        return
-
-    original_init = Scheduler.__init__
-
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        _reconcile_hybrid_producer_prefix_hits(self)
-
-    Scheduler.__init__ = patched_init
-    Scheduler._tpu_hybrid_producer_prefix_hit_patch = True
-    logger.info("Applied TPU patch: reconcile hybrid producer prefix hits.")
-
-
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     """Backport hybrid KV cache load failure recovery from vLLM #50388.
 

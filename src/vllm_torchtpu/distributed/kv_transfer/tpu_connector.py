@@ -449,6 +449,16 @@ def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
 class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     force_raiden_connector = False
 
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """Stage-3 suffix loads also restore the committed Mamba state."""
+        return (
+            self.use_raiden
+            and not self._kv_transfer_config.is_kv_producer
+            and _use_raiden_stage3_transport()
+            and _prefix_aware_load_enabled()
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,

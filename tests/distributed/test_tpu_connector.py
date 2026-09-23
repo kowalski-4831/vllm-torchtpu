@@ -22,6 +22,7 @@ import pytest
 import torch
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -279,6 +280,85 @@ def _make_raiden_worker(
 
 
 class TestTPUConnector:
+    @pytest.mark.parametrize("connector_cls", [TPUConnector, TPURaidenConnector])
+    @pytest.mark.parametrize(
+        (
+            "kv_role",
+            "transport",
+            "prefix_aware",
+            "suffix_supported",
+            "composition",
+            "divergent",
+        ),
+        [
+            ("kv_producer", "raiden", True, True, "direct", False),
+            ("kv_both", "raiden", True, True, "direct", False),
+            ("kv_consumer", "raiden", True, True, "direct", True),
+            ("kv_consumer", "raiden", False, True, "direct", False),
+            ("kv_consumer", "raiden", True, False, "direct", False),
+            ("kv_consumer", "zmq", True, True, "direct", False),
+            ("kv_consumer", "raiden", True, True, "multi", True),
+            ("kv_consumer", "raiden", True, True, "offloading", False),
+        ],
+    )
+    def test_upstream_prefix_lookup_uses_connector_capability(
+        self,
+        connector_cls,
+        kv_role,
+        transport,
+        prefix_aware,
+        suffix_supported,
+        composition,
+        divergent,
+        monkeypatch,
+    ):
+        from vllm_torchtpu.distributed.kv_transfer import tpu_connector
+        from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import (
+            TPUMultiConnector,
+        )
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+        monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", transport)
+        monkeypatch.setenv("TPU_RAIDEN_PREFIX_AWARE_LOAD", "1" if prefix_aware else "0")
+        monkeypatch.setattr(
+            tpu_connector, "_prefix_aware_load_supported", lambda: suffix_supported
+        )
+        monkeypatch.setattr(tpu_connector.dist_utils, "get_kv_ips", lambda: "127.0.0.1")
+        monkeypatch.setattr(tpu_connector.dist_utils, "get_kv_ports", lambda: 9100)
+        monkeypatch.setattr(
+            tpu_connector.dist_utils, "get_side_channel_port", lambda: "9600"
+        )
+        cfg = _make_vllm_config(is_producer=kv_role != "kv_consumer")
+        cfg.kv_transfer_config.kv_role = kv_role
+        connector = connector_cls(
+            cfg, KVConnectorRole.SCHEDULER, _make_stage3_hybrid_kv_cache_config()
+        )
+        if composition != "direct":
+            children = [connector]
+            if composition == "offloading":
+                # Capability lookup needs no store or worker resources.
+                children.append(object.__new__(TPURaidenOffloadingConnector))
+            connector = object.__new__(TPUMultiConnector)
+            connector._connectors = children
+
+        manager = SimpleNamespace(
+            get_computed_blocks=lambda request: (("common",), 3072, 6144),
+            get_computed_blocks_for_connector=lambda request: (
+                ("divergent",),
+                9216,
+                0,
+                True,
+            ),
+        )
+        scheduler = SimpleNamespace(connector=connector, kv_cache_manager=manager)
+        result = Scheduler._get_local_prefix_cache_hit(scheduler, object())
+        expected = (
+            (("divergent",), 9216, 0, True)
+            if divergent
+            else (("common",), 3072, 6144, False)
+        )
+        assert result == expected
+
     @patch(f"{_MOD}.TPUConnectorWorker")
     @patch(f"{_MOD}.TPUConnectorScheduler")
     def test_init_scheduler_role(self, mock_sched_cls, mock_worker_cls):
@@ -1250,7 +1330,8 @@ class TestTPURaidenConnectorScheduler:
         load = consumer.reqs_to_load[req.request_id]
         assert load.mamba_state_block_ids == [11]
 
-    def test_stage3_consumer_prefix_hit_pulls_suffix_pages_only(self):
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_stage3_consumer_prefix_hit_pulls_suffix_pages_only(self, hybrid):
         req = MagicMock()
         req.request_id = "suffix-load"
         req.num_computed_tokens = 0
@@ -1267,6 +1348,8 @@ class TestTPURaidenConnectorScheduler:
         }
         blocks = MagicMock()
         blocks.get_block_ids.return_value = ([50, 51, 52, 53],)
+        if hybrid:
+            blocks.get_block_ids.return_value = ([50, 51, 52, 53], [10, 11, 12, 13, 14])
 
         with (
             patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
@@ -1277,6 +1360,9 @@ class TestTPURaidenConnectorScheduler:
             consumer = _make_raiden_scheduler(
                 is_producer=False, block_size=1024, enable_prefix_caching=True
             )
+            if hybrid:
+                consumer._stage3_mamba_group_indices = [1]
+                consumer._stage3_mamba_num_speculative_blocks = 3
             matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
             consumer.update_state_after_alloc(req, blocks, matched)
 
@@ -1287,6 +1373,7 @@ class TestTPURaidenConnectorScheduler:
         assert load.local_block_ids == [52, 53]
         assert load.num_tokens == 4095
         assert not load.release_only
+        assert load.mamba_state_block_ids == ([11] if hybrid else None)
 
     @pytest.mark.parametrize(("requested", "supported"), ((False, True), (True, False)))
     def test_stage3_consumer_partial_hit_without_feature_pulls_full_payload(
@@ -2738,8 +2825,10 @@ class TestTPURaidenConnectorWorker:
                 )
         facade.start_transfer.assert_called_once()
 
-    def test_stage3_consumer_clip_kwarg_reflects_skip_tokens(self):
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_stage3_consumer_clip_kwarg_reflects_skip_tokens(self, hybrid):
         worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker._stage3_state_group_count = 1 if hybrid else 0
         worker._raiden_work_unit = MagicMock()
         facade = MagicMock()
         facade.start_transfer.return_value = True
@@ -2751,6 +2840,7 @@ class TestTPURaidenConnectorWorker:
             src_engine_id="producer-engine",
             src_data_replica_idx=0,
             src_parallelism=8,
+            mamba_state_block_ids=[11] if hybrid else None,
         )
         meta = TPUConnectorMetadata()
         meta.reqs_to_load["dst-suffix"] = _Stage3LoadMeta(
@@ -2790,10 +2880,14 @@ class TestTPURaidenConnectorWorker:
             for call in facade.start_transfer.call_args_list
         }
         clipped = by_uuid[997]
-        assert clipped["dst_skip_bytes"] == [2048 * 64]
-        assert clipped["dst_device_block_ids"] == [52, 53]
-        assert clipped["dst_block_counts"] == [2]
-        assert clipped["transfer_pool_tags"] == ["fa"]
+        assert clipped["dst_skip_bytes"] == ([131072, 0, 0] if hybrid else [131072])
+        assert clipped["dst_device_block_ids"] == (
+            [52, 53, 11, 11] if hybrid else [52, 53]
+        )
+        assert clipped["dst_block_counts"] == ([2, 1, 1] if hybrid else [2])
+        assert clipped["transfer_pool_tags"] == (
+            ["fa", "gdn.conv.g0", "gdn.ssm.g0"] if hybrid else ["fa"]
+        )
         assert clipped["num_tokens"] == 4095
         assert worker._stage3_submitted_loads["dst-suffix"] == 997
         assert worker._load_block_ids["dst-suffix"] == [52, 53]
@@ -2801,7 +2895,9 @@ class TestTPURaidenConnectorWorker:
         # kwarg is omitted entirely rather than passed as zeros.
         unclipped = by_uuid[998]
         assert "dst_skip_bytes" not in unclipped
-        assert unclipped["dst_device_block_ids"] == [50, 51, 52, 53]
+        assert unclipped["dst_device_block_ids"] == (
+            [50, 51, 52, 53, 11, 11] if hybrid else [50, 51, 52, 53]
+        )
 
     @pytest.mark.parametrize(("tp_rank", "tp_size"), [(0, 1), (0, 2), (1, 2)])
     @pytest.mark.parametrize("report_completion", [False, True])
