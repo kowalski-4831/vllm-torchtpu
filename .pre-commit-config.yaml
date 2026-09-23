@@ -35,9 +35,6 @@ repos:
 
 
 
-      # layers/core
-      |src/vllm_torchtpu/layers/core/
-      |src/vllm_torchtpu/layers/__init__\.py$
 
 
       # runner
