@@ -810,8 +810,11 @@ class TPUModelRunner(GPUModelRunner):
                                      if envs.USE_PHASED_PROFILER else "")
         self.phase_based_profiler = None
 
-    def start_phased_profiling(self,
-                               profile_prefix: str | None = None) -> None:
+    def start_phased_profiling(
+        self,
+        profile_prefix: str | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         """Arms the phase-based profiler. Called from TPUWorker.profile()."""
         if not self.phased_profiling_dir:
             logger.warning(
@@ -833,7 +836,9 @@ class TPUModelRunner(GPUModelRunner):
         # the per-phase subdirectories sit beneath it.
 
         profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
-            self.phased_profiling_dir, profile_prefix)
+            self.phased_profiling_dir,
+            profile_prefix,
+            profiler_kwargs=profiler_kwargs)
 
         # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
         # so every DP replica would call itself rank 0 and their traces would
