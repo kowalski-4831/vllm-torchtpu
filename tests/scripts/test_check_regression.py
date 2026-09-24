@@ -23,8 +23,13 @@ import pytest
 
 pytestmark = pytest.mark.cpu_test
 
-_SCRIPT = (pathlib.Path(__file__).resolve().parents[2] / "scripts" / "vllm" /
-           "benchmarking" / "check_regression.py")
+_SCRIPT = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "vllm"
+    / "benchmarking"
+    / "check_regression.py"
+)
 _spec = importlib.util.spec_from_file_location("check_regression", _SCRIPT)
 check_regression = importlib.util.module_from_spec(_spec)
 # Must be registered before exec_module: the script uses
@@ -33,8 +38,14 @@ check_regression = importlib.util.module_from_spec(_spec)
 sys.modules["check_regression"] = check_regression
 _spec.loader.exec_module(check_regression)
 
-_BASELINE_DIR = (pathlib.Path(__file__).resolve().parents[2] / "scripts" /
-                 "vllm" / "benchmarking" / "baselines" / "eval")
+_BASELINE_DIR = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "vllm"
+    / "benchmarking"
+    / "baselines"
+    / "eval"
+)
 
 
 def test_primary_metric():
@@ -65,22 +76,23 @@ def test_primary_stderr_custom_extract():
 
 
 def test_stderr_key():
-    assert (check_regression.stderr_key("exact_match,strict_match") ==
-            "exact_match_stderr,strict_match")
+    assert (
+        check_regression.stderr_key("exact_match,strict_match")
+        == "exact_match_stderr,strict_match"
+    )
     assert check_regression.stderr_key("acc,none") == "acc_stderr,none"
-    assert (check_regression.stderr_key("exact_match,none") ==
-            "exact_match_stderr,none")
+    assert check_regression.stderr_key("exact_match,none") == "exact_match_stderr,none"
+    assert check_regression.stderr_key("acc_norm,none") == "acc_norm_stderr,none"
     assert (
-        check_regression.stderr_key("acc_norm,none") == "acc_norm_stderr,none")
-    assert (check_regression.stderr_key("pass@1,create_test") ==
-            "pass@1_stderr,create_test")
-    assert (check_regression.stderr_key("pass_at_1,create_test") ==
-            "pass_at_1_stderr,create_test")
-    assert (check_regression.stderr_key("pass_at_1,none") ==
-            "pass_at_1_stderr,none")
+        check_regression.stderr_key("pass@1,create_test") == "pass@1_stderr,create_test"
+    )
+    assert (
+        check_regression.stderr_key("pass_at_1,create_test")
+        == "pass_at_1_stderr,create_test"
+    )
+    assert check_regression.stderr_key("pass_at_1,none") == "pass_at_1_stderr,none"
     assert check_regression.stderr_key("acc") == "acc_stderr"
-    assert (
-        check_regression.stderr_key("acc_stderr,none") == "acc_stderr,none")
+    assert check_regression.stderr_key("acc_stderr,none") == "acc_stderr,none"
 
 
 def test_primary_stderr_paired_variant():
@@ -144,14 +156,12 @@ def test_delta_stderr_uses_run_stderr_when_baseline_missing():
     baseline = {metric: 0.88}
     results = {metric: 0.86, "exact_match_stderr,custom-extract": 0.02}
     # hypot(0.0, 0.02) == 0.02: the run's stderr covers its own side only.
-    assert math.isclose(
-        check_regression.delta_stderr(baseline, results, metric), 0.02)
+    assert math.isclose(check_regression.delta_stderr(baseline, results, metric), 0.02)
 
 
 def test_delta_stderr_zero_when_neither_side_reports():
     metric = "exact_match,strict_match"
-    assert check_regression.delta_stderr({metric: 0.88}, {metric: 0.86},
-                                         metric) == 0.0
+    assert check_regression.delta_stderr({metric: 0.88}, {metric: 0.86}, metric) == 0.0
 
 
 def test_load_eval_results_ignores_orphan_stderr(tmp_path):
@@ -166,15 +176,15 @@ def test_load_eval_results_ignores_orphan_stderr(tmp_path):
         json.dump(
             {
                 "results": {
-                    "orphan": {
-                        "exact_match_stderr,strict_match": 0.01
-                    },
+                    "orphan": {"exact_match_stderr,strict_match": 0.01},
                     "good": {
                         "exact_match,strict_match": 0.88,
                         "exact_match_stderr,strict_match": 0.01,
                     },
                 }
-            }, f)
+            },
+            f,
+        )
 
     loaded = check_regression.load_eval_results(results_dir)
     assert "orphan" not in loaded
@@ -187,21 +197,24 @@ def test_load_eval_results_ignores_orphan_stderr(tmp_path):
 def test_format_drop_range():
     assert check_regression.format_drop_range([0.015]) == "1.50pp"
     assert check_regression.format_drop_range([0.015, 0.015]) == "1.50pp"
-    assert (check_regression.format_drop_range([0.015,
-                                                0.0526]) == "1.50pp..5.26pp")
-    assert (check_regression.format_drop_range(
-        [0.015, 0.0526], prefix="-") == "-1.50pp..-5.26pp")
+    assert check_regression.format_drop_range([0.015, 0.0526]) == "1.50pp..5.26pp"
+    assert (
+        check_regression.format_drop_range([0.015, 0.0526], prefix="-")
+        == "-1.50pp..-5.26pp"
+    )
 
 
 def test_eval_check_result_truthiness():
     """Truthy only when something failed; `main()` branches on this."""
     passing = check_regression.EvalCheckResult(
-        [check_regression.EvalRow("t", "m", "PASS", 0.015)])
+        [check_regression.EvalRow("t", "m", "PASS", 0.015)]
+    )
     assert not passing
     assert passing.failed_count == 0
 
     failing = check_regression.EvalCheckResult(
-        [check_regression.EvalRow("t", "m", "FAIL", 0.015)])
+        [check_regression.EvalRow("t", "m", "FAIL", 0.015)]
+    )
     assert failing
     assert failing.failed_count == 1
 
@@ -211,14 +224,12 @@ def test_eval_check_result_truthiness():
 
 def test_eval_check_result_excludes_ungated_rows_from_range():
     """Rows with no baseline metric must not widen the reported range."""
-    result = check_regression.EvalCheckResult([
-        check_regression.EvalRow("real", "m", "PASS", 0.05, gated=True),
-        check_regression.EvalRow("bogus",
-                                 "(no acc)",
-                                 "SKIP",
-                                 0.015,
-                                 gated=False),
-    ])
+    result = check_regression.EvalCheckResult(
+        [
+            check_regression.EvalRow("real", "m", "PASS", 0.05, gated=True),
+            check_regression.EvalRow("bogus", "(no acc)", "SKIP", 0.015, gated=False),
+        ]
+    )
     assert result.allowed_drops == [0.05]
 
 
@@ -253,8 +264,10 @@ def test_check_eval_scales_with_stderr():
             "exact_match,strict_match": 0.81,
         }
     }
-    assert check_regression.check_eval(results_pass, baseline,
-                                       tolerance=0.02).failed_count == 0
+    assert (
+        check_regression.check_eval(results_pass, baseline, tolerance=0.02).failed_count
+        == 0
+    )
 
     # drop of 0.090 -> fails, beyond 0.0814
     results_fail = {
@@ -262,8 +275,10 @@ def test_check_eval_scales_with_stderr():
             "exact_match,strict_match": 0.79,
         }
     }
-    assert check_regression.check_eval(results_fail, baseline,
-                                       tolerance=0.02).failed_count == 1
+    assert (
+        check_regression.check_eval(results_fail, baseline, tolerance=0.02).failed_count
+        == 1
+    )
 
 
 def test_check_eval_uses_noisier_run_stderr():
@@ -282,8 +297,10 @@ def test_check_eval_uses_noisier_run_stderr():
         }
     }
     # hypot(0.005, 0.050) = 0.05025, * 1.645 = 0.0827 -> a 0.05 drop passes.
-    assert check_regression.check_eval(noisy_run, baseline,
-                                       tolerance=0.02).failed_count == 0
+    assert (
+        check_regression.check_eval(noisy_run, baseline, tolerance=0.02).failed_count
+        == 0
+    )
 
     # Same drop, but a run as precise as the baseline -> hypot is 0.00707,
     # below the floor, so the 0.02 tolerance applies and 0.05 fails.
@@ -293,8 +310,10 @@ def test_check_eval_uses_noisier_run_stderr():
             "exact_match_stderr,strict_match": 0.005,
         }
     }
-    assert check_regression.check_eval(quiet_run, baseline,
-                                       tolerance=0.02).failed_count == 1
+    assert (
+        check_regression.check_eval(quiet_run, baseline, tolerance=0.02).failed_count
+        == 1
+    )
 
 
 def test_check_eval_uses_tolerance_floor_when_stderr_is_smaller():
@@ -313,8 +332,10 @@ def test_check_eval_uses_tolerance_floor_when_stderr_is_smaller():
         }
     }
     # drop of 0.015 -> passes (within 0.02 floor)
-    assert check_regression.check_eval(results_pass, baseline,
-                                       tolerance=0.02).failed_count == 0
+    assert (
+        check_regression.check_eval(results_pass, baseline, tolerance=0.02).failed_count
+        == 0
+    )
 
     results_fail = {
         "mmlu_llama": {
@@ -323,8 +344,10 @@ def test_check_eval_uses_tolerance_floor_when_stderr_is_smaller():
         }
     }
     # drop of 0.025 -> fails (> 0.02 floor)
-    assert check_regression.check_eval(results_fail, baseline,
-                                       tolerance=0.02).failed_count == 1
+    assert (
+        check_regression.check_eval(results_fail, baseline, tolerance=0.02).failed_count
+        == 1
+    )
 
 
 def test_check_eval_without_stderr():
@@ -340,13 +363,15 @@ def test_check_eval_without_stderr():
         }
     }
     # delta is -0.015, tolerance is 0.02 -> PASS
-    assert check_regression.check_eval(results, baseline,
-                                       tolerance=0.02).failed_count == 0
+    assert (
+        check_regression.check_eval(results, baseline, tolerance=0.02).failed_count == 0
+    )
 
     # delta is -0.025, tolerance is 0.02 -> FAIL
     results["mmlu_llama"]["exact_match,strict_match"] = 0.855
-    assert check_regression.check_eval(results, baseline,
-                                       tolerance=0.02).failed_count == 1
+    assert (
+        check_regression.check_eval(results, baseline, tolerance=0.02).failed_count == 1
+    )
 
 
 def test_check_eval_real_humaneval_shape():
@@ -365,8 +390,12 @@ def test_check_eval_real_humaneval_shape():
             "pass_at_1_stderr,create_test": 0.022578813351856353,
         }
     }
-    assert check_regression.check_eval(results_pass, baseline,
-                                       tolerance=0.015).failed_count == 0
+    assert (
+        check_regression.check_eval(
+            results_pass, baseline, tolerance=0.015
+        ).failed_count
+        == 0
+    )
 
     # A 6pp drop is a real regression even at this sample size.
     results_fail = {
@@ -375,8 +404,12 @@ def test_check_eval_real_humaneval_shape():
             "pass_at_1_stderr,create_test": 0.022578813351856353,
         }
     }
-    assert check_regression.check_eval(results_fail, baseline,
-                                       tolerance=0.015).failed_count == 1
+    assert (
+        check_regression.check_eval(
+            results_fail, baseline, tolerance=0.015
+        ).failed_count
+        == 1
+    )
 
 
 def test_check_eval_missing_task_fails():
@@ -425,13 +458,15 @@ def test_shipped_baselines_are_well_formed():
 
     new_gaps = missing - _BASELINES_MISSING_STDERR
     assert not new_gaps, (
-        "new baseline(s) missing stderr, regenerate with --calibrate: " +
-        ", ".join(sorted(new_gaps)))
+        "new baseline(s) missing stderr, regenerate with --calibrate: "
+        + ", ".join(sorted(new_gaps))
+    )
 
     fixed = _BASELINES_MISSING_STDERR - missing
-    assert not fixed, ("these baselines now have stderr; drop them from "
-                       "_BASELINES_MISSING_STDERR: " +
-                       ", ".join(sorted(fixed)))
+    assert not fixed, (
+        "these baselines now have stderr; drop them from "
+        "_BASELINES_MISSING_STDERR: " + ", ".join(sorted(fixed))
+    )
 
 
 def test_check_regression_cli(tmp_path, monkeypatch):
@@ -448,7 +483,7 @@ def test_check_regression_cli(tmp_path, monkeypatch):
         "mmlu_llama_other": {
             "exact_match,strict_match": 0.88,
             "exact_match_stderr,strict_match": 0.035,
-        }
+        },
     }
     with baseline_file.open("w") as f:
         json.dump(baseline_data, f)
@@ -467,7 +502,7 @@ def test_check_regression_cli(tmp_path, monkeypatch):
             "mmlu_llama_other": {
                 "exact_match,strict_match": 0.85,
                 "exact_match_stderr,strict_match": 0.035,
-            }
+            },
         }
     }
     with results_file.open("w") as f:
@@ -491,8 +526,7 @@ def test_check_regression_cli(tmp_path, monkeypatch):
     assert ret == 0
 
     # CLI test failing when other drops beyond its combined stderr (0.0814)
-    results_data["results"]["mmlu_llama_other"]["exact_match,strict_match"] = (
-        0.79)
+    results_data["results"]["mmlu_llama_other"]["exact_match,strict_match"] = 0.79
     with results_file.open("w") as f:
         json.dump(results_data, f)
 
@@ -554,6 +588,8 @@ def test_check_regression_cli_output(tmp_path, monkeypatch, capsys):
     ret = check_regression.main()
     assert ret == 1
     captured = capsys.readouterr()
-    assert ("| task | metric | actual | baseline | stderr(diff) |"
-            " allowed drop | delta | status |" in captured.out)
+    assert (
+        "| task | metric | actual | baseline | stderr(diff) |"
+        " allowed drop | delta | status |" in captured.out
+    )
     assert "FAILED: 1 task(s) regressed beyond 8.14pp" in captured.err
