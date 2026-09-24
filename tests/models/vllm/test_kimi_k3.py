@@ -2333,6 +2333,8 @@ def test_mla_wrapper_uses_global_rows_after_local_preprocessing():
     wrapper.qk_head_dim = 192
     wrapper.rotary_emb = None
     wrapper.is_sparse = False
+    wrapper.dcp_q_replicate = False
+    wrapper.dcp_group_size = 1
     wrapper.o_proj = object()
     calls = []
 
