@@ -52,7 +52,7 @@ def _make_runner(
     scheduled_tokens,
     token_paddings,
     uses_mrope=False,
-    pcp_mtp_k1_enabled=False,
+    mtp_enabled=False,
     pcp_size=2,
 ):
     num_reqs = len(scheduled_tokens)
@@ -77,7 +77,8 @@ def _make_runner(
     runner.lora_config = None
     runner.speculative_config = None
     runner.reorder_batch_threshold = 1
-    runner._pcp_mtp_k1_enabled = pcp_mtp_k1_enabled
+    runner._pcp_enabled = pcp_size > 1
+    runner._mtp_enabled = mtp_enabled
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
@@ -253,6 +254,57 @@ def _scheduler_output(scheduled_tokens):
         },
         scheduled_spec_decode_tokens={},
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "computed,prompt,scheduled,pcp_size,mtp_enabled,rejected",
+    [
+        (8, 8, 1, 2, True, True),  # Decode without a draft.
+        (8, 8, 2, 2, True, True),  # K=1 target verification.
+        (7, 8, 2, 2, True, True),  # A chunk crossing the prompt boundary.
+        (9, 8, 1, 2, True, True),  # A resumed request already past prefill.
+        (0, 8, 4, 2, True, False),  # Intermediate prefill chunk.
+        (7, 8, 1, 2, True, False),  # Final prompt token produces the first output.
+        (0, 8, 8, 2, True, False),  # Unchunked prefill.
+        (8, 8, 2, 2, False, False),  # PCP without MTP.
+        (8, 8, 2, 1, True, False),  # MTP without PCP.
+        (8, 8, 2, 1, False, False),  # Neither PCP nor MTP.
+    ],
+)
+def test_execute_model_pcp_mtp_prefill_only_boundary(
+    computed, prompt, scheduled, pcp_size, mtp_enabled, rejected, async_scheduling
+):
+    # Put a valid prefill first so validation must cover the whole batch.
+    scheduled_tokens = [4, scheduled]
+    runner = _make_runner(
+        num_computed_tokens=[0, computed],
+        prompt_tokens=[8, prompt],
+        scheduled_tokens=scheduled_tokens,
+        token_paddings=[256],
+        mtp_enabled=mtp_enabled,
+        pcp_size=pcp_size,
+    )
+    runner.execute_model_state = None
+    runner.scheduler_config.async_scheduling = async_scheduling
+    # The fixture already represents the batch after the scheduler update.
+    runner._update_states = lambda _: None
+    runner._flush_disjoint_async_results = lambda: None
+
+    class ForwardBoundaryReached(Exception):
+        pass
+
+    def stop_before_forward(_):
+        raise ForwardBoundaryReached
+
+    runner._reorder_batch_for_rpa = stop_before_forward
+    if rejected:
+        with pytest.raises(RuntimeError, match="PCP.*MTP.*req1"):
+            TPUModelRunner.execute_model(runner, _scheduler_output(scheduled_tokens))
+    else:
+        with pytest.raises(ForwardBoundaryReached):
+            TPUModelRunner.execute_model(runner, _scheduler_output(scheduled_tokens))
 
 
 @pytest.mark.cpu_test
@@ -442,7 +494,7 @@ def test_prepare_inputs_pcp_mtp_snapshots_request_major_tokens_before_pack(monke
         prompt_tokens=scheduled,
         scheduled_tokens=scheduled,
         token_paddings=[256],
-        pcp_mtp_k1_enabled=True,
+        mtp_enabled=True,
     )
 
     monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 1)
@@ -475,7 +527,7 @@ def test_prepare_inputs_pcp_mtp_returns_each_chunks_own_plan(monkeypatch):
         prompt_tokens=scheduled,
         scheduled_tokens=scheduled,
         token_paddings=[32],
-        pcp_mtp_k1_enabled=True,
+        mtp_enabled=True,
     )
     runner.num_reqs_max_model_len = 1
 

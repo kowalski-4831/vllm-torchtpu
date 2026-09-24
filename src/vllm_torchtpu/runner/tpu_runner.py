@@ -471,9 +471,9 @@ class TPUModelRunner(GPUModelRunner):
         # wrong scope and fails silently. See `_init_phased_profiling`.
         self._profiler_rank = profiler_rank
         self._profiler_world_size = profiler_world_size
-        self._pcp_mtp_k1_enabled = PcpStaticSupportValidator.from_vllm_config(
-            vllm_config
-        ).pcp_mtp_k1_enabled
+        pcp_config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
+        self._pcp_enabled = pcp_config.enabled
+        self._mtp_enabled = pcp_config.speculative_method == "mtp"
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
             # GPUModelRunner probes torch.cuda.mem_get_info during init. The
@@ -2576,7 +2576,7 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         request_major_input_ids_cpu: torch.Tensor
-        if self._pcp_mtp_k1_enabled:
+        if self._pcp_enabled and self._mtp_enabled:
             # prepare_real() may repack input_ids_cpu in place. Preserve only
             # the real request-major prefix before crossing that boundary.
             request_major_input_ids_cpu = self.input_ids_cpu.narrow(
@@ -2606,7 +2606,7 @@ class TPUModelRunner(GPUModelRunner):
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
         request_major_input_ids = None
-        if self._pcp_mtp_k1_enabled:
+        if self._pcp_enabled and self._mtp_enabled:
             request_major_input_ids_cpu_padded = torch.zeros(
                 layout_plan.global_padded_num_tokens,
                 dtype=request_major_input_ids_cpu.dtype,
@@ -3084,6 +3084,24 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        if self._pcp_enabled and self._mtp_enabled:
+            # Validate the actual scheduled span before any forward/collective.
+            # Ending exactly at the prompt boundary produces the first output;
+            # consuming any generated token would enter unsupported decode or
+            # target verification. Let the engine's fatal-error path handle it.
+            for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+                req_index = self.input_batch.req_id_to_index[req_id]
+                num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+                if num_computed + num_tokens > num_prompt:
+                    raise RuntimeError(
+                        "PCP + MTP only supports prefill and the first output "
+                        "token; refusing decode/verify for "
+                        f"request {req_id!r}: num_computed_tokens={num_computed}, "
+                        f"num_scheduled_tokens={num_tokens}, "
+                        f"num_prompt_tokens={num_prompt}. "
+                        "Set SamplingParams(max_tokens=1) at the service entry."
+                    )
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
         # explicitly, otherwise the encoder never runs, image placeholder
@@ -4892,7 +4910,9 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- num_seqs: %d", num_reqs)
             # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
             # we skip it here as well.
-            if self.speculative_config is None or self._pcp_mtp_k1_enabled:
+            if self.speculative_config is None or (
+                self._pcp_enabled and self._mtp_enabled
+            ):
                 return
             # For spec decoding, target logits have padded_logits_length rows.
             max_target_rows = (
@@ -5178,7 +5198,7 @@ class TPUModelRunner(GPUModelRunner):
             # bucket shape it may see at runtime.
             if self._is_async_drafter:
                 self.drafter.precompile()
-                if self._pcp_mtp_k1_enabled:
+                if self._pcp_enabled and self._mtp_enabled:
                     logger.info(
                         "Skipping rejection replay and decode/verify warmup "
                         "for prefill-only PCP MTP K1"

@@ -183,7 +183,7 @@ class Eagle3Proposer:
         draft_attn_layer_names = set(all_attn_layers.keys()) - target_attn_layer_names
         self._draft_attn_layer_names = draft_attn_layer_names
 
-        if self.runner._pcp_mtp_k1_enabled is True:
+        if self.runner._pcp_enabled and self.runner._mtp_enabled:
             self._validate_pcp_draft_model(draft_attn_layer_names)
         self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
 

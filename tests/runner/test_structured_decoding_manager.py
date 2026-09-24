@@ -19,7 +19,8 @@ def make_manager(
     req_id_to_index: dict[str, int] | None = None,
     num_spec_tokens: int | None = None,
     num_tokens_paddings: list[int] | None = None,
-    pcp_mtp_k1: bool = False,
+    pcp_enabled: bool = False,
+    mtp_enabled: bool = False,
     device: torch.device | str = "cpu",
 ):
     speculative_config = (
@@ -34,7 +35,8 @@ def make_manager(
         input_batch=SimpleNamespace(req_id_to_index=req_id_to_index or {}),
         speculative_config=speculative_config,
         num_tokens_paddings=num_tokens_paddings or [16, 32, 64],
-        _pcp_mtp_k1_enabled=pcp_mtp_k1,
+        _pcp_enabled=pcp_enabled,
+        _mtp_enabled=mtp_enabled,
     )
     return StructuredDecodingManager(runner)
 
@@ -390,7 +392,7 @@ class TestPrepareSpecStructuredDecodingInput:
 
     def test_prefill_only_pcp_mtp_k1_skips_target_buffers(self):
         # Prefill-only PCP MTP K1 never verifies drafts.
-        manager = make_manager(num_spec_tokens=1, pcp_mtp_k1=True)
+        manager = make_manager(num_spec_tokens=1, pcp_enabled=True, mtp_enabled=True)
         assert not hasattr(manager, "target_grammar_bitmask_cpu")
         assert not hasattr(manager, "require_structured_out_target_cpu")
 

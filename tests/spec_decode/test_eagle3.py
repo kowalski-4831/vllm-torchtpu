@@ -46,7 +46,10 @@ def _make_proposer(
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config, parallel_config=parallel_config
     )
-    return Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
+    return Eagle3Proposer(
+        runner=mock.MagicMock(_pcp_enabled=False, _mtp_enabled=method == "mtp"),
+        vllm_config=vllm_config,
+    )
 
 
 def _make_vocab_models():
