@@ -192,9 +192,6 @@ ignore = [
 
 
 
-# runner
-"src/vllm_torchtpu/runner/**" = ["I"]
-"tests/runner/**" = ["I"]
 
 
 
@@ -260,9 +257,6 @@ exclude = [
 
 
 
-    # runner
-    "src/vllm_torchtpu/runner/**",
-    "tests/runner/**",
 
 
 
