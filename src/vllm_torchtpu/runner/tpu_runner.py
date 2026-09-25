@@ -34,7 +34,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -1641,7 +1641,7 @@ class TPUModelRunner(GPUModelRunner):
         # never filled: beyond the row width it raises IndexError, within it
         # the null block silently swallows the recurrent state.
         try:
-            cp_world_size = get_dcp_group().world_size * get_pcp_group().world_size
+            cp_world_size = get_pcp_group().world_size
         except Exception:
             cp_world_size = 1
         col_stride = self._mamba_state_block_size * cp_world_size
