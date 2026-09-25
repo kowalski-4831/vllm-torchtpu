@@ -1055,6 +1055,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_world_size=self.dcp_world_size,
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
+            decode_query_size=self.decode_query_size,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1249,8 +1250,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             and getattr(parallel_config, "decode_context_parallel_size", 1) > 1
         )
         if dcp_configured:
-            # TODO(kwang3939): forward decode_query_size to the DCP ops
-            self.decode_query_size = 1
             # These backends allocate NHD even when the global layout is HND.
             # Passing HND to LONGCTX would reinterpret the physical KV pool.
             if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE and (
@@ -1275,6 +1274,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_group_size=self.dcp_world_size,
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
+                    decode_query_size=self.decode_query_size,
                 )
             return
 
