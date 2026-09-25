@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
+    TPU_RAIDEN_DSV4_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
     TPU_RAIDEN_JOB_NAME: str = ""
@@ -436,6 +437,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # must set it identically.
     "TPU_RAIDEN_POOL_TAGS_PER_LAYER": env_bool("TPU_RAIDEN_POOL_TAGS_PER_LAYER"),
     "TPU_RAIDEN_GLM_ADMISSION": env_bool("TPU_RAIDEN_GLM_ADMISSION"),
+    # DeepSeek-V4 admits several attention KV cache groups at once: CSA,
+    # indexer, HCA, SWA and the compressor states. Every other model here has
+    # exactly one.
+    "TPU_RAIDEN_DSV4_ADMISSION": env_bool("TPU_RAIDEN_DSV4_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves
     # the existing v1 connector protocol; selecting ``raiden`` enables
     # the fail-closed controller path.
