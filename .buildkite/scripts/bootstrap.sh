@@ -179,6 +179,9 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
+echo "Uploading Nightly Verification and Model Pipeline"
+upload_with_priority .buildkite/nightly_verify.yml "$JOB_PRIORITY"
+
 echo "Uploading Perf and Eval Pipeline"
 upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
 
