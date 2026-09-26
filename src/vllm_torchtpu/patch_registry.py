@@ -49,6 +49,13 @@ _ENGINE: tuple[Stage, ...] = (*_ACTIVE, "engine_core")
 PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering", ("import",)),
+    # TODO(https://github.com/vllm-project/vllm-torchtpu/pull/1182): Remove
+    # this patch once the pinned TorchTPU supports tuple-axis PartitionSpecs
+    # in both get_global_shape and get_local_shape.
+    Patch(
+        "vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),

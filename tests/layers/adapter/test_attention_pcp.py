@@ -5,12 +5,14 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import vllm.envs as vllm_envs
+from jax.sharding import PartitionSpec
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.config.attention import AttentionConfig
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter as pcp_adapter
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout, flat_kernel_ids
+from vllm_torchtpu.distributed import pallas_shapes
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl,
@@ -292,6 +294,37 @@ def test_no_kernel_reports_a_schedule_bound(vllm_config_context):
     assert not _impl().runs_batched_rpa_schedule()
 
 
+def test_streaming_rpa_partition_specs_cover_pcp_and_tp_axes():
+    assert (
+        PartitionSpec("pcp", None, "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+    ) == pcp_adapter.PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
+    assert (
+        PartitionSpec("pcp", None, "tp"),
+        PartitionSpec("pcp", "tp"),
+    ) == pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+
+
+def test_streaming_rpa_mesh_requests_full_pcp_tp_grid(monkeypatch):
+    captured = {}
+    mesh = object()
+
+    def fake_get_mesh(axis_name, *, tp_axis_name):
+        captured["axis_names"] = (axis_name, tp_axis_name)
+        return mesh
+
+    monkeypatch.setattr(pcp_adapter, "get_or_create_pcp_mesh", fake_get_mesh)
+
+    assert pcp_adapter.get_pcp_streaming_mesh() is mesh
+    assert captured["axis_names"] == ("pcp", "tp")
+
+
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     monkeypatch, vllm_config_context
 ):
@@ -350,8 +383,9 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     assert cached is prebuilt
 
 
+@pytest.mark.parametrize("block_major", [False, True])
 def test_build_streaming_kernel_registers_eight_tensor_custom_op(
-    monkeypatch, vllm_config_context
+    monkeypatch, vllm_config_context, block_major
 ):
     impl = _impl()
     fake_mesh = object()
@@ -378,6 +412,7 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
     def fake_jax_op(_name, fn, **kwargs):
         captured["signature"] = inspect.signature(fn, follow_wrapped=False)
         captured["input_partition_specs"] = kwargs["input_partition_specs"]
+        captured["output_partition_specs"] = kwargs["output_partition_specs"]
         return FakeOp()
 
     monkeypatch.setattr(
@@ -396,12 +431,28 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
             None,
             use_pcp_streaming=True,
             cp_kv_cache_interleave_size=4,
+            block_major=block_major,
         )
 
     params = list(captured["signature"].parameters.values())
     assert len(params) == 8
     assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
     assert len(captured["input_partition_specs"]) == 8
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    local_cache = (8, 3, 16, 2, 1, 128) if block_major else (8, 16, 2, 1, 128)
+    global_cache = (32, 3, 16, 4, 1, 128) if block_major else (32, 16, 4, 1, 128)
+    assert (
+        pallas_shapes.get_global_shape(
+            local_cache, mesh, captured["input_partition_specs"][0]
+        )
+        == global_cache
+    )
+    assert (
+        pallas_shapes.get_local_shape(
+            global_cache, mesh, captured["output_partition_specs"][0]
+        )
+        == local_cache
+    )
 
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -665,6 +716,32 @@ def test_build_pcp_streaming_callable_defaults_output_specs(monkeypatch):
         callable_.output_partition_specs
         == pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
     )
+
+
+def test_adapter_converts_dimensions_sharded_over_pcp_and_tp():
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    spec = PartitionSpec(None, ("tp", "pcp"), None)
+
+    global_shape = pallas_shapes._convert_partitioned_shape(
+        (3, 8, 16), mesh, spec, to_global=True
+    )
+    local_shape = pallas_shapes._convert_partitioned_shape(
+        global_shape, mesh, spec, to_global=False
+    )
+
+    assert global_shape == (3, 64, 16)
+    assert local_shape == (3, 8, 16)
+
+
+def test_adapter_rejects_nondivisible_compound_axis_output_shape():
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    with pytest.raises(ValueError, match="not divisible by mesh factor 8"):
+        pallas_shapes._convert_partitioned_shape(
+            (3, 63, 16),
+            mesh,
+            PartitionSpec(None, ("tp", "pcp"), None),
+            to_global=False,
+        )
 
 
 def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
