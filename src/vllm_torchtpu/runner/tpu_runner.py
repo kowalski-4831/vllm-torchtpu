@@ -2250,18 +2250,19 @@ class TPUModelRunner(GPUModelRunner):
 
             req_idx = self.input_batch.req_id_to_index[req_id]
 
-            # num_tokens_no_spec was advanced to (seq_len + n_placeholder)
+            # num_tokens_no_spec was advanced to (start_tok_idx + n_placeholder)
             # optimistically; roll back the over-count (= num_rejected) so it
             # reflects the real committed length (start_idx + len(sampled_ids)).
             end_idx = self.input_batch.num_tokens_no_spec[req_idx]
             start_idx = end_idx - n_placeholder
-            self.input_batch.num_tokens_no_spec[req_idx] = start_idx + len(sampled_ids)
+            end_tok_idx = start_idx + len(sampled_ids)
+            self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
 
-            target_slice = slice(seq_len - len(sampled_ids) + 1, seq_len + 1)
+            target_slice = slice(start_idx, end_tok_idx)
             # The committed tokens must fit within token_ids_cpu
             # ([num_reqs, max_model_len]); writing past the end is a sizing bug.
-            assert seq_len + 1 <= self.input_batch.token_ids_cpu.shape[1], (
-                f"req {req_id}: write end {seq_len + 1} exceeds max_model_len "
+            assert end_tok_idx <= self.input_batch.token_ids_cpu.shape[1], (
+                f"req {req_id}: write end {end_tok_idx} exceeds max_model_len "
                 f"{self.input_batch.token_ids_cpu.shape[1]}"
             )
             self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
@@ -2275,16 +2276,21 @@ class TPUModelRunner(GPUModelRunner):
     ):
         placeholder_req_id_to_index: dict[str, int] = {}
         discard_set = set(discard_sampled_tokens_req_indices)
-        for req_idx, req_state, seq_len, req_id in request_seq_lens:
+        for req_idx, req_state, _seq_len, req_id in request_seq_lens:
             if req_idx in discard_set:
                 continue
 
+            actual_idx = self.input_batch.req_id_to_index[req_id]
+            assert actual_idx == req_idx, (req_id, actual_idx, req_idx)
+
             # Async spec: optimistically advance by 1 (bonus) + num_draft;
-            # the over-count is corrected on-device next step by
-            # subtract_num_rejected_tokens.
-            n_new = 1 + (num_draft_per_req.get(req_idx, 0) if num_draft_per_req else 0)
-            end_idx = seq_len + n_new
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            # the over-count is rolled back in _modify_prev_results once true
+            # draft acceptance is sampled from the device.
+            n_draft = num_draft_per_req.get(req_idx, 0) if num_draft_per_req else 0
+            n_new = 1 + n_draft
+            start_tok_idx = self.input_batch.num_tokens_no_spec[actual_idx]
+            end_idx = start_tok_idx + n_new
+            self.input_batch.num_tokens_no_spec[actual_idx] = end_idx
 
             req_state.output_token_ids.extend([0] * n_new)
 
