@@ -91,6 +91,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.block_major_pool import unified_block_major_enabled
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
@@ -1190,22 +1191,19 @@ def _resolve_multi_shapes_kv_geometry(
     return block_size, per_block_shapes, kv_dtypes, block_size
 
 
-def resolve_kernel_geometry(
+def resolve_attention_geometry(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
-) -> tuple[int, tuple[int, ...] | set[tuple[int, ...]], object, int]:
-    """Resolve physical TPU kernel geometry:
-    (kernel_block_size, per_block_shape, kv_dtype, device_block_size).
+) -> tuple[AttentionSpec, int, tuple[int, ...]]:
+    """Resolves the attention KV cache geometry from `VllmConfig` and `KVCacheConfig`.
 
-    Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
-    (device view reconstruction) to guarantee exact geometry parity.
+    Returns `(attention_spec, kernel_block_size, per_block_shape)`.
 
     Supported architectures:
     - Dense models: Defined directly by the single group's full-attention spec.
     - Hybrid (Attention + Mamba) models: Requires TPU's unified block pool, where all
       groups share uniform, attention-sized page rows. Attention geometry defines the
       common row unit, allowing the dense sub-hash expansion to apply uniformly.
-    - Multi-kv-shape models: a model whose kv cache consists of multiple tensors with
-      different shapes, it's handled by `_resolve_multi_shapes_kv_geometry`.
+    Multi-kv-shape models are handled by `resolve_kernel_geometry`.
     """
     from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.worker.utils import select_common_block_size
@@ -1214,9 +1212,6 @@ def resolve_kernel_geometry(
 
     groups = kv_cache_config.kv_cache_groups
     assert groups, "TPURaidenOffloadingConnector: no KV cache groups"
-
-    if has_multi_shapes_kv_caches(vllm_config):
-        return _resolve_multi_shapes_kv_geometry(kv_cache_config)
 
     if len(groups) == 1:
         spec0 = groups[0].kv_cache_spec
@@ -1298,6 +1293,36 @@ def resolve_kernel_geometry(
             cache_dtype_str=spec0.dtype,
         )
     per_block_shape = tuple(full_5d_shape[1:])
+    return spec0, kernel_block_size, per_block_shape
+
+
+def resolve_kernel_geometry(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> tuple[int, tuple[int, ...] | set[tuple[int, ...]], object, int]:
+    """Resolve physical TPU kernel geometry:
+    (kernel_block_size, per_block_shape, kv_dtype, device_block_size).
+
+    Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
+    (device view reconstruction) to guarantee exact geometry parity.
+    """
+    if has_multi_shapes_kv_caches(vllm_config):
+        return _resolve_multi_shapes_kv_geometry(kv_cache_config)
+    spec0, kernel_block_size, per_block_shape = resolve_attention_geometry(
+        vllm_config, kv_cache_config
+    )
+    if unified_block_major_enabled(vllm_config):
+        # Register the block-major unified pool at scheduler-block granularity:
+        # each Raiden block corresponds to one manager block containing `split`
+        # kernel blocks per region so each block transfers as a single DMA.
+        from vllm_torchtpu.kv_cache_materializer import resolve_block_major_pool_layout
+
+        layout = resolve_block_major_pool_layout(kv_cache_config, kernel_block_size)
+        return (
+            spec0.block_size,
+            (layout.split,) + per_block_shape,
+            spec0.dtype,
+            spec0.block_size,
+        )
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
 

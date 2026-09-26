@@ -507,6 +507,11 @@ class TpuPlatform(Platform):
     ) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        # Ensure TPU attention backends (such as CUSTOM, which has no upstream
+        # default) are registered in the scheduler process, which resolves the
+        # backend for KV offloading without instantiating model layers.
+        import vllm_torchtpu.layers.adapter.attention  # noqa: F401
+
         if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 

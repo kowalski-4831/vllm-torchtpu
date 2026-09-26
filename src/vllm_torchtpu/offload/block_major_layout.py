@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -150,10 +151,14 @@ def resolve_block_major_contract(
         return None
 
     # Deferred import to avoid circular dependency with raiden_store.
+    from vllm_torchtpu.block_major_pool import unified_block_major_enabled
     from vllm_torchtpu.offload.raiden_store import (
         is_multi_shapes_geometry,
         resolve_kernel_geometry,
     )
+
+    if unified_block_major_enabled(vllm_config):
+        return _resolve_unified_pool_contract(vllm_config, kv_cache_config)
 
     (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
         resolve_kernel_geometry(vllm_config, kv_cache_config)
@@ -223,6 +228,67 @@ def resolve_block_major_contract(
         contract.bundle_row_bytes,
         kernel_block_size,
         factor,
+        contract.logical_fingerprint,
+    )
+    return contract
+
+
+def _resolve_unified_pool_contract(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+) -> BlockMajorContract:
+    """Describes the merged unified pool as one block-major offload contract.
+
+    Each fragment corresponds to one layer region's manager page (`split`
+    kernel blocks), and each bundle row packs all `P` region pages for a single
+    scheduler block contiguously so Raiden block indices map 1:1 to scheduler
+    block IDs.
+    """
+    from vllm_torchtpu.kv_cache_materializer import resolve_block_major_pool_layout
+    from vllm_torchtpu.offload.raiden_store import resolve_attention_geometry
+
+    spec, kernel_block_size, per_block_shape = resolve_attention_geometry(
+        vllm_config, kv_cache_config
+    )
+    layout = resolve_block_major_pool_layout(kv_cache_config, kernel_block_size)
+    kv_dtype = spec.dtype
+    device_block_size = spec.block_size
+    fragment_row_bytes = layout.split * math.prod(per_block_shape) * kv_dtype.itemsize
+
+    fragment_count = layout.num_pools
+    fragment_layers = [[] for _ in range(fragment_count)]
+    for name, index in layout.pool_index_by_layer.items():
+        fragment_layers[index].append(name)
+    fragment_order = tuple(
+        f"{index}:{','.join(sorted(names))}"
+        for index, names in enumerate(fragment_layers)
+    )
+
+    logical_fingerprint = _canonical_layout_fingerprint(
+        {
+            "layout": "block-major-unified-pool",
+            "layout_version": BLOCK_MAJOR_LAYOUT_VERSION,
+            "fragment_count": fragment_count,
+            "fragment_order": list(fragment_order),
+            "fragment_row_bytes": fragment_row_bytes,
+            "device_block_size": device_block_size,
+            "dtype": str(kv_dtype),
+            "per_block_shape": [layout.split, *per_block_shape],
+        }
+    )
+    contract = BlockMajorContract(
+        fragment_count=fragment_count,
+        fragment_row_bytes=fragment_row_bytes,
+        bundle_row_bytes=fragment_count * fragment_row_bytes,
+        logical_fingerprint=logical_fingerprint,
+    )
+    logger.info(
+        "Block-major unified pool contract: P=%d regions x %d B pages "
+        "(row %d B, block_size=%d), logical_fingerprint=%s",
+        contract.fragment_count,
+        contract.fragment_row_bytes,
+        contract.bundle_row_bytes,
+        device_block_size,
         contract.logical_fingerprint,
     )
     return contract

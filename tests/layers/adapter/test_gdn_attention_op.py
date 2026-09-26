@@ -25,6 +25,8 @@ from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout, flat_manager_ids
+from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
     gdn_attention_core_tpu_pcp_prefill,
@@ -422,7 +424,7 @@ class TestVllmGatedDeltaNetAttention:
             attn = VllmGatedDeltaNetAttention()
 
         mock_build.assert_called_once_with()
-        mock_build_pooled.assert_called_once_with()
+        mock_build_pooled.assert_called_once_with(block_major=False)
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
         assert not attn._pcp_streaming_configured
@@ -464,8 +466,8 @@ class TestVllmGatedDeltaNetAttention:
             attn = VllmGatedDeltaNetAttention()
 
         assert mock_build.call_args_list == [call(), call(pcp_streaming=True)]
-        mock_build_pooled.assert_called_once_with()
-        mock_build_pooled_pcp.assert_called_once_with()
+        mock_build_pooled.assert_called_once_with(block_major=False)
+        mock_build_pooled_pcp.assert_called_once_with(block_major=False)
         assert attn.gdn_op is regular_op
         assert attn.gdn_pooled_op is pooled_op
         assert attn._pcp_streaming_configured
@@ -1432,3 +1434,101 @@ def test_pcp_streaming_follows_the_declared_pcp_width(pcp_size, expected):
 def test_pcp_streaming_is_off_without_a_vllm_config():
     with set_vllm_model_wrapper_context(mesh=_mesh()):
         assert VllmGatedDeltaNetAttention._pcp_streaming_enabled() is False
+
+
+# --- block-major unified pool ---------------------------------------------------
+
+_BM_LAYOUT = BlockMajorPoolLayout(
+    num_blocks=4, num_pools=3, split=4, pool_index_by_layer={}
+)
+_BM_POOL_INDEX = 2
+
+
+@pytest.mark.parametrize("block_major", [True, False])
+def test_fused_pooled_pcp_forward_remaps_state_ids_for_the_block_major_pool(
+    monkeypatch, block_major
+):
+    attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+    attn.conv1d = SimpleNamespace(weight=torch.zeros(64, 1, 4), bias=None)
+    attn.A_log = torch.zeros(64)
+    attn.dt_bias = torch.zeros(64)
+    attn.in_proj_ba = lambda hidden: (torch.zeros(hidden.shape[0], 4), None)
+    attn._require_pcp_projection_parameters = lambda: (torch.zeros(1, 1), None)
+    attn._apply_output_projection = lambda out, _z, _num_tokens: out
+    captured = {}
+
+    def fake_pooled_pcp_op(
+        hidden, _w, _s, _b, _a, _pool, _cw, _cb, _a_log, _dt, state_indices, *_rest
+    ):
+        captured["state_indices"] = state_indices
+        out = torch.zeros(hidden.shape[0], 64, 128)
+        return out, out
+
+    attn.gdn_pooled_pcp_op = fake_pooled_pcp_op
+    if block_major:
+        attn._bm_kernel = True
+        attn.set_block_major_pool(_BM_POOL_INDEX, _BM_LAYOUT)
+    monkeypatch.setattr(
+        gdn_attention_op, "is_pcp_streaming_attention_metadata", lambda _m: True
+    )
+    state_indices = torch.tensor([0, 1, 3], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        mamba_state_indices=state_indices,
+        query_start_loc=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        request_distribution=torch.tensor([3, 0, 0], dtype=torch.int32),
+        seq_lens=torch.ones(3, dtype=torch.int32),
+    )
+
+    attn._forward_fused_pooled_pcp(torch.zeros(3, 8), torch.zeros(4, 12, 2), metadata)
+
+    passed = captured["state_indices"]
+    if block_major:
+        expected = flat_manager_ids(state_indices, _BM_POOL_INDEX, 3)
+        assert passed.tolist() == expected.tolist() == [2, 5, 11]
+    else:
+        assert passed is state_indices
+
+
+@pytest.mark.parametrize(
+    "block_major, suffix, kernel_pool_shape",
+    [(True, "_bm", (4 * 12, 2, 3)), (False, "", (4, 12, 2, 3))],
+)
+def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
+    block_major, suffix, kernel_pool_shape
+):
+    attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+    captured = {}
+
+    def fake_jax_op(name, wrapped_fn, **_kwargs):
+        captured["name"] = name
+        captured["wrapped_fn"] = wrapped_fn
+        return MagicMock()
+
+    def fake_core(mixed_qkv, _b, _a, pool, *_args, **_kwargs):
+        captured["kernel_pool_shape"] = tuple(pool.shape)
+        return pool, mixed_qkv
+
+    pool = torch.zeros(4, 12, 2, 3)
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch(
+            "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.pallas.jax_op",
+            side_effect=fake_jax_op,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+            "gdn_attention_pooled_core_tpu",
+            side_effect=fake_core,
+        ),
+    ):
+        attn._build_pooled_gdn_op(block_major=block_major)
+        new_pool, _ = captured["wrapped_fn"](
+            *([MagicMock()] * 3), pool, *([MagicMock()] * 8)
+        )
+
+    assert captured["name"] == (
+        "pallas::gdn_attention_pooled_language_model_model_layers_0_linear_attn"
+        + suffix
+    )
+    assert captured["kernel_pool_shape"] == kernel_pool_shape
+    assert tuple(new_pool.shape) == tuple(pool.shape)

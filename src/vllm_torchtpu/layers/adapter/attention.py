@@ -31,6 +31,12 @@ from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
 from vllm_torchtpu import envs
+from vllm_torchtpu.block_major_pool import (
+    BlockMajorPoolLayout,
+    flat_kernel_ids,
+    kernel_view,
+    unified_block_major_enabled,
+)
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
@@ -206,8 +212,14 @@ def _pallas_rpa_kernel_impl(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
+    # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
+    # the kernel indexes flat kernel blocks along dim 0. Both reshapes compile to
+    # zero-copy bitcasts on the donated buffer, preserving in-place updates.
+    if block_major:
+        kv_cache = kernel_view(kv_cache)
     if kv_cache.ndim == 4:
         if (
             kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
@@ -274,6 +286,8 @@ def _pallas_rpa_kernel_impl(
         new_kv_cache = _reshape_packed_kv_cache(
             new_kv_cache, packed_pool_shape
         ).reshape(pool_shape)
+    if block_major:
+        new_kv_cache = new_kv_cache.reshape(pool_shape)
     return new_kv_cache, outputs
 
 
@@ -297,6 +311,7 @@ def _pallas_rpa_kernel_default(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -323,6 +338,7 @@ def _pallas_rpa_kernel_default(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
+        block_major=block_major,
     )
 
 
@@ -467,6 +483,7 @@ def _pallas_rpa_kernel_batched(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
+    block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
@@ -497,6 +514,7 @@ def _pallas_rpa_kernel_batched(
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
+        block_major=block_major,
     )
 
 
@@ -812,11 +830,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer"
             )
-        # Cache the resolved config value during construction: compiled
+        # Cache the resolved config values during construction: compiled
         # forwards have no active vLLM config and must not look it up.
+        vllm_config = get_current_vllm_config()
         self.kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[
-            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+            vllm_config.cache_config.get_resolved_kv_cache_layout()
         ]
+        # Whether kernels consume the merged block-major unified pool via
+        # `kernel_view` and block tables remapped by `flat_kernel_ids`.
+        self._bm_kernel = unified_block_major_enabled(vllm_config)
         self._pool_is_seq_along_lane = (
             isinstance(self, PallasBatchedRPAAttentionBackendImpl)
             and self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
@@ -841,6 +863,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # standard execution.
         self.rpa_kernel_bundled = None
         self._bundle_layer_idx_tensor: torch.Tensor | None = None
+        # `(pool_index, layout)` identifying this layer's region in the merged
+        # block-major unified pool; populated by `set_block_major_pool()`.
+        self._bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+
+    def set_block_major_pool(
+        self, pool_index: int, layout: BlockMajorPoolLayout
+    ) -> None:
+        """Binds this layer to its region index within the merged block-major pool."""
+        assert self._bm_kernel, "kernels were built for per-region pools"
+        self._bm_region = (pool_index, layout)
 
     @classmethod
     def _allocate_kernel_instance_id(cls) -> int:
@@ -856,6 +888,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         skip_kv_update: bool = False,
         use_pcp_streaming: bool = False,
         cp_kv_cache_interleave_size: int = 0,
+        block_major: bool = False,
     ):
         ctx = get_vllm_model_wrapper_context()
         vllm_config = ctx.vllm_config
@@ -880,6 +913,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             max_model_len,
             pcp_kv_layout,
             self.decode_query_size,
+            block_major,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -910,6 +944,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.use_causal_mask,
             pcp_kv_layout,
             self.decode_query_size,
+            block_major,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -931,6 +966,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 skip_kv_update=skip_kv_update,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                 kv_layout=pcp_kv_layout,
+                block_major=block_major,
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
@@ -940,6 +976,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["kv_layout"] = self.kv_layout
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if block_major:
+                if "block_major" not in entry_params:
+                    raise NotImplementedError(
+                        "VLLM_TPU_BLOCK_MAJOR_KV=1: "
+                        f"{type(self).__name__} overrides the RPA kernel "
+                        "entry with one that cannot address the block-major "
+                        "pool"
+                    )
+                entry_kwargs["block_major"] = True
             wrapped_fn = functools.partial(
                 self._kernel_entry,
                 mesh=mesh,
@@ -1248,6 +1293,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 skip_kv_update=skip_kv_update,
                 use_pcp_streaming=True,
                 cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,
+                block_major=self._bm_kernel,
             )
             return
 
@@ -1285,7 +1331,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
             return
 
         self.rpa_kernel = self._build_rpa_kernel(
-            q_scale, k_scale, v_scale, skip_kv_update=skip_kv_update
+            q_scale,
+            k_scale,
+            v_scale,
+            skip_kv_update=skip_kv_update,
+            block_major=self._bm_kernel,
         )
 
     def runs_batched_rpa_schedule(self) -> bool:
@@ -1326,6 +1376,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 or, under SEQ_ALONG_LANE,
                 [num_blocks, num_kv_heads_x2, padded_head_size // kv_packing,
                  kv_packing, block_size]
+                or, on the block-major unified pool, the merged 6D pool
+                [num_blocks, num_pools * split, *page] that `kernel_view`
+                folds to one of the above inside the compiled op
             attn_metadata: Metadata for attention.
             output: buffer written in place, shape
                 = [num_tokens, num_heads, head_size_v]
@@ -1377,11 +1430,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Only the head dim is reconciled. A layer whose `num_kv_heads`
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
-        # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
+        # SEQ_ALONG_LANE places `page_size` on the last axis and the packed
+        # `head_dim` axes at `[-3, -2]` (indexed from the end so both 5D
+        # layer-major and 6D block-major pools resolve identically).
         if kv_cache.ndim == 4:
             pool_head_dim = self.head_size
         elif self._pool_is_seq_along_lane:
-            pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
+            pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
         else:
             pool_head_dim = kv_cache.shape[-1]
         if pool_head_dim > self.head_size:
@@ -1443,6 +1498,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             skip_kv_update=skip_kv_update,
             use_pcp_streaming=use_pcp_streaming,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            block_major=self._bm_kernel,
         )
 
         # TODO (geyuhao) the support of this API is pending discussion.
@@ -1474,6 +1530,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 sink,
             )
         else:
+            block_tables = attn_metadata.block_tables
+            if self._bm_kernel:
+                pool_index, layout = self._bm_region
+                block_tables = flat_kernel_ids(
+                    block_tables, pool_index, layout.num_pools, layout.split
+                )
             # Call the operator
             outputs = rpa_kernel(
                 kv_cache,
@@ -1481,7 +1543,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 key,
                 value,
                 attn_metadata.seq_lens,
-                attn_metadata.block_tables,
+                block_tables,
                 attn_metadata.query_start_loc,
                 attn_metadata.request_distribution,
                 sink,

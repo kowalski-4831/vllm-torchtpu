@@ -51,6 +51,10 @@ from vllm.v1.worker.utils import (
 )
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.block_major_pool import (
+    BlockMajorPoolLayout,
+    unified_block_major_enabled,
+)
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
@@ -1092,18 +1096,32 @@ class KVCacheManager:
                 == self.runner.input_batch.block_table[group_id].get_cpu_tensor().dtype
             )
 
+        block_major = unified_block_major_enabled(self.runner.vllm_config)
+        if block_major:
+            self._check_block_major_pool_supported()
         materialized = materialize_kv_cache_tensors(
             kv_cache_config=kv_cache_config,
             attn_groups=self.runner.attn_groups,
             kernel_block_sizes=kernel_block_sizes,
             device=self.runner.device,
             cache_dtype=self.runner.kv_cache_dtype,
+            block_major=block_major,
         )
         kv_caches = materialized.kv_caches
         self.runner.kv_cache_raw_tensors = materialized.raw_tensors
+        self.runner.bm_pool_layout = materialized.bm_pool_layout
+        if materialized.bm_pool_layout is not None:
+            logger.info(
+                "Block-major unified pool: %d regions x %d kernel blocks per "
+                "scheduler block, pool %s %s",
+                materialized.bm_pool_layout.num_pools,
+                materialized.bm_pool_layout.split,
+                tuple(materialized.raw_tensors[0].shape),
+                materialized.raw_tensors[0].dtype,
+            )
         if self.runner._unified_kv_layout:
             self.runner._build_mamba_copy_plan(
-                kv_cache_config, materialized.raw_tensors
+                kv_cache_config, materialized.layer_to_raw, materialized.bm_pool_layout
             )
 
         for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items():
@@ -1138,6 +1156,8 @@ class KVCacheManager:
             self.runner.vllm_config.compilation_config.static_forward_context,
             self.runner.kv_caches,
         )
+        if materialized.bm_pool_layout is not None:
+            self._bind_block_major_pool_layers(materialized.bm_pool_layout)
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
@@ -1168,6 +1188,60 @@ class KVCacheManager:
         if not self.runner.enforce_eager:
             self.runner._precompile_substitute_placeholder_token()
 
+    def _check_block_major_pool_supported(self) -> None:
+        """Refuses execution features the block-major unified pool cannot index.
+
+        Runs before buffer allocation.
+        """
+        runner = self.runner
+        unsupported = None
+        if runner.speculative_config is not None:
+            # Pooled GDN speculative verification indexes `slot_read_offsets`
+            # directly by region-local state ID rather than remapped row IDs.
+            unsupported = "speculative decoding"
+        elif runner.parallel_config.decode_context_parallel_size > 1:
+            unsupported = "decode context parallelism"
+        elif runner.parallel_config.pipeline_parallel_size > 1:
+            unsupported = "pipeline parallelism"
+        elif runner.use_spmd:
+            unsupported = "SPMD"
+        if unsupported is not None:
+            raise NotImplementedError(
+                f"VLLM_TPU_BLOCK_MAJOR_KV=1: {unsupported} is not supported "
+                "on the block-major unified pool"
+            )
+
+    def _bind_block_major_pool_layers(self, layout: BlockMajorPoolLayout) -> None:
+        """Binds each unified-pool layer to its region index within the merged pool.
+
+        Full-attention and GDN layers remap their block IDs before invoking the
+        underlying kernels; any other layer type lacks region-offset remapping
+        and is rejected to prevent cross-region aliasing.
+        """
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+        from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+            VllmGatedDeltaNetAttention,
+        )
+
+        pool_index = dict(layout.pool_index_by_layer)
+        for name, target in self.runner.shared_kv_cache_layers.items():
+            pool_index[name] = pool_index[target]
+        layers = get_layers_from_vllm_config(
+            self.runner.vllm_config, AttentionLayerBase
+        )
+        for name, index in pool_index.items():
+            layer = layers[name]
+            if isinstance(layer, VllmGatedDeltaNetAttention):
+                layer.set_block_major_pool(index, layout)
+            elif isinstance(layer.impl, PallasAttentionBackendImpl):
+                layer.impl.set_block_major_pool(index, layout)
+            else:
+                raise NotImplementedError(
+                    "VLLM_TPU_BLOCK_MAJOR_KV=1: layer "
+                    f"{name} ({type(layer).__name__}) cannot address "
+                    "the block-major unified pool"
+                )
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -1191,14 +1265,6 @@ class KVCacheManager:
             for gid in range(len(self.runner.kv_cache_config.kv_cache_groups))
         }
         if self.runner._unified_kv_layout:
-            # Fail closed: unified pool allocation bypasses the block-major gate below,
-            # which would incorrectly register a block-major contract over
-            # unified-pool memory.
-            if envs.VLLM_TPU_BLOCK_MAJOR_KV:
-                raise NotImplementedError(
-                    "VLLM_TPU_BLOCK_MAJOR_KV=1: the unified KV block pool "
-                    "layout is not supported by the block-major KV bundle"
-                )
             self._initialize_unified_kv_cache(kv_cache_config)
             return
         backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)

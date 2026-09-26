@@ -125,6 +125,10 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
         _pad_to_bucket=TPUModelRunner._pad_to_bucket,
         device="cpu",
         mamba_slot_read_offsets=None,
+        bm_pool_layout=None,
+    )
+    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
+        fake
     )
     calls = []
 
@@ -199,6 +203,10 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
         _pool_block_split=2,
         _pad_to_bucket=TPUModelRunner._pad_to_bucket,
         device="cpu",
+        bm_pool_layout=None,
+    )
+    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
+        fake
     )
     migrated = []
 
@@ -240,6 +248,10 @@ def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
         _bucket_len=TPUModelRunner._bucket_len,
         _precompile_timed=mock_timed,
         device="cpu",
+        bm_pool_layout=None,
+    )
+    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
+        fake
     )
     compiled_raws = []
     compiled_lens = []

@@ -432,11 +432,8 @@ def test_no_layout_lookup_on_the_compiled_forward_path():
 
 
 def test_raiden_geometry_resolves_the_layout_under_a_config():
-    """`resolve_kernel_geometry` runs in the EngineCore, where no config is set.
-
-    Both calls resolve the KV cache layout, which falls through to the KV
-    connector and asserts without one.
-    """
+    """Verify `resolve_attention_geometry` sets the vLLM config context before
+    querying KV cache layout in the EngineCore process."""
     import ast
     import inspect
     import textwrap
@@ -444,7 +441,7 @@ def test_raiden_geometry_resolves_the_layout_under_a_config():
     from vllm_torchtpu.offload import raiden_store
 
     tree = ast.parse(
-        textwrap.dedent(inspect.getsource(raiden_store.resolve_kernel_geometry))
+        textwrap.dedent(inspect.getsource(raiden_store.resolve_attention_geometry))
     )
     guarded = set()
     for node in ast.walk(tree):

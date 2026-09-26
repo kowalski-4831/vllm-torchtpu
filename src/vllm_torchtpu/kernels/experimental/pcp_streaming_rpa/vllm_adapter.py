@@ -191,8 +191,14 @@ def make_pcp_streaming_rpa_kernel(
     kv_layout: batched_rpa_configs.KVLayout = (
         batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
+    block_major: bool = False,
 ) -> Callable[..., tuple[jax.Array, jax.Array]]:
-    """Build a PCP streaming RPA entry with only tensor args in its signature."""
+    """Build a PCP streaming RPA entry with only tensor args in its signature.
+
+    When ``block_major`` is True, ``kv_cache`` is the merged block-major pool
+    ``(num_blocks, rows_per_block, *page)``, which the wrapper folds into flat
+    kernel blocks along dim 0 via zero-copy bitcasts before and after the kernel.
+    """
     if soft_cap is not None:
         raise NotImplementedError("PCP streaming RPA does not support logits soft cap.")
     if skip_kv_update:
@@ -208,12 +214,15 @@ def make_pcp_streaming_rpa_kernel(
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        output, new_kv_cache = sharded_pcp_ragged_paged_attention(
+        # Fold the block-major pool so kernel blocks run along dim 0
+        # (zero-copy bitcast).
+        pool = kv_cache.reshape((-1,) + kv_cache.shape[2:]) if block_major else kv_cache
+        output, new_pool = sharded_pcp_ragged_paged_attention(
             mesh=mesh,
             q=query,
             k=key,
             v=value,
-            kv_cache=kv_cache,
+            kv_cache=pool,
             kv_lens=seq_lens,
             page_indices=block_tables,
             cu_q_lens=query_start_loc,
@@ -230,7 +239,9 @@ def make_pcp_streaming_rpa_kernel(
             q_compute_size=q_compute_size,
             kv_layout=kv_layout,
         )
-        return new_kv_cache, output
+        if block_major:
+            new_pool = new_pool.reshape(kv_cache.shape)
+        return new_pool, output
 
     return _pcp_streaming_rpa_kernel
 

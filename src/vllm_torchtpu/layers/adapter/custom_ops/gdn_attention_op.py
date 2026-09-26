@@ -31,6 +31,12 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu.block_major_pool import (
+    BlockMajorPoolLayout,
+    flat_manager_ids,
+    kernel_view,
+    unified_block_major_enabled,
+)
 from vllm_torchtpu.distributed.pcp import (
     get_or_create_pcp_mesh,
     get_pcp_rank,
@@ -314,6 +320,12 @@ def _localize_gdn_mamba_spec_for_pcp(
 
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+    # Whether pooled ops consume the merged block-major unified pool, along
+    # with `(pool_index, layout)` once bound by `set_block_major_pool()`.
+    # Class-level defaults support test/mock instances constructed without `__init__`.
+    _bm_kernel: bool = False
+    _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
@@ -324,16 +336,35 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         self.kv_cache = None
+        vllm_config = get_vllm_model_wrapper_context().vllm_config
+        self._bm_kernel = vllm_config is not None and unified_block_major_enabled(
+            vllm_config
+        )
         self.gdn_op = self._build_gdn_op()
-        self.gdn_pooled_op = self._build_pooled_gdn_op()
+        self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
         )
         self.gdn_pooled_pcp_op = (
-            self._build_pooled_pcp_gdn_op() if pcp_enabled else None
+            self._build_pooled_pcp_gdn_op(block_major=self._bm_kernel)
+            if pcp_enabled
+            else None
         )
+
+    def set_block_major_pool(
+        self, pool_index: int, layout: BlockMajorPoolLayout
+    ) -> None:
+        """Binds this layer to its region index within the merged block-major pool."""
+        assert self._bm_kernel, "pooled ops were built for per-region pools"
+        self._bm_region = (pool_index, layout)
+
+    def _bm_state_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        if not self._bm_kernel:
+            return ids
+        pool_index, layout = self._bm_region
+        return flat_manager_ids(ids, pool_index, layout.num_pools)
 
     @property
     def tp_head_geometry(self) -> GdnHeadGeometry:
@@ -612,7 +643,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
-    def _build_pooled_gdn_op(self):
+    def _build_pooled_gdn_op(self, *, block_major: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = vllm_context.vllm_config
@@ -647,11 +678,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
-            return gdn_attention_pooled_core_tpu(
+            # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
+            # pool adapters index flat kernel blocks along dim 0; both reshapes
+            # compile to zero-copy bitcasts on the donated buffer.
+            pool = kernel_view(recurrent_state) if block_major else recurrent_state
+            result = gdn_attention_pooled_core_tpu(
                 mixed_qkv,
                 b,
                 a,
-                recurrent_state,
+                pool,
                 conv_weight,
                 conv_bias,
                 A_log,
@@ -678,8 +713,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
             )
+            if not block_major:
+                return result
+            new_pool, output = result
+            return new_pool.reshape(recurrent_state.shape), output
 
-        op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
+        op_name = (
+            f"pallas::gdn_attention_pooled_"
+            f"{self.prefix.replace('.', '_')}"
+            f"{'_bm' if block_major else ''}"
+        )
         # The recurrent state (arg 3) is the attention-shaped pool: the ssm
         # and conv byte-regions are read/written through it by the pool
         # adapters, so it is the only donated input. inplace-donation
@@ -735,7 +778,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
-    def _build_pooled_pcp_gdn_op(self):
+    def _build_pooled_pcp_gdn_op(self, *, block_major: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
@@ -777,13 +820,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: jax.Array,
             qkvz_weight_scale: jax.Array | None,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            return run_jax_gdn_attention_pooled_pcp_prefill_projection(
+            pool = kernel_view(recurrent_state) if block_major else recurrent_state
+            result = run_jax_gdn_attention_pooled_pcp_prefill_projection(
                 hidden_states,
                 qkvz_weight,
                 qkvz_weight_scale,
                 b,
                 a,
-                recurrent_state,
+                pool,
                 conv_weight,
                 conv_bias,
                 A_log,
@@ -803,9 +847,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 interleave_size=interleave_size,
                 recurrent_state_dtype=recurrent_state_dtype,
             )
+            if not block_major:
+                return result
+            new_pool, output, z = result
+            return new_pool.reshape(recurrent_state.shape), output, z
 
         op_name = (
-            f"pallas::gdn_attention_pooled_pcp_fused_{self.prefix.replace('.', '_')}"
+            "pallas::gdn_attention_pooled_pcp_fused_"
+            f"{self.prefix.replace('.', '_')}"
+            f"{'_bm' if block_major else ''}"
         )
         input_partition_specs = (
             PartitionSpec("pcp"),  # hidden states
@@ -969,6 +1019,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
+        state_indices = self._bm_state_ids(state_indices.to(torch.int32))
         core_attn_out, z = gdn_pooled_pcp_op(
             hidden_states,
             qkvz_weight,
@@ -980,7 +1031,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self.conv1d.bias,
             self.A_log,
             self.dt_bias,
-            state_indices.to(torch.int32),
+            state_indices,
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
             attn_metadata.seq_lens,
@@ -1052,7 +1103,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # metadata builder.
                 (recurrent_state,) = kv_cache
                 assert attn_metadata.mamba_state_indices is not None
-                state_indices = attn_metadata.mamba_state_indices.to(torch.int32)
+                state_indices = self._bm_state_ids(
+                    attn_metadata.mamba_state_indices.to(torch.int32)
+                )
                 # Speculative decoding: the GDN kernel's windowed segment
                 # covers both 1-token decodes and speculative verify
                 # windows (the batch is ordered [decode][verify][prefill]);

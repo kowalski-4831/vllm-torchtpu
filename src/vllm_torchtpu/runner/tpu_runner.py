@@ -72,6 +72,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
@@ -86,6 +87,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 )
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
+    copy_mamba_state_rows,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -613,6 +615,10 @@ class TPUModelRunner(GPUModelRunner):
         # block-table blocks in one attention-shaped pool per cache tensor.
         self._unified_kv_layout: bool = unified_kv_layout_enabled(self.vllm_config)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
+        # Populated by `_initialize_unified_kv_cache` when `VLLM_TPU_BLOCK_MAJOR_KV`
+        # merges unified pools into a single block-major pool; `None` when each
+        # layer region uses a separate pool (see `vllm_torchtpu.block_major_pool`).
+        self.bm_pool_layout: BlockMajorPoolLayout | None = None
         # Set by initialize_kv_cache; None until then (dummy runs check this).
         self.kv_cache_config: KVCacheConfig | None = None
         # Layout plan of the most recent prepared batch; None before the
@@ -1535,7 +1541,8 @@ class TPUModelRunner(GPUModelRunner):
     def _build_mamba_copy_plan(
         self,
         kv_cache_config: KVCacheConfig,
-        raw_tensors: list[torch.Tensor],
+        layer_to_raw: dict[str, torch.Tensor],
+        bm_pool_layout: BlockMajorPoolLayout | None,
     ) -> None:
         """Map each mamba kv-cache group to the raw pool buffers hosting its
         layers, for the per-step state-block seed copies.
@@ -1550,12 +1557,6 @@ class TPUModelRunner(GPUModelRunner):
             self._mamba_copy_plan = []
             self._mamba_state_block_size = None
             return
-        from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
-
-        layer_to_raw = {
-            name: raw_tensors[index]
-            for name, index in layer_to_pool_index(kv_cache_config).items()
-        }
         plan: list[tuple[int, list[torch.Tensor]]] = []
         state_block_size: int | None = None
         manager_page_bytes: int | None = None
@@ -1575,7 +1576,13 @@ class TPUModelRunner(GPUModelRunner):
                 manager_page_bytes = group.kv_cache_spec.page_size_bytes
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
-        for raw in raw_tensors:
+        if bm_pool_layout is not None:
+            # Merged block-major pool rows correspond 1:1 to manager blocks, so
+            # state seed copies index rows directly by manager block ID without
+            # kernel-block fan-out.
+            self._pool_block_split = 1
+            return
+        for raw in dict.fromkeys(layer_to_raw.values()):
             if raw.dim() > 1:
                 # Manager blocks span whole pool pages. Which axis of the
                 # pool tensor carries tokens is backend-dependent — shape[1]
@@ -1855,8 +1862,18 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pending_mamba_state_copies:
             return
         for raws, src_t, dst_t in self._pending_mamba_state_copies:
-            copy_mamba_state_blocks(raws, src_t, dst_t)
+            self._copy_mamba_state_blocks(raws, src_t, dst_t)
         self._pending_mamba_state_copies.clear()
+
+    def _copy_mamba_state_blocks(
+        self, raws: list[torch.Tensor], src: torch.Tensor, dst: torch.Tensor
+    ) -> None:
+        layout = self.bm_pool_layout
+        if layout is None:
+            copy_mamba_state_blocks(raws, src, dst)
+            return
+        (pool,) = raws
+        copy_mamba_state_rows(pool, src, dst, layout.num_pools, layout.split)
 
     def is_unified_pool_used(self) -> bool:
         """Whether the attention-shaped unified KV block pool is active
@@ -1904,7 +1921,7 @@ class TPUModelRunner(GPUModelRunner):
         dst_t = torch.tensor([dst for _, dst in pairs], dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
+        self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
@@ -5463,7 +5480,7 @@ class TPUModelRunner(GPUModelRunner):
                 src = torch.zeros(n, dtype=torch.int32).to(self.device)
                 dst = torch.zeros(n, dtype=torch.int32).to(self.device)
                 for raws in raw_sets.values():
-                    copy_mamba_state_blocks(raws, src, dst)
+                    self._copy_mamba_state_blocks(raws, src, dst)
                 n *= 4
             for raws in raw_sets.values():
                 synchronize_tensors(raws)

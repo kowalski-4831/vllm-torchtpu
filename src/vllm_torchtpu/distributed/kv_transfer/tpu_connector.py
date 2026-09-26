@@ -2602,6 +2602,11 @@ class TPURaidenConnectorWorker:
             mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
         )
         if self._stage3_kimi:
+            if runner.bm_pool_layout is not None:
+                raise NotImplementedError(
+                    "VLLM_TPU_BLOCK_MAJOR_KV=1: the Kimi K3 pool manifest has "
+                    "no block-major layout"
+                )
             manifest = rpm.build_kimi_k3_pool_manifest(**manifest_args)
         else:
             assert head_geometry is not None
@@ -2615,18 +2620,28 @@ class TPURaidenConnectorWorker:
                 ),
                 conv_kernel_size=self._model_config_int("linear_conv_kernel_dim", 4),
             )
-            build_manifest = rpm.build_qwen35_pool_manifest
             if _raiden_seq_on_lane_layout():
+                if runner.bm_pool_layout is not None:
+                    raise NotImplementedError(
+                        "VLLM_TPU_BLOCK_MAJOR_KV=1: the seq-on-lane pool "
+                        "manifest has no block-major layout"
+                    )
                 from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (
                     build_qwen35_pool_manifest_sol,
                 )
 
-                build_manifest = build_qwen35_pool_manifest_sol
-            manifest = build_manifest(
-                **manifest_args,
-                per_layer_tags=_use_per_layer_pool_tags(),
-                gdn_geometry=gdn_geometry,
-            )
+                manifest = build_qwen35_pool_manifest_sol(
+                    **manifest_args,
+                    per_layer_tags=_use_per_layer_pool_tags(),
+                    gdn_geometry=gdn_geometry,
+                )
+            else:
+                manifest = rpm.build_qwen35_pool_manifest(
+                    **manifest_args,
+                    per_layer_tags=_use_per_layer_pool_tags(),
+                    gdn_geometry=gdn_geometry,
+                    block_major=runner.bm_pool_layout,
+                )
         # Hard-fail before manager construction if the pools point at storage
         # that the model kernels do not actually use.
         verified_storages = rpm.verify_storage_binding(
@@ -3026,13 +3041,13 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _measure_raiden_fa_layout(
-        manifest: Any,
+        manifest: Any, block_major: bool = False
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_fa_layout_fingerprint,
         )
 
-        return measured_fa_layout_fingerprint(manifest)
+        return measured_fa_layout_fingerprint(manifest, block_major=block_major)
 
     @staticmethod
     def _measure_raiden_glm_layout(
@@ -3098,7 +3113,10 @@ class TPURaidenConnectorWorker:
             fa_page_tokens,
         )
 
-        fingerprint, payload = self._measure_raiden_fa_layout(manifest)
+        assert self.runner is not None
+        fingerprint, payload = self._measure_raiden_fa_layout(
+            manifest, block_major=self.runner.bm_pool_layout is not None
+        )
         return fingerprint, payload, fa_page_tokens(manifest)
 
     def _validate_stage3_transfer_parallelism(self, transfer_parallelism: int) -> None:
@@ -4529,8 +4547,8 @@ class TPURaidenConnectorWorker:
             lower_kda_state_shard_spans,
         )
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
-            EXPECTED_FA_MINOR_TO_MAJOR,
             EXPECTED_FA_TILES,
+            expected_fa_minor_to_major,
         )
         from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
             BINDING_ALIASED_RAW,
@@ -4562,7 +4580,8 @@ class TPURaidenConnectorWorker:
             )
             measured_element_bits = int(payload.get("element_size_in_bits", 0))
             if (
-                measured_minor_to_major != EXPECTED_FA_MINOR_TO_MAJOR
+                measured_minor_to_major
+                != expected_fa_minor_to_major(payload.get("kv_layout"))
                 or measured_tiles != EXPECTED_FA_TILES
                 or measured_element_bits != 8
             ):
