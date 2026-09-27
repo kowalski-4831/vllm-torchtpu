@@ -4411,7 +4411,7 @@ class TPUModelRunner(GPUModelRunner):
         layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         initialized_count = 0
         decode_query_sizes = []
-        pinned_draft_layers = []
+        layer_widths = []
         with set_vllm_model_wrapper_context(
             mesh=self.mesh, vllm_config=self.vllm_config
         ):
@@ -4421,32 +4421,35 @@ class TPUModelRunner(GPUModelRunner):
                 ):
                     is_draft = name in draft_attn_names
                     pre_w = attn_layer.impl.decode_query_size
-                    if is_draft:
-                        # A K+1-wide decode tile describes the TARGET's verify
-                        # step; a proposer runs one query token per draft step,
-                        # so pin it to 1. NOTE: on Gemma-4 the draft layers are
-                        # observed to already be 1 here, so this is a guard
-                        # rather than the fix for b/536992014.
+                    # Keep a sharded draft at its K+1 decode tile. The drafter's
+                    # first pass attends with the TARGET's request_distribution
+                    # (eagle3 `_build_draft_attn_metadata`, step_idx == 0), so
+                    # with reorder_batch_threshold > 1 its K+1-token verify
+                    # windows sit in the DECODE bucket, and a 1-wide DECODE tile
+                    # there drops all but one query token per sequence (MTP
+                    # acceptance ~0.5% on Qwen3.5 DCP4 + MTP3). Loop steps (one
+                    # token) are fine in a K+1 tile.
+                    # A REPLICATED (tp=1) draft moves to the LOCAL (non-shard_map)
+                    # kernel, which is 1-wide; its width is folded into the
+                    # threshold below.
+                    if (
+                        is_draft
+                        and self.speculative_config.draft_tensor_parallel_size == 1
+                    ):
                         attn_layer.impl.decode_query_size = 1
-                        # Relocate a REPLICATED (tp=1) draft's attention to the
-                        # LOCAL (non-shard_map) kernel. Independent of the tile
-                        # width above: this is about the draft's TP topology.
-                        if self.speculative_config.draft_tensor_parallel_size == 1:
-                            # Instance attrs shadow the ClassVars; unique prefix
-                            # keeps the local kernel op out of the sharded
-                            # registry.
-                            attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
-                            attn_layer.impl._kernel_op_prefix = (
-                                "pallas::rpa_kernel_local"
-                            )
-                            logger.info(
-                                "Draft attn %s -> LOCAL (non-shard_map) RPA "
-                                "kernel | DRAFT_KV_BLOCK_CAP=%d",
-                                name,
-                                _DRAFT_KV_BLOCK_CAP,
-                            )
+                        # Instance attrs shadow the ClassVars; unique prefix
+                        # keeps the local kernel op out of the sharded
+                        # registry.
+                        attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
+                        attn_layer.impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+                        logger.info(
+                            "Draft attn %s -> LOCAL (non-shard_map) RPA "
+                            "kernel | DRAFT_KV_BLOCK_CAP=%d",
+                            name,
+                            _DRAFT_KV_BLOCK_CAP,
+                        )
                     attn_layer.impl.initialize_kernel(attn_layer)
-                    pinned_draft_layers.append(
+                    layer_widths.append(
                         (
                             "draft" if is_draft else "target",
                             type(attn_layer.impl).__name__,
@@ -4455,17 +4458,12 @@ class TPUModelRunner(GPUModelRunner):
                             getattr(attn_layer.impl, "head_size", None),
                         )
                     )
-                    # Target layers only. `reorder_batch_threshold` is read in
-                    # exactly one place (`rpa_num_decode_reqs` in
-                    # `_prepare_inputs`), which shapes the TARGET's batch; the
-                    # draft never reads it and builds its own pure-decode
-                    # distribution instead (eagle3 `_propose_step`). So draft
-                    # widths have no business in this min() -- folding the
-                    # draft's necessary 1 in would drag the threshold to 1 and
-                    # silently disable #1008 for every spec config that has a
-                    # draft, which is every config it was written for.
-                    if not is_draft:
-                        decode_query_sizes.append(attn_layer.impl.decode_query_size)
+                    # Draft layers count too. `reorder_batch_threshold` shapes
+                    # the target's request_distribution, and the drafter's
+                    # first pass attends with that same distribution, so every
+                    # layer that consumes it needs a DECODE tile at least as
+                    # wide as the widest window the threshold puts there.
+                    decode_query_sizes.append(attn_layer.impl.decode_query_size)
                     initialized_count += 1
 
             # Pre-build custom attention, compressor, and indexer kernels
@@ -4500,13 +4498,13 @@ class TPUModelRunner(GPUModelRunner):
         self.reorder_batch_threshold = min(decode_query_sizes, default=1)
         # State it, don't infer it: a target-only [4] and an undetected-draft
         # [4] print identically, so the draft count is the only way to tell
-        # whether the pinning below actually matched any layer.
+        # whether any draft layer was detected.
         from collections import Counter
 
         logger.info(
             "Attn layer census (role, impl, width_before_init, "
             "width_after_init, head_size) -> count: %s | draft names known=%d",
-            dict(Counter(pinned_draft_layers)),
+            dict(Counter(layer_widths)),
             len(draft_attn_names),
         )
         logger.info(
