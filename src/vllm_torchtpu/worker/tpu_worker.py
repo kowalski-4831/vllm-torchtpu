@@ -64,6 +64,8 @@ def _configure_tpu_process_env(
 
 
 class TPUWorker(WorkerBase):
+    model_runner_cls: type[TPUModelRunner] = TPUModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -434,7 +436,7 @@ class TPUWorker(WorkerBase):
         is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
-        self.model_runner = TPUModelRunner(
+        self.model_runner = self.model_runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,

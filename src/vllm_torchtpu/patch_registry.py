@@ -132,6 +132,11 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen3_omni_moe_thinker_patch:maybe_patch_qwen3_omni_moe_thinker",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
 )
 
 _applied: set[str] = set()

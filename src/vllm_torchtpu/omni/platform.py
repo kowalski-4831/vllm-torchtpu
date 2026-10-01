@@ -23,6 +23,25 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     _omni_enum = OmniPlatformEnum.OOT
 
+    @classmethod
+    def set_device_control_env_var(cls, device_ids: str | list[str | int]) -> None:
+        device_str = (
+            ",".join(str(d) for d in device_ids)
+            if isinstance(device_ids, list)
+            else str(device_ids)
+        )
+        os.environ["TPU_VISIBLE_CHIPS"] = device_str
+        os.environ["TPU_VISIBLE_DEVICES"] = device_str
+
+    @classmethod
+    def unset_device_control_env_var(cls) -> None:
+        os.environ.pop("TPU_VISIBLE_CHIPS", None)
+        os.environ.pop("TPU_VISIBLE_DEVICES", None)
+
+    @classmethod
+    def validate_request(cls, processed_inputs, params) -> None:
+        """TorchTPU supports RANDOM_SEED, RANDOM, and GREEDY."""
+
     @property
     def dist_backend(self) -> str:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
@@ -128,11 +147,11 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
-        return "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        return "vllm_torchtpu.omni.worker.TPUARWorker"
 
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
-        return "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        return "vllm_torchtpu.omni.worker.TPUGenerationWorker"
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
