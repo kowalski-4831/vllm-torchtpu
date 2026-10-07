@@ -214,3 +214,95 @@ def test_apply_omni_ar_patches_audio_attention_and_padded_encoder(monkeypatch):
     assert torch.allclose(merged[:4], torch.ones(4, 8))
     assert torch.allclose(merged[4:], torch.zeros(12, 8))
 
+    class DummyViTBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_shapes = []
+
+        def forward(
+            self,
+            hs,
+            cu_seqlens=None,
+            rotary_pos_emb_cos=None,
+            rotary_pos_emb_sin=None,
+            max_seqlen=None,
+            sequence_lengths=None,
+        ):
+            self.seen_shapes.append(int(hs.shape[0]))
+            return hs
+
+    class DummyViT(nn.Module):
+        dtype = torch.float32
+        apply_vit_abs_pos_embed = True
+        deepstack_visual_indexes = [0]
+        spatial_merge_unit = 4
+
+        def __init__(self):
+            super().__init__()
+            self.pos_embed = nn.Embedding(16, 8)
+            self.rotary_pos_emb = nn.Embedding(16, 4)
+            self.patch_embed = SimpleNamespace(
+                proj=SimpleNamespace(weight=torch.ones(8, 8)),
+                __call__=lambda x: x,
+            )
+            self.blk = DummyViTBlock()
+            self.blocks = nn.ModuleList([self.blk])
+            self.merger = lambda hs: hs.squeeze(1)[::4]
+            self.merger_list = [lambda d: d.squeeze(1)[::4]]
+
+        def fast_pos_embed_interpolate(self, grid_thw):
+            n = sum(int(t) * int(h) * int(w) for t, h, w in grid_thw)
+            return torch.zeros(n, 8)
+
+        def rot_pos_emb(self, grid_thw):
+            n = int((grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).sum().item())
+            return torch.ones(n, 4), torch.zeros(n, 4)
+
+    thinker_mod.Qwen3Omni_VisionTransformer = DummyViT
+    apply_omni_ar_patches.cache_clear()
+    apply_omni_ar_patches()
+
+    vit = DummyViT()
+    vit.patch_embed = nn.Identity()
+    vit.patch_embed.proj = SimpleNamespace(weight=torch.ones(8, 8))
+    # 5 frames of 4000 patches = 20000 patches (> 16384 max bucket) -> splits into
+    # chunk 1 (4 frames = 16000 -> bucket 16384) and chunk 2 (1 frame = 4000 -> bucket 4096)
+    out_vit = vit(torch.ones(20000, 8), torch.tensor([[5, 40, 100]], dtype=torch.int32))
+    assert out_vit.shape == (20000 // 4, 16)
+    assert vit.blk.seen_shapes == [16384, 4096]
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    vid_emb = torch.ones(6, 32)
+    vid_emb.modality = "video"
+    aud_emb = torch.ones(4, 8)
+    aud_emb.modality = "audio"
+
+    captured_mm = []
+
+    class DummyModel:
+        def embed_input_ids(self, input_ids, multimodal_embeddings=None, is_multimodal=None):
+            captured_mm.append(multimodal_embeddings)
+            return torch.zeros(input_ids.shape[0], 8)
+
+    class DummyRunner:
+        supports_mm_inputs = True
+        model = DummyModel()
+
+    runner = DummyRunner()
+    runner._omni_mm_embeds_list = [vid_emb, aud_emb]
+    idx_slice = torch.arange(4, 9, dtype=torch.int64)
+    _, embeds_out = TPUModelRunner._get_model_inputs(
+        runner,
+        torch.zeros(5, dtype=torch.long),
+        ([idx_slice], torch.ones(5, dtype=torch.bool)),
+    )
+    assert embeds_out.shape == (5, 8)
+    assert len(captured_mm) == 1
+    assert len(captured_mm[0]) == 2
+    assert captured_mm[0][0].shape == (2, 32)
+    assert captured_mm[0][0].modality == "video"
+    assert captured_mm[0][1].shape == (3, 8)
+    assert captured_mm[0][1].modality == "audio"
+
+

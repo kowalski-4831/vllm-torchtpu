@@ -179,51 +179,78 @@ def apply_omni_ar_patches() -> None:
                     else torch.as_tensor(grid_thw, dtype=torch.int32)
                 )
                 g_list = [[int(v) for v in r] for r in g_cpu.tolist()]
-                n_p = int(x.shape[0])
-                b_p = _select_bucket(n_p, _VISION_PATCH_BUCKETS, align=512)
-                pad_p = b_p - n_p
-                pos = F.pad(
-                    self.fast_pos_embed_interpolate(g_list).cpu(),
-                    (0, 0, 0, pad_p),
-                ).to(device=dev, dtype=dtype)
-                cos, sin = self.rot_pos_emb(g_cpu)
-                cos = F.pad(cos.cpu(), (0, 0, 0, pad_p)).to(dev)
-                sin = F.pad(sin.cpu(), (0, 0, 0, pad_p)).to(dev)
-                hs = self.patch_embed(
-                    F.pad(x.detach().cpu().to(dtype), (0, 0, 0, pad_p)).to(dev)
+                pos_all = (
+                    self.fast_pos_embed_interpolate(g_list).cpu()
+                    if self.apply_vit_abs_pos_embed
+                    else None
                 )
-                if self.apply_vit_abs_pos_embed:
-                    hs = hs + pos
-                hs = hs.unsqueeze(1)
-                seqlens = torch.repeat_interleave(
+                cos_all, sin_all = self.rot_pos_emb(g_cpu)
+                cos_all, sin_all = cos_all.cpu(), sin_all.cpu()
+                x_cpu = x.detach().cpu().to(dtype)
+                seqlens_all = torch.repeat_interleave(
                     g_cpu[:, 1] * g_cpu[:, 2], g_cpu[:, 0]
-                )
-                max_s = int(seqlens.max().item())
-                cu = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))
-                cu = F.pad(cu, (0, (-cu.numel()) % 16), value=b_p + 1).to(dev)
-                ds_idx, hs_list = self.deepstack_visual_indexes, []
-                for i, blk in enumerate(self.blocks):
-                    hs = blk(
-                        hs,
-                        cu_seqlens=cu,
-                        rotary_pos_emb_cos=cos,
-                        rotary_pos_emb_sin=sin,
-                        max_seqlen=max_s,
-                        sequence_lengths=None,
+                ).tolist()
+                chunks: list[list[int]] = []
+                cur: list[int] = []
+                cur_s = 0
+                for s in seqlens_all:
+                    if cur and cur_s + s > _VISION_PATCH_BUCKETS[-1]:
+                        chunks.append(cur)
+                        cur, cur_s = [s], s
+                    else:
+                        cur.append(s)
+                        cur_s += s
+                if cur:
+                    chunks.append(cur)
+                outs, off = [], 0
+                for c_lens in chunks:
+                    n_p = sum(c_lens)
+                    b_p = _select_bucket(n_p, _VISION_PATCH_BUCKETS, align=512)
+                    pad_p = b_p - n_p
+                    cos = F.pad(
+                        cos_all[off : off + n_p], (0, 0, 0, pad_p)
+                    ).to(dev)
+                    sin = F.pad(
+                        sin_all[off : off + n_p], (0, 0, 0, pad_p)
+                    ).to(dev)
+                    hs = self.patch_embed(
+                        F.pad(x_cpu[off : off + n_p], (0, 0, 0, pad_p)).to(dev)
                     )
-                    if ds_idx is not None and i in ds_idx:
-                        hs_list.append(hs)
-                hs = self.merger(hs)
-                if ds_idx is not None:
-                    hs = torch.cat(
-                        [hs]
-                        + [
-                            self.merger_list[i](d)
-                            for i, d in enumerate(hs_list)
-                        ],
-                        dim=1,
-                    )
-                out = hs.cpu()[: n_p // self.spatial_merge_unit]
+                    if pos_all is not None:
+                        hs = hs + F.pad(
+                            pos_all[off : off + n_p], (0, 0, 0, pad_p)
+                        ).to(device=dev, dtype=dtype)
+                    hs = hs.unsqueeze(1)
+                    seqlens = torch.tensor(c_lens, dtype=torch.int32)
+                    cu = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+                    cu = F.pad(
+                        cu, (0, (-cu.numel()) % 16), value=b_p + 1
+                    ).to(dev)
+                    ds_idx, hs_list = self.deepstack_visual_indexes, []
+                    for i, blk in enumerate(self.blocks):
+                        hs = blk(
+                            hs,
+                            cu_seqlens=cu,
+                            rotary_pos_emb_cos=cos,
+                            rotary_pos_emb_sin=sin,
+                            max_seqlen=max(c_lens),
+                            sequence_lengths=None,
+                        )
+                        if ds_idx is not None and i in ds_idx:
+                            hs_list.append(hs)
+                    hs = self.merger(hs)
+                    if ds_idx is not None:
+                        hs = torch.cat(
+                            [hs]
+                            + [
+                                self.merger_list[i](d)
+                                for i, d in enumerate(hs_list)
+                            ],
+                            dim=1,
+                        )
+                    outs.append(hs.cpu()[: n_p // self.spatial_merge_unit])
+                    off += n_p
+                out = torch.cat(outs, dim=0)
                 return out if dev.type == "tpu" else out.to(dev)
 
             vit_cls.forward = _padded_vit_forward
@@ -391,6 +418,58 @@ def apply_omni_ar_patches() -> None:
                 )
 
             thinker_cls.embed_input_ids = _cpu_mm_embed
+
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        if not getattr(
+            TPUModelRunner._gather_mm_embeddings, "_is_omni_patched", False
+        ):
+            orig_gather = TPUModelRunner._gather_mm_embeddings
+            orig_get_inputs = TPUModelRunner._get_model_inputs
+
+            def _omni_gather_mm(
+                self: Any, *args: Any, **kwargs: Any
+            ) -> tuple[list[torch.Tensor], torch.Tensor]:
+                mm_list, is_mm = orig_gather(self, *args, **kwargs)
+                self._omni_mm_embeds_list = mm_list
+                if mm_list:
+                    total = sum(int(e.shape[0]) for e in mm_list)
+                    return [torch.arange(total, dtype=torch.int64)], is_mm
+                return mm_list, is_mm
+
+            def _omni_get_model_inputs(
+                self: Any,
+                input_ids: torch.Tensor,
+                mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+            ) -> Any:
+                if mm_embed_inputs is not None:
+                    c_embeds, is_mm = mm_embed_inputs
+                    mm_list = getattr(self, "_omni_mm_embeds_list", None)
+                    if (
+                        c_embeds
+                        and mm_list
+                        and c_embeds[0].ndim == 1
+                        and c_embeds[0].dtype == torch.int64
+                    ):
+                        mm_start = int(c_embeds[0][0].item())
+                        mm_end = mm_start + int(c_embeds[0].shape[0])
+                        real_embeds = []
+                        pos = 0
+                        for e in mm_list:
+                            n = int(e.shape[0])
+                            s, t = max(0, mm_start - pos), min(n, mm_end - pos)
+                            if s < t:
+                                sub = e if (s == 0 and t == n) else e[s:t]
+                                if hasattr(e, "modality"):
+                                    sub.modality = e.modality
+                                real_embeds.append(sub)
+                            pos += n
+                        mm_embed_inputs = (real_embeds, is_mm)
+                return orig_get_inputs(self, input_ids, mm_embed_inputs)
+
+            _omni_gather_mm._is_omni_patched = True  # type: ignore[attr-defined]
+            TPUModelRunner._gather_mm_embeddings = _omni_gather_mm
+            TPUModelRunner._get_model_inputs = _omni_get_model_inputs
 
         logger.info(
             "Applied TPU patch: Qwen3-Omni Thinker audio/vision encoders and attention."
