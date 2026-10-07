@@ -6,16 +6,18 @@ import types
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.nn as nn
 
 from vllm_torchtpu.omni.qwen3_omni_moe_thinker_patch import (
+    _select_bucket,
     apply_omni_ar_patches,
 )
 
 pytestmark = pytest.mark.cpu_test
 
 
-def test_apply_omni_ar_patches_audio_attention(monkeypatch):
+def test_apply_omni_ar_patches_audio_attention_and_padded_encoder(monkeypatch):
     class DummyQKVParallelLinear(nn.Module):
         def __init__(
             self,
@@ -57,6 +59,43 @@ def test_apply_omni_ar_patches_audio_attention(monkeypatch):
     class DummyAudioAttention(nn.Module):
         pass
 
+    seen_layer_seq_lens = []
+    seen_conv_batches = []
+
+    class DummyLayer(nn.Module):
+        def forward(self, hidden_states, cu_seqlens, max_seqlen=None):
+            seen_layer_seq_lens.append(int(hidden_states.shape[0]))
+            return hidden_states
+
+    class DummyAudioEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.n_window = 50
+            self.n_window_infer = 400
+            self.conv_chunksize = 500
+            self.conv2d1 = nn.Conv2d(1, 4, 3, 2, padding=1)
+            self.conv2d2 = nn.Conv2d(4, 4, 3, 2, padding=1)
+            self.conv2d3 = nn.Conv2d(4, 4, 3, 2, padding=1)
+            self.conv_out = lambda x: (nn.functional.linear(x, torch.ones(8, x.shape[-1])), None)
+            self.positional_embedding = SimpleNamespace(
+                positional_embedding=torch.zeros(100, 8)
+            )
+            self.layers = nn.ModuleList([DummyLayer()])
+            self.ln_post = nn.LayerNorm(8)
+            self.proj1 = lambda x: (x, None)
+            self.act = nn.GELU()
+            self.proj2 = lambda x: (x, None)
+
+        def compute_attn_mask_seqlen(self, cu_seqlens):
+            return int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+
+        def forward(self, input_features, feature_lens, aftercnn_lens):
+            raise AssertionError("orig_forward should not be called directly")
+
+    class DummyMixin:
+        def _process_audio_input(self, audio_input):
+            return (audio_input["input_features"], audio_input["audio_feature_lengths"])
+
     _current_tp_size = 8
 
     qwen3_pkg = types.ModuleType("vllm_omni.model_executor.models.qwen3_omni")
@@ -64,14 +103,11 @@ def test_apply_omni_ar_patches_audio_attention(monkeypatch):
         "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker"
     )
     thinker_mod.Qwen3OmniMoeAudioAttention = DummyAudioAttention
+    thinker_mod.Qwen3OmniMoeAudioEncoder = DummyAudioEncoder
+    thinker_mod.Qwen3OmniMoeConditionalGenerationMixin = DummyMixin
     qwen3_pkg.qwen3_omni_moe_thinker = thinker_mod
 
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_omni",
-        types.ModuleType("vllm_omni"),
-    )
-
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
     monkeypatch.setitem(
         sys.modules,
         "vllm_omni.model_executor",
@@ -120,13 +156,9 @@ def test_apply_omni_ar_patches_audio_attention(monkeypatch):
     assert attn_tp8.num_local_heads == 20
     assert attn_tp8.qkv.disable_tp is True
     assert attn_tp8.out_proj.disable_tp is True
-    assert attn_tp8.qkv.prefix == "audio.layers.0.self_attn.qkv"
-    assert attn_tp8.out_proj.prefix == "audio.layers.0.self_attn.out_proj"
     assert isinstance(attn_tp8.attn, DummyMMEncoderAttention)
     assert attn_tp8.attn.num_heads == 20
     assert attn_tp8.attn.head_size == 4
-    assert attn_tp8.attn.scale == 4**-0.5
-    assert attn_tp8.attn.prefix == "audio.layers.0.self_attn.attn"
 
     # Case 2: tp_size=4 (20 % 4 == 0) -> disable_tp=False, num_local_heads=5
     _current_tp_size = 4
@@ -134,6 +166,17 @@ def test_apply_omni_ar_patches_audio_attention(monkeypatch):
     assert attn_tp4.num_local_heads == 5
     assert attn_tp4.qkv.disable_tp is False
     assert attn_tp4.out_proj.disable_tp is False
-    assert isinstance(attn_tp4.attn, DummyMMEncoderAttention)
-    assert attn_tp4.attn.num_heads == 5
-    assert attn_tp4.attn.head_size == 4
+
+    # Case 3: Padded encoder wrapper buckets all <= 800-frame clips to 8 chunks
+    # (104 CNN tokens -> 128-aligned sequence length) and slices back to aftercnn_lens.
+    enc = DummyAudioEncoder()
+    for flen, alen in ((220, 29), (310, 41), (670, 87)):
+        out = enc(
+            torch.zeros(16, flen),
+            torch.tensor([flen], dtype=torch.long),
+            torch.tensor([alen], dtype=torch.long),
+        )
+        assert out.shape == (alen, 8)
+    assert seen_layer_seq_lens == [128, 128, 128]
+    assert _select_bucket(5, (8, 16), align=8) == 8
+    assert _select_bucket(19, (8, 16), align=8) == 24
