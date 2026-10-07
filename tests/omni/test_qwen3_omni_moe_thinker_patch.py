@@ -180,3 +180,37 @@ def test_apply_omni_ar_patches_audio_attention_and_padded_encoder(monkeypatch):
     assert seen_layer_seq_lens == [128, 128, 128]
     assert _select_bucket(5, (8, 16), align=8) == 8
     assert _select_bucket(19, (8, 16), align=8) == 24
+
+    class SchemaLikeAudioInput:
+        def __init__(self, data):
+            self._data = data
+
+        def __getitem__(self, key):
+            return self._data[key]
+
+    mixin = DummyMixin()
+    feats, flens = mixin._process_audio_input(
+        SchemaLikeAudioInput(
+            {
+                "input_features": torch.zeros(16, 220),
+                "audio_feature_lengths": torch.tensor([220]),
+            }
+        )
+    )
+    assert feats.shape == (16, 220)
+    assert flens.tolist() == [220]
+
+    import vllm.model_executor.models.utils as vllm_utils
+
+    inputs_embeds = torch.zeros(16, 8)
+    mm_emb = torch.ones(4, 8)
+    is_mm = torch.zeros(16, dtype=torch.bool)
+    is_mm[:4] = True
+    merged = vllm_utils._merge_multimodal_embeddings(
+        inputs_embeds=inputs_embeds.clone(),
+        multimodal_embeddings=[mm_emb],
+        is_multimodal=is_mm,
+    )
+    assert torch.allclose(merged[:4], torch.ones(4, 8))
+    assert torch.allclose(merged[4:], torch.zeros(12, 8))
+
