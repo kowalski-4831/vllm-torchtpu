@@ -30,11 +30,11 @@ def _select_bucket(
     )
 
 
-def _with_modality(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-    """Copy the vLLM `.modality` tag (e.g. 'audio', 'video') from src to dst."""
-    if hasattr(src, "modality"):
-        dst.modality = src.modality
-    return dst
+def _with_modality(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+    """Copy the vLLM `.modality` tag (e.g. 'audio', 'video') from source to target."""
+    if hasattr(source, "modality"):
+        target.modality = source.modality
+    return target
 
 
 @run_once
@@ -71,15 +71,15 @@ def apply_omni_ar_patches() -> None:
             self.num_heads = config.encoder_attention_heads
             self.head_dim = self.embed_dim // self.num_heads
             tp_size = get_tensor_model_parallel_world_size()
-            no_tp = self.num_heads % tp_size != 0
+            disable_tp = self.num_heads % tp_size != 0
             self.num_local_heads = (
-                self.num_heads if no_tp else self.num_heads // tp_size
+                self.num_heads if disable_tp else self.num_heads // tp_size
             )
             self.scaling = self.head_dim**-0.5
             linear_kwargs = {
                 "bias": True,
                 "quant_config": quant_config,
-                "disable_tp": no_tp,
+                "disable_tp": disable_tp,
             }
             self.qkv = QKVParallelLinear(
                 self.embed_dim,
@@ -112,63 +112,77 @@ def apply_omni_ar_patches() -> None:
             feature_lens: torch.Tensor,
             aftercnn_lens: torch.Tensor,
         ) -> torch.Tensor:
-            win = self.n_window * 2
-            t_chunk = (((win + 1) // 2 + 1) // 2 + 1) // 2
-            win_cnn = t_chunk * (self.n_window_infer // win)
-            dev = self.conv2d1.weight.device
+            window_size = self.n_window * 2
+            tokens_per_chunk = (((window_size + 1) // 2 + 1) // 2 + 1) // 2
+            window_aftercnn = tokens_per_chunk * (self.n_window_infer // window_size)
+            device = self.conv2d1.weight.device
             dtype = self.conv2d1.weight.dtype
-            flens = [int(v) for v in feature_lens.tolist()]
-            alens = [int(v) for v in aftercnn_lens.tolist()]
-            feats = input_features.detach().cpu().to(dtype).split(flens, dim=1)
-            pos_emb = (
-                self.positional_embedding.positional_embedding[:t_chunk]
+            feat_lens = [int(x) for x in feature_lens.tolist()]
+            cnn_lens = [int(x) for x in aftercnn_lens.tolist()]
+            feature_list = (
+                input_features.detach().cpu().to(dtype).split(feat_lens, dim=1)
+            )
+            positional_embedding = (
+                self.positional_embedding.positional_embedding[:tokens_per_chunk]
                 .unsqueeze(0)
-                .to(device=dev, dtype=dtype)
+                .to(device=device, dtype=dtype)
             )
             outputs = []
-            for feat, flen, alen in zip(feats, flens, alens):
-                bucket = _select_bucket((flen + win - 1) // win)
-                seq_pad = (-(bucket * t_chunk)) % 128
-                rem = alen % win_cnn
-                cu_lens = (
-                    [0] + [win_cnn] * (alen // win_cnn) + ([rem] if rem else [])
+            for feature, feat_len, cnn_len in zip(feature_list, feat_lens, cnn_lens):
+                num_chunks = _select_bucket(
+                    (feat_len + window_size - 1) // window_size
                 )
-                cu = torch.tensor(cu_lens, dtype=torch.int32).cumsum(
+                seq_pad_len = (-(num_chunks * tokens_per_chunk)) % 128
+                remainder = cnn_len % window_aftercnn
+                cu_chunk_lens = (
+                    [0]
+                    + [window_aftercnn] * (cnn_len // window_aftercnn)
+                    + ([remainder] if remainder else [])
+                )
+                cu_seqlens = torch.tensor(cu_chunk_lens, dtype=torch.int32).cumsum(
                     -1, dtype=torch.int32
                 )
-                cu = F.pad(
-                    cu,
-                    (0, (-cu.numel()) % 16),
-                    value=bucket * t_chunk + seq_pad + 1,
-                ).to(dev)
-                conv_in = (
-                    F.pad(feat, (0, bucket * win - flen))
-                    .T.reshape(bucket, win, -1)
+                cu_seqlens = F.pad(
+                    cu_seqlens,
+                    (0, (-cu_seqlens.numel()) % 16),
+                    value=num_chunks * tokens_per_chunk + seq_pad_len + 1,
+                ).to(device)
+                padded_feature = (
+                    F.pad(feature, (0, num_chunks * window_size - feat_len))
+                    .T.reshape(num_chunks, window_size, -1)
                     .transpose(1, 2)
                     .unsqueeze(1)
                     .contiguous()
-                    .to(dev)
+                    .to(device)
                 )
-                conv_chunks = [
+                padded_embeds = [
                     F.gelu(self.conv2d3(F.gelu(self.conv2d2(F.gelu(self.conv2d1(c))))))
-                    for c in conv_in.split(getattr(self, "conv_chunksize", 500), dim=0)
+                    for c in padded_feature.split(
+                        getattr(self, "conv_chunksize", 500), dim=0
+                    )
                 ]
-                hs, _ = self.conv_out(
-                    torch.cat(conv_chunks, dim=0)
+                hidden_states, _ = self.conv_out(
+                    torch.cat(padded_embeds, dim=0)
                     .permute(0, 3, 1, 2)
                     .contiguous()
-                    .view(bucket, t_chunk, -1)
+                    .view(num_chunks, tokens_per_chunk, -1)
                 )
-                hs = F.pad(
-                    (hs + pos_emb).reshape(bucket * t_chunk, -1),
-                    (0, 0, 0, seq_pad),
+                hidden_states = F.pad(
+                    (hidden_states + positional_embedding).reshape(
+                        num_chunks * tokens_per_chunk, -1
+                    ),
+                    (0, 0, 0, seq_pad_len),
                 )
-                for layer in self.layers:
-                    hs = layer(hs, cu, max_seqlen=max(cu_lens))
-                hs = self.proj2(self.act(self.proj1(self.ln_post(hs))[0]))[0]
-                outputs.append(hs.cpu()[:alen])
-            res = torch.cat(outputs, dim=0)
-            return res if dev.type == "tpu" else res.to(dev)
+                for encoder_layer in self.layers:
+                    hidden_states = encoder_layer(
+                        hidden_states, cu_seqlens, max_seqlen=max(cu_chunk_lens)
+                    )
+                hidden_states = self.proj2(
+                    self.act(self.proj1(self.ln_post(hidden_states))[0])
+                )[0]
+                outputs.append(hidden_states.cpu()[:cnn_len])
+            output = torch.cat(outputs, dim=0)
+            return output if device.type == "tpu" else output.to(device)
 
         Qwen3OmniMoeAudioEncoder.forward = _padded_encoder_forward
 
@@ -181,9 +195,9 @@ def apply_omni_ar_patches() -> None:
             def _padded_vit_forward(
                 self: Any, x: torch.Tensor, grid_thw: Any
             ) -> torch.Tensor:
-                dev = self.patch_embed.proj.weight.device
+                device = self.patch_embed.proj.weight.device
                 dtype = self.dtype
-                if dev.type == "tpu" and self.pos_embed.weight.device.type == "tpu":
+                if device.type == "tpu" and self.pos_embed.weight.device.type == "tpu":
                     self.pos_embed.cpu()
                     self.rotary_pos_emb.cpu()
                 grid_cpu = (
@@ -192,77 +206,93 @@ def apply_omni_ar_patches() -> None:
                     else torch.as_tensor(grid_thw, dtype=torch.int32)
                 )
                 grid_list = [[int(v) for v in row] for row in grid_cpu.tolist()]
-                pos_all = (
+                pos_embeds = (
                     self.fast_pos_embed_interpolate(grid_list).cpu()
                     if self.apply_vit_abs_pos_embed
                     else None
                 )
-                cos_all, sin_all = (t.cpu() for t in self.rot_pos_emb(grid_cpu))
+                rotary_cos, rotary_sin = (t.cpu() for t in self.rot_pos_emb(grid_cpu))
                 x_cpu = x.detach().cpu().to(dtype)
 
                 frame_seqlens = torch.repeat_interleave(
                     grid_cpu[:, 1] * grid_cpu[:, 2], grid_cpu[:, 0]
                 ).tolist()
-                chunks: list[list[int]] = []
+                frame_chunks: list[list[int]] = []
                 for seqlen in frame_seqlens:
-                    if chunks and sum(chunks[-1]) + seqlen <= _VISION_PATCH_BUCKETS[-1]:
-                        chunks[-1].append(seqlen)
+                    if (
+                        frame_chunks
+                        and sum(frame_chunks[-1]) + seqlen <= _VISION_PATCH_BUCKETS[-1]
+                    ):
+                        frame_chunks[-1].append(seqlen)
                     else:
-                        chunks.append([seqlen])
+                        frame_chunks.append([seqlen])
 
                 outputs, offset = [], 0
-                ds_indexes = self.deepstack_visual_indexes
-                for chunk_lens in chunks:
-                    num_p = sum(chunk_lens)
-                    bucket_p = _select_bucket(
-                        num_p, _VISION_PATCH_BUCKETS, align=512
+                deepstack_indexes = self.deepstack_visual_indexes
+                for chunk_seqlens in frame_chunks:
+                    num_patches = sum(chunk_seqlens)
+                    padded_patches = _select_bucket(
+                        num_patches, _VISION_PATCH_BUCKETS, align=512
                     )
-                    pad = (0, 0, 0, bucket_p - num_p)
-                    cos = F.pad(cos_all[offset : offset + num_p], pad).to(dev)
-                    sin = F.pad(sin_all[offset : offset + num_p], pad).to(dev)
-                    hs = self.patch_embed(
-                        F.pad(x_cpu[offset : offset + num_p], pad).to(dev)
+                    patch_pad = (0, 0, 0, padded_patches - num_patches)
+                    cos = F.pad(
+                        rotary_cos[offset : offset + num_patches], patch_pad
+                    ).to(device)
+                    sin = F.pad(
+                        rotary_sin[offset : offset + num_patches], patch_pad
+                    ).to(device)
+                    hidden_states = self.patch_embed(
+                        F.pad(x_cpu[offset : offset + num_patches], patch_pad).to(
+                            device
+                        )
                     )
-                    if pos_all is not None:
-                        hs = hs + F.pad(
-                            pos_all[offset : offset + num_p], pad
-                        ).to(device=dev, dtype=dtype)
-                    hs = hs.unsqueeze(1)
-                    cu = F.pad(
-                        torch.tensor(chunk_lens, dtype=torch.int32).cumsum(
+                    if pos_embeds is not None:
+                        hidden_states = hidden_states + F.pad(
+                            pos_embeds[offset : offset + num_patches], patch_pad
+                        ).to(device=device, dtype=dtype)
+                    hidden_states = hidden_states.unsqueeze(1)
+                    cu_seqlens = F.pad(
+                        torch.tensor(chunk_seqlens, dtype=torch.int32).cumsum(
                             0, dtype=torch.int32
                         ),
                         (1, 0),
                     )
-                    cu = F.pad(
-                        cu, (0, (-cu.numel()) % 16), value=bucket_p + 1
-                    ).to(dev)
-                    ds_feats = []
-                    for idx, blk in enumerate(self.blocks):
-                        hs = blk(
-                            hs,
-                            cu_seqlens=cu,
+                    cu_seqlens = F.pad(
+                        cu_seqlens,
+                        (0, (-cu_seqlens.numel()) % 16),
+                        value=padded_patches + 1,
+                    ).to(device)
+                    deepstack_features = []
+                    for layer_idx, block in enumerate(self.blocks):
+                        hidden_states = block(
+                            hidden_states,
+                            cu_seqlens=cu_seqlens,
                             rotary_pos_emb_cos=cos,
                             rotary_pos_emb_sin=sin,
-                            max_seqlen=max(chunk_lens),
+                            max_seqlen=max(chunk_seqlens),
                             sequence_lengths=None,
                         )
-                        if ds_indexes is not None and idx in ds_indexes:
-                            ds_feats.append(hs)
-                    hs = self.merger(hs)
-                    if ds_indexes is not None:
-                        hs = torch.cat(
-                            [hs]
+                        if (
+                            deepstack_indexes is not None
+                            and layer_idx in deepstack_indexes
+                        ):
+                            deepstack_features.append(hidden_states)
+                    hidden_states = self.merger(hidden_states)
+                    if deepstack_indexes is not None:
+                        hidden_states = torch.cat(
+                            [hidden_states]
                             + [
                                 self.merger_list[i](feat)
-                                for i, feat in enumerate(ds_feats)
+                                for i, feat in enumerate(deepstack_features)
                             ],
                             dim=1,
                         )
-                    outputs.append(hs.cpu()[: num_p // self.spatial_merge_unit])
-                    offset += num_p
-                res = torch.cat(outputs, dim=0)
-                return res if dev.type == "tpu" else res.to(dev)
+                    outputs.append(
+                        hidden_states.cpu()[: num_patches // self.spatial_merge_unit]
+                    )
+                    offset += num_patches
+                output = torch.cat(outputs, dim=0)
+                return output if device.type == "tpu" else output.to(device)
 
             vit_cls.forward = _padded_vit_forward
 
@@ -272,43 +302,55 @@ def apply_omni_ar_patches() -> None:
             thinker_mod, "Qwen3OmniMoeConditionalGenerationMixin", None
         )
         if mixin_cls is not None:
-            orig_aud = mixin_cls._process_audio_input
-            mixin_cls._process_audio_input = lambda self, ai: orig_aud(
-                self,
-                {
-                    "input_features": ai["input_features"].detach().cpu(),
-                    "audio_feature_lengths": ai["audio_feature_lengths"]
-                    .detach()
-                    .cpu(),
-                },
-            )
-            if orig_vid := getattr(mixin_cls, "_process_video_input", None):
-                mixin_cls._process_video_input = lambda self, vi: orig_vid(
+            orig_process_audio = mixin_cls._process_audio_input
+            mixin_cls._process_audio_input = (
+                lambda self, audio_input: orig_process_audio(
                     self,
                     {
-                        "type": vi["type"],
-                        "pixel_values_videos": vi["pixel_values_videos"]
+                        "input_features": audio_input["input_features"].detach().cpu(),
+                        "audio_feature_lengths": audio_input["audio_feature_lengths"]
                         .detach()
                         .cpu(),
-                        "video_grid_thw": vi["video_grid_thw"].detach().cpu(),
-                    }
-                    if vi["type"] == "pixel_values_videos"
-                    else {
-                        "type": vi["type"],
-                        "video_embeds": vi["video_embeds"].detach().cpu(),
-                        "video_grid_thw": vi["video_grid_thw"].detach().cpu(),
                     },
                 )
-            if orig_img := getattr(mixin_cls, "_process_image_input", None):
-                mixin_cls._process_image_input = lambda self, ii: orig_img(
-                    self,
-                    {
-                        "type": ii["type"],
-                        "pixel_values": ii["pixel_values"].detach().cpu(),
-                        "image_grid_thw": ii["image_grid_thw"].detach().cpu(),
-                    }
-                    if ii["type"] == "pixel_values"
-                    else ii,
+            )
+            if orig_process_video := getattr(mixin_cls, "_process_video_input", None):
+                mixin_cls._process_video_input = (
+                    lambda self, video_input: orig_process_video(
+                        self,
+                        {
+                            "type": video_input["type"],
+                            "pixel_values_videos": video_input["pixel_values_videos"]
+                            .detach()
+                            .cpu(),
+                            "video_grid_thw": video_input["video_grid_thw"]
+                            .detach()
+                            .cpu(),
+                        }
+                        if video_input["type"] == "pixel_values_videos"
+                        else {
+                            "type": video_input["type"],
+                            "video_embeds": video_input["video_embeds"].detach().cpu(),
+                            "video_grid_thw": video_input["video_grid_thw"]
+                            .detach()
+                            .cpu(),
+                        },
+                    )
+                )
+            if orig_process_image := getattr(mixin_cls, "_process_image_input", None):
+                mixin_cls._process_image_input = (
+                    lambda self, image_input: orig_process_image(
+                        self,
+                        {
+                            "type": image_input["type"],
+                            "pixel_values": image_input["pixel_values"].detach().cpu(),
+                            "image_grid_thw": image_input["image_grid_thw"]
+                            .detach()
+                            .cpu(),
+                        }
+                        if image_input["type"] == "pixel_values"
+                        else image_input,
+                    )
                 )
 
         # 5. Static Multimodal Embedding Merge: pad flattened multimodal embeddings
@@ -324,49 +366,50 @@ def apply_omni_ar_patches() -> None:
             ) -> torch.Tensor:
                 if len(multimodal_embeddings) > 0:
                     cpu_embeds = [
-                        e.detach().cpu() if e.device.type == "tpu" else e
-                        for e in multimodal_embeddings
+                        embed.detach().cpu() if embed.device.type == "tpu" else embed
+                        for embed in multimodal_embeddings
                     ]
-                    flat = vllm_utils._flatten_embeddings(cpu_embeds)
-                    if 0 < flat.shape[0] < inputs_embeds.shape[0]:
-                        pad_rows = inputs_embeds.shape[0] - flat.shape[0]
+                    flattened_embeds = vllm_utils._flatten_embeddings(cpu_embeds)
+                    if 0 < flattened_embeds.shape[0] < inputs_embeds.shape[0]:
+                        pad_rows = inputs_embeds.shape[0] - flattened_embeds.shape[0]
                         multimodal_embeddings = [
-                            F.pad(flat, (0, 0, 0, pad_rows))
+                            F.pad(flattened_embeds, (0, 0, 0, pad_rows))
                         ]
                 if (
                     is_multimodal is not None
                     and is_multimodal.device != inputs_embeds.device
                 ):
                     is_multimodal = is_multimodal.to(inputs_embeds.device)
-                return base_merge(
-                    inputs_embeds, multimodal_embeddings, is_multimodal
-                )
+                return base_merge(inputs_embeds, multimodal_embeddings, is_multimodal)
 
             _omni_merge._is_omni_static_padded = True  # type: ignore[attr-defined]
             vllm_utils._merge_multimodal_embeddings = _omni_merge
-            for name, mod in list(sys.modules.items()):
+            for module_name, module in list(sys.modules.items()):
                 if (
-                    mod is not None
-                    and name.startswith(
+                    module is not None
+                    and module_name.startswith(
                         (
                             "vllm.model_executor.models",
                             "vllm_omni.model_executor.models",
                         )
                     )
-                    and hasattr(mod, "_merge_multimodal_embeddings")
+                    and hasattr(module, "_merge_multimodal_embeddings")
                 ):
-                    mod._merge_multimodal_embeddings = _omni_merge
+                    module._merge_multimodal_embeddings = _omni_merge
 
         # 6. Interleaved Audio+Video & CPU-Staged embed_input_ids: run non-zero mask
         #    checks and deepstack feature splitting on CPU, preserving `.modality`.
-        _active_merge = vllm_utils._merge_multimodal_embeddings
+        active_merge = vllm_utils._merge_multimodal_embeddings
         orig_check = getattr(thinker_mod, "check_interleaved_audio_video", None)
         if orig_check is not None:
             thinker_mod.check_interleaved_audio_video = (
-                lambda iv, ia, nv, na: orig_check(
-                    iv.detach().cpu(), ia.detach().cpu(), nv, na
+                lambda is_video, is_audio, num_videos, num_audios: orig_check(
+                    is_video.detach().cpu(),
+                    is_audio.detach().cpu(),
+                    num_videos,
+                    num_audios,
                 )
-                if nv and na
+                if num_videos and num_audios
                 else False
             )
 
@@ -382,20 +425,20 @@ def apply_omni_ar_patches() -> None:
                 from vllm.multimodal.utils import get_mm_embedding_modalities
 
                 is_image = is_multimodal & ~is_video & ~is_audio
-                mods = get_mm_embedding_modalities(multimodal_embeddings)
-                for mask, mod_name in (
+                modalities = get_mm_embedding_modalities(multimodal_embeddings)
+                for modality_mask, modality_name in (
                     (is_video, "video"),
                     (is_audio, "audio"),
                     (is_image, "image"),
                 ):
-                    group = [
-                        e
-                        for e, m in zip(multimodal_embeddings, mods)
-                        if m == mod_name
+                    modality_embeds = [
+                        embed
+                        for embed, mod in zip(multimodal_embeddings, modalities)
+                        if mod == modality_name
                     ]
-                    if group:
-                        inputs_embeds = _active_merge(
-                            inputs_embeds, group, mask
+                    if modality_embeds:
+                        inputs_embeds = active_merge(
+                            inputs_embeds, modality_embeds, modality_mask
                         )
                 return inputs_embeds
 
@@ -405,7 +448,7 @@ def apply_omni_ar_patches() -> None:
             thinker_mod, "Qwen3OmniMoeThinkerForConditionalGeneration", None
         )
         if thinker_cls is not None and hasattr(thinker_cls, "embed_input_ids"):
-            orig_embed = thinker_cls.embed_input_ids
+            orig_embed_input_ids = thinker_cls.embed_input_ids
 
             def _cpu_mm_embed(
                 self: Any,
@@ -417,16 +460,16 @@ def apply_omni_ar_patches() -> None:
                 if multimodal_embeddings:
                     multimodal_embeddings = [
                         _with_modality(
-                            e.detach().cpu() if e.device.type == "tpu" else e, e
+                            embed.detach().cpu()
+                            if embed.device.type == "tpu"
+                            else embed,
+                            embed,
                         )
-                        for e in multimodal_embeddings
+                        for embed in multimodal_embeddings
                     ]
-                    if (
-                        is_multimodal is not None
-                        and is_multimodal.device.type == "tpu"
-                    ):
+                    if is_multimodal is not None and is_multimodal.device.type == "tpu":
                         is_multimodal = is_multimodal.detach().cpu()
-                return orig_embed(
+                return orig_embed_input_ids(
                     self,
                     input_ids,
                     multimodal_embeddings=multimodal_embeddings,
@@ -446,12 +489,15 @@ def apply_omni_ar_patches() -> None:
             def _omni_gather_mm(
                 self: Any, *args: Any, **kwargs: Any
             ) -> tuple[list[torch.Tensor], torch.Tensor]:
-                mm_list, is_mm = orig_gather(self, *args, **kwargs)
-                self._omni_mm_embeds_list = mm_list
-                if mm_list:
-                    total_tokens = sum(int(e.shape[0]) for e in mm_list)
-                    return [torch.arange(total_tokens, dtype=torch.int64)], is_mm
-                return mm_list, is_mm
+                mm_embeds, is_multimodal = orig_gather(self, *args, **kwargs)
+                self._omni_mm_embeds_list = mm_embeds
+                if mm_embeds:
+                    total_tokens = sum(int(embed.shape[0]) for embed in mm_embeds)
+                    return (
+                        [torch.arange(total_tokens, dtype=torch.int64)],
+                        is_multimodal,
+                    )
+                return mm_embeds, is_multimodal
 
             def _omni_get_model_inputs(
                 self: Any,
@@ -459,21 +505,27 @@ def apply_omni_ar_patches() -> None:
                 mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
             ) -> Any:
                 if mm_embed_inputs is not None:
-                    c_embeds, is_mm = mm_embed_inputs
-                    mm_list = getattr(self, "_omni_mm_embeds_list", None)
-                    if c_embeds and mm_list and c_embeds[0].ndim == 1:
-                        mm_start = int(c_embeds[0][0].item())
-                        mm_end = mm_start + int(c_embeds[0].shape[0])
-                        real_embeds, pos = [], 0
-                        for e in mm_list:
-                            num_rows = int(e.shape[0])
-                            s = max(0, mm_start - pos)
-                            t = min(num_rows, mm_end - pos)
-                            if s < t:
-                                sub = e if (s == 0 and t == num_rows) else e[s:t]
-                                real_embeds.append(_with_modality(sub, e))
-                            pos += num_rows
-                        mm_embed_inputs = (real_embeds, is_mm)
+                    chunk_embeds, is_multimodal = mm_embed_inputs
+                    mm_embeds = getattr(self, "_omni_mm_embeds_list", None)
+                    if chunk_embeds and mm_embeds and chunk_embeds[0].ndim == 1:
+                        chunk_start = int(chunk_embeds[0][0].item())
+                        chunk_end = chunk_start + int(chunk_embeds[0].shape[0])
+                        sliced_embeds, offset = [], 0
+                        for embed in mm_embeds:
+                            num_rows = int(embed.shape[0])
+                            start = max(0, chunk_start - offset)
+                            end = min(num_rows, chunk_end - offset)
+                            if start < end:
+                                embed_slice = (
+                                    embed
+                                    if (start == 0 and end == num_rows)
+                                    else embed[start:end]
+                                )
+                                sliced_embeds.append(
+                                    _with_modality(embed_slice, embed)
+                                )
+                            offset += num_rows
+                        mm_embed_inputs = (sliced_embeds, is_multimodal)
                 return orig_get_inputs(self, input_ids, mm_embed_inputs)
 
             _omni_gather_mm._is_omni_patched = True  # type: ignore[attr-defined]
