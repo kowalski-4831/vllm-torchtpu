@@ -62,14 +62,14 @@ def apply_omni_ar_patches() -> None:
         Qwen3OmniMoeAudioAttention.__init__ = _init
 
         def _padded_encoder_forward(
-            self: Any, x: torch.Tensor, flens: torch.Tensor, alens: torch.Tensor
+            self: Any, input_features: torch.Tensor, feature_lens: torch.Tensor, aftercnn_lens: torch.Tensor
         ) -> torch.Tensor:
             win, dev, dt = self.n_window * 2, self.conv2d1.weight.device, self.conv2d1.weight.dtype
             tc = (((win + 1) // 2 + 1) // 2 + 1) // 2
-            w_cnn, fls, als = tc * (self.n_window_infer // win), [int(v) for v in flens.tolist()], [int(v) for v in alens.tolist()]
+            w_cnn, fls, als = tc * (self.n_window_infer // win), [int(v) for v in feature_lens.tolist()], [int(v) for v in aftercnn_lens.tolist()]
             pos = self.positional_embedding.positional_embedding[:tc].unsqueeze(0).to(dev, dt)
             outs = []
-            for feat, fl, al in zip(x.detach().cpu().to(dt).split(fls, dim=1), fls, als):
+            for feat, fl, al in zip(input_features.detach().cpu().to(dt).split(fls, dim=1), fls, als):
                 b = _select_bucket((fl + win - 1) // win)
                 sp, rem = (-(b * tc)) % 128, al % w_cnn
                 cu_l = [0] + [w_cnn] * (al // w_cnn) + ([rem] if rem else [])
@@ -135,19 +135,33 @@ def apply_omni_ar_patches() -> None:
             mixin_cls._process_audio_input = lambda self, ai: orig_aud(
                 self, {k: ai[k].detach().cpu() for k in ("input_features", "audio_feature_lengths")}
             )
+            if orig_vid := getattr(mixin_cls, "_process_video_input", None):
+                mixin_cls._process_video_input = lambda self, vi: orig_vid(
+                    self,
+                    {"type": vi["type"], "pixel_values_videos": vi["pixel_values_videos"].detach().cpu(), "video_grid_thw": vi["video_grid_thw"].detach().cpu()}
+                    if vi["type"] == "pixel_values_videos"
+                    else {"type": vi["type"], "video_embeds": vi["video_embeds"].detach().cpu(), "video_grid_thw": vi["video_grid_thw"].detach().cpu()},
+                )
+            if orig_img := getattr(mixin_cls, "_process_image_input", None):
+                mixin_cls._process_image_input = lambda self, ii: orig_img(
+                    self,
+                    {"type": ii["type"], "pixel_values": ii["pixel_values"].detach().cpu(), "image_grid_thw": ii["image_grid_thw"].detach().cpu()}
+                    if ii["type"] == "pixel_values"
+                    else ii,
+                )
 
         _patch_vllm_merge_multimodal_embeddings()
         base_merge = vllm_utils._merge_multimodal_embeddings
         if not getattr(base_merge, "_is_omni_static_padded", False):
 
-            def _omni_merge(ie: torch.Tensor, mm: Any, is_mm: Any = None) -> torch.Tensor:
-                if len(mm) > 0:
-                    flat = vllm_utils._flatten_embeddings([e.detach().cpu() if e.device.type == "tpu" else e for e in mm])
-                    if 0 < flat.shape[0] < ie.shape[0]:
-                        mm = [F.pad(flat, (0, 0, 0, ie.shape[0] - flat.shape[0]))]
-                if is_mm is not None and is_mm.device != ie.device:
-                    is_mm = is_mm.to(ie.device)
-                return base_merge(ie, mm, is_mm)
+            def _omni_merge(inputs_embeds: torch.Tensor, multimodal_embeddings: Any, is_multimodal: Any = None) -> torch.Tensor:
+                if len(multimodal_embeddings) > 0:
+                    flat = vllm_utils._flatten_embeddings([e.detach().cpu() if e.device.type == "tpu" else e for e in multimodal_embeddings])
+                    if 0 < flat.shape[0] < inputs_embeds.shape[0]:
+                        multimodal_embeddings = [F.pad(flat, (0, 0, 0, inputs_embeds.shape[0] - flat.shape[0]))]
+                if is_multimodal is not None and is_multimodal.device != inputs_embeds.device:
+                    is_multimodal = is_multimodal.to(inputs_embeds.device)
+                return base_merge(inputs_embeds, multimodal_embeddings, is_multimodal)
 
             _omni_merge._is_omni_static_padded = True  # type: ignore[attr-defined]
             vllm_utils._merge_multimodal_embeddings = _omni_merge
@@ -163,46 +177,50 @@ def apply_omni_ar_patches() -> None:
 
         if hasattr(thinker_mod, "merge_interleaved_embeddings"):
 
-            def _merge_interleaved(ie: torch.Tensor, mm: Any, iv: torch.Tensor, ia: torch.Tensor, im: torch.Tensor) -> torch.Tensor:
+            def _merge_interleaved(
+                inputs_embeds: torch.Tensor, multimodal_embeddings: Any, is_video: torch.Tensor, is_audio: torch.Tensor, is_multimodal: torch.Tensor
+            ) -> torch.Tensor:
                 from vllm.multimodal.utils import get_mm_embedding_modalities
 
-                mods = get_mm_embedding_modalities(mm)
-                for msk, name in ((iv, "video"), (ia, "audio"), (im & ~iv & ~ia, "image")):
-                    if grp := [e for e, m in zip(mm, mods) if m == name]:
-                        ie = _active_merge(ie, grp, msk)
-                return ie
+                mods = get_mm_embedding_modalities(multimodal_embeddings)
+                for msk, name in ((is_video, "video"), (is_audio, "audio"), (is_multimodal & ~is_video & ~is_audio, "image")):
+                    if grp := [e for e, m in zip(multimodal_embeddings, mods) if m == name]:
+                        inputs_embeds = _active_merge(inputs_embeds, grp, msk)
+                return inputs_embeds
 
             thinker_mod.merge_interleaved_embeddings = _merge_interleaved
 
         if (tc := getattr(thinker_mod, "Qwen3OmniMoeThinkerForConditionalGeneration", None)) and hasattr(tc, "embed_input_ids"):
             orig_embed = tc.embed_input_ids
 
-            def _cpu_mm_embed(self: Any, ids: torch.Tensor, mm: Any = None, *, is_multimodal: Any = None) -> torch.Tensor:
-                if mm:
-                    mm = [_with_mod(e.detach().cpu() if e.device.type == "tpu" else e, e) for e in mm]
+            def _cpu_mm_embed(
+                self: Any, input_ids: torch.Tensor, multimodal_embeddings: Any = None, *, is_multimodal: Any = None
+            ) -> torch.Tensor:
+                if multimodal_embeddings:
+                    multimodal_embeddings = [_with_mod(e.detach().cpu() if e.device.type == "tpu" else e, e) for e in multimodal_embeddings]
                     is_multimodal = is_multimodal.detach().cpu() if is_multimodal is not None and is_multimodal.device.type == "tpu" else is_multimodal
-                return orig_embed(self, ids, multimodal_embeddings=mm, is_multimodal=is_multimodal)
+                return orig_embed(self, input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal)
 
             tc.embed_input_ids = _cpu_mm_embed
 
         if not getattr(TPUModelRunner._gather_mm_embeddings, "_is_omni_patched", False):
             orig_gather, orig_get = TPUModelRunner._gather_mm_embeddings, TPUModelRunner._get_model_inputs
 
-            def _omni_gather_mm(self: Any, *a: Any, **kw: Any) -> Any:
-                ml, ism = orig_gather(self, *a, **kw)
+            def _omni_gather_mm(self: Any, *args: Any, **kwargs: Any) -> Any:
+                ml, ism = orig_gather(self, *args, **kwargs)
                 self._omni_mm_embeds_list = ml
                 return ([torch.arange(sum(int(e.shape[0]) for e in ml), dtype=torch.int64)] if ml else ml), ism
 
-            def _omni_get_model_inputs(self: Any, ids: torch.Tensor, mmi: Any) -> Any:
-                if mmi and mmi[0] and (ml := getattr(self, "_omni_mm_embeds_list", None)) and mmi[0][0].ndim == 1:
-                    st, en, pos, real = int(mmi[0][0][0].item()), int(mmi[0][0][0].item()) + int(mmi[0][0].shape[0]), 0, []
+            def _omni_get_model_inputs(self: Any, input_ids: torch.Tensor, mm_embed_inputs: Any) -> Any:
+                if mm_embed_inputs and mm_embed_inputs[0] and (ml := getattr(self, "_omni_mm_embeds_list", None)) and mm_embed_inputs[0][0].ndim == 1:
+                    st, en, pos, real = int(mm_embed_inputs[0][0][0].item()), int(mm_embed_inputs[0][0][0].item()) + int(mm_embed_inputs[0][0].shape[0]), 0, []
                     for e in ml:
                         s, t = max(0, st - pos), min(n := int(e.shape[0]), en - pos)
                         if s < t:
                             real.append(_with_mod(e if (s == 0 and t == n) else e[s:t], e))
                         pos += n
-                    mmi = (real, mmi[1])
-                return orig_get(self, ids, mmi)
+                    mm_embed_inputs = (real, mm_embed_inputs[1])
+                return orig_get(self, input_ids, mm_embed_inputs)
 
             _omni_gather_mm._is_omni_patched = True  # type: ignore[attr-defined]
             TPUModelRunner._gather_mm_embeddings, TPUModelRunner._get_model_inputs = _omni_gather_mm, _omni_get_model_inputs

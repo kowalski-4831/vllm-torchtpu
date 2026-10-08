@@ -93,6 +93,9 @@ def test_apply_omni_ar_patches_audio_attention_and_padded_encoder(monkeypatch):
         def _process_audio_input(self, ai):
             return ai["input_features"], ai["audio_feature_lengths"]
 
+        def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+            return multimodal_embeddings
+
     _current_tp_size = 8
     qwen3_pkg = types.ModuleType("vllm_omni.model_executor.models.qwen3_omni")
     thinker_mod = types.ModuleType(
@@ -102,6 +105,7 @@ def test_apply_omni_ar_patches_audio_attention_and_padded_encoder(monkeypatch):
     thinker_mod.Qwen3OmniMoeAudioEncoder = DummyAudioEncoder
     thinker_mod.Qwen3Omni_VisionTransformer = DummyViT
     thinker_mod.Qwen3OmniMoeConditionalGenerationMixin = DummyMixin
+    thinker_mod.Qwen3OmniMoeThinkerForConditionalGeneration = DummyMixin
     qwen3_pkg.qwen3_omni_moe_thinker = thinker_mod
 
     for mod_name, mod_obj in (
@@ -173,3 +177,11 @@ def test_apply_omni_ar_patches_audio_attention_and_padded_encoder(monkeypatch):
     assert embeds_out.shape == (5, 8) and len(captured_mm[0]) == 2
     assert captured_mm[0][0].shape == (2, 32) and captured_mm[0][0].modality == "video"
     assert captured_mm[0][1].shape == (3, 8) and captured_mm[0][1].modality == "audio"
+    kw_out = DummyMixin().embed_input_ids(
+        input_ids=torch.zeros(5, dtype=torch.long),
+        multimodal_embeddings=[vid_emb],
+        is_multimodal=torch.ones(5, dtype=torch.bool),
+    )
+    assert kw_out[0].shape == (6, 32) and kw_out[0].modality == "video"
+
+
