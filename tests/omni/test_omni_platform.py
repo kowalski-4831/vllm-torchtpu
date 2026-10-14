@@ -191,3 +191,33 @@ def test_safe_pack_tensor_if_large():
     res = ipc._pack_tensor_if_large(t)
     assert t.cpu_called is True
     assert res["device"] == "cpu"
+
+
+def test_qwen3_omni_audio_encoder_patch():
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeAudioEncoder,
+    )
+
+    from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
+
+    apply_omni_tpu_patches.cache_clear()
+    apply_omni_tpu_patches()
+
+    class TrackedTensor(torch.Tensor):
+        cpu_called: bool = False
+
+        def cpu(self, *args, **kwargs):
+            self.cpu_called = True
+            return super().cpu(*args, **kwargs)
+
+    enc = Qwen3OmniMoeAudioEncoder()
+    feat = torch.randn(128, 800)
+    lens = torch.tensor([800]).as_subclass(TrackedTensor)
+    aftercnn = torch.tensor([104])
+
+    out_feat, out_lens, out_aftercnn = enc.forward(feat, lens, aftercnn)
+    assert lens.cpu_called is True
+    assert out_lens.device.type == "cpu"
+    assert torch.equal(
+        enc._get_cnn_output_lengths(torch.tensor([100])), torch.tensor([100])
+    )
