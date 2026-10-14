@@ -28,8 +28,14 @@ def test_omni_tpu_model_runner_load_model():
     runner.model_config = MagicMock()
     runner.init_omni_connectors = MagicMock()
 
-    with patch.object(TPUModelRunner, "load_model") as mock_super_load:
+    with (
+        patch(
+            "vllm_torchtpu.omni.omni_tpu_model_runner.apply_omni_ar_patches"
+        ) as mock_patch,
+        patch.object(TPUModelRunner, "load_model") as mock_super_load,
+    ):
         runner.load_model()
+        mock_patch.assert_called_once_with()
         mock_super_load.assert_called_once_with()
 
     runner.init_omni_connectors.assert_called_once_with(runner.model_config)

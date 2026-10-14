@@ -3,6 +3,7 @@
 
 from typing import Any
 
+from vllm_torchtpu.omni.qwen3_omni_moe_thinker_patch import apply_omni_ar_patches
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -10,6 +11,7 @@ class OmniTPUModelRunner(TPUModelRunner):
     """Shared base for every Omni Runner on TPU."""
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
+        apply_omni_ar_patches()
         super().load_model(*args, **kwargs)
         if hasattr(self, "init_omni_connectors") and hasattr(self, "model_config"):
             self.init_omni_connectors(self.model_config)

@@ -49,6 +49,10 @@ class OmniTPUARModelRunner(OmniConnectorModelRunnerMixin, OmniTPUModelRunner):
                 mm_embed_inputs = (sliced_embeds, is_multimodal)
         return super()._get_model_inputs(input_ids, mm_embed_inputs)
 
+    def forward_model(self, *args: Any, **kwargs: Any) -> Any:
+        out, aux = super().forward_model(*args, **kwargs)
+        return getattr(out, "text_hidden_states", out), aux
+
     def sample_tokens(self, grammar_output: Any = None) -> Any:
         output = super().sample_tokens(grammar_output)
         if getattr(self, "_omni_connector_initialized", False):
