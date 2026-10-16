@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU runtime patches for vLLM-Omni diffusion models."""
+"""TPU runtime patches for vLLM-Omni diffusion/audio models."""
 
 from functools import cache as run_once
 from typing import Any
@@ -72,6 +72,45 @@ def apply_omni_tpu_patches() -> None:
     logger.info(
         "Applied TPU patch: safe torch.nn.functional.interpolate for 1D linear TPU ops."
     )
+
+    # In Qwen3OmniMoeAudioEncoder.forward, chunk_num is computed as:
+    #   chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+    # On TPU, `feature_lens / 100` lowers to float32 reciprocal multiplication
+    # (800 * 0.01000000074505806 = 8.000001), so `torch.ceil` rounds 800/100 up
+    # to 9 instead of 8 and crashes `split_with_sizes`. Moving `feature_lens` to
+    # CPU runs the division and `torch.ceil` with exact IEEE-754 CPU math (8.0).
+    try:
+        from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+            Qwen3OmniMoeAudioEncoder,
+        )
+
+        orig_audio_forward = Qwen3OmniMoeAudioEncoder.forward
+        orig_get_cnn_output_lengths = Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths
+
+        def _safe_audio_forward(
+            self: Any,
+            input_features: torch.Tensor,
+            feature_lens: torch.Tensor,
+            aftercnn_lens: torch.Tensor,
+        ) -> torch.Tensor:
+            return orig_audio_forward(
+                self, input_features, feature_lens.cpu(), aftercnn_lens
+            )
+
+        def _safe_get_cnn_output_lengths(
+            self: Any, input_lengths: torch.Tensor
+        ) -> torch.Tensor:
+            return orig_get_cnn_output_lengths(self, input_lengths).to(
+                self.conv2d1.weight.device
+            )
+
+        Qwen3OmniMoeAudioEncoder.forward = _safe_audio_forward
+        Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths = _safe_get_cnn_output_lengths
+        logger.info(
+            "Applied TPU patch: Qwen3-Omni audio encoder CPU chunk length math."
+        )
+    except Exception as e:
+        logger.debug("Skipped Qwen3-Omni audio encoder patch: %s", e)
 
 
 @run_once

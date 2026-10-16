@@ -97,6 +97,27 @@ class _MockLTXRuntime:
         return MagicMock(output=self.output)
 
 
+class _MockOmniWorkerMixin:
+    pass
+
+
+class _MockOmniConnectorModelRunnerMixin:
+    def attach_omni_connector_output(self, output):
+        return ("connector_attached", output)
+
+
+class _MockQwen3OmniMoeAudioEncoder:
+    def __init__(self):
+        self.conv2d1 = MagicMock()
+        self.conv2d1.weight.device = torch.device("cpu")
+
+    def forward(self, input_features, feature_lens, aftercnn_lens):
+        return (input_features, feature_lens, aftercnn_lens)
+
+    def _get_cnn_output_lengths(self, input_lengths):
+        return input_lengths
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -106,6 +127,13 @@ vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend 
     lambda *args, **kwargs: None
 )
 vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = _MockLTXRuntime
+vllm_omni_mock.worker.mixins.OmniWorkerMixin = _MockOmniWorkerMixin
+vllm_omni_mock.worker.omni_connector_model_runner_mixin.OmniConnectorModelRunnerMixin = (
+    _MockOmniConnectorModelRunnerMixin
+)
+vllm_omni_mock.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeAudioEncoder = (
+    _MockQwen3OmniMoeAudioEncoder
+)
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -130,3 +158,16 @@ sys.modules["vllm_omni.diffusion.models.ltx2"] = vllm_omni_mock.diffusion.models
 sys.modules["vllm_omni.diffusion.models.ltx2.ltx2_runtime"] = (
     vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime
 )
+sys.modules["vllm_omni.worker"] = vllm_omni_mock.worker
+sys.modules["vllm_omni.worker.mixins"] = vllm_omni_mock.worker.mixins
+sys.modules["vllm_omni.worker.omni_connector_model_runner_mixin"] = (
+    vllm_omni_mock.worker.omni_connector_model_runner_mixin
+)
+sys.modules["vllm_omni.model_executor"] = vllm_omni_mock.model_executor
+sys.modules["vllm_omni.model_executor.models"] = vllm_omni_mock.model_executor.models
+sys.modules["vllm_omni.model_executor.models.qwen3_omni"] = (
+    vllm_omni_mock.model_executor.models.qwen3_omni
+)
+sys.modules[
+    "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker"
+] = vllm_omni_mock.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker
