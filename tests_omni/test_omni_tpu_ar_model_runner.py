@@ -52,6 +52,27 @@ def test_omni_tpu_ar_model_runner_inheritance():
     assert issubclass(OmniTPUARModelRunner, OmniConnectorModelRunnerMixin)
 
 
+def test_omni_tpu_ar_model_runner_forward_model():
+    runner = _make_bare_ar_runner()
+
+    # 1. Extracts text_hidden_states from multimodal output
+    hidden = torch.randn(4, 16)
+    multimodal_out = SimpleNamespace(text_hidden_states=hidden, extra="mm")
+    with patch.object(
+        OmniTPUModelRunner, "forward_model", return_value=(multimodal_out, "aux")
+    ):
+        out, aux = runner.forward_model()
+    assert out is hidden
+    assert aux == "aux"
+
+    # 2. Passes plain tensor output through directly
+    plain = torch.randn(4, 16)
+    with patch.object(OmniTPUModelRunner, "forward_model", return_value=(plain, None)):
+        out, aux = runner.forward_model()
+    assert out is plain
+    assert aux is None
+
+
 def test_sample_tokens_sync_output():
     runner = _make_bare_ar_runner()
     with patch.object(OmniTPUModelRunner, "sample_tokens", return_value="raw_tokens"):

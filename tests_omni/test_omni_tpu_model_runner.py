@@ -54,8 +54,14 @@ def test_load_model_inits_connectors_when_needed(model_config):
     runner = _make_bare_runner()
     runner.model_config = model_config
 
-    with patch.object(TPUModelRunner, "load_model") as mock_super_load:
+    with (
+        patch(
+            "vllm_torchtpu.omni.omni_tpu_model_runner.apply_omni_ar_patches"
+        ) as mock_patch,
+        patch.object(TPUModelRunner, "load_model") as mock_super_load,
+    ):
         runner.load_model()
+        mock_patch.assert_called_once_with()
         mock_super_load.assert_called_once_with()
 
     runner.init_omni_connectors.assert_called_once_with(model_config)
@@ -71,8 +77,14 @@ def test_load_model_skips_connectors_when_not_needed():
         stage_connector_config=None,
     )
 
-    with patch.object(TPUModelRunner, "load_model") as mock_super_load:
+    with (
+        patch(
+            "vllm_torchtpu.omni.omni_tpu_model_runner.apply_omni_ar_patches"
+        ) as mock_patch,
+        patch.object(TPUModelRunner, "load_model") as mock_super_load,
+    ):
         runner.load_model()
+        mock_patch.assert_called_once_with()
         mock_super_load.assert_called_once_with()
 
     runner.init_omni_connectors.assert_not_called()

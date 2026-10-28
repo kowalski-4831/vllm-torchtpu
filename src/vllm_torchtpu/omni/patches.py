@@ -28,6 +28,7 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import align_to
 
 logger = init_logger(__name__)
 
@@ -78,6 +79,38 @@ def apply_omni_tpu_patches() -> None:
 _AUDIO_CHUNK_LENGTHS_PATCHED = "_tpu_audio_chunk_lengths_patched"
 
 
+class _ExactCeilDivTensor(torch.Tensor):
+    """Tensor wrapper that computes exact integer ceil-division on TPU."""
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        if func in (
+            torch.Tensor.div,
+            torch.div,
+            torch.Tensor.true_divide,
+            torch.true_divide,
+        ):
+            dividend, divisor = args[0], args[1]
+            if isinstance(dividend, cls):
+                dividend = dividend.as_subclass(torch.Tensor)
+            if isinstance(divisor, int) or (
+                isinstance(divisor, torch.Tensor) and not divisor.is_floating_point()
+            ):
+                return align_to(dividend, divisor) // divisor
+        if func in (torch.ceil, torch.Tensor.ceil):
+            x = args[0]
+            if isinstance(x, cls):
+                x = x.as_subclass(torch.Tensor)
+            if isinstance(x, torch.Tensor) and not x.is_floating_point():
+                return x
+        unwrapped_args = [
+            a.as_subclass(torch.Tensor) if isinstance(a, cls) else a for a in args
+        ]
+        return super().__torch_function__(func, types, unwrapped_args, kwargs)
+
+
 def _patch_qwen3_omni_audio_chunk_lengths() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove once vLLM-Omni computes chunk_num in
@@ -87,13 +120,10 @@ def _patch_qwen3_omni_audio_chunk_lengths() -> None:
     # Problem: on TPU, `feature_lens / 100` lowers to a float32 reciprocal
     #   multiplication (800 * 0.01000000074505806 = 8.000001), so torch.ceil
     #   rounds 800 / 100 up to 9 instead of 8 and split_with_sizes fails.
-    # Fix: hand `feature_lens` to the original forward on CPU, where the
-    #   division and torch.ceil use exact IEEE-754 math (8.0). Integer
-    #   ceil-division on TPU would need the whole forward re-implemented, as
-    #   the expression is inline upstream.
-    # Effect: `chunk_lengths` is built on CPU, so `_get_cnn_output_lengths`
-    #   returns to the encoder's device to keep the CNN padding mask on the
-    #   same device as the features.
+    # Fix: wrap `feature_lens` in `_ExactCeilDivTensor` so integer division by
+    #   `self.n_window * 2` executes exact integer ceiling math
+    #   (`align_to(feature_lens, window) // window`) directly on TPU without
+    #   transferring tensors to CPU.
     # -------------------------------------------------------------------------
     try:
         from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -106,7 +136,6 @@ def _patch_qwen3_omni_audio_chunk_lengths() -> None:
     orig_audio_forward = Qwen3OmniMoeAudioEncoder.forward
     if getattr(orig_audio_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False):
         return
-    orig_get_cnn_output_lengths = Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths
 
     def _safe_audio_forward(
         self: Any,
@@ -115,20 +144,15 @@ def _patch_qwen3_omni_audio_chunk_lengths() -> None:
         aftercnn_lens: torch.Tensor,
     ) -> torch.Tensor:
         return orig_audio_forward(
-            self, input_features, feature_lens.cpu(), aftercnn_lens
-        )
-
-    def _safe_get_cnn_output_lengths(
-        self: Any, input_lengths: torch.Tensor
-    ) -> torch.Tensor:
-        return orig_get_cnn_output_lengths(self, input_lengths).to(
-            self.conv2d1.weight.device
+            self,
+            input_features,
+            feature_lens.as_subclass(_ExactCeilDivTensor),
+            aftercnn_lens,
         )
 
     setattr(_safe_audio_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, True)
     Qwen3OmniMoeAudioEncoder.forward = _safe_audio_forward
-    Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths = _safe_get_cnn_output_lengths
-    logger.info("Applied TPU patch: Qwen3-Omni audio encoder CPU chunk length math.")
+    logger.info("Applied TPU patch: Qwen3-Omni audio encoder TPU chunk length math.")
 
 
 @run_once

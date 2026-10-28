@@ -63,6 +63,10 @@ class OmniTPUARModelRunner(OmniTPUModelRunner):
                 mm_embed_inputs = (sliced_embeds, is_multimodal)
         return super()._get_model_inputs(input_ids, mm_embed_inputs)
 
+    def forward_model(self, *args: Any, **kwargs: Any) -> Any:
+        out, aux = super().forward_model(*args, **kwargs)
+        return getattr(out, "text_hidden_states", out), aux
+
     def _with_omni_connector_output(self, output: Any) -> Any:
         """Attach connector signals to the ``ModelRunnerOutput`` the engine reads.
 

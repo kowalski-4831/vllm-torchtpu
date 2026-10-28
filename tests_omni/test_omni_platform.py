@@ -462,39 +462,21 @@ def test_qwen3_omni_audio_chunk_lengths_patch(monkeypatch):
     seen = {}
 
     def _forward(self, input_features, feature_lens, aftercnn_lens):
-        seen["feature_lens_device"] = feature_lens.device.type
+        seen["chunk_num"] = torch.ceil(feature_lens / (self.n_window * 2)).long()
         return input_features, feature_lens, aftercnn_lens
 
-    # Upstream forward runs the whole encoder. Both class attributes the patch
-    # rebinds are restored after the test.
     monkeypatch.setattr(Qwen3OmniMoeAudioEncoder, "forward", _forward)
-    monkeypatch.setattr(
-        Qwen3OmniMoeAudioEncoder, "_get_cnn_output_lengths", lambda self, x: x
-    )
 
     _patch_qwen3_omni_audio_chunk_lengths()
     patched = Qwen3OmniMoeAudioEncoder.forward
     assert patched is not _forward
     assert getattr(patched, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
 
-    class TrackedTensor(torch.Tensor):
-        cpu_called: bool = False
-
-        def cpu(self, *args, **kwargs):
-            self.cpu_called = True
-            return super().cpu(*args, **kwargs)
-
-    enc = SimpleNamespace(conv2d1=SimpleNamespace(weight=torch.empty(0)))
-    lens = torch.tensor([800]).as_subclass(TrackedTensor)
-    _, out_lens, _ = patched(enc, torch.randn(128, 800), lens, torch.tensor([104]))
-    # chunk_num's ceil(feature_lens / window) runs on CPU, where it is exact.
-    assert lens.cpu_called is True
-    assert seen["feature_lens_device"] == "cpu"
-    assert out_lens.device.type == "cpu"
-    # ... and the CNN lengths come back on the encoder's device.
-    out = Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths(enc, torch.tensor([100]))
-    assert out.device == enc.conv2d1.weight.device
-    assert torch.equal(out, torch.tensor([100]))
+    enc = SimpleNamespace(n_window=50, conv2d1=SimpleNamespace(weight=torch.empty(0)))
+    lens = torch.tensor([800, 750, 100])
+    _, out_lens, _ = patched(enc, torch.randn(128, 1650), lens, torch.tensor([104]))
+    assert torch.equal(seen["chunk_num"], torch.tensor([8, 8, 1], dtype=torch.long))
+    assert out_lens.device.type == lens.device.type
 
     _patch_qwen3_omni_audio_chunk_lengths()
     assert Qwen3OmniMoeAudioEncoder.forward is patched

@@ -20,6 +20,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     needs_omni_connector,
 )
 
+from vllm_torchtpu.omni.qwen3_omni_moe_thinker_patch import apply_omni_ar_patches
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -36,6 +37,7 @@ class OmniTPUModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
     _omni_connector_initialized: bool = False
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
+        apply_omni_ar_patches()
         super().load_model(*args, **kwargs)
         # Same gate as upstream GPUARModelRunner: a stage owns connectors only
         # when it consumes a full payload, produces inter-stage data
