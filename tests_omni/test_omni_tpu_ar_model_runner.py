@@ -16,6 +16,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -153,3 +154,73 @@ def test_omni_tpu_ar_model_runner_mixed_dim_mm_slicing():
     assert captured_mm[0][0].modality == "video"
     assert captured_mm[0][1].shape == (3, 8)
     assert captured_mm[0][1].modality == "audio"
+
+
+def test_omni_tpu_ar_model_runner_talker_preprocess_mtp_postprocess_and_output():
+    runner = _make_bare_ar_runner()
+    runner.supports_mm_inputs = False
+    runner.device = torch.device("cpu")
+    runner.input_batch = SimpleNamespace(
+        req_ids=["req-0"],
+        num_reqs=1,
+        num_computed_tokens_cpu=np.array([4], dtype=np.int32),
+    )
+    runner.query_start_loc_np = np.array([0, 1], dtype=np.int32)
+
+    class DummyTalkerStage:
+        has_preprocess = True
+        has_postprocess = True
+        gpu_resident_buffer_keys = {("hidden_states", "last"), ("codes", "audio")}
+
+        def preprocess(self, input_ids, input_embeds=None, **req_info):
+            assert req_info["_omni_num_computed_tokens"] == 4
+            assert req_info["_omni_is_prefill"] is False
+            return (
+                input_ids,
+                torch.ones(1, 8),
+                {"mtp_inputs": (torch.full((1, 8), 2.0), torch.full((1, 8), 3.0))},
+            )
+
+        def talker_mtp(self, input_ids, input_embeds, last_hidden, text_step):
+            return input_embeds + last_hidden + text_step, torch.arange(16).unsqueeze(0)
+
+        def postprocess(self, hidden_states, **kwargs):
+            return {"hidden_states": {"last": hidden_states[-1].detach()}}
+
+        def make_omni_output(self, model_outputs, model_intermediate_buffer=None):
+            codes = [b["codes"]["audio"] for b in model_intermediate_buffer]
+            return SimpleNamespace(
+                multimodal_outputs={"codes": {"audio": torch.cat(codes, dim=0)}}
+            )
+
+    runner.model = DummyTalkerStage()
+    out_ids, out_embeds = runner._get_model_inputs(
+        torch.tensor([42], dtype=torch.long), None
+    )
+    assert out_ids is None
+    assert torch.equal(out_embeds, torch.full((1, 8), 6.0))
+    assert torch.equal(
+        runner.model_intermediate_buffer["req-0"]["codes"]["audio"],
+        torch.arange(16).unsqueeze(0),
+    )
+
+    hidden = torch.full((1, 8), 9.0)
+    with patch.object(OmniTPUModelRunner, "forward_model", return_value=(hidden, None)):
+        fwd_out, fwd_aux = runner.forward_model()
+    assert torch.equal(fwd_out, hidden)
+    assert fwd_aux is None
+    assert torch.equal(
+        runner.model_intermediate_buffer["req-0"]["hidden_states"]["last"],
+        torch.full((8,), 9.0),
+    )
+
+    inner_out = SimpleNamespace(req_ids=["req-0"], inter_stage_outputs=None)
+    with patch.object(
+        OmniTPUModelRunner, "sample_tokens", return_value=_async_output(inner_out)
+    ):
+        runner.sample_tokens()
+    assert len(inner_out.inter_stage_outputs) == 1
+    assert torch.equal(
+        inner_out.inter_stage_outputs[0]["codes"]["audio"],
+        torch.arange(16).unsqueeze(0),
+    )

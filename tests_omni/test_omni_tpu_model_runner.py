@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
@@ -57,11 +58,15 @@ def test_load_model_inits_connectors_when_needed(model_config):
     with (
         patch(
             "vllm_torchtpu.omni.omni_tpu_model_runner.apply_omni_ar_patches"
-        ) as mock_patch,
+        ) as mock_ar_patch,
+        patch(
+            "vllm_torchtpu.omni.omni_tpu_model_runner.apply_omni_talker_patches"
+        ) as mock_talker_patch,
         patch.object(TPUModelRunner, "load_model") as mock_super_load,
     ):
         runner.load_model()
-        mock_patch.assert_called_once_with()
+        mock_ar_patch.assert_called_once_with()
+        mock_talker_patch.assert_called_once_with()
         mock_super_load.assert_called_once_with()
 
     runner.init_omni_connectors.assert_called_once_with(model_config)
@@ -80,11 +85,15 @@ def test_load_model_skips_connectors_when_not_needed():
     with (
         patch(
             "vllm_torchtpu.omni.omni_tpu_model_runner.apply_omni_ar_patches"
-        ) as mock_patch,
+        ) as mock_ar_patch,
+        patch(
+            "vllm_torchtpu.omni.omni_tpu_model_runner.apply_omni_talker_patches"
+        ) as mock_talker_patch,
         patch.object(TPUModelRunner, "load_model") as mock_super_load,
     ):
         runner.load_model()
-        mock_patch.assert_called_once_with()
+        mock_ar_patch.assert_called_once_with()
+        mock_talker_patch.assert_called_once_with()
         mock_super_load.assert_called_once_with()
 
     runner.init_omni_connectors.assert_not_called()
@@ -95,12 +104,14 @@ def test_update_states_cleans_finished_requests():
     runner = _make_bare_runner()
     runner._omni_connector_initialized = True
     runner.cleanup_finished_request = MagicMock()
+    runner.model_intermediate_buffer = {"req-1": {"meta": {"step": 1}}}
     sched_out = SimpleNamespace(finished_req_ids=["req-1"])
 
     with patch.object(TPUModelRunner, "_update_states", return_value="updated"):
         assert runner._update_states(sched_out) == "updated"
 
     runner.cleanup_finished_request.assert_called_once_with("req-1")
+    assert "req-1" not in runner.model_intermediate_buffer
 
 
 def test_update_states_without_connectors():
@@ -112,3 +123,34 @@ def test_update_states_without_connectors():
         assert runner._update_states(sched_out) == "updated"
 
     runner.cleanup_finished_request.assert_not_called()
+
+
+def test_update_states_populates_model_intermediate_buffer():
+    runner = _make_bare_runner()
+    runner.model = SimpleNamespace(gpu_resident_buffer_keys={("hidden_states", "last")})
+    new_req = SimpleNamespace(
+        req_id="req-new",
+        additional_information={"speaker": "ethan"},
+        model_intermediate_buffer={
+            "hidden_states": {"last": torch.ones(2, 4)},
+            "embed": {"prefill": torch.zeros(3, 4)},
+        },
+    )
+    cached_reqs = SimpleNamespace(
+        req_ids=["req-new"],
+        additional_information={"req-new": {"meta": {"decode_flag": True}}},
+    )
+    sched_out = SimpleNamespace(
+        finished_req_ids=[],
+        scheduled_new_reqs=[new_req],
+        scheduled_cached_reqs=cached_reqs,
+    )
+
+    with patch.object(TPUModelRunner, "_update_states", return_value="updated"):
+        runner._update_states(sched_out)
+
+    buf = runner.model_intermediate_buffer["req-new"]
+    assert buf["speaker"] == "ethan"
+    assert buf["meta"]["decode_flag"] is True
+    assert torch.equal(buf["hidden_states"]["last"], torch.ones(2, 4))
+    assert torch.equal(buf["embed"]["prefill"], torch.zeros(3, 4))
